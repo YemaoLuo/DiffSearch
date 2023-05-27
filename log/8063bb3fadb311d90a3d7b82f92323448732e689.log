@@ -1,0 +1,475 @@
+8063bb3fadb311d90a3d7b82f92323448732e689
+==================================================
+For EL expressions used within attribute values:
+==================================================
+Mark Thomas
+==================================================
+Thu Sep 10 13:18:02 2015 +0000
+==================================================
+AttributeParser.java
+For EL expressions used within attribute values:
+a) attribute escaping (e.g. for quotes) DOES NOT apply inside the EL expression
+b) EL expressions can not be used with scriptlets (<%= ... %>)
+
+For EL expressions in JSP
+c) '\$' is an escape for '$' rather than '\${' being an escape for '${'
+d) '\#' is an escape for '#' rather than '\#{' being an escape for '#{'
+
+The implications of this include:
+1. Due to a) 
+   <tags:echo echo="10-${'hello "world'}" />
+   is treated as valid (previously the double quote had to be escaped)
+
+2. Due to c) (and similarly for d))
+   <p>04-\$500</p>
+   will now render as
+   <p>04-$500</p>
+   whereas previously it rendered unchanged
+
+3. Due to a)
+   <tags:echo echo="01-${\"hello world\"}" />
+   will now trigger an error
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1702244 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+ELParser.java
+index 9540776680..59f6f835ff 100644
+--- a/java/org/apache/jasper/compiler/AttributeParser.java
++++ b/java/org/apache/jasper/compiler/AttributeParser.java
+@@ -202,11 +202,11 @@ public class AttributeParser {
+     }
+ 
+     /*
+-     * For EL need to unquote everything but no need to convert anything. The
+-     * EL is terminated by '}'. The only other valid location for '}' is inside
+-     * a StringLiteral. The literals are delimited by '\'' or '\"'. The only
+-     * other valid location for '\'' or '\"' is also inside a StringLiteral. A
+-     * quote character inside a StringLiteral must be escaped if the same quote
++     * Once inside EL, no need to unquote or convert anything. The EL is
++     * terminated by '}'. The only other valid location for '}' is inside a
++     * StringLiteral. The literals are delimited by '\'' or '\"'. The only other
++     * valid location for '\'' or '\"' is also inside a StringLiteral. A quote
++     * character inside a StringLiteral must be escaped if the same quote
+      * character is used to delimit the StringLiteral.
+      */
+     private void parseEL() {
+@@ -214,7 +214,7 @@ public class AttributeParser {
+         boolean insideLiteral = false;
+         char literalQuote = 0;
+         while (i < size && !endEL) {
+-            char ch = nextChar();
++            char ch = input.charAt(i++);
+             if (ch == '\'' || ch == '\"') {
+                 if (insideLiteral) {
+                     if (literalQuote == ch) {
+@@ -228,7 +228,7 @@ public class AttributeParser {
+             } else if (ch == '\\') {
+                 result.append(ch);
+                 if (insideLiteral && size < i) {
+-                    ch = nextChar();
++                    ch = input.charAt(i++);
+                     result.append(ch);
+                 }
+             } else if (ch == '}') {
+
+==================================================
+JspDocumentParser.java
+index 8760cf9249..ced5dc2226 100644
+--- a/java/org/apache/jasper/compiler/ELParser.java
++++ b/java/org/apache/jasper/compiler/ELParser.java
+@@ -205,11 +205,9 @@ public class ELParser {
+         while (hasNextChar()) {
+             char ch = nextChar();
+             if (ch == '\\') {
+-                // Is this the start of a "\${" or "\#{" escape sequence?
++                // Is this the start of a "\$" or "\#" escape sequence?
+                 char p0 = peek(0);
+-                char p1 = peek(1);
+-                if ((p0 == '$' || (p0 == '#' && !isDeferredSyntaxAllowedAsLiteral)) && p1 == '{') {
+-                    buf.append(nextChar());
++                if (p0 == '$' || (p0 == '#' && !isDeferredSyntaxAllowedAsLiteral)) {
+                     buf.append(nextChar());
+                 } else {
+                     buf.append(ch);
+@@ -229,7 +227,8 @@ public class ELParser {
+ 
+     /**
+      * Escape '$' and '#', inverting the unescaping performed in
+-     * {@link #skipUntilEL()}.
++     * {@link #skipUntilEL()} but only for ${ and #{ sequences since escaping
++     * for $ and # is optional.
+      *
+      * @param input Non-EL input to be escaped
+      * @param isDeferredSyntaxAllowedAsLiteral
+
+==================================================
+JspReader.java
+index b68a9a3351..ac08064e39 100644
+--- a/java/org/apache/jasper/compiler/JspDocumentParser.java
++++ b/java/org/apache/jasper/compiler/JspDocumentParser.java
+@@ -605,11 +605,7 @@ class JspDocumentParser
+                         lastCh = ch;
+                     }
+                 } else if (lastCh == '\\' && (ch == '$' || ch == '#')) {
+-                    if (i + 1 < charBuffer.length() && charBuffer.charAt(i + 1) == '{') {
+-                        if (pageInfo.isELIgnored()) {
+-                            ttext.write('\\');
+-                        }
+-                    } else {
++                    if (pageInfo.isELIgnored()) {
+                         ttext.write('\\');
+                     }
+                     ttext.write(ch);
+
+==================================================
+Parser.java
+index 810b16b611..412b56277c 100644
+--- a/java/org/apache/jasper/compiler/JspReader.java
++++ b/java/org/apache/jasper/compiler/JspReader.java
+@@ -436,15 +436,17 @@ class JspReader {
+ 
+     /**
+      * Skip until the given string is matched in the stream, but ignoring
+-     * chars initially escaped by a '\'.
++     * chars initially escaped by a '\' and any EL expressions.
+      * When returned, the context is positioned past the end of the match.
+      *
+      * @param s The String to match.
++     * @param ignoreEL <code>true</code> if something that looks like EL should
++     *                 not be treated as EL.
+      * @return A non-null <code>Mark</code> instance (positioned immediately
+      *         before the search string) if found, <strong>null</strong>
+      *         otherwise.
+      */
+-    Mark skipUntilIgnoreEsc(String limit) {
++    Mark skipUntilIgnoreEsc(String limit, boolean ignoreEL) {
+         Mark ret = mark();
+         int limlen = limit.length();
+         int ch;
+@@ -454,6 +456,12 @@ class JspReader {
+         for (ch = nextChar(ret) ; ch != -1 ; prev = ch, ch = nextChar(ret)) {
+             if (ch == '\\' && prev == '\\') {
+                 ch = 0;                // Double \ is not an escape char anymore
++            } else if (prev == '\\') {
++                continue;
++            } else if (!ignoreEL && (ch == '$' || ch == '#') && peekChar() == '{' ) {
++                // Move beyond the '{'
++                nextChar();
++                skipELExpression();
+             } else if (ch == firstChar && prev != '\\') {
+                 for (int i = 1 ; i < limlen ; i++) {
+                     if (peekChar() == limit.charAt(i))
+
+==================================================
+TestELInJsp.java
+index 4c8ae2f47e..837f199272 100644
+--- a/java/org/apache/jasper/compiler/Parser.java
++++ b/java/org/apache/jasper/compiler/Parser.java
+@@ -199,6 +199,8 @@ class Parser implements TagConstants {
+         if (qName == null)
+             return false;
+ 
++        boolean ignoreEL = pageInfo.isELIgnored();
++
+         // Determine prefix and local name components
+         String localName = qName;
+         String uri = "";
+@@ -223,11 +225,14 @@ class Parser implements TagConstants {
+             err.jspError(reader.mark(), "jsp.error.attribute.noquote");
+ 
+         String watchString = "";
+-        if (reader.matches("<%="))
++        if (reader.matches("<%=")) {
+             watchString = "%>";
++            // Can't embed EL in a script expression
++            ignoreEL = true;
++        }
+         watchString = watchString + quote;
+ 
+-        String attrValue = parseAttributeValue(watchString);
++        String attrValue = parseAttributeValue(watchString, ignoreEL);
+         attrs.addAttribute(uri, localName, qName, "CDATA", attrValue);
+         return true;
+     }
+@@ -258,9 +263,9 @@ class Parser implements TagConstants {
+      * RTAttributeValueDouble ::= ((QuotedChar - '"')* - ((QuotedChar-'"')'%>"')
+      * ('%>"' | TRANSLATION_ERROR)
+      */
+-    private String parseAttributeValue(String watch) throws JasperException {
++    private String parseAttributeValue(String watch, boolean ignoreEL) throws JasperException {
+         Mark start = reader.mark();
+-        Mark stop = reader.skipUntilIgnoreEsc(watch);
++        Mark stop = reader.skipUntilIgnoreEsc(watch, ignoreEL);
+         if (stop == null) {
+             err.jspError(start, "jsp.error.attribute.unterminated", watch);
+         }
+@@ -1275,7 +1280,11 @@ class Parser implements TagConstants {
+ 
+     /*
+      * Parse for a template text string until '<' or "${" or "#{" is encountered,
+-     * recognizing escape sequences "<\%", "\${", and "\#{".
++     * recognizing escape sequences "<\%", "\$", and "\#".
++     *
++     * Note: JSP uses '\$' as an escape for '$' and '\#' for '#' whereas EL uses
++     *       '\${' for '${' and '\#{' for '#{'. We are processing JSP template
++     *       test here so the JSP escapes apply.
+      */
+     private void parseTemplateText(Node parent) {
+ 
+@@ -1304,13 +1313,7 @@ class Parser implements TagConstants {
+             } else if (ch == '\\' && !pageInfo.isELIgnored()) {
+                 int next = reader.peekChar(0);
+                 if (next == '$' || next == '#') {
+-                    if (reader.peekChar(1) == '{') {
+-                        ttext.write(reader.nextChar());
+-                        ttext.write(reader.nextChar());
+-                    } else {
+-                        ttext.write(ch);
+-                        ttext.write(reader.nextChar());
+-                    }
++                    ttext.write(reader.nextChar());
+                 } else {
+                     ttext.write(ch);
+                 }
+@@ -1362,10 +1365,7 @@ class Parser implements TagConstants {
+                 } else if (ch == '\\') {
+                     int next = reader.peekChar(0);
+                     if (next == '$' || next =='#') {
+-                        if (reader.peekChar(1) == '{') {
+-                            ttext.write(reader.nextChar());
+-                            ttext.write(reader.nextChar());
+-                        }
++                        ttext.write(reader.nextChar());
+                     } else {
+                         ttext.write('\\');
+                     }
+
+==================================================
+TestAttributeParser.java
+index 1bdb89d0ec..5be9246bbf 100644
+--- a/test/org/apache/el/TestELInJsp.java
++++ b/test/org/apache/el/TestELInJsp.java
+@@ -93,21 +93,19 @@ public class TestELInJsp extends TomcatBaseTest {
+         assertEcho(result, "00-hello world");
+         assertEcho(result, "01-hello 'world");
+         assertEcho(result, "02-hello \"world");
+-        assertEcho(result, "03-hello world");
+-        assertEcho(result, "04-hello 'world");
+-        assertEcho(result, "05-hello \"world");
+-        assertEcho(result, "06-hello world");
+-        assertEcho(result, "07-hello 'world");
+-        assertEcho(result, "08-hello \"world");
+-        assertEcho(result, "09-hello world");
+-        assertEcho(result, "10-hello 'world");
++        assertEcho(result, "03-hello \"world");
++        assertEcho(result, "04-hello world");
++        assertEcho(result, "05-hello 'world");
++        assertEcho(result, "06-hello 'world");
++        assertEcho(result, "07-hello \"world");
++        assertEcho(result, "08-hello world");
++        assertEcho(result, "09-hello 'world");
++        assertEcho(result, "10-hello \"world");
+         assertEcho(result, "11-hello \"world");
+         assertEcho(result, "12-hello world");
+         assertEcho(result, "13-hello 'world");
+-        assertEcho(result, "14-hello \"world");
+-        assertEcho(result, "15-hello world");
+-        assertEcho(result, "16-hello 'world");
+-        assertEcho(result, "17-hello \"world");
++        assertEcho(result, "14-hello 'world");
++        assertEcho(result, "15-hello \"world");
+     }
+ 
+     @Test
+@@ -121,8 +119,6 @@ public class TestELInJsp extends TomcatBaseTest {
+         // Warning: JSP attribute escaping != Java String escaping
+         assertEcho(result, "00-\\'hello world\\'");
+         assertEcho(result, "01-\\'hello world\\'");
+-        assertEcho(result, "02-\\'hello world\\'");
+-        assertEcho(result, "03-\\'hello world\\'");
+ 
+         res = getUrl("http://localhost:" + getPort() + "/test/bug45nnn/bug45451b.jsp");
+         result = res.toString();
+@@ -133,18 +129,25 @@ public class TestELInJsp extends TomcatBaseTest {
+         assertEcho(result, "01-${1+1}");
+         assertEcho(result, "02-\\${1+1}");
+         assertEcho(result, "03-\\\\${1+1}");
+-        assertEcho(result, "04-\\$500");
++        assertEcho(result, "04-$500");
++        // Inside an EL literal '\' is only used to escape '\', ''' and '"'
++        assertEcho(result, "05-\\$");
++        assertEcho(result, "06-\\${");
+         assertEcho(result, "10-2");
+         assertEcho(result, "11-${1+1}");
+         assertEcho(result, "12-\\2");
+         assertEcho(result, "13-\\${1+1}");
+         assertEcho(result, "14-\\\\2");
+-        assertEcho(result, "15-\\$500");
++        assertEcho(result, "15-$500");
++        assertEcho(result, "16-\\$");
++        assertEcho(result, "17-\\${");
+         assertEcho(result, "20-2");
+         assertEcho(result, "21-#{1+1}");
+         assertEcho(result, "22-\\2");
+         assertEcho(result, "23-\\#{1+1}");
+         assertEcho(result, "24-\\\\2");
++        assertEcho(result, "25-\\#");
++        assertEcho(result, "26-\\#{");
+ 
+         res = getUrl("http://localhost:" + getPort() + "/test/bug45nnn/bug45451c.jsp");
+         result = res.toString();
+@@ -176,13 +179,13 @@ public class TestELInJsp extends TomcatBaseTest {
+         assertEcho(result, "01-${1+1}");
+         assertEcho(result, "02-\\${1+1}");
+         assertEcho(result, "03-\\\\${1+1}");
+-        assertEcho(result, "04-\\$500");
++        assertEcho(result, "04-$500");
+         assertEcho(result, "10-2");
+         assertEcho(result, "11-${1+1}");
+         assertEcho(result, "12-\\${1+1}");
+         assertEcho(result, "13-\\\\${1+1}");
+         assertEcho(result, "14-\\\\\\${1+1}");
+-        assertEcho(result, "15-\\$500");
++        assertEcho(result, "15-$500");
+         assertEcho(result, "20-2");
+         assertEcho(result, "21-#{1+1}");
+         assertEcho(result, "22-\\#{1+1}");
+@@ -198,13 +201,13 @@ public class TestELInJsp extends TomcatBaseTest {
+         assertEcho(result, "01-${1+1}");
+         assertEcho(result, "02-\\${1+1}");
+         assertEcho(result, "03-\\\\${1+1}");
+-        assertEcho(result, "04-\\$500");
++        assertEcho(result, "04-$500");
+         assertEcho(result, "10-2");
+         assertEcho(result, "11-${1+1}");
+         assertEcho(result, "12-\\2");
+         assertEcho(result, "13-\\${1+1}");
+         assertEcho(result, "14-\\\\2");
+-        assertEcho(result, "15-\\$500");
++        assertEcho(result, "15-$500");
+         assertEcho(result, "20-#{1+1}");
+         assertEcho(result, "21-\\#{1+1}");
+         assertEcho(result, "22-\\#{1+1}");
+@@ -303,13 +306,13 @@ public class TestELInJsp extends TomcatBaseTest {
+         assertEcho(result, "08-a2z");
+         assertEcho(result, "09-az2");
+         assertEcho(result, "10-${'foo'}bar");
+-        assertEcho(result, "11-\"}");
++        assertEcho(result, "11-\\\"}");
+         assertEcho(result, "12-foo\\bar\\baz");
+         assertEcho(result, "13-foo\\bar\\baz");
+         assertEcho(result, "14-foo\\bar\\baz");
+         assertEcho(result, "15-foo\\bar\\baz");
+         assertEcho(result, "16-foo\\bar\\baz");
+-        assertEcho(result, "17-foo\\bar\\baz");
++        assertEcho(result, "17-foo\\&apos;bar&apos;\\&quot;baz&quot;");
+         assertEcho(result, "18-3");
+         assertEcho(result, "19-4");
+         assertEcho(result, "20-4");
+
+==================================================
+TestELParser.java
+index 39280fb808..fba2866ee8 100644
+--- a/test/org/apache/jasper/compiler/TestAttributeParser.java
++++ b/test/org/apache/jasper/compiler/TestAttributeParser.java
+@@ -127,19 +127,15 @@ public class TestAttributeParser {
+         // list and looking at the spec to find some edge cases
+ 
+         // '\' is only an escape character inside a StringLiteral
+-        assertEquals("\\", evalAttr("${'\\\\\\\\'}", '\"'));
+-        assertEquals("\\", evalAttr("${\"\\\\\\\\\"}", '\"'));
++        // Attribute escaping does not apply inside EL expressions
++        assertEquals("\\", evalAttr("${'\\\\'}", '\"'));
+ 
+         // Can use ''' inside '"' when quoting with '"' and vice versa without
+         // escaping
+-        assertEquals("\\\"", evalAttr("${'\\\\\\\\\\\"'}", '\"'));
+-        assertEquals("\"\\", evalAttr("${'\\\"\\\\\\\\'}", '\"'));
+-        assertEquals("\\'", evalAttr("${'\\\\\\\\\\\\''}", '\"'));
+-        assertEquals("'\\", evalAttr("${'\\\\'\\\\\\\\'}", '\"'));
+-        assertEquals("\\'", evalAttr("${\\\"\\\\\\\\'\\\"}", '\"'));
+-        assertEquals("'\\", evalAttr("${\\\"'\\\\\\\\\\\"}", '\"'));
+-        assertEquals("\\\"", evalAttr("${\\\"\\\\\\\\\\\\\\\"\\\"}", '\"'));
+-        assertEquals("\"\\", evalAttr("${\\\"\\\\\\\"\\\\\\\\\\\"}", '\"'));
++        assertEquals("\\\"", evalAttr("${'\\\\\"'}", '\"'));
++        assertEquals("\"\\", evalAttr("${'\\\"\\\\'}", '\"'));
++        assertEquals("\\'", evalAttr("${'\\\\\\''}", '\"'));
++        assertEquals("'\\", evalAttr("${'\\'\\\\'}", '\"'));
+ 
+         // Quoting <% and %>
+         assertEquals("hello <% world", evalAttr("hello <\\% world", '\"'));
+@@ -156,9 +152,8 @@ public class TestAttributeParser {
+         // expression that follows from being evaluated.
+         //
+         assertEquals("foo\\bar\\baz", evalAttr("${\'foo\'}\\\\${\'bar\'}\\\\${\'baz\'}", '\"'));
+-        assertEquals("foo\\bar\\baz", evalAttr("${\'foo\'}\\\\${\\\"bar\\\"}\\\\${\'baz\'}", '\"'));
+-        assertEquals("foo\\bar\\baz", evalAttr("${\\\"foo\\\"}\\\\${\'bar\'}\\\\${\\\"baz\\\"}", '\"'));
+-        assertEquals("foo\\bar\\baz", evalAttr("${\"foo\"}\\\\${\\\'bar\\\'}\\\\${\"baz\"}", '\''));
++        assertEquals("foo\\bar\\baz", evalAttr("${\'foo\'}\\\\${\"bar\"}\\\\${\'baz\'}", '\"'));
++        assertEquals("foo\\bar\\baz", evalAttr("${\"foo\"}\\\\${\'bar\'}\\\\${\"baz\"}", '\"'));
+     }
+ 
+     @Test
+
+==================================================
+TestParser.java
+index b007bad1de..ec4a3cb941 100644
+--- a/test/org/apache/jasper/compiler/TestELParser.java
++++ b/test/org/apache/jasper/compiler/TestELParser.java
+@@ -238,13 +238,15 @@ public class TestELParser {
+ 
+     @Test
+     public void testEscape04() throws JasperException {
+-        doTestParser("\\$", "\\$");
++        // When parsed as EL in JSP the escaping of $ as \$ is optional
++        doTestParser("\\$", "\\$", "$");
+     }
+ 
+ 
+     @Test
+     public void testEscape05() throws JasperException {
+-        doTestParser("\\#", "\\#");
++        // When parsed as EL in JSP the escaping of # as \# is optional
++        doTestParser("\\#", "\\#", "#");
+     }
+ 
+ 
+@@ -280,18 +282,23 @@ public class TestELParser {
+ 
+ 
+     private void doTestParser(String input, String expected) throws JasperException {
++        doTestParser(input, expected, input);
++    }
++
++    private void doTestParser(String input, String expectedResult, String expectedBuilderOutput) throws JasperException {
++
+         ELException elException = null;
+         String elResult = null;
+ 
+         // Don't try and evaluate expressions that depend on variables or functions
+-        if (expected != null) {
++        if (expectedResult != null) {
+             try {
+                 ELManager manager = new ELManager();
+                 ELContext context = manager.getELContext();
+                 ExpressionFactory factory = ELManager.getExpressionFactory();
+                 ValueExpression ve = factory.createValueExpression(context, input, String.class);
+                 elResult = ve.getValue(context).toString();
+-                Assert.assertEquals(expected, elResult);
++                Assert.assertEquals(expectedResult, elResult);
+             } catch (ELException ele) {
+                 elException = ele;
+             }
+@@ -312,6 +319,6 @@ public class TestELParser {
+ 
+         nodes.visit(textBuilder);
+ 
+-        Assert.assertEquals(input, textBuilder.getText());
++        Assert.assertEquals(expectedBuilderOutput, textBuilder.getText());
+     }
+ }
+
+==================================================

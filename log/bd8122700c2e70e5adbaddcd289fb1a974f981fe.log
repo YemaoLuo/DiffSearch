@@ -1,0 +1,104 @@
+bd8122700c2e70e5adbaddcd289fb1a974f981fe
+==================================================
+Fix so that we don't do a busy read, instead we are properly doing a NIO poller wait
+==================================================
+Filip Hanik
+==================================================
+Thu Jun 22 19:05:02 2006 +0000
+==================================================
+Http11NioProcessor.java
+Fix so that we don't do a busy read, instead we are properly doing a NIO poller wait
+This way, we can achieve blocking read, without wasting CPU cycles.
+Since we are using Java 5, I will be changing this implementation from using synchronized to using the Exchanger, this is also to avoid anyi locks that can happen. For example, in the current implementation the poller can call notify before we have had a chance to call wait
+
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/tc6.0.x/trunk@416444 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+InternalNioInputBuffer.java
+index 55e4bdbe5c..9d9c7b8897 100644
+--- a/java/org/apache/coyote/http11/Http11NioProcessor.java
++++ b/java/org/apache/coyote/http11/Http11NioProcessor.java
+@@ -90,8 +90,8 @@ public class Http11NioProcessor implements ActionHook {
+             readTimeout = timeout;
+             //readTimeout = -1;
+         }
+-        inputBuffer = new InternalNioInputBuffer(request, headerBufferSize,
+-                readTimeout);
++        inputBuffer = new InternalNioInputBuffer(request, headerBufferSize,readTimeout);
++        inputBuffer.setPoller(endpoint.getPoller());
+         request.setInputBuffer(inputBuffer);
+ 
+         response = new Response();
+
+==================================================
+NioEndpoint.java
+index 948226a09a..486a99a4c1 100644
+--- a/java/org/apache/coyote/http11/InternalNioInputBuffer.java
++++ b/java/org/apache/coyote/http11/InternalNioInputBuffer.java
+@@ -28,6 +28,10 @@ import org.apache.tomcat.util.buf.ByteChunk;
+ import org.apache.tomcat.util.buf.MessageBytes;
+ import org.apache.tomcat.util.http.MimeHeaders;
+ import org.apache.tomcat.util.res.StringManager;
++import java.nio.channels.Selector;
++import java.nio.channels.SelectionKey;
++import org.apache.tomcat.util.net.NioEndpoint.KeyAttachment;
++import org.apache.tomcat.util.net.NioEndpoint.Poller;
+ 
+ /**
+  * Implementation of InputBuffer which provides HTTP request header parsing as
+@@ -183,7 +187,7 @@ public class InternalNioInputBuffer implements InputBuffer {
+      * header.
+      */
+     protected long readTimeout;
+-
++    private Poller poller;
+ 
+     // ------------------------------------------------------------- Properties
+ 
+@@ -203,6 +207,9 @@ public class InternalNioInputBuffer implements InputBuffer {
+         return socket;
+     }
+ 
++    public Poller getPoller() {
++        return poller;
++    }
+ 
+     /**
+      * Add an input filter to the filter library.
+@@ -272,6 +279,9 @@ public class InternalNioInputBuffer implements InputBuffer {
+         this.swallowInput = swallowInput;
+     }
+ 
++    public void setPoller(Poller poller) {
++        this.poller = poller;
++    }
+ 
+     // --------------------------------------------------------- Public Methods
+ 
+@@ -551,7 +561,20 @@ public class InternalNioInputBuffer implements InputBuffer {
+                 return false;
+             }
+             timedOut = (readTimeout != -1) && ((System.currentTimeMillis()-start)>this.readTimeout);
+-            //if ( !timedOut && nRead == 0 ) try {Thread.sleep(5);}catch ( Exception x ) {}
++            if ( !timedOut && nRead == 0 ) 
++                try {
++                    final SelectionKey key = socket.keyFor(poller.getSelector());
++                    KeyAttachment att = (KeyAttachment)key.attachment();
++                    att.setWakeUp(true);
++                    
++                    poller.addEvent(
++                        new Runnable() {
++                            public void run() {
++                                if ( key != null ) key.interestOps(SelectionKey.OP_READ);
++                            }
++                    });
++                    synchronized (att.getMutex()) { att.getMutex().wait(25);}
++                }catch ( Exception x ) {}
+         }while ( nRead == 0 && (!timedOut) );
+         //else throw new IOException(sm.getString("iib.failedread"));
+         return false; //timeout
+
+==================================================

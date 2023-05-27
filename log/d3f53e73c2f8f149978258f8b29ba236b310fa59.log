@@ -1,0 +1,193 @@
+d3f53e73c2f8f149978258f8b29ba236b310fa59
+==================================================
+First step in addressing https://bz.apache.org/bugzilla/show_bug.cgi?id=62273
+==================================================
+Mark Thomas
+==================================================
+Wed Apr 25 12:03:32 2018 +0000
+==================================================
+Http11InputBuffer.java
+First step in addressing https://bz.apache.org/bugzilla/show_bug.cgi?id=62273
+This commit actually tightens up the parsing by validating each part of the request target individually. Subsequent commits will introduce options to separately relax the parsing of the path segments and the query string.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1830068 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Http11Processor.java
+index b4c7cadbe2..3c57766ac9 100644
+--- a/java/org/apache/coyote/http11/Http11InputBuffer.java
++++ b/java/org/apache/coyote/http11/Http11InputBuffer.java
+@@ -456,7 +456,13 @@ public class Http11InputBuffer implements InputBuffer, ApplicationBufferHandler
+                     end = pos;
+                 } else if (chr == Constants.QUESTION && parsingRequestLineQPos == -1) {
+                     parsingRequestLineQPos = pos;
++                } else if (parsingRequestLineQPos != -1 && !HttpParser.isQuery(chr)) {
++                    // %nn decoding will be checked at the point of decoding
++                    throw new IllegalArgumentException(sm.getString("iib.invalidRequestTarget"));
+                 } else if (HttpParser.isNotRequestTarget(chr)) {
++                    // This is a general check that aims to catch problems early
++                    // Detailed checking of each part of the request target will
++                    // happen in Http11Processor#prepareRequest()
+                     throw new IllegalArgumentException(sm.getString("iib.invalidRequestTarget"));
+                 }
+             }
+
+==================================================
+ByteChunk.java
+index 651ae22b67..31a10be90a 100644
+--- a/java/org/apache/coyote/http11/LocalStrings.properties
++++ b/java/org/apache/coyote/http11/LocalStrings.properties
+@@ -21,6 +21,9 @@ http11processor.fallToDebug=\n Note: further occurrences of HTTP request parsing
+ http11processor.header.parse=Error parsing HTTP request header
+ http11processor.neverused=This method should never be used
+ http11processor.request.inconsistentHosts=The host specified in the request line is not consistent with the host header
++http11processor.request.invalidScheme=The HTTP request contained an absolute URI with an invalid scheme
++http11processor.request.invalidUri==The HTTP request contained an invalid URI
++http11processor.request.invalidUserInfo=The HTTP request contained an absolute URI with an invalid userinfo
+ http11processor.request.multipleHosts=The request contained multiple host headers
+ http11processor.request.noHostHeader=The HTTP/1.1 request did not provide a host header
+ http11processor.request.prepare=Error preparing request
+
+==================================================
+HttpParser.java
+index 78ef639dac..da2169ebf5 100644
+--- a/java/org/apache/tomcat/util/buf/ByteChunk.java
++++ b/java/org/apache/tomcat/util/buf/ByteChunk.java
+@@ -670,7 +670,33 @@ public final class ByteChunk extends AbstractChunk {
+ 
+ 
+     /**
+-     * Returns true if the buffer starts with the specified string.
++     * Returns true if the buffer starts with the specified string when tested
++     * in a case sensitive manner.
++     *
++     * @param s the string
++     * @param pos The position
++     *
++     * @return <code>true</code> if the start matches
++     */
++    public boolean startsWith(String s, int pos) {
++        byte[] b = buff;
++        int len = s.length();
++        if (b == null || len + pos > end - start) {
++            return false;
++        }
++        int off = start + pos;
++        for (int i = 0; i < len; i++) {
++            if (b[off++] != s.charAt(i)) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++
++    /**
++     * Returns true if the buffer starts with the specified string when tested
++     * in a case insensitive manner.
+      *
+      * @param s the string
+      * @param pos The position
+
+==================================================
+TestApplicationContext.java
+index 83f858fdc3..908335a06c 100644
+--- a/java/org/apache/tomcat/util/http/parser/HttpParser.java
++++ b/java/org/apache/tomcat/util/http/parser/HttpParser.java
+@@ -46,6 +46,11 @@ public class HttpParser {
+     private static final boolean[] IS_HTTP_PROTOCOL = new boolean[ARRAY_SIZE];
+     private static final boolean[] IS_ALPHA = new boolean[ARRAY_SIZE];
+     private static final boolean[] IS_NUMERIC = new boolean[ARRAY_SIZE];
++    private static final boolean[] IS_UNRESERVED = new boolean[ARRAY_SIZE];
++    private static final boolean[] IS_SUBDELIM = new boolean[ARRAY_SIZE];
++    private static final boolean[] IS_USERINFO = new boolean[ARRAY_SIZE];
++    private static final boolean[] IS_ABSOLUTEPATH = new boolean[ARRAY_SIZE];
++    private static final boolean[] IS_QUERY = new boolean[ARRAY_SIZE];
+ 
+     static {
+         for (int i = 0; i < ARRAY_SIZE; i++) {
+@@ -94,6 +99,40 @@ public class HttpParser {
+             if (i >= 'a' && i <= 'z' || i >= 'A' && i <= 'Z') {
+                 IS_ALPHA[i] = true;
+             }
++
++            if (IS_ALPHA[i] || IS_NUMERIC[i] || i == '-' || i == '.' || i == '_' || i == '~') {
++                IS_UNRESERVED[i] = true;
++            }
++
++            if (i == '!' || i == '$' || i == '&' || i == '\'' || i == '(' || i == ')' || i == '*' || i == '+' ||
++                    i == ',' || i == ';' || i == '=') {
++                IS_SUBDELIM[i] = true;
++            }
++
++            // userinfo    = *( unreserved / pct-encoded / sub-delims / ":" )
++            if (IS_UNRESERVED[i] || i == '%' || IS_SUBDELIM[i] || i == ':') {
++                IS_USERINFO[i] = true;
++            }
++
++            /*
++             * absolute-path  = 1*( "/" segment )
++             * segment        = *pchar
++             * pchar          = unreserved / pct-encoded / sub-delims / ":" / "@"
++             *
++             * Note pchar allows everything userinfo allows plus "@"
++             */
++            if (IS_USERINFO[i] || i == '@' || i == '/') {
++                IS_ABSOLUTEPATH[i] = true;
++            }
++
++            /*
++             * query          = *( pchar / "/" / "?" )
++             *
++             * Note query allows everything absolute-path allows plus "?"
++             */
++            if (IS_ABSOLUTEPATH[i] || i == '?') {
++                IS_QUERY[i] = true;
++            }
+         }
+     }
+ 
+@@ -196,6 +235,39 @@ public class HttpParser {
+     }
+ 
+ 
++    public static boolean isUserInfo(int c) {
++        // Fast for valid user info characters, slower for some incorrect
++        // ones
++        try {
++            return IS_USERINFO[c];
++        } catch (ArrayIndexOutOfBoundsException ex) {
++            return false;
++        }
++    }
++
++
++    public static boolean isAbsolutePath(int c) {
++        // Fast for valid user info characters, slower for some incorrect
++        // ones
++        try {
++            return IS_ABSOLUTEPATH[c];
++        } catch (ArrayIndexOutOfBoundsException ex) {
++            return false;
++        }
++    }
++
++
++    public static boolean isQuery(int c) {
++        // Fast for valid user info characters, slower for some incorrect
++        // ones
++        try {
++            return IS_QUERY[c];
++        } catch (ArrayIndexOutOfBoundsException ex) {
++            return false;
++        }
++    }
++
++
+     // Skip any LWS and return the next char
+     static int skipLws(Reader input, boolean withReset) throws IOException {
+ 
+
+==================================================

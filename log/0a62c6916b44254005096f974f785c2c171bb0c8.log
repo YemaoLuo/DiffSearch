@@ -1,0 +1,641 @@
+0a62c6916b44254005096f974f785c2c171bb0c8
+==================================================
+Support for setting SessionTrackingMode
+==================================================
+Mark Emlyn
+==================================================
+Mon Jan 12 13:39:35 2009 +0000
+==================================================
+Globals.java
+Support for setting SessionTrackingMode
+Most of this commit is to support invalidating the SSL session by the session manager.
+I'm not sure yet that support for SSL session tracking is a good idea. There are quite a few limitations (see the ssl howto doc) and the changes to do it are fairly invasive. The option remains to remove this at a later date and not support SSL session tracking in Tomcat 7.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@733748 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+CoyoteAdapter.java
+index 0d0125bf3b..dcfeaf42d6 100644
+--- a/java/org/apache/catalina/Globals.java
++++ b/java/org/apache/catalina/Globals.java
+@@ -144,6 +144,14 @@ public final class Globals {
+         "javax.servlet.request.ssl_session";
+ 
+ 
++    /**
++     * The request attribute key for the session manager.
++     * This one is a Tomcat extension to the Servlet spec.
++     */
++    public static final String SSL_SESSION_MGR_ATTR =
++        "javax.servlet.request.ssl_session_mgr";
++
++
+     /**
+      * The servlet context attribute under which the managed bean Registry
+      * will be stored for privileged contexts (if enabled).
+
+==================================================
+Request.java
+index 977b6d2bd1..731b540349 100644
+--- a/java/org/apache/catalina/connector/CoyoteAdapter.java
++++ b/java/org/apache/catalina/connector/CoyoteAdapter.java
+@@ -19,6 +19,9 @@
+ package org.apache.catalina.connector;
+ 
+ import java.io.IOException;
++import java.util.EnumSet;
++
++import javax.servlet.SessionTrackingMode;
+ 
+ import org.apache.catalina.CometEvent;
+ import org.apache.catalina.Context;
+@@ -36,6 +39,7 @@ import org.apache.tomcat.util.buf.CharChunk;
+ import org.apache.tomcat.util.buf.MessageBytes;
+ import org.apache.tomcat.util.http.Cookies;
+ import org.apache.tomcat.util.http.ServerCookie;
++import org.apache.tomcat.util.net.SSLSupport;
+ import org.apache.tomcat.util.net.SocketStatus;
+ 
+ 
+@@ -55,6 +59,8 @@ public class CoyoteAdapter
+ 
+     // -------------------------------------------------------------- Constants
+ 
++    private static final EnumSet<SessionTrackingMode> SSL_ONLY =
++        EnumSet.of(SessionTrackingMode.SSL);
+ 
+     public static final int ADAPTER_NOTES = 1;
+ 
+@@ -505,11 +511,31 @@ public class CoyoteAdapter
+ 
+         // Parse session Id
+         parseSessionCookiesId(req, request);
+-
++        parseSessionSslId(request);
+         return true;
+     }
+ 
+ 
++    /**
++     * Look for SSL sesison ID if required. Only look for SSL Session ID if it
++     * is the only tracking method enabled.
++     */
++    protected void parseSessionSslId(Request request) {
++        if (request.getRequestedSessionId() == null &&
++                SSL_ONLY.equals(request.getServletContext()
++                        .getEffectiveSessionTrackingModes()) &&
++                Boolean.TRUE.equals(
++                        request.getConnector().getAttribute("SSLEnabled"))) {
++            // TODO Is there a better way to map SSL sessions to our sesison ID?
++            // TODO The request.getAttribute() will cause a number of other SSL
++            //      attribute to be populated. Is this a performance concern?
++            request.setRequestedSessionId(
++                    request.getAttribute(SSLSupport.SESSION_ID_KEY).toString());
++            request.setRequestedSessionSSL(true);
++        }
++    }
++    
++    
+     /**
+      * Parse session id in URL.
+      */
+@@ -518,7 +544,9 @@ public class CoyoteAdapter
+         ByteChunk uriBC = req.requestURI().getByteChunk();
+         int semicolon = uriBC.indexOf(match, 0, match.length(), 0);
+ 
+-        if (semicolon > 0) {
++        if (semicolon > 0 &&
++                request.getServletContext().getEffectiveSessionTrackingModes()
++                        .contains(SessionTrackingMode.URL)) {
+ 
+             // Parse session ID, and extract it from the decoded request URI
+             int start = uriBC.getStart();
+@@ -563,7 +591,9 @@ public class CoyoteAdapter
+         // from a parent context with a session ID may be present which would
+         // overwrite the valid session ID encoded in the URL
+         Context context = (Context) request.getMappingData().context;
+-        if (context != null && !context.getCookies())
++        if (context != null && !context.getServletContext()
++                .getEffectiveSessionTrackingModes().contains(
++                        SessionTrackingMode.COOKIE))
+             return;
+         
+         // Parse session id from cookies
+
+==================================================
+Response.java
+index b92bb074b3..6f5699ac49 100644
+--- a/java/org/apache/catalina/connector/Request.java
++++ b/java/org/apache/catalina/connector/Request.java
+@@ -46,6 +46,7 @@ import javax.servlet.ServletRequestAttributeEvent;
+ import javax.servlet.ServletRequestAttributeListener;
+ import javax.servlet.ServletResponse;
+ import javax.servlet.SessionCookieConfig;
++import javax.servlet.SessionTrackingMode;
+ import javax.servlet.http.Cookie;
+ import javax.servlet.http.HttpServletRequest;
+ import javax.servlet.http.HttpSession;
+@@ -332,6 +333,12 @@ public class Request
+     protected boolean requestedSessionURL = false;
+ 
+ 
++    /**
++     * Was the requested session ID obtained from the SSL session?
++     */
++    protected boolean requestedSessionSSL = false;
++
++
+     /**
+      * Parse locales.
+      */
+@@ -1505,8 +1512,7 @@ public class Request
+     }
+ 
+     public ServletContext getServletContext() {
+-        // TODO SERVLET3
+-        return null;
++       return context.getServletContext();
+     }
+ 
+     public boolean isAsyncStarted() {
+@@ -1735,6 +1741,20 @@ public class Request
+     }
+ 
+ 
++    /**
++     * Set a flag indicating whether or not the requested session ID for this
++     * request came in through SSL.  This is normally called by the
++     * HTTP Connector, when it parses the request headers.
++     *
++     * @param flag The new flag
++     */
++    public void setRequestedSessionSSL(boolean flag) {
++
++        this.requestedSessionSSL = flag;
++
++    }
++
++
+     /**
+      * Set the unparsed request URI for this Request.  This will normally be
+      * called by the HTTP Connector, when it parses the request headers.
+@@ -2321,6 +2341,15 @@ public class Request
+         coyoteRequest.action(ActionCode.ACTION_COMET_SETTIMEOUT,new Long(timeout));
+     }
+     
++    /**
++     * Not part of Servlet 3 spec but probably should be.
++     * @return
++     */
++    public boolean isRequestedSessionIdFromSSL() {
++        return requestedSessionSSL;
++    }
++    
++    
+     // ------------------------------------------------------ Protected Methods
+ 
+ 
+@@ -2360,7 +2389,8 @@ public class Request
+         if (!create)
+             return (null);
+         if ((context != null) && (response != null) &&
+-            context.getCookies() &&
++            context.getServletContext().getEffectiveSessionTrackingModes().
++                    contains(SessionTrackingMode.COOKIE) &&
+             response.getResponse().isCommitted()) {
+             throw new IllegalStateException
+               (sm.getString("coyoteRequest.sessionCreateCommitted"));
+@@ -2369,16 +2399,26 @@ public class Request
+         // Attempt to reuse session id if one was submitted in a cookie
+         // Do not reuse the session id if it is from a URL, to prevent possible
+         // phishing attacks
+-        if (connector.getEmptySessionPath() 
+-                && isRequestedSessionIdFromCookie()) {
++        // Use the SSL session ID if one is present. 
++        if ((connector.getEmptySessionPath() 
++                && isRequestedSessionIdFromCookie()) || requestedSessionSSL ) {
+             session = manager.createSession(getRequestedSessionId());
++            if (requestedSessionSSL) {
++                coyoteRequest.action(ActionCode.ACTION_REQ_SSL_SESSION_MGR,
++                        null);
++                session.setNote(
++                        org.apache.catalina.session.Constants.SESS_SSL_MGMT,
++                        getAttribute(Globals.SSL_SESSION_MGR_ATTR));
++            }
+         } else {
+             session = manager.createSession(null);
+         }
+ 
+         // Creating a new session cookie based on that session
+         if ((session != null) && (getContext() != null)
+-               && getContext().getCookies()) {
++               && getContext().getServletContext().
++                       getEffectiveSessionTrackingModes().contains(
++                               SessionTrackingMode.COOKIE)) {
+             Cookie cookie = new Cookie(Globals.SESSION_COOKIE_NAME,
+                                        session.getIdInternal());
+             configureSessionCookie(cookie);
+
+==================================================
+ApplicationContext.java
+index 4b0e55c5d5..349b49d7c6 100644
+--- a/java/org/apache/catalina/connector/Response.java
++++ b/java/org/apache/catalina/connector/Response.java
+@@ -35,6 +35,7 @@ import java.util.TimeZone;
+ import java.util.Vector;
+ 
+ import javax.servlet.ServletOutputStream;
++import javax.servlet.SessionTrackingMode;
+ import javax.servlet.http.Cookie;
+ import javax.servlet.http.HttpServletResponse;
+ 
+@@ -1420,6 +1421,11 @@ public class Response
+         if (hreq.isRequestedSessionIdFromCookie())
+             return (false);
+         
++        // Is URL encoding permitted
++        if (!hreq.getServletContext().getEffectiveSessionTrackingModes().
++                contains(SessionTrackingMode.URL))
++            return false;
++
+         if (SecurityUtil.isPackageProtectionEnabled()) {
+             return (
+                 AccessController.doPrivileged(new PrivilegedAction<Boolean>() {
+
+==================================================
+ApplicationContextFacade.java
+index e2cd2e120f..29bc2c8697 100644
+--- a/java/org/apache/catalina/core/ApplicationContext.java
++++ b/java/org/apache/catalina/core/ApplicationContext.java
+@@ -44,8 +44,10 @@ import javax.servlet.SessionCookieConfig;
+ import javax.servlet.SessionTrackingMode;
+ 
+ import org.apache.catalina.Context;
++import org.apache.catalina.Engine;
+ import org.apache.catalina.Host;
+ import org.apache.catalina.Wrapper;
++import org.apache.catalina.connector.Connector;
+ import org.apache.catalina.deploy.ApplicationParameter;
+ import org.apache.catalina.util.Enumerator;
+ import org.apache.catalina.util.ResourceSet;
+@@ -85,6 +87,9 @@ public class ApplicationContext
+         super();
+         this.context = context;
+         this.basePath = basePath;
++        
++        // Populate default session tracking modes
++        populateDefaultSessionTrackingModes();
+     }
+ 
+ 
+@@ -154,6 +159,12 @@ public class ApplicationContext
+      * Session Cookie config
+      */
+     private SessionCookieConfig sessionCookieConfig;
++    
++    /**
++     * Session tracking modes
++     */
++    private EnumSet<SessionTrackingMode> sessionTrackingModes = null;
++    private EnumSet<SessionTrackingMode> defaultSessionTrackingModes = null;
+ 
+     // --------------------------------------------------------- Public Methods
+ 
+@@ -840,15 +851,50 @@ public class ApplicationContext
+     }
+ 
+ 
++    /**
++     * By default {@link SessionTrackingMode#URL} is always supported, {@link
++     * SessionTrackingMode#COOKIE} is supported unless the <code>cookies</code>
++     * attribute has been set to <code>false</code> for the context and {@link
++     * SessionTrackingMode#SSL} is supported if at least one of the connectors
++     * used by this context has the attribute <code>SSLEnabled</code> set to
++     * <code>true</code>.
++     */
+     public EnumSet<SessionTrackingMode> getDefaultSessionTrackingModes() {
+-        // TODO SERVLET3
+-        return null;
++        return defaultSessionTrackingModes;
+     }
+ 
++    private void populateDefaultSessionTrackingModes() {
++        // URL re-writing is always enabled by default
++        defaultSessionTrackingModes = EnumSet.of(SessionTrackingMode.URL); 
++        
++        if (context.getCookies()) {
++            defaultSessionTrackingModes.add(SessionTrackingMode.COOKIE);
++        }
++
++        // Context > Host > Engine > Service
++        Connector[] connectors = ((Engine) context.getParent().getParent())
++                .getService().findConnectors();
++        // Need at least one SSL enabled connector to use the SSL session ID.
++        // has to be SSL enabled so we can close the SSL session.
++        // TODO extend this for SSL sessions managed by accelerators, web
++        // servers etc
++        for (Connector connector : connectors) {
++            if (Boolean.TRUE.equals(connector.getAttribute("SSLEnabled"))) {
++                defaultSessionTrackingModes.add(SessionTrackingMode.SSL);
++                break;
++            }
++        }
++    }
+ 
++    /**
++     * Return the supplied value if one was previously set, else return the
++     * defaults.
++     */
+     public EnumSet<SessionTrackingMode> getEffectiveSessionTrackingModes() {
+-        // TODO SERVLET3
+-        return null;
++        if (sessionTrackingModes != null) {
++            return sessionTrackingModes;
++        }
++        return defaultSessionTrackingModes;
+     }
+ 
+ 
+@@ -862,9 +908,33 @@ public class ApplicationContext
+     }
+ 
+ 
++    /**
++     * @throws IllegalStateException if the context has already been initialised
++     * @throws IllegalArgumentException TODO SERVLET3 Something to do with SSL
++     *                                  but the spec language is not clear
++     *                                  If an unsupported tracking mode is
++     *                                  requested
++     */
+     public void setSessionTrackingModes(
+             EnumSet<SessionTrackingMode> sessionTrackingModes) {
+-        // TODO SERVLET3
++
++        if (context.getAvailable()) {
++            throw new IllegalStateException(
++                    sm.getString("applicationContext.setSessionTracking.ise",
++                            getContextPath()));
++        }
++        
++        // Check that only supported tracking modes have been requested
++        for (SessionTrackingMode sessionTrackingMode : sessionTrackingModes) {
++            if (!defaultSessionTrackingModes.contains(sessionTrackingMode)) {
++                throw new IllegalArgumentException(sm.getString(
++                        "applicationContext.setSessionTracking.iae",
++                        sessionTrackingMode.toString(), getContextPath()));
++            }
++        }
++        // TODO SERVLET3 - The SSL test
++        
++        this.sessionTrackingModes = sessionTrackingModes;
+     }
+ 
+ 
+
+==================================================
+JvmRouteBinderValve.java
+index 28f4ecacef..03efc679cb 100644
+--- a/java/org/apache/catalina/core/LocalStrings.properties
++++ b/java/org/apache/catalina/core/LocalStrings.properties
+@@ -18,6 +18,8 @@ applicationContext.mapping.error=Error during mapping
+ applicationContext.requestDispatcher.iae=Path {0} does not start with a "/" character
+ applicationContext.resourcePaths.iae=Path {0} does not start with a "/" character
+ applicationContext.setAttribute.namenull=Name cannot be null
++applicationContext.setSessionTracking.ise=The session tracking modes for context {0} cannot be set whilst the context is running
++applicationContext.setSessionTracking.iae=The session tracking mode {0} requested for context {1} is not supported by that context
+ applicationDispatcher.allocateException=Allocate exception for servlet {0}
+ applicationDispatcher.deallocateException=Deallocate exception for servlet {0}
+ applicationDispatcher.forward.ise=Cannot forward after response has been committed
+
+==================================================
+Constants.java
+index 14644a2d31..131672841a 100644
+--- a/java/org/apache/catalina/ha/session/JvmRouteBinderValve.java
++++ b/java/org/apache/catalina/ha/session/JvmRouteBinderValve.java
+@@ -19,6 +19,7 @@ package org.apache.catalina.ha.session;
+ import java.io.IOException;
+ 
+ import javax.servlet.ServletException;
++import javax.servlet.SessionTrackingMode;
+ import javax.servlet.http.Cookie;
+ 
+ import org.apache.catalina.Container;
+@@ -431,7 +432,8 @@ public class JvmRouteBinderValve extends ValveBase implements ClusterValve, Life
+                                        Response response, String sessionId) {
+         if (response != null) {
+             Context context = request.getContext();
+-            if (context.getCookies()) {
++            if (context.getServletContext().getEffectiveSessionTrackingModes()
++                    .contains(SessionTrackingMode.COOKIE)) {
+                 // set a new session cookie
+                 Cookie newCookie = new Cookie(Globals.SESSION_COOKIE_NAME,
+                         sessionId);
+
+==================================================
+ManagerBase.java
+index 24546879e5..ca4b09aa04 100644
+--- a/java/org/apache/catalina/session/Constants.java
++++ b/java/org/apache/catalina/session/Constants.java
+@@ -29,4 +29,10 @@ public class Constants {
+ 
+     public static final String Package = "org.apache.catalina.session";
+ 
++    /**
++     * Name of note containing SSL session manager
++     */
++    public static final String SESS_SSL_MGMT =
++        "org.apache.catalina.session.SSL_MGMT";
++
+ }
+
+==================================================
+ActionCode.java
+index 8f5749fcc5..5624c9a727 100644
+--- a/java/org/apache/catalina/session/ManagerBase.java
++++ b/java/org/apache/catalina/session/ManagerBase.java
+@@ -53,6 +53,7 @@ import org.apache.catalina.util.StringManager;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.modeler.Registry;
++import org.apache.tomcat.util.net.SSLSessionManager;
+ 
+ 
+ /**
+@@ -907,6 +908,12 @@ public abstract class ManagerBase implements Manager, MBeanRegistration {
+     public void remove(Session session) {
+ 
+         sessions.remove(session.getIdInternal());
++        // Close the underlying SSL session
++        SSLSessionManager mgr =
++            (SSLSessionManager) session.getNote(Constants.SESS_SSL_MGMT);
++        if (mgr != null) {
++            mgr.invalidateSession();
++        }
+ 
+     }
+ 
+
+==================================================
+Http11AprProcessor.java
+index ac2e0fcab3..eb55f760ee 100644
+--- a/java/org/apache/coyote/ActionCode.java
++++ b/java/org/apache/coyote/ActionCode.java
+@@ -17,6 +17,8 @@
+  
+ package org.apache.coyote;
+ 
++import org.apache.tomcat.util.net.SSLSessionManager;
++
+ 
+ /**
+  * Enumerated class containing the adapter event codes.
+@@ -161,6 +163,12 @@ public final class ActionCode {
+      */
+     public static final ActionCode ACTION_COMET_SETTIMEOUT = new ActionCode(25);
+     
++    /**
++     * Callback for lazy evaluation - obtain the SSL Session Manager
++     */
++    public static final ActionCode ACTION_REQ_SSL_SESSION_MGR =
++        new ActionCode(26);
++    
+     // ----------------------------------------------------------- Constructors
+     int code;
+ 
+
+==================================================
+Http11NioProcessor.java
+index fae37f9775..78446df8c9 100644
+--- a/java/org/apache/coyote/http11/Http11AprProcessor.java
++++ b/java/org/apache/coyote/http11/Http11AprProcessor.java
+@@ -1198,6 +1198,9 @@ public class Http11AprProcessor implements ActionHook {
+             //no op
+         } else if (actionCode == ActionCode.ACTION_COMET_SETTIMEOUT) {
+             //no op
++        } else if (actionCode == ActionCode.ACTION_REQ_SSL_SESSION_MGR) {
++            //TODO SERVLET3 provide a hook to enable the SSL session to be
++            // invalidated
+         }
+ 
+     }
+
+==================================================
+Http11Processor.java
+index 118a7e6da4..e6768c70fc 100644
+--- a/java/org/apache/coyote/http11/Http11NioProcessor.java
++++ b/java/org/apache/coyote/http11/Http11NioProcessor.java
+@@ -1236,8 +1236,11 @@ public class Http11NioProcessor implements ActionHook {
+             RequestInfo rp = request.getRequestProcessor();
+             if ( rp.getStage() != org.apache.coyote.Constants.STAGE_SERVICE ) //async handling
+                 attach.setTimeout(timeout);
++        } else if (actionCode == ActionCode.ACTION_REQ_SSL_SESSION_MGR) {
++            if( sslSupport != null) {
++                request.setAttribute(SSLSupport.SESSION_MGR, sslSupport);
++            }
+         }
+-
+     }
+ 
+ 
+
+==================================================
+AprEndpoint.java
+index 7a0a3dd84b..05305880bb 100644
+--- a/java/org/apache/coyote/http11/Http11Processor.java
++++ b/java/org/apache/coyote/http11/Http11Processor.java
+@@ -1105,6 +1105,10 @@ public class Http11Processor implements ActionHook {
+             InternalInputBuffer internalBuffer = (InternalInputBuffer)
+                 request.getInputBuffer();
+             internalBuffer.addActiveFilter(savedBody);
++        } else if (actionCode == ActionCode.ACTION_REQ_SSL_SESSION_MGR) {
++            if( sslSupport != null) {
++                request.setAttribute(SSLSupport.SESSION_MGR, sslSupport);
++            }
+         }
+ 
+     }
+
+==================================================
+SSLSessionManager.java
+index 1127f07c91..84919c8c28 100644
+--- a/java/org/apache/tomcat/util/net/AprEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AprEndpoint.java
+@@ -87,6 +87,13 @@ public class AprEndpoint {
+      */
+     public static final String SESSION_ID_KEY = "javax.servlet.request.ssl_session";
+ 
++    /**
++     * The request attribute key for the session manager.
++     * This one is a Tomcat extension to the Servlet spec.
++     */
++    public static final String SESSION_MGR =
++        "javax.servlet.request.ssl_session_mgr";
++
+ 
+     // ----------------------------------------------------------------- Fields
+ 
+
+==================================================
+SSLSupport.java
+new file mode 100644
+index 0000000000..0269311043
+--- /dev/null
++++ b/java/org/apache/tomcat/util/net/SSLSessionManager.java
+@@ -0,0 +1,32 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++
++package org.apache.tomcat.util.net;
++
++/**
++ * Defines an interface used to manage SSL sessions. The manager operates on a
++ * single session.
++ * 
++ * $Id$
++ */
++public interface SSLSessionManager {
++    /**
++     * Invalidate the specified SSL session
++     * @param   sessionId   The ID of the session to invalidate.
++     */
++    public void invalidateSession();
++}
+
+==================================================
+JSSESupport.java
+index 9ffe605dce..f1437e0d05 100644
+--- a/java/org/apache/tomcat/util/net/SSLSupport.java
++++ b/java/org/apache/tomcat/util/net/SSLSupport.java
+@@ -48,6 +48,14 @@ public interface SSLSupport {
+      */
+     public static final String SESSION_ID_KEY = "javax.servlet.request.ssl_session";
+ 
++    /**
++     * The request attribute key for the session manager.
++     * This one is a Tomcat extension to the Servlet spec.
++     */
++    public static final String SESSION_MGR =
++        "javax.servlet.request.ssl_session_mgr";
++
++    
+     /**
+      * A mapping table to determine the number of effective bits in the key
+      * when using a cipher suite containing the specified cipher name.  The
+
+==================================================

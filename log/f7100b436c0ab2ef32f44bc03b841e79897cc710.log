@@ -1,0 +1,692 @@
+f7100b436c0ab2ef32f44bc03b841e79897cc710
+==================================================
+Remove the ExtensionValidator and associated classes
+==================================================
+Mark Thomas
+==================================================
+Wed Jul 28 17:57:21 2021 +0100
+==================================================
+StandardContext.java
+index c7bad2fa9c..1c81baa427 100644
+--- a/java/org/apache/catalina/core/LocalStrings_zh_CN.properties
++++ b/java/org/apache/catalina/core/LocalStrings_zh_CN.properties
+@@ -174,7 +174,6 @@ standardContext.duplicateListener=当前上下文已经配置了监听器[{0}]
+ standardContext.errorPage.error=错误页面位置[{0}]必须以“ /”开头
+ standardContext.errorPage.required=ErrorPage不能为null
+ standardContext.errorPage.warning=警告：在Servlet 2.4中，错误页位置 [{0}] 必须以"/"开头
+-standardContext.extensionValidationError=尝试校验必需的应用程序扩展时发生错误
+ standardContext.filterFail=一个或多个筛选器启动失败。完整的详细信息将在相应的容器日志文件中找到
+ standardContext.filterMap.either=过滤器映射必须指定 <url-pattern> 或 <servlet-name>
+ standardContext.filterMap.name=Filter mapping 指定了一个未知的 filter名称 [{0}]
+
+==================================================
+StandardServer.java
+index abdfced042..7eeb1b2d3a 100644
+--- a/java/org/apache/catalina/core/StandardContext.java
++++ b/java/org/apache/catalina/core/StandardContext.java
+@@ -106,7 +106,6 @@ import org.apache.catalina.session.StandardManager;
+ import org.apache.catalina.util.CharsetMapper;
+ import org.apache.catalina.util.ContextName;
+ import org.apache.catalina.util.ErrorPageSupport;
+-import org.apache.catalina.util.ExtensionValidator;
+ import org.apache.catalina.util.URLEncoder;
+ import org.apache.catalina.webresources.StandardRoot;
+ import org.apache.juli.logging.Log;
+@@ -4986,21 +4985,6 @@ public class StandardContext extends ContainerBase
+         // Initialize character set mapper
+         getCharsetMapper();
+ 
+-        // Validate required extensions
+-        boolean dependencyCheck = true;
+-        try {
+-            dependencyCheck = ExtensionValidator.validateApplication
+-                (getResources(), this);
+-        } catch (IOException ioe) {
+-            log.error(sm.getString("standardContext.extensionValidationError"), ioe);
+-            dependencyCheck = false;
+-        }
+-
+-        if (!dependencyCheck) {
+-            // do not make application available if dependency check fails
+-            ok = false;
+-        }
+-
+         // Reading the "catalina.useNaming" environment variable
+         String useNamingProperty = System.getProperty("catalina.useNaming");
+         if ((useNamingProperty != null)
+
+==================================================
+Extension.java
+index d0ead54c4a..b2684b56f0 100644
+--- a/java/org/apache/catalina/core/StandardServer.java
++++ b/java/org/apache/catalina/core/StandardServer.java
+@@ -25,9 +25,6 @@ import java.net.InetAddress;
+ import java.net.ServerSocket;
+ import java.net.Socket;
+ import java.net.SocketTimeoutException;
+-import java.net.URISyntaxException;
+-import java.net.URL;
+-import java.net.URLClassLoader;
+ import java.security.AccessControlException;
+ import java.util.Random;
+ import java.util.concurrent.ExecutionException;
+@@ -50,7 +47,6 @@ import org.apache.catalina.Service;
+ import org.apache.catalina.deploy.NamingResourcesImpl;
+ import org.apache.catalina.mbeans.MBeanFactory;
+ import org.apache.catalina.startup.Catalina;
+-import org.apache.catalina.util.ExtensionValidator;
+ import org.apache.catalina.util.LifecycleMBeanBase;
+ import org.apache.catalina.util.ServerInfo;
+ import org.apache.juli.logging.Log;
+@@ -1011,32 +1007,6 @@ public final class StandardServer extends LifecycleMBeanBase implements Server {
+         // Register the naming resources
+         globalNamingResources.init();
+ 
+-        // Populate the extension validator with JARs from common and shared
+-        // class loaders
+-        if (getCatalina() != null) {
+-            ClassLoader cl = getCatalina().getParentClassLoader();
+-            // Walk the class loader hierarchy. Stop at the system class loader.
+-            // This will add the shared (if present) and common class loaders
+-            while (cl != null && cl != ClassLoader.getSystemClassLoader()) {
+-                if (cl instanceof URLClassLoader) {
+-                    URL[] urls = ((URLClassLoader) cl).getURLs();
+-                    for (URL url : urls) {
+-                        if (url.getProtocol().equals("file")) {
+-                            try {
+-                                File f = new File (url.toURI());
+-                                if (f.isFile() &&
+-                                        f.getName().endsWith(".jar")) {
+-                                    ExtensionValidator.addSystemResource(f);
+-                                }
+-                            } catch (URISyntaxException | IOException e) {
+-                                // Ignore
+-                            }
+-                        }
+-                    }
+-                }
+-                cl = cl.getParent();
+-            }
+-        }
+         // Initialize our defined Services
+         for (Service service : services) {
+             service.init();
+
+==================================================
+ExtensionValidator.java
+deleted file mode 100644
+index ccc77f1e7c..0000000000
+--- a/java/org/apache/catalina/util/Extension.java
++++ /dev/null
+@@ -1,310 +0,0 @@
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package org.apache.catalina.util;
+-
+-
+-import java.util.StringTokenizer;
+-
+-
+-/**
+- * Utility class that represents either an available "Optional Package"
+- * (formerly known as "Standard Extension") as described in the manifest
+- * of a JAR file, or the requirement for such an optional package.  It is
+- * used to support the requirements of the Servlet Specification, version
+- * 2.3, related to providing shared extensions to all webapps.
+- * <p>
+- * In addition, static utility methods are available to scan a manifest
+- * and return an array of either available or required optional modules
+- * documented in that manifest.
+- * <p>
+- * For more information about optional packages, see the document
+- * <em>Optional Package Versioning</em> in the documentation bundle for your
+- * Java2 Standard Edition package, in file
+- * <code>guide/extensions/versioning.html</code>.
+- *
+- * @author Craig McClanahan
+- * @author Justyna Horwat
+- * @author Greg Murray
+- */
+-public final class Extension {
+-
+-
+-    // ------------------------------------------------------------- Properties
+-
+-
+-    /**
+-     * The name of the optional package being made available, or required.
+-     */
+-    private String extensionName = null;
+-
+-
+-    public String getExtensionName() {
+-        return this.extensionName;
+-    }
+-
+-    public void setExtensionName(String extensionName) {
+-        this.extensionName = extensionName;
+-    }
+-
+-    /**
+-     * The URL from which the most recent version of this optional package
+-     * can be obtained if it is not already installed.
+-     */
+-    private String implementationURL = null;
+-
+-    public String getImplementationURL() {
+-        return this.implementationURL;
+-    }
+-
+-    public void setImplementationURL(String implementationURL) {
+-        this.implementationURL = implementationURL;
+-    }
+-
+-
+-    /**
+-     * The name of the company or organization that produced this
+-     * implementation of this optional package.
+-     */
+-    private String implementationVendor = null;
+-
+-    public String getImplementationVendor() {
+-        return this.implementationVendor;
+-    }
+-
+-    public void setImplementationVendor(String implementationVendor) {
+-        this.implementationVendor = implementationVendor;
+-    }
+-
+-
+-    /**
+-     * The unique identifier of the company that produced the optional
+-     * package contained in this JAR file.
+-     */
+-    private String implementationVendorId = null;
+-
+-    public String getImplementationVendorId() {
+-        return this.implementationVendorId;
+-    }
+-
+-    public void setImplementationVendorId(String implementationVendorId) {
+-        this.implementationVendorId = implementationVendorId;
+-    }
+-
+-
+-    /**
+-     * The version number (dotted decimal notation) for this implementation
+-     * of the optional package.
+-     */
+-    private String implementationVersion = null;
+-
+-    public String getImplementationVersion() {
+-        return this.implementationVersion;
+-    }
+-
+-    public void setImplementationVersion(String implementationVersion) {
+-        this.implementationVersion = implementationVersion;
+-    }
+-
+-
+-    /**
+-     * The name of the company or organization that originated the
+-     * specification to which this optional package conforms.
+-     */
+-    private String specificationVendor = null;
+-
+-    public String getSpecificationVendor() {
+-        return this.specificationVendor;
+-    }
+-
+-    public void setSpecificationVendor(String specificationVendor) {
+-        this.specificationVendor = specificationVendor;
+-    }
+-
+-
+-    /**
+-     * The version number (dotted decimal notation) of the specification
+-     * to which this optional package conforms.
+-     */
+-    private String specificationVersion = null;
+-
+-    public String getSpecificationVersion() {
+-        return this.specificationVersion;
+-    }
+-
+-    public void setSpecificationVersion(String specificationVersion) {
+-        this.specificationVersion = specificationVersion;
+-    }
+-
+-
+-    /**
+-     * fulfilled is true if all the required extension dependencies have been
+-     * satisfied
+-     */
+-    private boolean fulfilled = false;
+-
+-    public void setFulfilled(boolean fulfilled) {
+-        this.fulfilled = fulfilled;
+-    }
+-
+-    public boolean isFulfilled() {
+-        return fulfilled;
+-    }
+-
+-    // --------------------------------------------------------- Public Methods
+-
+-    /**
+-     * Return <code>true</code> if the specified <code>Extension</code>
+-     * (which represents an optional package required by this application)
+-     * is satisfied by this <code>Extension</code> (which represents an
+-     * optional package that is already installed.  Otherwise, return
+-     * <code>false</code>.
+-     *
+-     * @param required Extension of the required optional package
+-     * @return <code>true</code> if the extension is satisfied
+-     */
+-    public boolean isCompatibleWith(Extension required) {
+-
+-        // Extension Name must match
+-        if (extensionName == null) {
+-            return false;
+-        }
+-        if (!extensionName.equals(required.getExtensionName())) {
+-            return false;
+-        }
+-
+-        // If specified, available specification version must be >= required
+-        if (required.getSpecificationVersion() != null) {
+-            if (!isNewer(specificationVersion,
+-                         required.getSpecificationVersion())) {
+-                return false;
+-            }
+-        }
+-
+-        // If specified, Implementation Vendor ID must match
+-        if (required.getImplementationVendorId() != null) {
+-            if (implementationVendorId == null) {
+-                return false;
+-            }
+-            if (!implementationVendorId.equals(required
+-                    .getImplementationVendorId())) {
+-                return false;
+-            }
+-        }
+-
+-        // If specified, Implementation version must be >= required
+-        if (required.getImplementationVersion() != null) {
+-            if (!isNewer(implementationVersion,
+-                         required.getImplementationVersion())) {
+-                return false;
+-            }
+-        }
+-
+-        // This available optional package satisfies the requirements
+-        return true;
+-
+-    }
+-
+-    @Override
+-    public String toString() {
+-        StringBuilder sb = new StringBuilder("Extension[");
+-        sb.append(extensionName);
+-        if (implementationURL != null) {
+-            sb.append(", implementationURL=");
+-            sb.append(implementationURL);
+-        }
+-        if (implementationVendor != null) {
+-            sb.append(", implementationVendor=");
+-            sb.append(implementationVendor);
+-        }
+-        if (implementationVendorId != null) {
+-            sb.append(", implementationVendorId=");
+-            sb.append(implementationVendorId);
+-        }
+-        if (implementationVersion != null) {
+-            sb.append(", implementationVersion=");
+-            sb.append(implementationVersion);
+-        }
+-        if (specificationVendor != null) {
+-            sb.append(", specificationVendor=");
+-            sb.append(specificationVendor);
+-        }
+-        if (specificationVersion != null) {
+-            sb.append(", specificationVersion=");
+-            sb.append(specificationVersion);
+-        }
+-        sb.append(']');
+-        return sb.toString();
+-    }
+-
+-
+-    // -------------------------------------------------------- Private Methods
+-
+-
+-
+-    /**
+-     * Return <code>true</code> if the first version number is greater than
+-     * or equal to the second; otherwise return <code>false</code>.
+-     *
+-     * @param first First version number (dotted decimal)
+-     * @param second Second version number (dotted decimal)
+-     *
+-     * @exception NumberFormatException on a malformed version number
+-     */
+-    private boolean isNewer(String first, String second)
+-        throws NumberFormatException {
+-
+-        if ((first == null) || (second == null)) {
+-            return false;
+-        }
+-        if (first.equals(second)) {
+-            return true;
+-        }
+-
+-        StringTokenizer fTok = new StringTokenizer(first, ".", true);
+-        StringTokenizer sTok = new StringTokenizer(second, ".", true);
+-        int fVersion = 0;
+-        int sVersion = 0;
+-        while (fTok.hasMoreTokens() || sTok.hasMoreTokens()) {
+-            if (fTok.hasMoreTokens()) {
+-                fVersion = Integer.parseInt(fTok.nextToken());
+-            } else {
+-                fVersion = 0;
+-            }
+-            if (sTok.hasMoreTokens()) {
+-                sVersion = Integer.parseInt(sTok.nextToken());
+-            } else {
+-                sVersion = 0;
+-            }
+-            if (fVersion < sVersion) {
+-                return false;
+-            } else if (fVersion > sVersion) {
+-                return true;
+-            }
+-            if (fTok.hasMoreTokens()) {
+-                fTok.nextToken();
+-            }
+-            if (sTok.hasMoreTokens()) {
+-                sTok.nextToken();
+-            }
+-        }
+-
+-        return true;  // Exact match
+-
+-    }
+-
+-
+-}
+
+==================================================
+ManifestResource.java
+index 5a40c92899..aa80deabcc 100644
+--- a/java/org/apache/catalina/util/LocalStrings_zh_CN.properties
++++ b/java/org/apache/catalina/util/LocalStrings_zh_CN.properties
+@@ -18,11 +18,6 @@ SecurityUtil.doAsPrivilege=运行PrivilegedExceptionAction块时发生异常。
+ customObjectInputStream.logRequired=使用日志记录进行类名过滤需要一个有效的日志记录器
+ customObjectInputStream.nomatch=因为类允许被反序列化，类[{0}]未能匹配常规的表达式[{1}]
+ 
+-extensionValidator.extension-not-found-error=ExtensionValidator[{0}][{1}]: 请求的拓展[{2}]未找到。
+-extensionValidator.extension-validation-error=扩展验证程序[{0}]：找不到[{1}]所需的扩展。
+-extensionValidator.failload=加载扩展名[{0}]失败
+-extensionValidator.web-application-manifest=web 应用程序清单
+-
+ introspection.classLoadFailed=加载 class [{0}] 失败
+ 
+ lifecycleBase.alreadyDestroyed=在调用destroy（）之后，在组件[{0}]上调用了destroy（）方法。第二个呼叫将被忽略。
+
+==================================================
+AntCompiler.java
+deleted file mode 100644
+index d4c80de825..0000000000
+--- a/java/org/apache/catalina/util/ManifestResource.java
++++ /dev/null
+@@ -1,233 +0,0 @@
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package org.apache.catalina.util;
+-
+-import java.util.ArrayList;
+-import java.util.jar.Attributes;
+-import java.util.jar.Manifest;
+-
+-/**
+- *  Representation of a Manifest file and its available extensions and
+- *  required extensions
+- *
+- * @author Greg Murray
+- * @author Justyna Horwat
+- */
+-public class ManifestResource {
+-
+-    // ------------------------------------------------------------- Properties
+-
+-    // These are the resource types for determining effect error messages
+-    public static final int SYSTEM = 1;
+-    public static final int WAR = 2;
+-    public static final int APPLICATION = 3;
+-
+-    private ArrayList<Extension> availableExtensions = null;
+-    private ArrayList<Extension> requiredExtensions = null;
+-
+-    private final String resourceName;
+-    private final int resourceType;
+-
+-    public ManifestResource(String resourceName, Manifest manifest,
+-                            int resourceType) {
+-        this.resourceName = resourceName;
+-        this.resourceType = resourceType;
+-        processManifest(manifest);
+-    }
+-
+-    /**
+-     * Gets the name of the resource
+-     *
+-     * @return The name of the resource
+-     */
+-    public String getResourceName() {
+-        return resourceName;
+-    }
+-
+-    /**
+-     * Gets the list of available extensions
+-     *
+-     * @return List of available extensions
+-     */
+-    public ArrayList<Extension> getAvailableExtensions() {
+-        return availableExtensions;
+-    }
+-
+-    /**
+-     * Gets the list of required extensions
+-     *
+-     * @return List of required extensions
+-     */
+-    public ArrayList<Extension> getRequiredExtensions() {
+-        return requiredExtensions;
+-    }
+-
+-    // --------------------------------------------------------- Public Methods
+-
+-    /**
+-     * Gets the number of available extensions
+-     *
+-     * @return The number of available extensions
+-     */
+-    public int getAvailableExtensionCount() {
+-        return (availableExtensions != null) ? availableExtensions.size() : 0;
+-    }
+-
+-    /**
+-     * Gets the number of required extensions
+-     *
+-     * @return The number of required extensions
+-     */
+-    public int getRequiredExtensionCount() {
+-        return (requiredExtensions != null) ? requiredExtensions.size() : 0;
+-    }
+-
+-    /**
+-     * Returns <code>true</code> if all required extension dependencies
+-     * have been meet for this <code>ManifestResource</code> object.
+-     *
+-     * @return boolean true if all extension dependencies have been satisfied
+-     */
+-    public boolean isFulfilled() {
+-        if (requiredExtensions == null) {
+-            return true;
+-        }
+-        for (Extension ext : requiredExtensions) {
+-            if (!ext.isFulfilled()) {
+-                return false;
+-            }
+-        }
+-        return true;
+-    }
+-
+-    @Override
+-    public String toString() {
+-        StringBuilder sb = new StringBuilder("ManifestResource[");
+-        sb.append(resourceName);
+-
+-        sb.append(", isFulfilled=");
+-        sb.append(isFulfilled() +"");
+-        sb.append(", requiredExtensionCount =");
+-        sb.append(getRequiredExtensionCount());
+-        sb.append(", availableExtensionCount=");
+-        sb.append(getAvailableExtensionCount());
+-        switch (resourceType) {
+-            case SYSTEM : sb.append(", resourceType=SYSTEM"); break;
+-            case WAR : sb.append(", resourceType=WAR"); break;
+-            case APPLICATION : sb.append(", resourceType=APPLICATION"); break;
+-        }
+-        sb.append(']');
+-        return sb.toString();
+-    }
+-
+-
+-    // -------------------------------------------------------- Private Methods
+-
+-    private void processManifest(Manifest manifest) {
+-        availableExtensions = getAvailableExtensions(manifest);
+-        requiredExtensions = getRequiredExtensions(manifest);
+-    }
+-
+-    /**
+-     * Return the set of <code>Extension</code> objects representing optional
+-     * packages that are required by the application associated with the
+-     * specified <code>Manifest</code>.
+-     *
+-     * @param manifest Manifest to be parsed
+-     *
+-     * @return List of required extensions, or null if the application
+-     * does not require any extensions
+-     */
+-    private ArrayList<Extension> getRequiredExtensions(Manifest manifest) {
+-
+-        Attributes attributes = manifest.getMainAttributes();
+-        String names = attributes.getValue("Extension-List");
+-        if (names == null) {
+-            return null;
+-        }
+-
+-        ArrayList<Extension> extensionList = new ArrayList<>();
+-        names += " ";
+-
+-        while (true) {
+-
+-            int space = names.indexOf(' ');
+-            if (space < 0) {
+-                break;
+-            }
+-            String name = names.substring(0, space).trim();
+-            names = names.substring(space + 1);
+-
+-            String value =
+-                attributes.getValue(name + "-Extension-Name");
+-            if (value == null) {
+-                continue;
+-            }
+-            Extension extension = new Extension();
+-            extension.setExtensionName(value);
+-            extension.setImplementationURL
+-                (attributes.getValue(name + "-Implementation-URL"));
+-            extension.setImplementationVendorId
+-                (attributes.getValue(name + "-Implementation-Vendor-Id"));
+-            String version = attributes.getValue(name + "-Implementation-Version");
+-            extension.setImplementationVersion(version);
+-            extension.setSpecificationVersion
+-                (attributes.getValue(name + "-Specification-Version"));
+-            extensionList.add(extension);
+-        }
+-        return extensionList;
+-    }
+-
+-    /**
+-     * Return the set of <code>Extension</code> objects representing optional
+-     * packages that are bundled with the application associated with the
+-     * specified <code>Manifest</code>.
+-     *
+-     * @param manifest Manifest to be parsed
+-     *
+-     * @return List of available extensions, or null if the web application
+-     * does not bundle any extensions
+-     */
+-    private ArrayList<Extension> getAvailableExtensions(Manifest manifest) {
+-
+-        Attributes attributes = manifest.getMainAttributes();
+-        String name = attributes.getValue("Extension-Name");
+-        if (name == null) {
+-            return null;
+-        }
+-
+-        ArrayList<Extension> extensionList = new ArrayList<>();
+-
+-        Extension extension = new Extension();
+-        extension.setExtensionName(name);
+-        extension.setImplementationURL(
+-            attributes.getValue("Implementation-URL"));
+-        extension.setImplementationVendor(
+-            attributes.getValue("Implementation-Vendor"));
+-        extension.setImplementationVendorId(
+-            attributes.getValue("Implementation-Vendor-Id"));
+-        extension.setImplementationVersion(
+-            attributes.getValue("Implementation-Version"));
+-        extension.setSpecificationVersion(
+-            attributes.getValue("Specification-Version"));
+-
+-        extensionList.add(extension);
+-
+-        return extensionList;
+-    }
+-
+-}
+
+==================================================

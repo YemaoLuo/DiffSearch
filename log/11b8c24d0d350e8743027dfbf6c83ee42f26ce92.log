@@ -1,0 +1,247 @@
+11b8c24d0d350e8743027dfbf6c83ee42f26ce92
+==================================================
+Remove the request.isAsyncOperation() method and the associated plumbing as res.getWriteListener() != null does the same thing with less code.
+==================================================
+Mark Emlyn
+==================================================
+Tue Apr 30 10:39:36 2013 +0000
+==================================================
+CoyoteAdapter.java
+Remove the request.isAsyncOperation() method and the associated plumbing as res.getWriteListener() != null does the same thing with less code.
+Add a (currently unimplemented) dispatch() line from READ_WRITE_OP to the state diagram.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1477543 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Request.java
+index 8b5eea6781..506f392110 100644
+--- a/java/org/apache/catalina/connector/CoyoteAdapter.java
++++ b/java/org/apache/catalina/connector/CoyoteAdapter.java
+@@ -345,44 +345,37 @@ public class CoyoteAdapter implements Adapter {
+                 }
+             }
+ 
+-
+-            if (!request.isAsyncDispatching() && request.isAsync() &&
+-                    request.isAsyncOperation()) {
+-                if (status == SocketStatus.OPEN_WRITE) {
+-                    if (res.getWriteListener() == null) {
+-                        success = false;
+-                    } else {
+-                        ClassLoader oldCL =
+-                                Thread.currentThread().getContextClassLoader();
+-                        ClassLoader newCL =
+-                                request.getContext().getLoader().getClassLoader();
+-                        try {
+-                            Thread.currentThread().setContextClassLoader(newCL);
+-                            res.getWriteListener().onWritePossible();
+-                        } finally {
+-                            Thread.currentThread().setContextClassLoader(oldCL);
+-                        }
+-                        success = true;
++            // Check to see if non-blocking writes are reads are being used
++            if (!request.isAsyncDispatching() && request.isAsync()) {
++                if (res.getWriteListener() != null &&
++                        status == SocketStatus.OPEN_WRITE) {
++                    ClassLoader oldCL =
++                            Thread.currentThread().getContextClassLoader();
++                    ClassLoader newCL =
++                            request.getContext().getLoader().getClassLoader();
++                    try {
++                        Thread.currentThread().setContextClassLoader(newCL);
++                        res.getWriteListener().onWritePossible();
++                    } finally {
++                        Thread.currentThread().setContextClassLoader(oldCL);
+                     }
+-                } else if (status == SocketStatus.OPEN_READ) {
+-                    if (req.getReadListener() == null) {
+-                        success = false;
+-                    } else {
+-                        ClassLoader oldCL =
+-                                Thread.currentThread().getContextClassLoader();
+-                        ClassLoader newCL =
+-                                request.getContext().getLoader().getClassLoader();
+-                        try {
+-                            Thread.currentThread().setContextClassLoader(newCL);
+-                            req.getReadListener().onDataAvailable();
+-                            if (request.getInputStream().isFinished()) {
+-                                req.getReadListener().onAllDataRead();
+-                            }
+-                        } finally {
+-                            Thread.currentThread().setContextClassLoader(oldCL);
++                    success = true;
++                } else if (req.getReadListener() != null &&
++                        status == SocketStatus.OPEN_READ) {
++                    ClassLoader oldCL =
++                            Thread.currentThread().getContextClassLoader();
++                    ClassLoader newCL =
++                            request.getContext().getLoader().getClassLoader();
++                    try {
++                        Thread.currentThread().setContextClassLoader(newCL);
++                        req.getReadListener().onDataAvailable();
++                        if (request.getInputStream().isFinished()) {
++                            req.getReadListener().onAllDataRead();
+                         }
+-                        success = true;
++                    } finally {
++                        Thread.currentThread().setContextClassLoader(oldCL);
+                     }
++                    success = true;
+                 }
+             }
+ 
+
+==================================================
+ActionCode.java
+index 1f3a55af45..aea441e285 100644
+--- a/java/org/apache/catalina/connector/Request.java
++++ b/java/org/apache/catalina/connector/Request.java
+@@ -1661,16 +1661,6 @@ public class Request
+         return result.get();
+     }
+ 
+-    public boolean isAsyncOperation() {
+-        if (asyncContext == null) {
+-            return false;
+-        }
+-
+-        AtomicBoolean result = new AtomicBoolean(false);
+-        coyoteRequest.action(ActionCode.ASYNC_IS_ASYNC_OPERATION, result);
+-        return result.get();
+-    }
+-
+     @Override
+     public boolean isAsyncSupported() {
+         if (this.asyncSupported == null) {
+
+==================================================
+AsyncStateMachine.java
+index 8557dbdaca..c7baaab6b1 100644
+--- a/java/org/apache/coyote/ActionCode.java
++++ b/java/org/apache/coyote/ActionCode.java
+@@ -175,11 +175,6 @@ public enum ActionCode {
+      */
+     ASYNC_IS_ASYNC,
+ 
+-    /**
+-     * Callback to determine if async read/write is in progress
+-     */
+-    ASYNC_IS_ASYNC_OPERATION,
+-
+     /**
+      * Callback to determine if async dispatch is in progress
+      */
+
+==================================================
+AbstractAjpProcessor.java
+index 666d0ec165..d16c833d48 100644
+--- a/java/org/apache/coyote/AsyncStateMachine.java
++++ b/java/org/apache/coyote/AsyncStateMachine.java
+@@ -71,26 +71,28 @@ import org.apache.tomcat.util.res.StringManager;
+  * |   |      |       |               |                 |             |     /-----------|         |
+  * |   |      |       ^               |dispatch()       |             |    /                      |
+  * |   |      |       |               |                 |             |   /                       |
+- * |   |      |       |              \|/                /            \|/ /      postProcess()     |
++ * |   |      |       |              \|/                /            \|/ /    postProcess()       |
+  * |   |      |       |         MUST_DISPATCH          /           STARTED<---------<---------|   |
+- * |   |      |       |           |                   /            /|  \                      |   |
+- * |   |      |       |           |postProcess()     /            / |   \                     |   |
+- * ^   |      ^       |           |                 /  dispatch()/  |    \                    |   |
+- * |   |      |       |           |                /            /   |     \                   |   |
+- * |   |      |       |           |   |---------- / -----------/    |auto  \                  |   |
+- * |   |      |       |           |   |          /                  |       \                 |   |
+- * |   |      |       |           |   |   |-----/                   |       |                 |   |
+- * |   |      |       | auto     \|/ \|/ \|/                       \|/      |                 |   |
+- * |   |      |       |---<------DISPATCHING<-----------------TIMING_OUT    |                 |   |
+- * |   |      |                               dispatch()        |   |       |asyncOperation() ^   |
+- * |   |      |                                                 |   |      \|/                |   ^
+- * |   |      |-------<----------------------------------<------|   |     READ_WRITE_OP->-----|   |
+- * |   |                          complete()                        |        |      |             |
+- * |   |                                                            |        |      |  error()    |
+- * |<- | ----<-------------------<-------------------------------<--|        |      |->-----------|
+- *     |                           error()                                   |
+- *     |                                                  complete()         |
+- *     |---------------------------------------------------------------------|
++ * |   |      |       |           |                   /           / |   |                     |   |
++ * |   |      |       |           |postProcess()     /           /  |   |                     ^   |
++ * ^   |      ^       |           |                 /           /   |   |asyncOperation()     |   |
++ * |   |      |       |           |                /           /    |   |                     |   |
++ * |   |      |       |           |   |---------- / ----------/     |   |--READ_WRITE_OP-->---|   |
++ * |   |      |       |           |   |          /   dispatch()     |            |  |  |          |
++ * |   |      |       |           |   |   |-----/               auto|            |  |  |   error()|
++ * |   |      |       | auto     \|/ \|/ \|/                        |  dispatch()|  |  |->--------|
++ * |   |      |       |---<------DISPATCHING<--------<------------- | ------<----|  |
++ * |   |      |                      /|\                            |               |
++ * |   |      |                       |       dispatch()           \|/              |
++ * |   |      |                       |-----------------------TIMING_OUT            |
++ * |   |      |                                                 |   |               |
++ * |   |      |-------<----------------------------------<------|   |               |
++ * |   |                          complete()                        |               |
++ * |   |                                                            |               |
++ * |<- | ----<-------------------<-------------------------------<--|               |
++ *     |                           error()                                          |
++ *     |                                                  complete()                |
++ *     |----------------------------------------------------------------------------|
+  * </pre>
+  */
+ public class AsyncStateMachine<S> {
+@@ -153,10 +155,6 @@ public class AsyncStateMachine<S> {
+         return state.isAsync();
+     }
+ 
+-    public boolean isAsyncOperation() {
+-        return state == AsyncState.READ_WRITE_OP;
+-    }
+-
+     public boolean isAsyncDispatching() {
+         return state.isDispatching();
+     }
+
+==================================================
+AbstractHttp11Processor.java
+index f044be4228..db86b4bb78 100644
+--- a/java/org/apache/coyote/ajp/AbstractAjpProcessor.java
++++ b/java/org/apache/coyote/ajp/AbstractAjpProcessor.java
+@@ -456,8 +456,6 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+             ((AtomicBoolean) param).set(asyncStateMachine.isAsyncDispatching());
+         } else if (actionCode == ActionCode.ASYNC_IS_ASYNC) {
+             ((AtomicBoolean) param).set(asyncStateMachine.isAsync());
+-        } else if (actionCode == ActionCode.ASYNC_IS_ASYNC_OPERATION) {
+-            ((AtomicBoolean) param).set(asyncStateMachine.isAsyncOperation());
+         } else if (actionCode == ActionCode.ASYNC_IS_TIMINGOUT) {
+             ((AtomicBoolean) param).set(asyncStateMachine.isAsyncTimingOut());
+         } else if (actionCode == ActionCode.ASYNC_IS_ERROR) {
+
+==================================================
+Http11NioProcessor.java
+index f401ce08b6..452806ca7a 100644
+--- a/java/org/apache/coyote/http11/AbstractHttp11Processor.java
++++ b/java/org/apache/coyote/http11/AbstractHttp11Processor.java
+@@ -797,8 +797,6 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+             ((AtomicBoolean) param).set(asyncStateMachine.isAsyncDispatching());
+         } else if (actionCode == ActionCode.ASYNC_IS_ASYNC) {
+             ((AtomicBoolean) param).set(asyncStateMachine.isAsync());
+-        } else if (actionCode == ActionCode.ASYNC_IS_ASYNC_OPERATION) {
+-            ((AtomicBoolean) param).set(asyncStateMachine.isAsyncOperation());
+         } else if (actionCode == ActionCode.ASYNC_IS_TIMINGOUT) {
+             ((AtomicBoolean) param).set(asyncStateMachine.isAsyncTimingOut());
+         } else if (actionCode == ActionCode.ASYNC_IS_ERROR) {
+
+==================================================
+SpdyProcessor.java
+index df4e17b23c..50c2d2ed2a 100644
+--- a/java/org/apache/coyote/http11/Http11NioProcessor.java
++++ b/java/org/apache/coyote/http11/Http11NioProcessor.java
+@@ -196,7 +196,7 @@ public class Http11NioProcessor extends AbstractHttp11Processor<NioChannel> {
+                 if (status == SocketStatus.OPEN_WRITE && isRegisteredForWrite(attach)) {
+                     return SocketState.LONG;
+                 }
+-            }catch (IllegalStateException x) {
++            } catch (IllegalStateException x) {
+                 attach.interestOps(attach.interestOps() | SelectionKey.OP_WRITE);
+             }
+         } else if (status == SocketStatus.OPEN_READ) {
+
+==================================================

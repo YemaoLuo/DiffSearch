@@ -1,0 +1,140 @@
+a51446b5bb943ab8bb22d4e821c246da2fca73c4
+==================================================
+Refactor Stream / Connection flow control window allocation
+==================================================
+Mark Thomas
+==================================================
+Mon Jun 3 14:15:59 2019 +0100
+==================================================
+Http2UpgradeHandler.java
+Refactor Stream / Connection flow control window allocation
+
+
+
+==================================================
+Stream.java
+index c4f3bc2bdd..65d4d9914e 100644
+--- a/java/org/apache/coyote/http2/LocalStrings_ko.properties
++++ b/java/org/apache/coyote/http2/LocalStrings_ko.properties
+@@ -119,14 +119,12 @@ upgradeHandler.allocate.left=연결 [{0}], 스트림 [{1}], [{2}] 바이트들
+ upgradeHandler.allocate.recipient=연결 [{0}], 스트림 [{1}], 가중치 [{3}]의 잠재적 수신자 [{2}]
+ upgradeHandler.connectionError=연결 오류
+ upgradeHandler.dependency.invalid=연결 [{0}], 스트림 [{1}], 스트림들은 자기 자신들에 의존해서는 안됩니다.
+-upgradeHandler.dispatchWrite=연결 [{0}], 스트림 [{1}], 비동기 쓰기를 위한 컨테이너 쓰레드로 디스패치합니다.
+ upgradeHandler.goaway.debug=연결 [{0}], Goaway, 마지막 스트림 [{1}], 오류 코드 [{2}], 디버그 데이터 [{3}]
+ upgradeHandler.init=연결 [{0}], 상태 [{1}]
+ upgradeHandler.initialWindowSize.invalid=연결 [{0}]: 값 [{1}]은(는), 초기 윈도우 크기로서 불허되므로, 무시됩니다.
+ upgradeHandler.invalidPreface=연결 [{0}]: 유효하지 않은 연결 preface
+ upgradeHandler.ioerror=연결 [{0}]
+ upgradeHandler.noNewStreams=연결 [{0}], 스트림 [{1}], 이 연결에는 새로운 스트림들이 허용되지 않기에, 스트림이 무시되었습니다.
+-upgradeHandler.notify=연결 [{0}], 스트림 [{1}], notify()이 StreamOutputBuffer를 해제하기 위하여 호출되었습니다.
+ upgradeHandler.pause.entry=연결 [{0}]이(가) 일시 정지 중
+ upgradeHandler.pingFailed=연결 [{0}]: 클라이언트에 ping 메시지를 보내지 못했습니다.
+ upgradeHandler.prefaceReceived=연결 [{0}]: 연결 preface를 클라이언트로부터 받았습니다.
+
+==================================================
+WindowAllocationManager.java
+index d437c982ec..b70c2273cb 100644
+--- a/java/org/apache/coyote/http2/Stream.java
++++ b/java/org/apache/coyote/http2/Stream.java
+@@ -72,7 +72,7 @@ class Stream extends AbstractStream implements HeaderEmitter {
+ 
+     private final Http2UpgradeHandler handler;
+     private final StreamStateMachine state;
+-    private final Object connectionAllocationLock = new Object();
++    private final WindowAllocationManager allocationManager = new WindowAllocationManager(this);
+ 
+     // State machine would be too much overhead
+     private int headerState = HEADER_STATE_START;
+@@ -236,14 +236,7 @@ class Stream extends AbstractStream implements HeaderEmitter {
+ 
+ 
+     final void cancelAllocationRequests() {
+-        // Cancel wait on stream allocation request (if any)
+-        synchronized (this) {
+-            this.notify();
+-        }
+-        // Cancel wait on connection allocation request (if any)
+-        synchronized (connectionAllocationLock) {
+-            connectionAllocationLock.notify();
+-        }
++        allocationManager.notifyAny();
+     }
+ 
+ 
+@@ -261,17 +254,7 @@ class Stream extends AbstractStream implements HeaderEmitter {
+         boolean notify = getWindowSize() < 1;
+         super.incrementWindowSize(windowSizeIncrement);
+         if (notify && getWindowSize() > 0) {
+-            if (coyoteResponse.getWriteListener() == null) {
+-                // Blocking, so use notify to release StreamOutputBuffer
+-                notify();
+-            } else {
+-                // Non-blocking so dispatch
+-                coyoteResponse.action(ActionCode.DISPATCH_WRITE, null);
+-                // Need to explicitly execute dispatches on the StreamProcessor
+-                // as this thread is being processed by an UpgradeProcessor
+-                // which won't see this dispatch
+-                coyoteResponse.action(ActionCode.DISPATCH_EXECUTE, null);
+-            }
++            allocationManager.notifyStream();
+         }
+     }
+ 
+@@ -287,11 +270,7 @@ class Stream extends AbstractStream implements HeaderEmitter {
+             if (block) {
+                 try {
+                     long writeTimeout = handler.getProtocol().getStreamWriteTimeout();
+-                    if (writeTimeout < 0) {
+-                        wait();
+-                    } else {
+-                        wait(writeTimeout);
+-                    }
++                    allocationManager.waitForStream(writeTimeout);
+                     windowSize = getWindowSize();
+                     if (windowSize == 0) {
+                         doWriteTimeout();
+@@ -303,6 +282,7 @@ class Stream extends AbstractStream implements HeaderEmitter {
+                     throw new IOException(e);
+                 }
+             } else {
++                allocationManager.waitForStreamNonBlocking();
+                 return 0;
+             }
+         }
+@@ -332,6 +312,21 @@ class Stream extends AbstractStream implements HeaderEmitter {
+     }
+ 
+ 
++    void waitForConnectionAllocation(long timeout) throws InterruptedException {
++        allocationManager.waitForConnection(timeout);
++    }
++
++
++    void waitForConnectionAllocationNonBlocking() {
++        allocationManager.waitForConnectionNonBlocking();
++    }
++
++
++    void notifyConnection() {
++        allocationManager.notifyConnection();
++    }
++
++
+     @Override
+     public final void emitHeader(String name, String value) throws HpackException {
+         if (log.isDebugEnabled()) {
+@@ -783,11 +778,6 @@ class Stream extends AbstractStream implements HeaderEmitter {
+     }
+ 
+ 
+-    Object getConnectionAllocationLock() {
+-        return connectionAllocationLock;
+-    }
+-
+-
+     private static void push(final Http2UpgradeHandler handler, final Request request,
+             final Stream stream) throws IOException {
+         if (org.apache.coyote.Constants.IS_SECURITY_ENABLED) {
+
+==================================================

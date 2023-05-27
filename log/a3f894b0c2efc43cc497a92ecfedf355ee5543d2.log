@@ -1,0 +1,653 @@
+a3f894b0c2efc43cc497a92ecfedf355ee5543d2
+==================================================
+- Pass along a status code when there's an error. This allows sending the appropriate event to the servlet, and far
+==================================================
+Remy Maucherat
+==================================================
+Fri Sep 22 10:04:40 2006 +0000
+==================================================
+CoyoteAdapter.java
+- Pass along a status code when there's an error. This allows sending the appropriate event to the servlet, and far
+  more flexible handling (for example, for timeouts, where the servlet gets to decide if the connection is done - or not).
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/tc6.0.x/trunk@448883 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Adapter.java
+index 18114dd829..8203e26eb4 100644
+--- a/java/org/apache/catalina/connector/CoyoteAdapter.java
++++ b/java/org/apache/catalina/connector/CoyoteAdapter.java
+@@ -34,6 +34,7 @@ import org.apache.tomcat.util.buf.CharChunk;
+ import org.apache.tomcat.util.buf.MessageBytes;
+ import org.apache.tomcat.util.http.Cookies;
+ import org.apache.tomcat.util.http.ServerCookie;
++import org.apache.tomcat.util.net.SocketStatus;
+ 
+ 
+ /**
+@@ -104,19 +105,34 @@ public class CoyoteAdapter
+      * @return false to indicate an error, expected or not
+      */
+     public boolean event(org.apache.coyote.Request req, 
+-            org.apache.coyote.Response res, boolean error) {
++            org.apache.coyote.Response res, SocketStatus status) {
+ 
+         Request request = (Request) req.getNote(ADAPTER_NOTES);
+         Response response = (Response) res.getNote(ADAPTER_NOTES);
+ 
+         if (request.getWrapper() != null) {
+             
++            boolean error = false;
+             try {
+-                if (error) {
+-                    request.getEvent().setEventType(CometEvent.EventType.ERROR);
+-                } else {
++                if (status == SocketStatus.OPEN) {
+                     request.getEvent().setEventType(CometEvent.EventType.READ);
++                    request.getEvent().setEventSubType(null);
++                } else if (status == SocketStatus.DISCONNECT) {
++                    request.getEvent().setEventType(CometEvent.EventType.ERROR);
++                    request.getEvent().setEventSubType(CometEvent.EventSubType.CLIENT_DISCONNECT);
++                    error = true;
++                } else if (status == SocketStatus.ERROR) {
++                    request.getEvent().setEventType(CometEvent.EventType.ERROR);
++                    request.getEvent().setEventSubType(CometEvent.EventSubType.IOEXCEPTION);
++                    error = true;
++                } else if (status == SocketStatus.STOP) {
++                    request.getEvent().setEventType(CometEvent.EventType.END);
++                    request.getEvent().setEventSubType(CometEvent.EventSubType.SERVER_SHUTDOWN);
++                } else if (status == SocketStatus.TIMEOUT) {
++                    request.getEvent().setEventType(CometEvent.EventType.ERROR);
++                    request.getEvent().setEventSubType(CometEvent.EventSubType.TIMEOUT);
+                 }
++                
+                 // Calling the container
+                 connector.getContainer().getPipeline().getFirst().event(request, response, request.getEvent());
+ 
+@@ -140,8 +156,10 @@ public class CoyoteAdapter
+                     response.recycle();
+                 }
+             }
++            
++        } else {
++            return false;
+         }
+-        return true;
+     }
+     
+ 
+
+==================================================
+AjpAprProtocol.java
+index 228d770852..c5de355d39 100644
+--- a/java/org/apache/coyote/Adapter.java
++++ b/java/org/apache/coyote/Adapter.java
+@@ -16,6 +16,8 @@
+ 
+ package org.apache.coyote;
+ 
++import org.apache.tomcat.util.net.SocketStatus;
++
+ 
+ /**
+  * Adapter. This represents the entry point in a coyote-based servlet container.
+@@ -26,7 +28,6 @@ package org.apache.coyote;
+  */
+ public interface Adapter {
+ 
+-
+     /** 
+      * Call the service method, and notify all listeners
+      *
+@@ -45,7 +46,7 @@ public interface Adapter {
+     public void service(Request req, Response res)
+ 	throws Exception;
+ 
+-    public boolean event(Request req, Response res, boolean error)
++    public boolean event(Request req, Response res, SocketStatus status)
+     throws Exception;
+ 
+ }
+
+==================================================
+Http11AprProcessor.java
+index a0706a12bd..5fabfdc304 100644
+--- a/java/org/apache/coyote/ajp/AjpAprProtocol.java
++++ b/java/org/apache/coyote/ajp/AjpAprProtocol.java
+@@ -34,8 +34,8 @@ import org.apache.coyote.RequestGroupInfo;
+ import org.apache.coyote.RequestInfo;
+ import org.apache.tomcat.util.modeler.Registry;
+ import org.apache.tomcat.util.net.AprEndpoint;
++import org.apache.tomcat.util.net.SocketStatus;
+ import org.apache.tomcat.util.net.AprEndpoint.Handler;
+-import org.apache.tomcat.util.net.AprEndpoint.Handler.SocketState;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+ 
+@@ -431,7 +431,7 @@ public class AjpAprProtocol
+         }
+ 
+         // FIXME: Support for this could be added in AJP as well
+-        public SocketState event(long socket, boolean error) {
++        public SocketState event(long socket, SocketStatus status) {
+             return SocketState.CLOSED;
+         }
+         
+
+==================================================
+Http11AprProtocol.java
+index 0403940839..3b3daf4eee 100644
+--- a/java/org/apache/coyote/http11/Http11AprProcessor.java
++++ b/java/org/apache/coyote/http11/Http11AprProcessor.java
+@@ -52,6 +52,7 @@ import org.apache.tomcat.util.buf.MessageBytes;
+ import org.apache.tomcat.util.http.FastHttpDateFormat;
+ import org.apache.tomcat.util.http.MimeHeaders;
+ import org.apache.tomcat.util.net.AprEndpoint;
++import org.apache.tomcat.util.net.SocketStatus;
+ import org.apache.tomcat.util.net.AprEndpoint.Handler.SocketState;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+@@ -736,14 +737,14 @@ public class Http11AprProcessor implements ActionHook {
+      *
+      * @throws IOException error during an I/O operation
+      */
+-    public SocketState event(boolean error)
++    public SocketState event(SocketStatus status)
+         throws IOException {
+         
+         RequestInfo rp = request.getRequestProcessor();
+         
+         try {
+             rp.setStage(org.apache.coyote.Constants.STAGE_SERVICE);
+-            error = !adapter.event(request, response, error);
++            error = !adapter.event(request, response, status);
+         } catch (InterruptedIOException e) {
+             error = true;
+         } catch (Throwable t) {
+
+==================================================
+Http11NioProcessor.java
+index 4ae29d789c..fd27184055 100644
+--- a/java/org/apache/coyote/http11/Http11AprProtocol.java
++++ b/java/org/apache/coyote/http11/Http11AprProtocol.java
+@@ -35,6 +35,7 @@ import org.apache.coyote.RequestGroupInfo;
+ import org.apache.coyote.RequestInfo;
+ import org.apache.tomcat.util.modeler.Registry;
+ import org.apache.tomcat.util.net.AprEndpoint;
++import org.apache.tomcat.util.net.SocketStatus;
+ import org.apache.tomcat.util.net.AprEndpoint.Handler;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+@@ -615,15 +616,14 @@ public class Http11AprProtocol implements ProtocolHandler, MBeanRegistration
+             this.proto = proto;
+         }
+ 
+-        public SocketState event(long socket, boolean error) {
++        public SocketState event(long socket, SocketStatus status) {
+             Http11AprProcessor result = connections.get(socket);
+             
+             SocketState state = SocketState.CLOSED; 
+             if (result != null) {
+-                boolean recycle = error;
+                 // Call the appropriate event
+                 try {
+-                    state = result.event(error);
++                    state = result.event(status);
+                 } catch (java.net.SocketException e) {
+                     // SocketExceptions are normal
+                     Http11AprProtocol.log.debug
+
+==================================================
+Http11NioProtocol.java
+index 36f2cf558e..b9d535c818 100644
+--- a/java/org/apache/coyote/http11/Http11NioProcessor.java
++++ b/java/org/apache/coyote/http11/Http11NioProcessor.java
+@@ -48,6 +48,7 @@ import org.apache.tomcat.util.http.MimeHeaders;
+ import org.apache.tomcat.util.net.NioChannel;
+ import org.apache.tomcat.util.net.NioEndpoint;
+ import org.apache.tomcat.util.net.SSLSupport;
++import org.apache.tomcat.util.net.SocketStatus;
+ import org.apache.tomcat.util.net.NioEndpoint.Handler.SocketState;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+@@ -739,14 +740,14 @@ public class Http11NioProcessor implements ActionHook {
+      *
+      * @throws IOException error during an I/O operation
+      */
+-    public SocketState event(boolean error)
++    public SocketState event(SocketStatus status)
+         throws IOException {
+ 
+         RequestInfo rp = request.getRequestProcessor();
+ 
+         try {
+             rp.setStage(org.apache.coyote.Constants.STAGE_SERVICE);
+-            error = !adapter.event(request, response, error);
++            error = !adapter.event(request, response, status);
+             SelectionKey key = socket.getIOChannel().keyFor(socket.getPoller().getSelector());
+             if ( key != null ) {
+                 NioEndpoint.KeyAttachment attach = (NioEndpoint.KeyAttachment) key.attachment();
+
+==================================================
+AprEndpoint.java
+index f485bbec80..fb2b12d35f 100644
+--- a/java/org/apache/coyote/http11/Http11NioProtocol.java
++++ b/java/org/apache/coyote/http11/Http11NioProtocol.java
+@@ -39,6 +39,7 @@ import org.apache.tomcat.util.res.StringManager;
+ import org.apache.tomcat.util.net.NioChannel;
+ import org.apache.tomcat.util.net.SSLImplementation;
+ import org.apache.tomcat.util.net.SecureNioChannel;
++import org.apache.tomcat.util.net.SocketStatus;
+ 
+ 
+ /**
+@@ -554,15 +555,14 @@ public class Http11NioProtocol implements ProtocolHandler, MBeanRegistration
+             this.proto = proto;
+         }
+ 
+-        public SocketState event(NioChannel socket, boolean error) {
++        public SocketState event(NioChannel socket, SocketStatus status) {
+             Http11NioProcessor result = connections.get(socket);
+ 
+             SocketState state = SocketState.CLOSED; 
+             if (result != null) {
+-                boolean recycle = error;
+                 // Call the appropriate event
+                 try {
+-                    state = result.event(error);
++                    state = result.event(status);
+                 } catch (java.net.SocketException e) {
+                     // SocketExceptions are normal
+                     Http11NioProtocol.log.debug
+
+==================================================
+NioEndpoint.java
+index 621c87ac86..617f9a016b 100644
+--- a/java/org/apache/tomcat/util/net/AprEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AprEndpoint.java
+@@ -1052,12 +1052,12 @@ public class AprEndpoint {
+     /**
+      * Process given socket for an event.
+      */
+-    protected boolean processSocket(long socket, boolean error) {
++    protected boolean processSocket(long socket, SocketStatus status) {
+         try {
+             if (executor == null) {
+-                getWorkerThread().assign(socket, error);
++                getWorkerThread().assign(socket, status);
+             } else {
+-                executor.execute(new SocketEventProcessor(socket, error));
++                executor.execute(new SocketEventProcessor(socket, status));
+             }
+         } catch (Throwable t) {
+             // This means we got an OOM or similar creating a thread, or that
+@@ -1186,7 +1186,7 @@ public class AprEndpoint {
+             // Close all sockets in the add queue
+             for (int i = 0; i < addCount; i++) {
+                 if (comet) {
+-                    processSocket(addS[i], true);
++                    processSocket(addS[i], SocketStatus.STOP);
+                 } else {
+                     Socket.destroy(addS[i]);
+                 }
+@@ -1196,7 +1196,7 @@ public class AprEndpoint {
+             if (rv > 0) {
+                 for (int n = 0; n < rv; n++) {
+                     if (comet) {
+-                        processSocket(desc[n*2+1], true);
++                        processSocket(desc[n*2+1], SocketStatus.STOP);
+                     } else {
+                         Socket.destroy(desc[n*2+1]);
+                     }
+@@ -1222,7 +1222,7 @@ public class AprEndpoint {
+                 if (addCount >= addS.length) {
+                     // Can't do anything: close the socket right away
+                     if (comet) {
+-                        processSocket(socket, true);
++                        processSocket(socket, SocketStatus.ERROR);
+                     } else {
+                         Socket.destroy(socket);
+                     }
+@@ -1276,7 +1276,7 @@ public class AprEndpoint {
+                                 } else {
+                                     // Can't do anything: close the socket right away
+                                     if (comet) {
+-                                        processSocket(addS[i], true);
++                                        processSocket(addS[i], SocketStatus.ERROR);
+                                     } else {
+                                         Socket.destroy(addS[i]);
+                                     }
+@@ -1295,11 +1295,11 @@ public class AprEndpoint {
+                             // Check for failed sockets and hand this socket off to a worker
+                             if (((desc[n*2] & Poll.APR_POLLHUP) == Poll.APR_POLLHUP)
+                                     || ((desc[n*2] & Poll.APR_POLLERR) == Poll.APR_POLLERR)
+-                                    || (comet && (!processSocket(desc[n*2+1], false))) 
++                                    || (comet && (!processSocket(desc[n*2+1], SocketStatus.OPEN))) 
+                                     || (!comet && (!processSocket(desc[n*2+1])))) {
+                                 // Close socket and clear pool
+                                 if (comet) {
+-                                    processSocket(desc[n*2+1], true);
++                                    processSocket(desc[n*2+1], SocketStatus.DISCONNECT);
+                                 } else {
+                                     Socket.destroy(desc[n*2+1]);
+                                 }
+@@ -1330,7 +1330,7 @@ public class AprEndpoint {
+                             for (int n = 0; n < rv; n++) {
+                                 // Close socket and clear pool
+                                 if (comet) {
+-                                    processSocket(desc[n], true);
++                                    processSocket(desc[n], SocketStatus.TIMEOUT);
+                                 } else {
+                                     Socket.destroy(desc[n]);
+                                 }
+@@ -1364,8 +1364,7 @@ public class AprEndpoint {
+         protected Thread thread = null;
+         protected boolean available = false;
+         protected long socket = 0;
+-        protected boolean event = false;
+-        protected boolean error = false;
++        protected SocketStatus status = null;
+         protected boolean options = false;
+ 
+ 
+@@ -1390,8 +1389,7 @@ public class AprEndpoint {
+ 
+             // Store the newly available Socket and notify our thread
+             this.socket = socket;
+-            event = false;
+-            error = false;
++            status = null;
+             options = true;
+             available = true;
+             notifyAll();
+@@ -1420,8 +1418,7 @@ public class AprEndpoint {
+ 
+             // Store the newly available Socket and notify our thread
+             this.socket = socket;
+-            event = false;
+-            error = false;
++            status = null;
+             options = false;
+             available = true;
+             notifyAll();
+@@ -1429,7 +1426,7 @@ public class AprEndpoint {
+         }
+ 
+ 
+-        protected synchronized void assign(long socket, boolean error) {
++        protected synchronized void assign(long socket, SocketStatus status) {
+ 
+             // Wait for the Processor to get the previous Socket
+             while (available) {
+@@ -1441,8 +1438,7 @@ public class AprEndpoint {
+ 
+             // Store the newly available Socket and notify our thread
+             this.socket = socket;
+-            event = true;
+-            this.error = error;
++            this.status = status;
+             options = false;
+             available = true;
+             notifyAll();
+@@ -1489,11 +1485,11 @@ public class AprEndpoint {
+                     continue;
+ 
+                 // Process the request from this socket
+-                if ((event) && (handler.event(socket, error) == Handler.SocketState.CLOSED)) {
++                if ((status != null) && (handler.event(socket, status) == Handler.SocketState.CLOSED)) {
+                     // Close socket and pool
+                     Socket.destroy(socket);
+                     socket = 0;
+-                } else if ((!event) && ((options && !setSocketOptions(socket)) 
++                } else if ((status == null) && ((options && !setSocketOptions(socket)) 
+                         || handler.process(socket) == Handler.SocketState.CLOSED)) {
+                     // Close socket and pool
+                     Socket.destroy(socket);
+@@ -1824,7 +1820,7 @@ public class AprEndpoint {
+             OPEN, CLOSED, LONG
+         }
+         public SocketState process(long socket);
+-        public SocketState event(long socket, boolean error);
++        public SocketState event(long socket, SocketStatus status);
+     }
+ 
+ 
+@@ -1954,17 +1950,17 @@ public class AprEndpoint {
+     protected class SocketEventProcessor implements Runnable {
+         
+         protected long socket = 0;
+-        protected boolean error = false; 
++        protected SocketStatus status = null; 
+         
+-        public SocketEventProcessor(long socket, boolean error) {
++        public SocketEventProcessor(long socket, SocketStatus status) {
+             this.socket = socket;
+-            this.error = error;
++            this.status = status;
+         }
+ 
+         public void run() {
+ 
+             // Process the request from this socket
+-            if (handler.event(socket, error) == Handler.SocketState.CLOSED) {
++            if (handler.event(socket, status) == Handler.SocketState.CLOSED) {
+                 // Close socket and pool
+                 Socket.destroy(socket);
+                 socket = 0;
+
+==================================================
+SocketStatus.java
+index 926e6eaba4..b2c8bae752 100644
+--- a/java/org/apache/tomcat/util/net/NioEndpoint.java
++++ b/java/org/apache/tomcat/util/net/NioEndpoint.java
+@@ -20,6 +20,7 @@ import java.io.FileInputStream;
+ import java.io.IOException;
+ import java.net.InetAddress;
+ import java.net.InetSocketAddress;
++import java.net.Socket;
+ import java.nio.ByteBuffer;
+ import java.nio.channels.CancelledKeyException;
+ import java.nio.channels.SelectionKey;
+@@ -28,9 +29,12 @@ import java.nio.channels.ServerSocketChannel;
+ import java.nio.channels.SocketChannel;
+ import java.security.KeyStore;
+ import java.util.Iterator;
+-import java.util.LinkedList;
+ import java.util.Set;
++import java.util.StringTokenizer;
++import java.util.concurrent.ConcurrentLinkedQueue;
+ import java.util.concurrent.Executor;
++import java.util.concurrent.atomic.AtomicLong;
++
+ import javax.net.ssl.KeyManagerFactory;
+ import javax.net.ssl.SSLContext;
+ import javax.net.ssl.SSLEngine;
+@@ -40,13 +44,6 @@ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.tomcat.util.net.SecureNioChannel.ApplicationBufferHandler;
+ import org.apache.tomcat.util.res.StringManager;
+-import java.util.concurrent.ConcurrentLinkedQueue;
+-import java.util.concurrent.atomic.AtomicLong;
+-import java.util.concurrent.ThreadPoolExecutor;
+-import java.util.concurrent.TimeUnit;
+-import java.util.concurrent.LinkedBlockingQueue;
+-import java.net.Socket;
+-import java.util.StringTokenizer;
+ 
+ /**
+  * NIO tailored thread pool, providing the following services:
+@@ -855,12 +852,12 @@ public class NioEndpoint {
+     /**
+      * Process given socket for an event.
+      */
+-    protected boolean processSocket(NioChannel socket, boolean error) {
++    protected boolean processSocket(NioChannel socket, SocketStatus status) {
+         try {
+             if (executor == null) {
+-                getWorkerThread().assign(socket, error);
++                getWorkerThread().assign(socket, status);
+             } else {
+-                executor.execute(new SocketEventProcessor(socket, error));
++                executor.execute(new SocketEventProcessor(socket, status));
+             }
+         } catch (Throwable t) {
+             // This means we got an OOM or similar creating a thread, or that
+@@ -1041,11 +1038,14 @@ public class NioEndpoint {
+             addEvent(r);
+         }
+         
+-        public void cancelledKey(SelectionKey key) {
++        public void cancelledKey(SelectionKey key, SocketStatus status) {
+             try {
+                 KeyAttachment ka = (KeyAttachment) key.attachment();
+                 if ( key.isValid() ) key.cancel();
+-                if (ka != null && ka.getComet()) processSocket( ka.getChannel(), true);
++                if (ka != null && ka.getComet()) processSocket( ka.getChannel(), status);
++                // FIXME: closing in all these cases is a bit mean. IMO, it should leave it
++                // to the worker (or executor) depending on what the request processor
++                // returns
+                 if ( key.channel().isOpen() ) key.channel().close();
+                 key.attach(null);
+             } catch (Throwable e) {
+@@ -1116,7 +1116,8 @@ public class NioEndpoint {
+                                     attachment.setWakeUp(false);
+                                     synchronized (attachment.getMutex()) {attachment.getMutex().notifyAll();}
+                                 } else if ( attachment.getComet() ) {
+-                                    if (!processSocket(channel,false)) processSocket(channel,true);
++                                    if (!processSocket(channel, SocketStatus.OPEN))
++                                        processSocket(channel, SocketStatus.DISCONNECT);
+                                 } else {
+                                     boolean close = (!processSocket(channel));
+                                     if ( close ) {
+@@ -1127,10 +1128,10 @@ public class NioEndpoint {
+                             } 
+                         } else {
+                             //invalid key
+-                            cancelledKey(sk);
++                            cancelledKey(sk, SocketStatus.ERROR);
+                         }
+                     } catch ( CancelledKeyException ckx ) {
+-                        cancelledKey(sk);
++                        cancelledKey(sk, SocketStatus.ERROR);
+                     } catch (Throwable t) {
+                         log.error("",t);
+                     }
+@@ -1156,23 +1157,23 @@ public class NioEndpoint {
+                 try {
+                     KeyAttachment ka = (KeyAttachment) key.attachment();
+                     if ( ka == null ) {
+-                        cancelledKey(key); //we don't support any keys without attachments
++                        cancelledKey(key, SocketStatus.ERROR); //we don't support any keys without attachments
+                     } else if ( ka.getError() ) {
+-                        cancelledKey(key);
++                        cancelledKey(key, SocketStatus.DISCONNECT);
+                     }else if ((ka.interestOps()&SelectionKey.OP_READ) == SelectionKey.OP_READ) {
+                         //only timeout sockets that we are waiting for a read from
+                         long delta = now - ka.getLastAccess();
+                         long timeout = (ka.getTimeout()==-1)?((long) soTimeout):(ka.getTimeout());
+                         boolean isTimedout = delta > timeout;
+                         if (isTimedout) {
+-                            cancelledKey(key);
++                            cancelledKey(key, SocketStatus.TIMEOUT);
+                         } else {
+                             long nextTime = now+(timeout-delta);
+                             nextExpiration = (nextTime < nextExpiration)?nextTime:nextExpiration;
+                         }
+                     }//end if
+                 }catch ( CancelledKeyException ckx ) {
+-                    cancelledKey(key);
++                    cancelledKey(key, SocketStatus.ERROR);
+                 }
+             }//for
+         }
+@@ -1230,8 +1231,7 @@ public class NioEndpoint {
+         protected Thread thread = null;
+         protected boolean available = false;
+         protected Object socket = null;
+-        protected boolean event = false;
+-        protected boolean error = false;
++        protected SocketStatus status = null;
+ 
+ 
+         /**
+@@ -1254,15 +1254,14 @@ public class NioEndpoint {
+             }
+             // Store the newly available Socket and notify our thread
+             this.socket = socket;
+-            event = false;
+-            error = false;
++            status = null;
+             available = true;
+             notifyAll();
+ 
+         }
+ 
+ 
+-        protected synchronized void assign(Object socket, boolean error) {
++        protected synchronized void assign(Object socket, SocketStatus status) {
+ 
+             // Wait for the Processor to get the previous Socket
+             while (available) {
+@@ -1274,8 +1273,7 @@ public class NioEndpoint {
+ 
+             // Store the newly available Socket and notify our thread
+             this.socket = socket;
+-            event = true;
+-            this.error = error;
++            this.status = status;
+             available = true;
+             notifyAll();
+         }
+@@ -1348,7 +1346,7 @@ public class NioEndpoint {
+                         }
+                         if ( handshake == 0 ) {
+                             // Process the request from this socket
+-                            if ((event) && (handler.event(socket, error) == Handler.SocketState.CLOSED)) {
++                            if ((status != null) && (handler.event(socket, status) == Handler.SocketState.CLOSED)) {
+                                 // Close socket and pool
+                                 try {
+                                     
+@@ -1358,7 +1356,7 @@ public class NioEndpoint {
+                                 }catch ( Exception x ) {
+                                     log.error("",x);
+                                 }
+-                            } else if ((!event) && (handler.process(socket) == Handler.SocketState.CLOSED)) {
++                            } else if ((status == null) && (handler.process(socket) == Handler.SocketState.CLOSED)) {
+                                 // Close socket and pool
+                                 try {
+                                     
+@@ -1454,7 +1452,7 @@ public class NioEndpoint {
+             OPEN, CLOSED, LONG
+         }
+         public SocketState process(NioChannel socket);
+-        public SocketState event(NioChannel socket, boolean error);
++        public SocketState event(NioChannel socket, SocketStatus status);
+     }
+ 
+ 
+@@ -1584,17 +1582,17 @@ public class NioEndpoint {
+     protected class SocketEventProcessor implements Runnable {
+ 
+         protected NioChannel socket = null;
+-        protected boolean error = false; 
++        protected SocketStatus status = null; 
+ 
+-        public SocketEventProcessor(NioChannel socket, boolean error) {
++        public SocketEventProcessor(NioChannel socket, SocketStatus status) {
+             this.socket = socket;
+-            this.error = error;
++            this.status = status;
+         }
+ 
+         public void run() {
+ 
+             // Process the request from this socket
+-            if (handler.event(socket, error) == Handler.SocketState.CLOSED) {
++            if (handler.event(socket, status) == Handler.SocketState.CLOSED) {
+                 // Close socket and pool
+                 try {
+                     try {socket.close();}catch (Exception ignore){}
+
+==================================================

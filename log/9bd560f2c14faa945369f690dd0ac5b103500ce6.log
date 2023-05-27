@@ -1,0 +1,231 @@
+9bd560f2c14faa945369f690dd0ac5b103500ce6
+==================================================
+Refactor write event registration for non-blocking IO. Unit tests pass on Windows. Need to check other platforms.
+==================================================
+Mark Emlyn
+==================================================
+Thu May 30 11:51:47 2013 +0000
+==================================================
+CoyoteOutputStream.java
+Refactor write event registration for non-blocking IO. Unit tests pass on Windows. Need to check other platforms.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1487824 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+OutputBuffer.java
+index 2d19dd5f48..4d5949cac0 100644
+--- a/java/org/apache/catalina/connector/CoyoteOutputStream.java
++++ b/java/org/apache/catalina/connector/CoyoteOutputStream.java
+@@ -77,8 +77,11 @@ public class CoyoteOutputStream extends ServletOutputStream {
+ 
+     @Override
+     public void write(int i) throws IOException {
+-        checkNonBlockingWrite();
++        boolean nonBlocking = checkNonBlockingWrite();
+         ob.writeByte(i);
++        if (nonBlocking) {
++            checkRegisterForWrite();
++        }
+     }
+ 
+ 
+@@ -90,26 +93,55 @@ public class CoyoteOutputStream extends ServletOutputStream {
+ 
+     @Override
+     public void write(byte[] b, int off, int len) throws IOException {
+-        checkNonBlockingWrite();
++        boolean nonBlocking = checkNonBlockingWrite();
+         ob.write(b, off, len);
++        if (nonBlocking) {
++            checkRegisterForWrite();
++        }
++    }
++
++
++    /**
++     * Will send the buffer to the client.
++     */
++    @Override
++    public void flush() throws IOException {
++        boolean nonBlocking = checkNonBlockingWrite();
++        ob.flush();
++        if (nonBlocking) {
++            checkRegisterForWrite();
++        }
+     }
+ 
+ 
+-    private void checkNonBlockingWrite() {
+-        if (!ob.isBlocking() && !ob.isReady()) {
++    /**
++     * Checks for concurrent writes which are not permitted. This object has no
++     * state information so the call chain is
++     * CoyoyeOutputStream->OutputBuffer->CoyoteResponse.
++     *
++     * @return <code>true</code> if this OutputStream is currently in
++     *         non-blocking mode.
++     */
++    private boolean checkNonBlockingWrite() {
++        boolean nonBlocking = !ob.isBlocking();
++        if (nonBlocking && !ob.isReady()) {
+             throw new IllegalStateException(
+                     sm.getString("coyoteOutputStream.nbNotready"));
+         }
++        return nonBlocking;
+     }
+ 
+ 
+     /**
+-     * Will send the buffer to the client.
++     * Checks to see if there is data left in the Coyote output buffers (NOT the
++     * servlet output buffer) and if so registers the associated socket for
++     * write so the buffers will be emptied. The container will take care of
++     * this. As far as the app is concerned, there is a non-blocking write in
++     * progress. It doesn't have visibility of whether the data is buffered in
++     * the socket buffer or the Coyote buffers.
+      */
+-    @Override
+-    public void flush() throws IOException {
+-        checkNonBlockingWrite();
+-        ob.flush();
++    private void checkRegisterForWrite() {
++        ob.checkRegisterForWrite();
+     }
+ 
+ 
+
+==================================================
+Response.java
+index 6229352dff..e55beb508f 100644
+--- a/java/org/apache/catalina/connector/OutputBuffer.java
++++ b/java/org/apache/catalina/connector/OutputBuffer.java
+@@ -645,6 +645,11 @@ public class OutputBuffer extends Writer
+     }
+ 
+ 
++    /*
++     * All the non-blocking write state information is held in the Response so
++     * it is visible / accessible to all the code that needs it.
++     */
++
+     public boolean isReady() {
+         return coyoteResponse.isReady();
+     }
+@@ -658,4 +663,8 @@ public class OutputBuffer extends Writer
+     public boolean isBlocking() {
+         return coyoteResponse.getWriteListener() == null;
+     }
++
++    public void checkRegisterForWrite() {
++        coyoteResponse.checkRegisterForWrite(true);
++    }
+ }
+
+==================================================
+AbstractHttp11Processor.java
+index 20e7b95f59..5dc9f2f9e4 100644
+--- a/java/org/apache/coyote/Response.java
++++ b/java/org/apache/coyote/Response.java
+@@ -547,9 +547,15 @@ public final class Response {
+         return outputBuffer.getBytesWritten();
+     }
+ 
++    /*
++     * State for non-blocking output is maintained here as it is the one point
++     * easily reachable from the CoyoteOutputStream and the Processor which both
++     * need access to state.
++     */
+     protected volatile WriteListener listener;
+     private boolean fireListener = false;
+-    private final Object fireListenerLock = new Object();
++    private boolean registeredForWrite = false;
++    private final Object nonBlockingStateLock = new Object();
+ 
+     public WriteListener getWriteListener() {
+         return listener;
+@@ -582,16 +588,27 @@ public final class Response {
+             throw new IllegalStateException("not in non blocking mode.");
+         }
+         // Assume write is not possible
+-        AtomicBoolean isReady = new AtomicBoolean(false);
+-        synchronized (fireListenerLock) {
+-            if (fireListener) {
+-                // isReady() has already returned false
++        boolean ready = false;
++        synchronized (nonBlockingStateLock) {
++            if (registeredForWrite) {
++                fireListener = true;
+                 return false;
+             }
+-            action(ActionCode.NB_WRITE_INTEREST, isReady);
+-            fireListener = !isReady.get();
++            ready = checkRegisterForWrite(false);
++            fireListener = !ready;
++        }
++        return ready;
++    }
++
++    public boolean checkRegisterForWrite(boolean internal) {
++        AtomicBoolean ready = new AtomicBoolean(false);
++        synchronized (nonBlockingStateLock) {
++            if (!registeredForWrite || internal) {
++                action(ActionCode.NB_WRITE_INTEREST, ready);
++                registeredForWrite = !ready.get();
++            }
+         }
+-        return isReady.get();
++        return ready.get();
+     }
+ 
+     public void onWritePossible() throws IOException {
+@@ -599,7 +616,8 @@ public final class Response {
+         // written in the Processor so if this point is reached the app is able
+         // to write data.
+         boolean fire = false;
+-        synchronized (fireListenerLock) {
++        synchronized (nonBlockingStateLock) {
++            registeredForWrite = false;
+             if (fireListener) {
+                 fireListener = false;
+                 fire = true;
+
+==================================================
+InternalAprOutputBuffer.java
+index 12ab14efa0..f2d3eedb80 100644
+--- a/java/org/apache/coyote/http11/AbstractHttp11Processor.java
++++ b/java/org/apache/coyote/http11/AbstractHttp11Processor.java
+@@ -1543,7 +1543,9 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+                 try {
+                     if (outputBuffer.hasDataToWrite()) {
+                         if (outputBuffer.flushBuffer(false)) {
+-                            registerForEvent(false, true);
++                            // There is data to write but go via Response to
++                            // maintain a consistent view of non-blocking state
++                            response.checkRegisterForWrite(true);
+                             return SocketState.LONG;
+                         }
+                     }
+
+==================================================
+InternalNioOutputBuffer.java
+index 925e14a65b..64f7d08c62 100644
+--- a/java/org/apache/coyote/http11/InternalAprOutputBuffer.java
++++ b/java/org/apache/coyote/http11/InternalAprOutputBuffer.java
+@@ -315,9 +315,11 @@ public class InternalAprOutputBuffer extends AbstractOutputBuffer<Long> {
+         if (bbuf.remaining() == 0) {
+             bbuf.clear();
+             flipped = false;
+-        } else {
+-            registerWriteInterest();
+         }
++        // If there is data left in the buffer the socket will be registered for
++        // write further up the stack. This is to ensure the socket is only
++        // registered for write once as both container and user code can trigger
++        // write registration.
+     }
+ 
+ 
+
+==================================================

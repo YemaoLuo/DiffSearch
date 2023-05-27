@@ -1,0 +1,505 @@
+5d11c13cf40e05720fe2b9d63d85bc0445cd6144
+==================================================
+Pull up Handler.process for the Ajp Connectors.
+==================================================
+Mark Emlyn
+==================================================
+Fri Jul 8 17:19:19 2011 +0000
+==================================================
+AbstractAjpProcessor.java
+Pull up Handler.process for the Ajp Connectors.
+Note that this is an intermediate step. The aim is to pull this up to AbstractProtocol
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1144390 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AbstractAjpProtocol.java
+index 3107331787..7824eba755 100644
+--- a/java/org/apache/coyote/ajp/AbstractAjpProcessor.java
++++ b/java/org/apache/coyote/ajp/AbstractAjpProcessor.java
+@@ -14,7 +14,6 @@
+  *  See the License for the specific language governing permissions and
+  *  limitations under the License.
+  */
+-
+ package org.apache.coyote.ajp;
+ 
+ import java.io.ByteArrayInputStream;
+@@ -43,12 +42,13 @@ import org.apache.tomcat.util.net.AbstractEndpoint;
+ import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
+ import org.apache.tomcat.util.net.SSLSupport;
+ import org.apache.tomcat.util.net.SocketStatus;
++import org.apache.tomcat.util.net.SocketWrapper;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+ /**
+  * Base class for AJP Processor implementations.
+  */
+-public abstract class AbstractAjpProcessor extends AbstractProcessor {
++public abstract class AbstractAjpProcessor<S> extends AbstractProcessor {
+ 
+     protected abstract Log getLog();
+ 
+@@ -454,6 +454,9 @@ public abstract class AbstractAjpProcessor extends AbstractProcessor {
+     protected abstract void finish() throws IOException;
+ 
+ 
++    public abstract SocketState process(SocketWrapper<S> socket)
++            throws IOException;
++
+     public SocketState asyncDispatch(SocketStatus status) {
+ 
+         RequestInfo rp = request.getRequestProcessor();
+
+==================================================
+AjpAprProcessor.java
+index 9c69bd7d7e..f59b45e962 100644
+--- a/java/org/apache/coyote/ajp/AbstractAjpProtocol.java
++++ b/java/org/apache/coyote/ajp/AbstractAjpProtocol.java
+@@ -16,7 +16,12 @@
+  */
+ package org.apache.coyote.ajp;
+ 
++import java.util.concurrent.ConcurrentHashMap;
++
+ import org.apache.coyote.AbstractProtocol;
++import org.apache.tomcat.util.ExceptionUtils;
++import org.apache.tomcat.util.net.SocketStatus;
++import org.apache.tomcat.util.net.SocketWrapper;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+ public abstract class AbstractAjpProtocol extends AbstractProtocol {
+@@ -70,4 +75,87 @@ public abstract class AbstractAjpProtocol extends AbstractProtocol {
+             this.packetSize = packetSize;
+         }
+     }
++    
++    protected abstract static class AbstractAjpConnectionHandler<S,P extends AbstractAjpProcessor<S>>
++            extends AbstractConnectionHandler {
++
++        protected ConcurrentHashMap<SocketWrapper<S>,P> connections =
++            new ConcurrentHashMap<SocketWrapper<S>,P>();
++
++        protected RecycledProcessors<P> recycledProcessors =
++            new RecycledProcessors<P>(this);
++        
++        @Override
++        public void recycle() {
++            recycledProcessors.clear();
++        }
++        
++        public SocketState process(SocketWrapper<S> socket,
++                SocketStatus status) {
++            P processor = connections.remove(socket);
++
++            socket.setAsync(false);
++
++            try {
++                if (processor == null) {
++                    processor = recycledProcessors.poll();
++                }
++                if (processor == null) {
++                    processor = createProcessor();
++                }
++
++                SocketState state = SocketState.CLOSED;
++                do {
++                    if (processor.isAsync() || state == SocketState.ASYNC_END) {
++                        state = processor.asyncDispatch(status);
++                    } else {
++                        state = processor.process(socket);
++                    }
++    
++                    if (state != SocketState.CLOSED && processor.isAsync()) {
++                        state = processor.asyncPostProcess();
++                    }
++                } while (state == SocketState.ASYNC_END);
++
++                if (state == SocketState.LONG) {
++                    // In the middle of processing a request/response. Keep the
++                    // socket associated with the processor.
++                    connections.put(socket, processor);
++                    socket.setAsync(true);
++                } else if (state == SocketState.OPEN){
++                    // In keep-alive but between requests. OK to recycle
++                    // processor. Continue to poll for the next request.
++                    release(socket, processor, false, true);
++                } else {
++                    // Connection closed. OK to recycle the processor.
++                    release(socket, processor, true, false);
++                }
++                return state;
++            } catch(java.net.SocketException e) {
++                // SocketExceptions are normal
++                getLog().debug(sm.getString(
++                        "ajpprotocol.proto.socketexception.debug"), e);
++            } catch (java.io.IOException e) {
++                // IOExceptions are normal
++                getLog().debug(sm.getString(
++                        "ajpprotocol.proto.ioexception.debug"), e);
++            }
++            // Future developers: if you discover any other
++            // rare-but-nonfatal exceptions, catch them here, and log as
++            // above.
++            catch (Throwable e) {
++                ExceptionUtils.handleThrowable(e);
++                // any other exception or error is odd. Here we log it
++                // with "ERROR" level, so it will show up even on
++                // less-than-verbose logs.
++                getLog().error(sm.getString("ajpprotocol.proto.error"), e);
++            }
++            release(socket, processor, true, false);
++            return SocketState.CLOSED;
++        }
++        
++        protected abstract P createProcessor();
++        protected abstract void release(SocketWrapper<S> socket, P processor,
++                boolean socketClosing, boolean addToPoller);
++    }
+ }
+
+==================================================
+AjpAprProtocol.java
+index 94880bca14..275f25522b 100644
+--- a/java/org/apache/coyote/ajp/AjpAprProcessor.java
++++ b/java/org/apache/coyote/ajp/AjpAprProcessor.java
+@@ -47,7 +47,7 @@ import org.apache.tomcat.util.net.SocketWrapper;
+  * @author Costin Manolache
+  * @author Bill Barker
+  */
+-public class AjpAprProcessor extends AbstractAjpProcessor {
++public class AjpAprProcessor extends AbstractAjpProcessor<Long> {
+ 
+ 
+     /**
+@@ -106,6 +106,7 @@ public class AjpAprProcessor extends AbstractAjpProcessor {
+      *
+      * @throws IOException error during an I/O operation
+      */
++    @Override
+     public SocketState process(SocketWrapper<Long> socket)
+         throws IOException {
+         RequestInfo rp = request.getRequestProcessor();
+
+==================================================
+AjpNioProcessor.java
+index 50b25add2b..d314cb2c93 100644
+--- a/java/org/apache/coyote/ajp/AjpAprProtocol.java
++++ b/java/org/apache/coyote/ajp/AjpAprProtocol.java
+@@ -14,19 +14,14 @@
+  *  See the License for the specific language governing permissions and
+  *  limitations under the License.
+  */
+-
+ package org.apache.coyote.ajp;
+ 
+-import java.util.concurrent.ConcurrentHashMap;
+-
+ import org.apache.coyote.AbstractProtocol;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+-import org.apache.tomcat.util.ExceptionUtils;
+ import org.apache.tomcat.util.net.AbstractEndpoint;
+ import org.apache.tomcat.util.net.AprEndpoint;
+ import org.apache.tomcat.util.net.AprEndpoint.Handler;
+-import org.apache.tomcat.util.net.SocketStatus;
+ import org.apache.tomcat.util.net.SocketWrapper;
+ 
+ 
+@@ -100,16 +95,11 @@ public class AjpAprProtocol extends AbstractAjpProtocol {
+ 
+ 
+     protected static class AjpConnectionHandler
+-            extends AbstractConnectionHandler implements Handler {
++            extends AbstractAjpConnectionHandler<Long,AjpAprProcessor>
++            implements Handler {
+ 
+         protected AjpAprProtocol proto;
+ 
+-        protected ConcurrentHashMap<SocketWrapper<Long>, AjpAprProcessor> connections =
+-            new ConcurrentHashMap<SocketWrapper<Long>, AjpAprProcessor>();
+-
+-        protected RecycledProcessors<AjpAprProcessor> recycledProcessors =
+-            new RecycledProcessors<AjpAprProcessor>(this);
+-
+         public AjpConnectionHandler(AjpAprProtocol proto) {
+             this.proto = proto;
+         }
+@@ -124,15 +114,11 @@ public class AjpAprProtocol extends AbstractAjpProtocol {
+             return log;
+         }
+ 
+-        @Override
+-        public void recycle() {
+-            recycledProcessors.clear();
+-        }
+-        
+         /**
+          * Expected to be used by the handler once the processor is no longer
+          * required.
+          */
++        @Override
+         public void release(SocketWrapper<Long> socket,
+                 AjpAprProcessor processor, boolean isSocketClosing,
+                 boolean addToPoller) {
+@@ -146,70 +132,6 @@ public class AjpAprProtocol extends AbstractAjpProtocol {
+ 
+ 
+         @Override
+-        public SocketState process(SocketWrapper<Long> socket,
+-                SocketStatus status) {
+-            AjpAprProcessor processor = connections.remove(socket);
+-
+-            socket.setAsync(false);
+-
+-            try {
+-                if (processor == null) {
+-                    processor = recycledProcessors.poll();
+-                }
+-                if (processor == null) {
+-                    processor = createProcessor();
+-                }
+-
+-                SocketState state = SocketState.CLOSED;
+-                do {
+-                    if (processor.isAsync() || state == SocketState.ASYNC_END) {
+-                        state = processor.asyncDispatch(status);
+-                    } else {
+-                        state = processor.process(socket);
+-                    }
+-
+-                    if (state != SocketState.CLOSED && processor.isAsync()) {
+-                        state = processor.asyncPostProcess();
+-                    }
+-                } while (state == SocketState.ASYNC_END);
+-                
+-                if (state == SocketState.LONG) {
+-                    // Need to make socket available for next processing cycle
+-                    // but no need for the poller
+-                    connections.put(socket, processor);
+-                    socket.setAsync(true);
+-                } else if (state == SocketState.OPEN){
+-                    // In keep-alive but between requests. OK to recycle
+-                    // processor. Continue to poll for the next request.
+-                    release(socket, processor, false, true);
+-                } else {
+-                    // Connection closed. OK to recycle the processor.
+-                    release(socket, processor, true, false);
+-                }
+-                return state;
+-            } catch(java.net.SocketException e) {
+-                // SocketExceptions are normal
+-                log.debug(sm.getString(
+-                        "ajpprotocol.proto.socketexception.debug"), e);
+-            } catch (java.io.IOException e) {
+-                // IOExceptions are normal
+-                log.debug(sm.getString(
+-                        "ajpprotocol.proto.ioexception.debug"), e);
+-            }
+-            // Future developers: if you discover any other
+-            // rare-but-nonfatal exceptions, catch them here, and log as
+-            // above.
+-            catch (Throwable e) {
+-                ExceptionUtils.handleThrowable(e);
+-                // any other exception or error is odd. Here we log it
+-                // with "ERROR" level, so it will show up even on
+-                // less-than-verbose logs.
+-                log.error(sm.getString("ajpprotocol.proto.error"), e);
+-            }
+-            release(socket, processor, true, false);
+-            return SocketState.CLOSED;
+-        }
+-
+         protected AjpAprProcessor createProcessor() {
+             AjpAprProcessor processor = new AjpAprProcessor(proto.packetSize, (AprEndpoint)proto.endpoint);
+             processor.setAdapter(proto.adapter);
+
+==================================================
+AjpNioProtocol.java
+index e68057e560..4ce2ee8085 100644
+--- a/java/org/apache/coyote/ajp/AjpNioProcessor.java
++++ b/java/org/apache/coyote/ajp/AjpNioProcessor.java
+@@ -42,7 +42,7 @@ import org.apache.tomcat.util.net.SocketWrapper;
+ /**
+  * Processes AJP requests using NIO.
+  */
+-public class AjpNioProcessor extends AbstractAjpProcessor {
++public class AjpNioProcessor extends AbstractAjpProcessor<NioChannel> {
+ 
+ 
+     /**
+@@ -91,6 +91,7 @@ public class AjpNioProcessor extends AbstractAjpProcessor {
+      *
+      * @throws IOException error during an I/O operation
+      */
++    @Override
+     public SocketState process(SocketWrapper<NioChannel> socket)
+         throws IOException {
+         RequestInfo rp = request.getRequestProcessor();
+
+==================================================
+AjpProcessor.java
+index baeaf5c3c4..987761b0ef 100644
+--- a/java/org/apache/coyote/ajp/AjpNioProtocol.java
++++ b/java/org/apache/coyote/ajp/AjpNioProtocol.java
+@@ -14,23 +14,19 @@
+  *  See the License for the specific language governing permissions and
+  *  limitations under the License.
+  */
+-
+ package org.apache.coyote.ajp;
+ 
+ import java.nio.channels.SocketChannel;
+ import java.util.Iterator;
+-import java.util.concurrent.ConcurrentHashMap;
+ 
+ import org.apache.coyote.AbstractProtocol;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+-import org.apache.tomcat.util.ExceptionUtils;
+ import org.apache.tomcat.util.net.AbstractEndpoint;
+ import org.apache.tomcat.util.net.NioChannel;
+ import org.apache.tomcat.util.net.NioEndpoint;
+ import org.apache.tomcat.util.net.NioEndpoint.Handler;
+ import org.apache.tomcat.util.net.SSLImplementation;
+-import org.apache.tomcat.util.net.SocketStatus;
+ import org.apache.tomcat.util.net.SocketWrapper;
+ 
+ 
+@@ -90,16 +86,11 @@ public class AjpNioProtocol extends AbstractAjpProtocol {
+ 
+ 
+     protected static class AjpConnectionHandler
+-            extends AbstractConnectionHandler implements Handler {
++            extends AbstractAjpConnectionHandler<NioChannel, AjpNioProcessor>
++            implements Handler {
+ 
+         protected AjpNioProtocol proto;
+ 
+-        protected ConcurrentHashMap<SocketWrapper<NioChannel>, AjpNioProcessor> connections =
+-            new ConcurrentHashMap<SocketWrapper<NioChannel>, AjpNioProcessor>();
+-
+-        protected RecycledProcessors<AjpNioProcessor> recycledProcessors =
+-            new RecycledProcessors<AjpNioProcessor>(this);
+-
+         public AjpConnectionHandler(AjpNioProtocol proto) {
+             this.proto = proto;
+         }
+@@ -114,11 +105,6 @@ public class AjpNioProtocol extends AbstractAjpProtocol {
+             return log;
+         }
+ 
+-        @Override
+-        public void recycle() {
+-            recycledProcessors.clear();
+-        }
+-        
+         @Override
+         public SSLImplementation getSslImplementation() {
+             // AJP does not support SSL
+@@ -167,6 +153,7 @@ public class AjpNioProtocol extends AbstractAjpProtocol {
+          * Expected to be used by the handler once the processor is no longer
+          * required.
+          */
++        @Override
+         public void release(SocketWrapper<NioChannel> socket,
+                 AjpNioProcessor processor, boolean isSocketClosing,
+                 boolean addToPoller) {
+@@ -179,70 +166,6 @@ public class AjpNioProtocol extends AbstractAjpProtocol {
+ 
+ 
+         @Override
+-        public SocketState process(SocketWrapper<NioChannel> socket,
+-                SocketStatus status) {
+-            AjpNioProcessor processor = connections.remove(socket);
+-
+-            socket.setAsync(false); //no longer check for timeout
+-
+-            try {
+-                if (processor == null) {
+-                    processor = recycledProcessors.poll();
+-                }
+-                if (processor == null) {
+-                    processor = createProcessor();
+-                }
+-
+-                SocketState state = SocketState.CLOSED;
+-                do {
+-                    if (processor.isAsync() || state == SocketState.ASYNC_END) {
+-                        state = processor.asyncDispatch(status);
+-                    } else {
+-                        state = processor.process(socket);
+-                    }
+-
+-                    if (state != SocketState.CLOSED && processor.isAsync()) {
+-                        state = processor.asyncPostProcess();
+-                    }
+-                } while (state == SocketState.ASYNC_END);
+-
+-                if (state == SocketState.LONG) {
+-                    // In the middle of processing a request/response. Keep the
+-                    // socket associated with the processor.
+-                    connections.put(socket, processor);
+-                    socket.setAsync(true);
+-                } else if (state == SocketState.OPEN){
+-                    // In keep-alive but between requests. OK to recycle
+-                    // processor. Continue to poll for the next request.
+-                    release(socket, processor, false, true);
+-                } else {
+-                    // Connection closed. OK to recycle the processor.
+-                    release(socket, processor, true, false);
+-                }
+-                return state;
+-            } catch(java.net.SocketException e) {
+-                // SocketExceptions are normal
+-                log.debug(sm.getString(
+-                        "ajpprotocol.proto.socketexception.debug"), e);
+-            } catch (java.io.IOException e) {
+-                // IOExceptions are normal
+-                log.debug(sm.getString(
+-                        "ajpprotocol.proto.ioexception.debug"), e);
+-            }
+-            // Future developers: if you discover any other
+-            // rare-but-nonfatal exceptions, catch them here, and log as
+-            // above.
+-            catch (Throwable e) {
+-                ExceptionUtils.handleThrowable(e);
+-                // any other exception or error is odd. Here we log it
+-                // with "ERROR" level, so it will show up even on
+-                // less-than-verbose logs.
+-                log.error(sm.getString("ajpprotocol.proto.error"), e);
+-            }
+-            release(socket, processor, true, false);
+-            return SocketState.CLOSED;
+-        }
+-
+         protected AjpNioProcessor createProcessor() {
+             AjpNioProcessor processor = new AjpNioProcessor(proto.packetSize, (NioEndpoint)proto.endpoint);
+             processor.setAdapter(proto.adapter);
+
+==================================================
+AjpProtocol.java
+index e62085d6ee..35b77b36a9 100644
+--- a/java/org/apache/coyote/ajp/AjpProcessor.java
++++ b/java/org/apache/coyote/ajp/AjpProcessor.java
+@@ -47,7 +47,7 @@ import org.apache.tomcat.util.net.SocketWrapper;
+  * @author Costin Manolache
+  * @author Bill Barker
+  */
+-public class AjpProcessor extends AbstractAjpProcessor {
++public class AjpProcessor extends AbstractAjpProcessor<Socket> {
+ 
+ 
+     /**
+@@ -100,6 +100,7 @@ public class AjpProcessor extends AbstractAjpProcessor {
+      *
+      * @throws IOException error during an I/O operation
+      */
++    @Override
+     public SocketState process(SocketWrapper<Socket> socket)
+         throws IOException {
+         RequestInfo rp = request.getRequestProcessor();
+
+==================================================

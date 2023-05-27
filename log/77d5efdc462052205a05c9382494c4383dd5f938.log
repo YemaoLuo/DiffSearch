@@ -1,0 +1,173 @@
+77d5efdc462052205a05c9382494c4383dd5f938
+==================================================
+Add support for reading priority update frame
+==================================================
+Mark Thomas
+==================================================
+Fri Dec 9 15:49:32 2022 +0000
+==================================================
+FrameType.java
+Add support for reading priority update frame
+
+
+
+==================================================
+Http2AsyncParser.java
+index 8734944595..acd60eaa2c 100644
+--- a/java/org/apache/coyote/http2/FrameType.java
++++ b/java/org/apache/coyote/http2/FrameType.java
+@@ -22,17 +22,18 @@ import org.apache.tomcat.util.res.StringManager;
+ 
+ enum FrameType {
+ 
+-    DATA          (0,   false,  true, null,              false),
+-    HEADERS       (1,   false,  true, null,               true),
+-    PRIORITY      (2,   false,  true, (x) -> x == 5,     false),
+-    RST           (3,   false,  true, (x) -> x == 4,     false),
+-    SETTINGS      (4,    true, false, (x) -> x % 6 == 0,  true),
+-    PUSH_PROMISE  (5,   false,  true, (x) -> x >= 4,      true),
+-    PING          (6,    true, false, (x) -> x == 8,     false),
+-    GOAWAY        (7,    true, false, (x) -> x >= 8,     false),
+-    WINDOW_UPDATE (8,    true,  true, (x) -> x == 4,      true),
+-    CONTINUATION  (9,   false,  true, null,               true),
+-    UNKNOWN       (256,  true,  true, null,              false);
++    DATA            (  0, false,  true, null,              false),
++    HEADERS         (  1, false,  true, null,               true),
++    PRIORITY        (  2, false,  true, (x) -> x == 5,     false),
++    RST             (  3, false,  true, (x) -> x == 4,     false),
++    SETTINGS        (  4,  true, false, (x) -> x % 6 == 0,  true),
++    PUSH_PROMISE    (  5, false,  true, (x) -> x >= 4,      true),
++    PING            (  6,  true, false, (x) -> x == 8,     false),
++    GOAWAY          (  7,  true, false, (x) -> x >= 8,     false),
++    WINDOW_UPDATE   (  8,  true,  true, (x) -> x == 4,      true),
++    CONTINUATION    (  9, false,  true, null,               true),
++    PRIORITY_UPDATE ( 16,  true, false, (x) -> x >= 4,      true),
++    UNKNOWN         (256,  true,  true, null,              false);
+ 
+     private static final StringManager sm = StringManager.getManager(FrameType.class);
+ 
+@@ -107,6 +108,8 @@ enum FrameType {
+             return WINDOW_UPDATE;
+         case 9:
+             return CONTINUATION;
++        case 16:
++            return PRIORITY_UPDATE;
+         default:
+             return UNKNOWN;
+         }
+
+==================================================
+Http2Parser.java
+index a2043557b7..e05eeea4a2 100644
+--- a/java/org/apache/coyote/http2/Http2AsyncParser.java
++++ b/java/org/apache/coyote/http2/Http2AsyncParser.java
+@@ -276,6 +276,9 @@ class Http2AsyncParser extends Http2Parser {
+                             case CONTINUATION:
+                                 readContinuationFrame(streamId, flags, payloadSize, payload);
+                                 break;
++                            case PRIORITY_UPDATE:
++                                readPriorityUpdateFrame(payloadSize, payload);
++                                break;
+                             case UNKNOWN:
+                                 readUnknownFrame(streamId, frameTypeId, flags, payloadSize, payload);
+                             }
+
+==================================================
+Http2UpgradeHandler.java
+index a68ce25dcb..bf3689d9c0 100644
+--- a/java/org/apache/coyote/http2/Http2Parser.java
++++ b/java/org/apache/coyote/http2/Http2Parser.java
+@@ -16,7 +16,11 @@
+  */
+ package org.apache.coyote.http2;
+ 
++import java.io.BufferedReader;
++import java.io.ByteArrayInputStream;
+ import java.io.IOException;
++import java.io.InputStreamReader;
++import java.io.Reader;
+ import java.nio.ByteBuffer;
+ import java.nio.charset.StandardCharsets;
+ 
+@@ -27,6 +31,7 @@ import org.apache.coyote.http2.HpackDecoder.HeaderEmitter;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.buf.ByteBufferUtils;
++import org.apache.tomcat.util.http.parser.Priority;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+ class Http2Parser {
+@@ -121,6 +126,9 @@ class Http2Parser {
+         case CONTINUATION:
+             readContinuationFrame(streamId, flags, payloadSize, null);
+             break;
++        case PRIORITY_UPDATE:
++            readPriorityUpdateFrame(payloadSize, null);
++            break;
+         case UNKNOWN:
+             readUnknownFrame(streamId, frameTypeId, flags, payloadSize, null);
+         }
+@@ -441,6 +449,36 @@ class Http2Parser {
+     }
+ 
+ 
++    protected void readPriorityUpdateFrame(int payloadSize, ByteBuffer buffer) throws Http2Exception, IOException {
++        // Identify prioritized stream ID
++        byte[] payload = new byte[payloadSize];
++        if (buffer == null) {
++            input.fill(true, payload);
++        } else {
++            buffer.get(payload);
++        }
++
++        int prioritizedStreamID = ByteUtil.get31Bits(payload, 0);
++
++        if (prioritizedStreamID == 0) {
++            throw new ConnectionException(
++                    sm.getString("http2Parser.processFramePriorityUpdate.streamZero"), Http2Error.PROTOCOL_ERROR);
++        }
++
++        ByteArrayInputStream bais = new ByteArrayInputStream(payload, 4, payloadSize - 4);
++        Reader r = new BufferedReader(new InputStreamReader(bais, StandardCharsets.US_ASCII));
++        Priority p = Priority.parsePriority(r);
++
++        if (log.isDebugEnabled()) {
++            log.debug(sm.getString("http2Parser.processFramePriorityUpdate.debug", connectionId,
++                    Integer.toString(prioritizedStreamID), Integer.toString(p.getUrgency()),
++                    Boolean.valueOf(p.getIncremental())));
++        }
++
++        output.priorityUpdate(prioritizedStreamID, p);
++    }
++
++
+     protected void readHeaderPayload(int streamId, int payloadSize, ByteBuffer buffer)
+             throws Http2Exception, IOException {
+ 
+@@ -783,6 +821,9 @@ class Http2Parser {
+         // Window size
+         void incrementWindowSize(int streamId, int increment) throws Http2Exception;
+ 
++        // Priority update
++        void priorityUpdate(int prioritizedStreamID, Priority p) throws Http2Exception;
++
+         /**
+          * Notification triggered when the parser swallows the payload of an
+          * unknown frame.
+
+==================================================
+Http2TestBase.java
+index 7dfa1676f6..6d6c5a33b5 100644
+--- a/java/org/apache/coyote/http2/LocalStrings.properties
++++ b/java/org/apache/coyote/http2/LocalStrings.properties
+@@ -73,6 +73,8 @@ http2Parser.processFrameData.window=Connection [{0}], Client sent more data than
+ http2Parser.processFrameHeaders.decodingDataLeft=Data left over after HPACK decoding - it should have been consumed
+ http2Parser.processFrameHeaders.decodingFailed=There was an error during the HPACK decoding of HTTP headers
+ http2Parser.processFrameHeaders.payload=Connection [{0}], Stream [{1}], Processing headers payload of size [{2}]
++http2Parser.processFramePriorityUpdate.debug=Connection [{0}], Stream [{1}], Urgency [{2}], Incremental [{3}]
++http2Parser.processFramePriorityUpdate.streamZero=Connection [{0}], Priority update frame received to prioritize stream zero
+ http2Parser.processFramePushPromise=Connection [{0}], Stream [{1}], Push promise frames should not be sent by the client
+ http2Parser.processFrameSettings.ackWithNonZeroPayload=Settings frame received with the ACK flag set and payload present
+ http2Parser.processFrameWindowUpdate.debug=Connection [{0}], Stream [{1}], Window size increment [{2}]
+
+==================================================

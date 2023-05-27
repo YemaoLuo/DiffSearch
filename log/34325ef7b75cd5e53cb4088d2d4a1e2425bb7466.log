@@ -1,0 +1,157 @@
+34325ef7b75cd5e53cb4088d2d4a1e2425bb7466
+==================================================
+More plumbing for write.
+==================================================
+Mark Thomas
+==================================================
+Wed May 20 19:21:52 2015 +0000
+==================================================
+AbstractStream.java
+More plumbing for write.
+Generally:
+ - uses a state machine to co-orindate writes across multiple threads
+ - all writes are done on the main Connection thread, not on the Stream threads
+ - if there is a read thread, see if we need to (and can) write when it finishes
+ - written with an eye on non-blocking IO but that side of things isn't fully thought through 
+
+Also some improvements to debug logging. Added a connection ID and made logs slightly less verbose.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1680661 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Http2UpgradeHandler.java
+index c0039c484b..8895b5c536 100644
+--- a/java/org/apache/coyote/http2/AbstractStream.java
++++ b/java/org/apache/coyote/http2/AbstractStream.java
+@@ -48,8 +48,9 @@ abstract class AbstractStream {
+ 
+     public void rePrioritise(AbstractStream parent, boolean exclusive, int weight) {
+         if (getLog().isDebugEnabled()) {
+-            getLog().debug(sm.getString("abstractStream.reprioritisation.debug", identifier,
+-                    Boolean.toString(exclusive), parent.getIdentifier(), Integer.toString(weight)));
++            getLog().debug(sm.getString("abstractStream.reprioritisation.debug",
++                    Long.toString(getConnectionId()), identifier, Boolean.toString(exclusive),
++                    parent.getIdentifier(), Integer.toString(weight)));
+         }
+ 
+         // Check if new parent is a descendant of this stream
+@@ -120,4 +121,6 @@ abstract class AbstractStream {
+     }
+ 
+     protected abstract Log getLog();
++
++    protected abstract int getConnectionId();
+ }
+
+==================================================
+Stream.java
+index cdcf1f0d2e..bd491ecddc 100644
+--- a/java/org/apache/coyote/http2/LocalStrings.properties
++++ b/java/org/apache/coyote/http2/LocalStrings.properties
+@@ -13,7 +13,8 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+-abstractStream.reprioritisation.debug=Reprioritising stream [{0}] with exclusive [{1}], parent [{2}] and weight [{3}]
++abstractStream.reprioritisation.debug=Connection [{0}], Stream [{1}], Exclusive [{2}], Parent [{3}], Weight [{4}]
++
+ connectionPrefaceParser.eos=Unexpected end of stream while reading opening client preface byte sequence. Only [{0}] bytes read.
+ connectionPrefaceParser.ioError=Failed to read opening client preface byte sequence
+ connectionPrefaceParser.mismatch=An unexpected byte sequence was received at the start of the client preface [{0}]
+@@ -30,13 +31,15 @@ hpackdecoder.zeroNotValidHeaderTableIndex=Zero is not a valid header table index
+ 
+ hpackhuffman.huffmanEncodedHpackValueDidNotEndWithEOS=Huffman encoded value in HPACK headers did not end with EOS padding
+ 
+-stream.header.debug=Stream [{0}] recieved HTTP header [{1}] with value [{2}]
++stream.header.debug=Connection [{0}], Stream [{1}], HTTP header [{2}], Value [{3}]
++stream.write=Connection [{0}], Stream [{1}]
+ 
+ streamProcessor.httpupgrade.notsupported=HTTP upgrade is not supported within HTTP/2 streams
+ 
+ upgradeHandler.connectionError=An error occurred that requires the HTTP/2 connection to be closed.
++upgradeHandler.init=Connection [{0}]
+ upgradeHandler.payloadTooBig=The payload is [{0}] bytes long but the maximum frame size is [{1}]
+-upgradeHandler.processFrame=Processing frame of type [{0}] for stream [{2}] with flags [{1}] and payload size [{3}]
++upgradeHandler.processFrame=Connection [{0}], Stream [{1}], Flags [{2}], Payload size [{3}]
+ upgradeHandler.processFrame.ioerror=An I/O error occurred while reading an incoming HTTP/2 frame
+ upgradeHandler.processFrameHeaders.invalidStream=Headers frame received for stream [0]
+ upgradeHandler.processFrameHeaders.decodingFailed=There was an error during the HPACK decoding of HTTP headers
+@@ -46,11 +49,17 @@ upgradeHandler.processFramePriority.invalidStream=Priority frame received for st
+ upgradeHandler.processFrameSettings.ackWithNonZeroPayload=Settings frame received with the ACK flag set and payload present
+ upgradeHandler.processFrameSettings.invalidPayloadSize=Settings frame received with a payload size of [{0}] which is not a multiple of 6
+ upgradeHandler.processFrameSettings.invalidStream=Settings frame received for stream [{0}]
+-upgradeHandler.processFrameWindowUpdate.debug=Received notification to increment the flow control window for stream [{0}] by [{1}]
++upgradeHandler.processFrameWindowUpdate.debug=Connection [{0}], Stream [{1}], Window size increment [{2}]
+ upgradeHandler.processFrameWindowUpdate.invalidIncrement=Window update frame received with an invalid increment size of [0]
+ upgradeHandler.processFrameWindowUpdate.invalidPayloadSize=Window update frame received with an invalid payload size of [{0}]
+ upgradeHandler.receivePrefaceNotSettings=The first frame received from the client was not a settings frame
+ upgradeHandler.sendPrefaceFail=Failed to send preface to client
+ upgradeHandler.socketCloseFailed=Error closing socket
+ upgradeHandler.unexpectedEos=Unexpected end of stream
+-upgradeHandler.unexpectedStatus=An unexpected value of status ([{0}]) was passed to this method
+\ No newline at end of file
++upgradeHandler.unexpectedStatus=An unexpected value of status ([{0}]) was passed to this method
++upgradeHandler.upgradeDispatch.entry=Entry, Connection [{0}], SocketStatus [{1}]
++upgradeHandler.upgradeDispatch.exit=Exit, Connection [{0}], SocketState [{1}]
++
++
++writeStateMachine.endWrite.ise=It is illegal to specify [{0}] for the new state once a write has completed
++writeStateMachine.ise=It is illegal to call [{0}()] in state [{1}]
+\ No newline at end of file
+
+==================================================
+WriteStateMachine.java
+index 13a3bd751d..1d25fe6e89 100644
+--- a/java/org/apache/coyote/http2/Stream.java
++++ b/java/org/apache/coyote/http2/Stream.java
+@@ -56,7 +56,8 @@ public class Stream extends AbstractStream implements HeaderEmitter {
+     @Override
+     public void emitHeader(String name, String value, boolean neverIndex) {
+         if (log.isDebugEnabled()) {
+-            log.debug(sm.getString("stream.header.debug", getIdentifier(), name, value));
++            log.debug(sm.getString("stream.header.debug",
++                    Long.toString(getConnectionId()), getIdentifier(), name, value));
+         }
+ 
+         switch(name) {
+@@ -95,13 +96,23 @@ public class Stream extends AbstractStream implements HeaderEmitter {
+ 
+ 
+     void writeHeaders() {
++        if (log.isDebugEnabled()) {
++            log.debug(sm.getString("stream.write",
++                    Long.toString(getConnectionId()), getIdentifier()));
++        }
+         // Format the frames.
+         // TODO
++        handler.addWrite("HEADERS");
+     }
+ 
+ 
+     void flushData() {
++        if (log.isDebugEnabled()) {
++            log.debug(sm.getString("stream.write",
++                    Long.toString(getConnectionId()), getIdentifier()));
++        }
+         // TODO
++        handler.addWrite("DATA");
+     }
+ 
+ 
+@@ -111,6 +122,12 @@ public class Stream extends AbstractStream implements HeaderEmitter {
+     }
+ 
+ 
++    @Override
++    protected final int getConnectionId() {
++        return getParentStream().getConnectionId();
++    }
++
++
+     public Request getCoyoteRequest() {
+         return coyoteRequest;
+     }
+
+==================================================

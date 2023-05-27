@@ -1,0 +1,261 @@
+bdd791c7b8ebba84a2bdc5b8be655471ce70146a
+==================================================
+Implement keep alive timeout, and while doing this, I realized that keepalive is either on or off, but there is no counter
+==================================================
+Filip Hanik
+==================================================
+Tue Dec 9 19:38:44 2008 +0000
+==================================================
+Http11NioProcessor.java
+Implement keep alive timeout, and while doing this, I realized that keepalive is either on or off, but there is no counter
+
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@724849 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Http11NioProtocol.java
+index 818b594403..118a7e6da4 100644
+--- a/java/org/apache/coyote/http11/Http11NioProcessor.java
++++ b/java/org/apache/coyote/http11/Http11NioProcessor.java
+@@ -208,8 +208,7 @@ public class Http11NioProcessor implements ActionHook {
+      * Maximum number of Keep-Alive requests to honor.
+      */
+     protected int maxKeepAliveRequests = -1;
+-
+-
++    
+     /**
+      * SSL enabled ?
+      */
+@@ -726,13 +725,15 @@ public class Http11NioProcessor implements ActionHook {
+     public SocketState event(SocketStatus status)
+         throws IOException {
+ 
+-        RequestInfo rp = request.getRequestProcessor();
++        long soTimeout = endpoint.getSoTimeout();
++        int keepAliveTimeout = endpoint.getKeepAliveTimeout();
+ 
++        RequestInfo rp = request.getRequestProcessor();
++        final NioEndpoint.KeyAttachment attach = (NioEndpoint.KeyAttachment)socket.getAttachment(false);
+         try {
+             rp.setStage(org.apache.coyote.Constants.STAGE_SERVICE);
+             error = !adapter.event(request, response, status);
+             if ( !error ) {
+-                NioEndpoint.KeyAttachment attach = (NioEndpoint.KeyAttachment)socket.getAttachment(false);
+                 if (attach != null) {
+                     attach.setComet(comet);
+                     if (comet) {
+@@ -740,7 +741,11 @@ public class Http11NioProcessor implements ActionHook {
+                         if (comettimeout != null) attach.setTimeout(comettimeout.longValue());
+                     } else {
+                         //reset the timeout
+-                        attach.setTimeout(endpoint.getSocketProperties().getSoTimeout());
++                        if (keepAlive && keepAliveTimeout>0) {
++                            attach.setTimeout(keepAliveTimeout);
++                        } else {
++                            attach.setTimeout(soTimeout);
++                        }
+                     }
+ 
+                 }
+@@ -761,7 +766,6 @@ public class Http11NioProcessor implements ActionHook {
+             return SocketState.CLOSED;
+         } else if (!comet) {
+             recycle();
+-            //pay attention to the keep alive flag set in process()
+             return (keepAlive)?SocketState.OPEN:SocketState.CLOSED;
+         } else {
+             return SocketState.LONG;
+@@ -791,15 +795,17 @@ public class Http11NioProcessor implements ActionHook {
+         keepAlive = true;
+         comet = false;
+         
+-
+-        int keepAliveLeft = maxKeepAliveRequests;
+         long soTimeout = endpoint.getSoTimeout();
++        int keepAliveTimeout = endpoint.getKeepAliveTimeout();
+ 
+         boolean keptAlive = false;
+         boolean openSocket = false;
+         boolean recycle = true;
++        final KeyAttachment ka = (KeyAttachment)socket.getAttachment(false);
++        
+         while (!error && keepAlive && !comet) {
+-
++            //always default to our soTimeout
++            ka.setTimeout(soTimeout);
+             // Parsing the request header
+             try {
+                 if( !disableUploadTimeout && keptAlive && soTimeout > 0 ) {
+@@ -810,6 +816,10 @@ public class Http11NioProcessor implements ActionHook {
+                     //of the request line, we can't recycle the processor
+                     openSocket = true;
+                     recycle = false;
++                    if (inputBuffer.getParsingRequestLinePhase()<2) {
++                        //keep alive timeout here
++                        if (keepAliveTimeout>0) ka.setTimeout(keepAliveTimeout);
++                    }
+                     break;
+                 }
+                 keptAlive = true;
+@@ -851,8 +861,10 @@ public class Http11NioProcessor implements ActionHook {
+                 response.setStatus(400);
+                 error = true;
+             }
+-
+-            if (maxKeepAliveRequests > 0 && --keepAliveLeft == 0)
++            
++            if (maxKeepAliveRequests == 1 )
++                keepAlive = false;
++            if (maxKeepAliveRequests > 0 && ka.decrementKeepAlive() <= 0)
+                 keepAlive = false;
+ 
+             // Process the request in the adapter
+@@ -916,7 +928,6 @@ public class Http11NioProcessor implements ActionHook {
+             
+             // Do sendfile as needed: add socket to sendfile and end
+             if (sendfileData != null && !error) {
+-                KeyAttachment ka = (KeyAttachment)socket.getAttachment(false);
+                 ka.setSendfileData(sendfileData);
+                 sendfileData.keepAlive = keepAlive;
+                 SelectionKey key = socket.getIOChannel().keyFor(socket.getPoller().getSelector());
+@@ -928,10 +939,9 @@ public class Http11NioProcessor implements ActionHook {
+ 
+             rp.setStage(org.apache.coyote.Constants.STAGE_KEEPALIVE);
+ 
+-        }
++        }//while
+ 
+         rp.setStage(org.apache.coyote.Constants.STAGE_ENDED);
+-
+         if (comet) {
+             if (error) {
+                 recycle();
+@@ -940,7 +950,9 @@ public class Http11NioProcessor implements ActionHook {
+                 return SocketState.LONG;
+             }
+         } else {
+-            if ( recycle ) recycle();
++            if ( recycle ) {
++                recycle();
++            }
+             //return (openSocket) ? (SocketState.OPEN) : SocketState.CLOSED;
+             return (openSocket) ? (recycle?SocketState.OPEN:SocketState.LONG) : SocketState.CLOSED;
+         }
+
+==================================================
+InternalNioInputBuffer.java
+index e765eb66d1..df54b58d50 100644
+--- a/java/org/apache/coyote/http11/Http11NioProtocol.java
++++ b/java/org/apache/coyote/http11/Http11NioProtocol.java
+@@ -19,6 +19,7 @@ package org.apache.coyote.http11;
+ 
+ import java.net.InetAddress;
+ import java.net.URLEncoder;
++import java.nio.channels.SocketChannel;
+ import java.util.Hashtable;
+ import java.util.Iterator;
+ import java.util.concurrent.ConcurrentHashMap;
+@@ -212,7 +213,6 @@ public class Http11NioProtocol implements ProtocolHandler, MBeanRegistration
+     protected Hashtable<String, Object> attributes =
+         new Hashtable<String, Object>();
+ 
+-    private int maxKeepAliveRequests=100; // as in Apache HTTPD server
+     private int timeout = 300000;   // 5 minutes as in Apache HTTPD server
+     private int maxSavePostSize = 4 * 1024;
+     private int maxHttpHeaderSize = 8 * 1024;
+@@ -456,6 +456,14 @@ public class Http11NioProtocol implements ProtocolHandler, MBeanRegistration
+         ep.setSoTimeout(i);
+         setAttribute("soTimeout", "" + i);
+     }
++    
++    public void setKeepAliveTimeout(int keepAliveTimeout) {
++        ep.setKeepAliveTimeout(keepAliveTimeout);
++    }
++    
++    public int getKeepAliveTimeout() {
++        return ep.getKeepAliveTimeout();
++    }
+ 
+     public String getProtocol() {
+         return getProperty("protocol");
+@@ -477,13 +485,13 @@ public class Http11NioProtocol implements ProtocolHandler, MBeanRegistration
+     }
+ 
+     public int getMaxKeepAliveRequests() {
+-        return maxKeepAliveRequests;
++        return ep.getMaxKeepAliveRequests();
+     }
+ 
+     /** Set the maximum number of Keep-Alive requests that we will honor.
+      */
+     public void setMaxKeepAliveRequests(int mkar) {
+-        maxKeepAliveRequests = mkar;
++        ep.setMaxKeepAliveRequests(mkar);
+         setAttribute("maxKeepAliveRequests", "" + mkar);
+     }
+ 
+@@ -491,7 +499,7 @@ public class Http11NioProtocol implements ProtocolHandler, MBeanRegistration
+      * Return the Keep-Alive policy for the connection.
+      */
+     public boolean getKeepAlive() {
+-        return ((maxKeepAliveRequests != 0) && (maxKeepAliveRequests != 1));
++        return ((ep.getMaxKeepAliveRequests() != 0) && (ep.getMaxKeepAliveRequests() != 1));
+     }
+ 
+     /**
+@@ -638,6 +646,25 @@ public class Http11NioProtocol implements ProtocolHandler, MBeanRegistration
+             recycledProcessors.clear();
+         }
+         
++        public void release(SocketChannel socket) {
++            if (log.isDebugEnabled()) 
++                log.debug("Iterating through our connections to release a socket channel:"+socket);
++            boolean released = false;
++            Iterator<java.util.Map.Entry<NioChannel, Http11NioProcessor>> it = connections.entrySet().iterator();
++            while (it.hasNext()) {
++                java.util.Map.Entry<NioChannel, Http11NioProcessor> entry = it.next();
++                if (entry.getKey().getIOChannel()==socket) {
++                    it.remove();
++                    Http11NioProcessor result = entry.getValue();
++                    result.recycle();
++                    released = true;
++                    break;
++                }
++            }
++            if (log.isDebugEnabled()) 
++                log.debug("Done iterating through our connections to release a socket channel:"+socket +" released:"+released);
++        }
++        
+         public void release(NioChannel socket) {
+             Http11NioProcessor result = connections.remove(socket);
+             if ( result != null ) {
+@@ -770,7 +797,7 @@ public class Http11NioProtocol implements ProtocolHandler, MBeanRegistration
+               proto.maxHttpHeaderSize,
+               proto.ep);
+             processor.setAdapter(proto.adapter);
+-            processor.setMaxKeepAliveRequests(proto.maxKeepAliveRequests);
++            processor.setMaxKeepAliveRequests(proto.getMaxKeepAliveRequests());
+             processor.setTimeout(proto.timeout);
+             processor.setDisableUploadTimeout(proto.disableUploadTimeout);
+             processor.setCompressionMinSize(proto.compressionMinSize);
+
+==================================================
+NioEndpoint.java
+index d57d214113..2ee2e07028 100644
+--- a/java/org/apache/coyote/http11/InternalNioInputBuffer.java
++++ b/java/org/apache/coyote/http11/InternalNioInputBuffer.java
+@@ -934,4 +934,9 @@ public class InternalNioInputBuffer implements InputBuffer {
+     }
+ 
+ 
++    public int getParsingRequestLinePhase() {
++        return parsingRequestLinePhase;
++    }
++
++
+ }
+
+==================================================

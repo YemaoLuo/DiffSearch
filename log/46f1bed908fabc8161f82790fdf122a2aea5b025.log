@@ -1,0 +1,393 @@
+46f1bed908fabc8161f82790fdf122a2aea5b025
+==================================================
+Hook up credential generation
+==================================================
+Mark Emlyn
+==================================================
+Thu Sep 25 19:32:39 2014 +0000
+==================================================
+CredentialHandlerBase.java
+Hook up credential generation
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1627601 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+MessageDigestCredentialHandler.java
+index a57ce12125..8b79353588 100644
+--- a/java/org/apache/catalina/realm/CredentialHandlerBase.java
++++ b/java/org/apache/catalina/realm/CredentialHandlerBase.java
+@@ -16,6 +16,10 @@
+  */
+ package org.apache.catalina.realm;
+ 
++import java.security.NoSuchAlgorithmException;
++import java.security.SecureRandom;
++import java.util.Random;
++
+ import org.apache.catalina.CredentialHandler;
+ import org.apache.tomcat.util.buf.HexUtils;
+ import org.apache.tomcat.util.res.StringManager;
+@@ -24,6 +28,37 @@ public abstract class CredentialHandlerBase implements CredentialHandler {
+ 
+     protected static final StringManager sm = StringManager.getManager(Constants.Package);
+ 
++    private int iterations = getDefaultIterations();
++    private Random random = null;
++
++
++    public int getIterations() {
++        return iterations;
++    }
++
++
++    public void setIterations(int iterations) {
++        this.iterations = iterations;
++    }
++
++
++    public String generate(int saltLength, String userCredential) {
++        byte[] salt = null;
++        int iterations = getIterations();
++        if (saltLength > 0) {
++            if (random == null) {
++                random = new SecureRandom();
++            }
++            salt = new byte[saltLength];
++            random.nextBytes(salt);
++        }
++
++        String serverCredential = mutate(userCredential, salt, iterations);
++
++        return HexUtils.toHexString(salt) + "$" + iterations + "$" + serverCredential;
++    }
++
++
+     protected boolean matchesSaltIterationsEncoded(String inputCredentials, String storedCredentials) {
+ 
+         int sep1 = storedCredentials.indexOf('$');
+@@ -40,4 +75,9 @@ public abstract class CredentialHandlerBase implements CredentialHandler {
+ 
+         return storedHexEncoded.equalsIgnoreCase(inputHexEncoded);
+     }
++
++
++    protected abstract void setAlgorithm(String algorithm) throws NoSuchAlgorithmException;
++
++    protected abstract int getDefaultIterations();
+ }
+
+==================================================
+PBECredentialHandler.java
+index 5e023c5dac..c799a148fd 100644
+--- a/java/org/apache/catalina/realm/MessageDigestCredentialHandler.java
++++ b/java/org/apache/catalina/realm/MessageDigestCredentialHandler.java
+@@ -56,8 +56,10 @@ public class MessageDigestCredentialHandler extends CredentialHandlerBase {
+ 
+     private static final Log log = LogFactory.getLog(MessageDigestCredentialHandler.class);
+ 
++    public static final int DEFAULT_ITERATIONS = 1;
++
+     private Charset encoding = StandardCharsets.UTF_8;
+-    private String digest = null;
++    private String algorithm = null;
+ 
+ 
+     public String getEncoding() {
+@@ -79,18 +81,15 @@ public class MessageDigestCredentialHandler extends CredentialHandlerBase {
+     }
+ 
+ 
+-    public String getDigest() {
+-        return digest;
++    public String getAlgorithm() {
++        return algorithm;
+     }
+ 
+ 
+-    public void setDigest(String digest) {
+-        try {
+-            MessageDigest.getInstance(digest);
+-        } catch (NoSuchAlgorithmException e) {
+-            throw new IllegalArgumentException(e);
+-        }
+-        this.digest = digest;
++    @Override
++    public void setAlgorithm(String algorithm) throws NoSuchAlgorithmException {
++        MessageDigest.getInstance(algorithm);
++        this.algorithm = algorithm;
+     }
+ 
+ 
+@@ -101,7 +100,7 @@ public class MessageDigestCredentialHandler extends CredentialHandlerBase {
+             return false;
+         }
+ 
+-        if (getDigest() == null) {
++        if (getAlgorithm() == null) {
+             // No digests, compare directly
+             return storedCredentials.equals(inputCredentials);
+         } else {
+@@ -114,7 +113,7 @@ public class MessageDigestCredentialHandler extends CredentialHandlerBase {
+                 // the digest type
+                 String serverDigest = storedCredentials.substring(5);
+                 String userDigest = Base64.encodeBase64String(ConcurrentMessageDigest.digest(
+-                        getDigest(), inputCredentials.getBytes(StandardCharsets.ISO_8859_1)));
++                        getAlgorithm(), inputCredentials.getBytes(StandardCharsets.ISO_8859_1)));
+                 return userDigest.equals(serverDigest);
+ 
+             } else if (storedCredentials.startsWith("{SSHA}")) {
+@@ -138,7 +137,7 @@ public class MessageDigestCredentialHandler extends CredentialHandlerBase {
+ 
+                 // Generate the digested form of the user provided password
+                 // using the salt
+-                byte[] userDigestBytes = ConcurrentMessageDigest.digest(getDigest(),
++                byte[] userDigestBytes = ConcurrentMessageDigest.digest(getAlgorithm(),
+                         inputCredentials.getBytes(StandardCharsets.ISO_8859_1),
+                         serverSaltBytes);
+ 
+@@ -158,18 +157,24 @@ public class MessageDigestCredentialHandler extends CredentialHandlerBase {
+ 
+     @Override
+     public String mutate(String inputCredentials, byte[] salt, int iterations) {
+-        if (digest == null) {
++        if (algorithm == null) {
+             return inputCredentials;
+         } else {
+             byte[] userDigest;
+             if (salt == null) {
+-                userDigest = ConcurrentMessageDigest.digest(digest, iterations,
++                userDigest = ConcurrentMessageDigest.digest(algorithm, iterations,
+                         inputCredentials.getBytes(encoding));
+             } else {
+-                userDigest = ConcurrentMessageDigest.digest(digest, iterations,
++                userDigest = ConcurrentMessageDigest.digest(algorithm, iterations,
+                         salt, inputCredentials.getBytes(encoding));
+             }
+             return HexUtils.toHexString(userDigest);
+         }
+     }
++
++
++    @Override
++    protected int getDefaultIterations() {
++        return DEFAULT_ITERATIONS;
++    }
+ }
+
+==================================================
+RealmBase.java
+index 464ed7f303..48b13fd9b1 100644
+--- a/java/org/apache/catalina/realm/PBECredentialHandler.java
++++ b/java/org/apache/catalina/realm/PBECredentialHandler.java
+@@ -32,10 +32,11 @@ public class PBECredentialHandler extends CredentialHandlerBase {
+     private static final Log log = LogFactory.getLog(PBECredentialHandler.class);
+ 
+     public static final String DEFAULT_ALGORITHM = "PBKDF2WithHmacSHA1";
+-    public static final int DEFAULT_KEYLENGTH = 160;
++    public static final int DEFAULT_KEY_LENGTH = 160;
++    public static final int DEFAULT_ITERATIONS = 20000;
+ 
+     private SecretKeyFactory secretKeyFactory;
+-    private int keyLength = 160;
++    private int keyLength = DEFAULT_KEY_LENGTH;
+ 
+ 
+     public PBECredentialHandler() throws NoSuchAlgorithmException {
+@@ -48,6 +49,7 @@ public class PBECredentialHandler extends CredentialHandlerBase {
+     }
+ 
+ 
++    @Override
+     public void setAlgorithm(String algorithm) throws NoSuchAlgorithmException {
+         SecretKeyFactory secretKeyFactory = SecretKeyFactory.getInstance(algorithm);
+         this.secretKeyFactory = secretKeyFactory;
+@@ -81,4 +83,10 @@ public class PBECredentialHandler extends CredentialHandlerBase {
+             return null;
+         }
+     }
++
++
++    @Override
++    protected int getDefaultIterations() {
++        return DEFAULT_ITERATIONS;
++    }
+ }
+
+==================================================
+TestRealmBase.java
+index d4fd64653b..8492f81bcc 100644
+--- a/java/org/apache/catalina/realm/RealmBase.java
++++ b/java/org/apache/catalina/realm/RealmBase.java
+@@ -29,6 +29,7 @@ import java.security.Principal;
+ import java.security.cert.X509Certificate;
+ import java.util.ArrayList;
+ import java.util.Arrays;
++import java.util.List;
+ import java.util.Locale;
+ 
+ import javax.servlet.http.HttpServletResponse;
+@@ -74,6 +75,14 @@ public abstract class RealmBase extends LifecycleMBeanBase implements Realm {
+ 
+     private static final Log log = LogFactory.getLog(RealmBase.class);
+ 
++    private static final List<Class<? extends CredentialHandlerBase>> credentialHandlerClasses =
++            new ArrayList<>();
++
++    static {
++        credentialHandlerClasses.add(MessageDigestCredentialHandler.class);
++        credentialHandlerClasses.add(PBECredentialHandler.class);
++    }
++
+     // ----------------------------------------------------- Instance Variables
+ 
+ 
+@@ -240,7 +249,7 @@ public abstract class RealmBase extends LifecycleMBeanBase implements Realm {
+     public String getDigest() {
+         CredentialHandler ch = credentialHandler;
+         if (ch instanceof MessageDigestCredentialHandler) {
+-            return ((MessageDigestCredentialHandler) ch).getDigest();
++            return ((MessageDigestCredentialHandler) ch).getAlgorithm();
+         }
+         return null;
+     }
+@@ -262,7 +271,11 @@ public abstract class RealmBase extends LifecycleMBeanBase implements Realm {
+             credentialHandler = ch;
+         }
+         if (ch instanceof MessageDigestCredentialHandler) {
+-            ((MessageDigestCredentialHandler) ch).setDigest(digest);
++            try {
++                ((MessageDigestCredentialHandler) ch).setAlgorithm(digest);
++            } catch (NoSuchAlgorithmException e) {
++                throw new IllegalArgumentException(e);
++            }
+         } else {
+             log.warn(sm.getString("realmBase.credentialHandler.customCredentialHandler",
+                     "digest", digest));
+@@ -1411,30 +1424,108 @@ public abstract class RealmBase extends LifecycleMBeanBase implements Realm {
+ 
+ 
+     /**
+-     * Digest password using the algorithm specified and
+-     * convert the result to a corresponding hex string.
+-     * If exception, the plain credentials string is returned
++     * Generate a stored credential string for the given password and associated
++     * parameters. The following parameters are supported:
++     * <ul>
++     * <li><b>-a</b> - The algorithm to use to generate the stored
++     *                 credential. If not specified a default of SHA-512 will be
++     *                 used.</li>
++     * <li><b>-e</b> - The encoding to use for any byte to/from character
++     *                 conversion that may be necessary. If not specified, a
++     *                 default of UTF-8 will be used.</li>
++     * <li><b>-i</b> - The number of iterations to use when generating the
++     *                 stored credential. If not specified, the default for the
++     *                 CredentialHandler will be used.</li>
++     * <li><b>-s</b> - The length (in bytes) of salt to generate and store as
++     *                 part of the credential. If not specified, a default of 32
++     *                 will be used.</li>
++     * <li><b>-k</b> - The length (in bits) of the key(s), if any, created while
++     *                 generating the credential. If not specified, a default of
++     *                 160 will be used.</li>
++     * </ul>
++     * This generation process currently supports the following
++     * CredentialHandlers, the correct one being selected based on the algorithm
++     * specified:
++     * <ul>
++     * <li>MessageDigestCredentialHandler</li>
++     * <li>PBECredentialHandler</li>
++     * </li>
+      */
+     public static void main(String args[]) {
+ 
+-        String encoding = null;
+-        int firstCredentialArg = 2;
++        String algorithm = "SHA-512";
++        String encoding = "UTF-8";
++        int saltLength = 32;
++        int iterations = 0;
++        int keyLength = 160;
+ 
+-        if (args.length > 4 && args[2].equalsIgnoreCase("-e")) {
+-            encoding = args[3];
+-            firstCredentialArg = 4;
++        int argIndex = 0;
++
++        while (args.length > argIndex + 2 && args[argIndex].length() == 2 &&
++                args[argIndex].charAt(0) == '-' ) {
++            switch (args[argIndex].charAt(1)) {
++            case 'a': {
++                algorithm = args[argIndex + 1];
++                break;
++            }
++            case 'e': {
++                encoding = args[argIndex + 1];
++                break;
++            }
++            case 'i': {
++                iterations = Integer.parseInt(args[argIndex + 1]);
++                break;
++            }
++            case 's': {
++                saltLength = Integer.parseInt(args[argIndex + 1]);
++                break;
++            }
++            case 'k': {
++                keyLength = Integer.parseInt(args[argIndex + 1]);
++                break;
++            }
++            default: {
++                System.out.println("Usage: RealmBase [-a <algorithm>] [-e <encoding>] " +
++                        "[-s <salt-length>] [-k <key-length>] <credentials>");
++                return;
++            }
++            }
++            argIndex += 2;
+         }
+ 
+-        if(args.length > firstCredentialArg && args[0].equalsIgnoreCase("-a")) {
+-            for(int i=firstCredentialArg; i < args.length ; i++){
+-                System.out.print(args[i]+":");
+-                System.out.println(Digest(args[i], args[1], encoding));
++        CredentialHandlerBase handler = null;
++
++        for (Class<? extends CredentialHandlerBase> clazz : credentialHandlerClasses) {
++            try {
++                handler = clazz.newInstance();
++                handler.setAlgorithm(algorithm);
++            } catch (NoSuchAlgorithmException e) {
++                // Ignore - Algorithm is for a different CredentialHandler
++            } catch (InstantiationException | IllegalAccessException e) {
++                // This isn't good.
++                throw new RuntimeException(e);
+             }
+-        } else {
+-            System.out.println
+-                ("Usage: RealmBase -a <algorithm> [-e <encoding>] <credentials>");
+         }
+ 
++        if (handler == null) {
++            throw new RuntimeException(new NoSuchAlgorithmException(algorithm));
++        }
++
++        if (iterations > 0) {
++            handler.setIterations(iterations);
++        }
++
++        if (handler instanceof MessageDigestCredentialHandler) {
++            ((MessageDigestCredentialHandler) handler).setEncoding(encoding);
++        } else if (handler instanceof PBECredentialHandler) {
++            ((PBECredentialHandler) handler).setKeyLength(keyLength);
++        }
++
++        for (; argIndex < args.length; argIndex++) {
++            String credential = args[argIndex];
++            System.out.println(credential);
++            handler.generate(saltLength, credential);
++        }
+     }
+ 
+ 
+
+==================================================

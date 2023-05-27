@@ -1,0 +1,186 @@
+910a29a92261163bd7165b1378487dced79065ba
+==================================================
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=47834
+==================================================
+Mark Emlyn
+==================================================
+Mon Sep 14 12:39:45 2009 +0000
+==================================================
+TldConfig.java
+index cadc30ecc0..6a93bd7265 100644
+--- a/java/org/apache/catalina/startup/LocalStrings.properties
++++ b/java/org/apache/catalina/startup/LocalStrings.properties
+@@ -94,6 +94,7 @@ tldConfig.addListeners=Adding {0} listeners from TLD files
+ tldConfig.cce=Lifecycle event data object {0} is not a Context
+ tldConfig.classloaderFail=Failed to process ''{0}'' for TLDs.
+ tldConfig.classloaderStart=Scanning for TLDs in classloader hierarchy
++tldConfig.dirScan=Scanning for TLD files in directory ''{0}''
+ tldConfig.execute=Error processing TLD files for context path {0}
+ tldConfig.jarUrlStart=Scanning for TLD files in URL ''{0}''
+ tldConfig.webinflibStart=Scanning WEB-INF/lib for JARs containing META-INF/**/*.TLD
+
+==================================================
+TagLibraryInfoImpl.java
+index 33bf53d423..530bb71b36 100644
+--- a/java/org/apache/catalina/startup/TldConfig.java
++++ b/java/org/apache/catalina/startup/TldConfig.java
+@@ -19,9 +19,12 @@
+ package org.apache.catalina.startup;
+ 
+ 
++import java.io.File;
++import java.io.FileInputStream;
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.net.JarURLConnection;
++import java.net.URISyntaxException;
+ import java.net.URL;
+ import java.net.URLClassLoader;
+ import java.net.URLConnection;
+@@ -69,6 +72,16 @@ public final class TldConfig  implements LifecycleListener {
+                 "org.apache.jasper.compiler.TldLocationsCache.SCAN_CLASSPATH",
+                 "true")).booleanValue();
+ 
++    private static final boolean SCAN_ALL_FILES = Boolean.valueOf(
++            System.getProperty(
++                "org.apache.jasper.compiler.TldLocationsCache.SCAN_ALL_FILES",
++                "false")).booleanValue();
++
++    private static final boolean SCAN_ALL_DIRS = Boolean.valueOf(
++            System.getProperty(
++                "org.apache.jasper.compiler.TldLocationsCache.SCAN_ALL_DIRS",
++                "false")).booleanValue();
++
+     // Names of JARs that are known not to contain any TLDs
+     private static HashSet<String> noTldJars;
+ 
+@@ -564,10 +577,73 @@ public final class TldConfig  implements LifecycleListener {
+             tldScanJar((JarURLConnection) conn);
+         } else {
+             String urlStr = url.toString();
+-            if (urlStr.startsWith("file:")
+-                    && urlStr.endsWith(JAR_EXT)) {
+-                URL jarURL = new URL("jar:" + urlStr + "!/");
+-                tldScanJar((JarURLConnection) jarURL.openConnection());
++            if (urlStr.startsWith("file:")) {
++                if (urlStr.endsWith(JAR_EXT)) {
++                    URL jarURL = new URL("jar:" + urlStr + "!/");
++                    tldScanJar((JarURLConnection) jarURL.openConnection());
++                } else {
++                    File f;
++                    try {
++                        f = new File(url.toURI());
++                        if (f.isFile() && SCAN_ALL_FILES) {
++                            // Treat this file as a JAR
++                            URL jarURL = new URL("jar:" + urlStr + "!/");
++                            tldScanJar((JarURLConnection) jarURL.openConnection());
++                        } else if (f.isDirectory() && SCAN_ALL_DIRS) {
++                            File metainf = new File(f.getAbsoluteFile() +
++                                    File.separator + "META-INF");
++                            if (metainf.isDirectory()) {
++                                tldScanDir(metainf);
++                            }
++                        }
++                    } catch (URISyntaxException e) {
++                        // Wrap the exception and re-throw
++                        IOException ioe = new IOException();
++                        ioe.initCause(e);
++                        throw ioe;
++                    }
++                }
++            }
++        }
++    }
++
++    /*
++     * Scans the directory identified by startPath, along with its
++     * sub-directories, for TLDs.
++     *
++     * Keep in sync with o.a.j.comiler.TldLocationsCache
++     */
++    private void tldScanDir(File start) {
++
++        if (log.isTraceEnabled()) {
++            log.trace(sm.getString("tldConfig.dirScan", start.getAbsolutePath()));
++        }
++
++        File[] fileList = start.listFiles();
++        if (fileList != null) {
++            for (int i = 0; i < fileList.length; i++) {
++                // Scan recursively
++                if (fileList[i].isDirectory()) {
++                    tldScanDir(fileList[i]);
++                } else if (fileList[i].getAbsolutePath().endsWith(TLD_EXT)) {
++                    InputStream stream = null;
++                    try {
++                        stream = new FileInputStream(fileList[i]);
++                        tldScanStream(stream);
++                    } catch (IOException ioe) {
++                        log.warn(sm.getString("tldConfig.dirFail",
++                                fileList[i].getAbsolutePath()),
++                                ioe);
++                    } finally {
++                        if (stream != null) {
++                            try {
++                                stream.close();
++                            } catch (Throwable t) {
++                                // do nothing
++                            }
++                        }
++                    }
++                }
+             }
+         }
+     }
+
+==================================================
+TldLocationsCache.java
+index b3b7e92b57..63725b324d 100644
+--- a/java/org/apache/jasper/compiler/TagLibraryInfoImpl.java
++++ b/java/org/apache/jasper/compiler/TagLibraryInfoImpl.java
+@@ -17,6 +17,7 @@
+ 
+ package org.apache.jasper.compiler;
+ 
++import java.io.File;
+ import java.io.FileInputStream;
+ import java.io.FileNotFoundException;
+ import java.io.InputStream;
+@@ -111,20 +112,24 @@ class TagLibraryInfoImpl extends TagLibraryInfo implements TagConstants {
+     // the following is a workaround until these problems are resolved.
+     private InputStream getResourceAsStream(String uri)
+             throws FileNotFoundException {
+-        try {
+-            // see if file exists on the filesystem first
+-            String real = ctxt.getRealPath(uri);
+-            if (real == null) {
++        // Is uri absolute?
++        if (uri.startsWith("file:")) {
++            return new FileInputStream(new File(uri.substring(5)));
++        } else {
++            try {
++                // see if file exists on the filesystem
++                String real = ctxt.getRealPath(uri);
++                if (real == null) {
++                    return ctxt.getResourceAsStream(uri);
++                } else {
++                    return new FileInputStream(real);
++                }
++            } catch (FileNotFoundException ex) {
++                // if file not found on filesystem, get the resource through
++                // the context
+                 return ctxt.getResourceAsStream(uri);
+-            } else {
+-                return new FileInputStream(real);
+             }
+-        } catch (FileNotFoundException ex) {
+-            // if file not found on filesystem, get the resource through
+-            // the context
+-            return ctxt.getResourceAsStream(uri);
+         }
+-
+     }
+ 
+     /**
+
+==================================================

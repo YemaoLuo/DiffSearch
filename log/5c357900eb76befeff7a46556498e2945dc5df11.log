@@ -1,0 +1,162 @@
+5c357900eb76befeff7a46556498e2945dc5df11
+==================================================
+- Cleanup and prefer non direct buffers for SSL by default (32KB of direct buffers per connection looks a bit too much).
+==================================================
+Remy Maucherat
+==================================================
+Sat Mar 15 11:19:50 2014 +0000
+==================================================
+Nio2Endpoint.java
+- Cleanup and prefer non direct buffers for SSL by default (32KB of direct buffers per connection looks a bit too much).
+- Give up on the SSL test for now.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1577831 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+SecureNio2Channel.java
+index 5eed52210b..c642e1870d 100644
+--- a/java/org/apache/tomcat/util/net/Nio2Endpoint.java
++++ b/java/org/apache/tomcat/util/net/Nio2Endpoint.java
+@@ -270,8 +270,8 @@ public class Nio2Endpoint extends AbstractEndpoint<Nio2Channel> {
+      * Number of keepalive sockets.
+      */
+     public int getKeepAliveCount() {
+-        return 0;
+-        // FIXME: would need some specific statistics gathering
++        // For this connector, only the overall connection count is relevant
++        return -1;
+     }
+ 
+ 
+@@ -464,9 +464,9 @@ public class Nio2Endpoint extends AbstractEndpoint<Nio2Channel> {
+                 // SSL setup
+                 if (sslContext != null) {
+                     SSLEngine engine = createSSLEngine();
+-                    int appbufsize = engine.getSession().getApplicationBufferSize();
+-                    NioBufferHandler bufhandler = new NioBufferHandler(Math.max(appbufsize,socketProperties.getAppReadBufSize()),
+-                            socketProperties.getAppWriteBufSize(),
++                    int appBufferSize = engine.getSession().getApplicationBufferSize();
++                    NioBufferHandler bufhandler = new NioBufferHandler(Math.max(appBufferSize, socketProperties.getAppReadBufSize()),
++                            Math.max(appBufferSize, socketProperties.getAppWriteBufSize()),
+                             socketProperties.getDirectBuffer());
+                     channel = new SecureNio2Channel(socket, engine, bufhandler, this);
+                 } else {
+@@ -493,9 +493,13 @@ public class Nio2Endpoint extends AbstractEndpoint<Nio2Channel> {
+             socketWrapper.setKeepAliveLeft(Nio2Endpoint.this.getMaxKeepAliveRequests());
+             socketWrapper.setSecure(isSSLEnabled());
+             channel.setSocket(socketWrapper);
+-            processSocket(socketWrapper, SocketStatus.OPEN_READ, true);
+-            // FIXME: In theory, awaitBytes is better, but the SSL handshake is done by processSocket
+-            //awaitBytes(socketWrapper);
++            if (sslContext != null) {
++                // Use the regular processing, as the first handshake needs to be done there
++                processSocket(socketWrapper, SocketStatus.OPEN_READ, true);
++            } else {
++                // Wait until some bytes are available to start the real processing
++                awaitBytes(socketWrapper);
++            }
+         } catch (Throwable t) {
+             ExceptionUtils.handleThrowable(t);
+             try {
+
+==================================================
+SocketProperties.java
+index fb59535148..8342c54cb1 100644
+--- a/java/org/apache/tomcat/util/net/SecureNio2Channel.java
++++ b/java/org/apache/tomcat/util/net/SecureNio2Channel.java
+@@ -59,19 +59,21 @@ public class SecureNio2Channel extends Nio2Channel  {
+     public SecureNio2Channel(AsynchronousSocketChannel channel, SSLEngine engine,
+             ApplicationBufferHandler bufHandler, Nio2Endpoint endpoint0) throws IOException {
+         super(channel, bufHandler);
+-        this.sslEngine = engine;
+-        this.endpoint = endpoint0;
+-        int appBufSize = sslEngine.getSession().getApplicationBufferSize();
++        sslEngine = engine;
++        endpoint = endpoint0;
+         int netBufSize = sslEngine.getSession().getPacketBufferSize();
+-        //allocate network buffers - TODO, add in optional direct non-direct buffers
+-        netInBuffer = ByteBuffer.allocateDirect(netBufSize);
+-        netOutBuffer = ByteBuffer.allocateDirect(netBufSize);
+-
++        if (endpoint.getSocketProperties().getDirectSslBuffer()) {
++            netInBuffer = ByteBuffer.allocateDirect(netBufSize);
++            netOutBuffer = ByteBuffer.allocateDirect(netBufSize);
++        } else {
++            netInBuffer = ByteBuffer.allocate(netBufSize);
++            netOutBuffer = ByteBuffer.allocate(netBufSize);
++        }
+         handshakeReadCompletionHandler = new CompletionHandler<Integer, SocketWrapper<Nio2Channel>>() {
+             @Override
+             public void completed(Integer result, SocketWrapper<Nio2Channel> attachment) {
+                 if (result.intValue() < 0) {
+-                    failed(new IOException("Error"), attachment);
++                    failed(new EOFException(), attachment);
+                     return;
+                 }
+                 endpoint.processSocket(attachment, SocketStatus.OPEN_READ, false);
+@@ -85,7 +87,7 @@ public class SecureNio2Channel extends Nio2Channel  {
+             @Override
+             public void completed(Integer result, SocketWrapper<Nio2Channel> attachment) {
+                 if (result.intValue() < 0) {
+-                    failed(new IOException("Error"), attachment);
++                    failed(new EOFException(), attachment);
+                     return;
+                 }
+                 endpoint.processSocket(attachment, SocketStatus.OPEN_WRITE, false);
+@@ -95,11 +97,6 @@ public class SecureNio2Channel extends Nio2Channel  {
+                 endpoint.closeSocket(attachment, SocketStatus.ERROR);
+             }
+         };
+-
+-        //ensure that the application has a large enough read/write buffers
+-        //by doing this, we should not encounter any buffer overflow errors
+-        // FIXME: this does nothing, so it is in the NIO2 endpoint
+-        bufHandler.expand(bufHandler.getReadBuffer(), appBufSize);
+         reset();
+     }
+ 
+
+==================================================
+TestWebSocketFrameClientSSL.java
+index be5296eb96..40f9fca517 100644
+--- a/java/org/apache/tomcat/util/net/SocketProperties.java
++++ b/java/org/apache/tomcat/util/net/SocketProperties.java
+@@ -64,6 +64,12 @@ public class SocketProperties {
+      */
+     protected boolean directBuffer = false;
+ 
++    /**
++     * Enable/disable direct buffers for the network buffers for SSL
++     * Default value is enabled
++     */
++    protected boolean directSslBuffer = false;
++
+     /**
+      * Socket receive buffer size in bytes (SO_RCVBUF).
+      * JVM default used if not set.
+@@ -242,6 +248,10 @@ public class SocketProperties {
+         return directBuffer;
+     }
+ 
++    public boolean getDirectSslBuffer() {
++        return directSslBuffer;
++    }
++
+     public boolean getOoBInline() {
+         return ooBInline.booleanValue();
+     }
+@@ -379,6 +389,10 @@ public class SocketProperties {
+         this.directBuffer = directBuffer;
+     }
+ 
++    public void setDirectSslBuffer(boolean directSslBuffer) {
++        this.directSslBuffer = directSslBuffer;
++    }
++
+     public void setSoLingerOn(boolean soLingerOn) {
+         this.soLingerOn = Boolean.valueOf(soLingerOn);
+     }
+
+==================================================

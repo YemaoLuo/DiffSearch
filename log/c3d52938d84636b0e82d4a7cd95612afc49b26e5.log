@@ -1,0 +1,392 @@
+c3d52938d84636b0e82d4a7cd95612afc49b26e5
+==================================================
+Expand functionality of ConcurrentStack and then switch to ConcurrentStack removing ~25% of the remaining object allocation during load test.
+==================================================
+Mark Emlyn
+==================================================
+Sun Sep 23 19:12:44 2012 +0000
+==================================================
+Constants.java
+Expand functionality of ConcurrentStack and then switch to ConcurrentStack removing ~25% of the remaining object allocation during load test.
+No noticeable performance hit.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1389122 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+ConcurrentStack.java
+index bbe581a9eb..5e1db965a5 100644
+--- a/java/org/apache/catalina/valves/Constants.java
++++ b/java/org/apache/catalina/valves/Constants.java
+@@ -76,4 +76,12 @@ public final class Constants {
+     public static final char[] SC_SERVICE_UNAVAILABLE_CHAR = new char[] {'5', '0', '3'};
+     public static final char[] SC_GATEWAY_TIMEOUT_CHAR = new char[] {'5', '0', '4'};
+     public static final char[] SC_HTTP_VERSION_NOT_SUPPORTED_CHAR = new char[] {'5', '0', '5'};
++
++    public static final char[][] OCTETS = new char[256][];
++
++    static {
++        for (int i = 0; i < 256; i++) {
++            OCTETS[i] = Integer.toString(i).toCharArray();
++        }
++    }
+ }
+
+==================================================
+NioEndpoint.java
+index ed6bbcd29c..9f011689b1 100644
+--- a/java/org/apache/tomcat/util/collections/ConcurrentStack.java
++++ b/java/org/apache/tomcat/util/collections/ConcurrentStack.java
+@@ -25,18 +25,40 @@ package org.apache.tomcat.util.collections;
+  */
+ public class ConcurrentStack<T> {
+ 
+-    private int size = 128;
++    public static final int DEFAULT_SIZE = 128;
++    private static final int DEFAULT_LIMIT = -1;
++
++    private int size;
++    private int limit;
++
+     /*
+      * Points to the next available object in the stack
+      */
+     private int index = -1;
+ 
+-    private Object[] stack = new Object[size];
++    private Object[] stack;
++
++
++    public ConcurrentStack() {
++        this(DEFAULT_SIZE, DEFAULT_LIMIT);
++    }
++
++    public ConcurrentStack(int size, int limit) {
++        this.size = size;
++        this.limit = limit;
++        stack = new Object[size];
++    }
++
+ 
+     public synchronized void push(T obj) {
+         index++;
+         if (index == size) {
+-            expand();
++            if (limit == -1 || size < limit) {
++                expand();
++            } else {
++                index--;
++                return;
++            }
+         }
+         stack[index] = obj;
+     }
+@@ -46,11 +68,25 @@ public class ConcurrentStack<T> {
+         if (index == -1) {
+             return null;
+         }
+-        return (T) stack[index--];
++        T result = (T) stack[index];
++        stack[index--] = null;
++        return result;
++    }
++
++    public synchronized void clear() {
++        if (index > -1) {
++            for (int i = 0; i < index + 1; i++) {
++                stack[i] = null;
++            }
++        }
++        index = -1;
+     }
+ 
+     private void expand() {
+         int newSize = size * 2;
++        if (limit != -1 && newSize > limit) {
++            newSize = limit;
++        }
+         Object[] newStack = new Object[newSize];
+         System.arraycopy(stack, 0, newStack, 0, size);
+         // This is the only point where garbage is created by throwing away the
+
+==================================================
+TestConcurrentStack.java
+index 5674024387..457a74f6ec 100644
+--- a/java/org/apache/tomcat/util/net/NioEndpoint.java
++++ b/java/org/apache/tomcat/util/net/NioEndpoint.java
+@@ -51,6 +51,7 @@ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.ExceptionUtils;
+ import org.apache.tomcat.util.IntrospectionUtils;
++import org.apache.tomcat.util.collections.ConcurrentStack;
+ import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
+ import org.apache.tomcat.util.net.SecureNioChannel.ApplicationBufferHandler;
+ import org.apache.tomcat.util.net.jsse.NioX509KeyManager;
+@@ -126,157 +127,30 @@ public class NioEndpoint extends AbstractEndpoint {
+     /**
+      * Cache for SocketProcessor objects
+      */
+-    protected ConcurrentLinkedQueue<SocketProcessor> processorCache = new ConcurrentLinkedQueue<SocketProcessor>() {
+-        private static final long serialVersionUID = 1L;
+-        protected AtomicInteger size = new AtomicInteger(0);
+-        @Override
+-        public boolean offer(SocketProcessor sc) {
+-            sc.reset(null,null);
+-            boolean offer = socketProperties.getProcessorCache()==-1?true:size.get()<socketProperties.getProcessorCache();
+-            //avoid over growing our cache or add after we have stopped
+-            if ( running && (!paused) && (offer) ) {
+-                boolean result = super.offer(sc);
+-                if ( result ) {
+-                    size.incrementAndGet();
+-                }
+-                return result;
+-            }
+-            else return false;
+-        }
+-
+-        @Override
+-        public SocketProcessor poll() {
+-            SocketProcessor result = super.poll();
+-            if ( result != null ) {
+-                size.decrementAndGet();
+-            }
+-            return result;
+-        }
+-
+-        @Override
+-        public void clear() {
+-            super.clear();
+-            size.set(0);
+-        }
+-    };
+-
++    protected final ConcurrentStack<SocketProcessor> processorCache =
++            new ConcurrentStack<>(ConcurrentStack.DEFAULT_SIZE,
++                    socketProperties.getProcessorCache());
+ 
+     /**
+      * Cache for key attachment objects
+      */
+-    protected ConcurrentLinkedQueue<KeyAttachment> keyCache = new ConcurrentLinkedQueue<KeyAttachment>() {
+-        private static final long serialVersionUID = 1L;
+-        protected AtomicInteger size = new AtomicInteger(0);
+-        @Override
+-        public boolean offer(KeyAttachment ka) {
+-            ka.reset();
+-            boolean offer = socketProperties.getKeyCache()==-1?true:size.get()<socketProperties.getKeyCache();
+-            //avoid over growing our cache or add after we have stopped
+-            if ( running && (!paused) && (offer) ) {
+-                boolean result = super.offer(ka);
+-                if ( result ) {
+-                    size.incrementAndGet();
+-                }
+-                return result;
+-            }
+-            else return false;
+-        }
+-
+-        @Override
+-        public KeyAttachment poll() {
+-            KeyAttachment result = super.poll();
+-            if ( result != null ) {
+-                size.decrementAndGet();
+-            }
+-            return result;
+-        }
+-
+-        @Override
+-        public void clear() {
+-            super.clear();
+-            size.set(0);
+-        }
+-    };
+-
++    protected final ConcurrentStack<KeyAttachment> keyCache =
++            new ConcurrentStack<>(ConcurrentStack.DEFAULT_SIZE,
++                    socketProperties.getKeyCache());
+ 
+     /**
+      * Cache for poller events
+      */
+-    protected ConcurrentLinkedQueue<PollerEvent> eventCache = new ConcurrentLinkedQueue<PollerEvent>() {
+-        private static final long serialVersionUID = 1L;
+-        protected AtomicInteger size = new AtomicInteger(0);
+-        @Override
+-        public boolean offer(PollerEvent pe) {
+-            pe.reset();
+-            boolean offer = socketProperties.getEventCache()==-1?true:size.get()<socketProperties.getEventCache();
+-            //avoid over growing our cache or add after we have stopped
+-            if ( running && (!paused) && (offer) ) {
+-                boolean result = super.offer(pe);
+-                if ( result ) {
+-                    size.incrementAndGet();
+-                }
+-                return result;
+-            }
+-            else return false;
+-        }
+-
+-        @Override
+-        public PollerEvent poll() {
+-            PollerEvent result = super.poll();
+-            if ( result != null ) {
+-                size.decrementAndGet();
+-            }
+-            return result;
+-        }
+-
+-        @Override
+-        public void clear() {
+-            super.clear();
+-            size.set(0);
+-        }
+-    };
+-
++    protected final ConcurrentStack<PollerEvent> eventCache =
++            new ConcurrentStack<>(ConcurrentStack.DEFAULT_SIZE,
++                    socketProperties.getEventCache());
+ 
+     /**
+      * Bytebuffer cache, each channel holds a set of buffers (two, except for SSL holds four)
+      */
+-    protected ConcurrentLinkedQueue<NioChannel> nioChannels = new ConcurrentLinkedQueue<NioChannel>() {
+-        private static final long serialVersionUID = 1L;
+-        protected AtomicInteger size = new AtomicInteger(0);
+-        protected AtomicInteger bytes = new AtomicInteger(0);
+-        @Override
+-        public boolean offer(NioChannel socket) {
+-            boolean offer = socketProperties.getBufferPool()==-1?true:size.get()<socketProperties.getBufferPool();
+-            offer = offer && (socketProperties.getBufferPoolSize()==-1?true:(bytes.get()+socket.getBufferSize())<socketProperties.getBufferPoolSize());
+-            //avoid over growing our cache or add after we have stopped
+-            if ( running && (!paused) && (offer) ) {
+-                boolean result = super.offer(socket);
+-                if ( result ) {
+-                    size.incrementAndGet();
+-                    bytes.addAndGet(socket.getBufferSize());
+-                }
+-                return result;
+-            }
+-            else return false;
+-        }
+-
+-        @Override
+-        public NioChannel poll() {
+-            NioChannel result = super.poll();
+-            if ( result != null ) {
+-                size.decrementAndGet();
+-                bytes.addAndGet(-result.getBufferSize());
+-            }
+-            return result;
+-        }
+-
+-        @Override
+-        public void clear() {
+-            super.clear();
+-            size.set(0);
+-            bytes.set(0);
+-        }
+-    };
++    protected final ConcurrentStack<NioChannel> nioChannels =
++            new ConcurrentStack<>(ConcurrentStack.DEFAULT_SIZE,
++                    socketProperties.getBufferPoolSize());
+ 
+ 
+     // ------------------------------------------------------------- Properties
+@@ -663,7 +537,7 @@ public class NioEndpoint extends AbstractEndpoint {
+             Socket sock = socket.socket();
+             socketProperties.setProperties(sock);
+ 
+-            NioChannel channel = nioChannels.poll();
++            NioChannel channel = nioChannels.pop();
+             if ( channel == null ) {
+                 // SSL setup
+                 if (sslContext != null) {
+@@ -747,7 +621,7 @@ public class NioEndpoint extends AbstractEndpoint {
+                 return false;
+             }
+             attachment.setCometNotify(false); //will get reset upon next reg
+-            SocketProcessor sc = processorCache.poll();
++            SocketProcessor sc = processorCache.pop();
+             if ( sc == null ) sc = new SocketProcessor(socket,status);
+             else sc.reset(socket,status);
+             if ( dispatch && getExecutor()!=null ) getExecutor().execute(sc);
+@@ -1020,7 +894,7 @@ public class NioEndpoint extends AbstractEndpoint {
+         }
+ 
+         public void add(final NioChannel socket, final int interestOps) {
+-            PollerEvent r = eventCache.poll();
++            PollerEvent r = eventCache.pop();
+             if ( r==null) r = new PollerEvent(socket,null,interestOps);
+             else r.reset(socket,null,interestOps);
+             if ( (interestOps&OP_CALLBACK) == OP_CALLBACK ) {
+@@ -1048,7 +922,9 @@ public class NioEndpoint extends AbstractEndpoint {
+                     r.run();
+                     if ( r instanceof PollerEvent ) {
+                         ((PollerEvent)r).reset();
+-                        eventCache.offer((PollerEvent)r);
++                        if (running && !paused) {
++                            eventCache.push((PollerEvent)r);
++                        }
+                     }
+                 } catch ( Throwable x ) {
+                     log.error("",x);
+@@ -1061,11 +937,11 @@ public class NioEndpoint extends AbstractEndpoint {
+         public void register(final NioChannel socket)
+         {
+             socket.setPoller(this);
+-            KeyAttachment key = keyCache.poll();
++            KeyAttachment key = keyCache.pop();
+             final KeyAttachment ka = key!=null?key:new KeyAttachment(socket);
+             ka.reset(this,socket,getSocketProperties().getSoTimeout());
+             ka.setKeepAliveLeft(NioEndpoint.this.getMaxKeepAliveRequests());
+-            PollerEvent r = eventCache.poll();
++            PollerEvent r = eventCache.pop();
+             ka.interestOps(SelectionKey.OP_READ);//this is what OP_REGISTER turns into.
+             if ( r==null) r = new PollerEvent(socket,ka,OP_REGISTER);
+             else r.reset(socket,ka,OP_REGISTER);
+@@ -1699,9 +1575,13 @@ public class NioEndpoint extends AbstractEndpoint {
+                             try {
+                                 if (ka!=null) ka.setComet(false);
+                                 socket.getPoller().cancelledKey(key, SocketStatus.ERROR);
+-                                nioChannels.offer(socket);
++                                if (running && !paused) {
++                                    nioChannels.push(socket);
++                                }
+                                 socket = null;
+-                                if ( ka!=null ) keyCache.offer(ka);
++                                if (running && !paused && ka != null) {
++                                    keyCache.push(ka);
++                                }
+                                 ka = null;
+                             }catch ( Exception x ) {
+                                 log.error("",x);
+@@ -1716,9 +1596,13 @@ public class NioEndpoint extends AbstractEndpoint {
+                             ka = (KeyAttachment) key.attachment();
+                             socket.getPoller().cancelledKey(key, SocketStatus.DISCONNECT);
+                         }
+-                        nioChannels.offer(socket);
++                        if (running && !paused) {
++                            nioChannels.push(socket);
++                        }
+                         socket = null;
+-                        if ( ka!=null ) keyCache.offer(ka);
++                        if (running && !paused && ka != null) {
++                            keyCache.push(ka);
++                        }
+                         ka = null;
+                     } else {
+                         final SelectionKey fk = key;
+@@ -1759,7 +1643,9 @@ public class NioEndpoint extends AbstractEndpoint {
+                     socket = null;
+                     status = null;
+                     //return to cache
+-                    processorCache.offer(this);
++                    if (running && !paused) {
++                        processorCache.push(this);
++                    }
+                 }
+             }
+         }
+
+==================================================

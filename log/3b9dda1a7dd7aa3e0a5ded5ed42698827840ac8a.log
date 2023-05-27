@@ -1,0 +1,1961 @@
+3b9dda1a7dd7aa3e0a5ded5ed42698827840ac8a
+==================================================
+More work on tomcat-lite connector: more experimenting with spdy, few more tests and fixes.
+==================================================
+Costin Manolache
+==================================================
+Wed Jan 6 00:08:33 2010 +0000
+==================================================
+CompressFilter.java
+index ba90c11597..36974b008c 100644
+--- a/modules/tomcat-lite/build.xml
++++ b/modules/tomcat-lite/build.xml
+@@ -40,6 +40,7 @@
+                source="${compile.source}"
+                optimize="${compile.optimize}"
+                encoding="ISO-8859-1">
++            <classpath refid="lite-classpath" />
+             <src path="${tomcat.lite.src}/java" />
+             <classpath refid="head-classpath" />
+             <exclude name="**/ServletApi25.java"/>
+@@ -83,6 +84,7 @@
+                optimize="${compile.optimize}"
+                encoding="ISO-8859-1"
+         >
++            <classpath refid="lite-classpath" />
+             <classpath refid="head-classpath" />
+             <classpath path="${classes}" />
+             <src path="${tomcat.lite.src}/test" />
+@@ -95,6 +97,7 @@
+         <!-- Need to run it in tomcat to find output/build/webapps --> 
+         <junit printsummary="yes" fork="yes" dir="${tomcat.base}"
+             >
++            <classpath refid="lite-classpath" />
+             <classpath refid="head-classpath" />
+             <classpath path="${test-classes}" />
+             <classpath path="${classes}" />
+
+==================================================
+Http11Connection.java
+new file mode 100644
+index 0000000000..612cd18cf7
+--- /dev/null
++++ b/modules/tomcat-lite/java/org/apache/tomcat/lite/http/CompressFilter.java
+@@ -0,0 +1,209 @@
++/*
++ */
++package org.apache.tomcat.lite.http;
++
++import java.io.IOException;
++import java.nio.ByteBuffer;
++
++import org.apache.tomcat.lite.io.BBucket;
++import org.apache.tomcat.lite.io.IOBuffer;
++
++import com.jcraft.jzlib.JZlib;
++import com.jcraft.jzlib.ZStream;
++
++public class CompressFilter {
++
++    // Stream format: RFC1950
++    // 1CMF 1FLG [4DICTID] DATA 4ADLER
++    // CMF:  CINFO + CM (compression method). == x8
++    // 78 == deflate with 32k window, i.e. max window
++    
++    // FLG: 2bit level, 1 bit FDICT, 5 bit FCHECK
++    // Cx, Dx - no dict; Fx, Ex - dict ( for BEST_COMPRESSION )
++    
++    // Overhead: 6 bytes without dict, 10 with dict
++    // data is encoded in blocks - there is a 'block end' marker and
++    // 'last block'.
++    
++    // Flush: http://www.bolet.org/~pornin/deflate-flush.html
++    // inflater needs about 9 bits 
++    // Z_SYNC_FLUSH: send empty block, 00 00 FF FF - seems recomended
++    // PPP can skip this - there is a record format on top
++    // Z_PARTIAL_FLUSH: standard for SSH
++
++    ZStream cStream;
++    ZStream dStream;
++    
++    byte[] dict;
++    long dictId;
++    
++    public CompressFilter() {
++        cStream = new ZStream();
++        cStream.deflateInit(JZlib.Z_BEST_COMPRESSION);
++        
++        dStream = new ZStream();
++        dStream.inflateInit();
++    }
++    
++    public void recycle() {
++        // can't call: cStream.free(); - will kill the adler, NPE
++
++        cStream.deflateInit(JZlib.Z_BEST_COMPRESSION);
++        dStream.inflateInit();
++
++    }
++    
++    CompressFilter setDictionary(byte[] dict, long id) {
++        this.dict = dict;
++        this.dictId = id;
++        cStream.deflateSetDictionary(dict, dict.length);
++        return this;
++    }
++
++    void compress(IOBuffer in, IOBuffer out) throws IOException {
++        BBucket bb = in.popFirst();
++        
++        while (bb != null) {
++            // TODO: only the last one needs flush
++
++            // TODO: size missmatches ?
++            compress(bb, out, false);
++            bb = in.popFirst();
++        }
++        
++        if (in.isClosedAndEmpty()) {
++            compressEnd(out);
++        }
++    }
++    
++    void compress(BBucket bb, IOBuffer out, boolean last) throws IOException {
++        // TODO: only the last one needs flush
++
++        // TODO: size missmatches ?
++        int flush = JZlib.Z_PARTIAL_FLUSH;
++
++        cStream.next_in = bb.array();
++        cStream.next_in_index = bb.position();
++        cStream.avail_in = bb.remaining();
++
++        while (true) {
++            ByteBuffer outB = out.getWriteBuffer();
++            cStream.next_out = outB.array();
++            cStream.next_out_index = outB.position();
++            cStream.avail_out = outB.remaining();
++
++            int err = cStream.deflate(flush);
++            check(err, cStream);
++            outB.position(cStream.next_out_index);
++            out.releaseWriteBuffer(1);
++            if (cStream.avail_out > 0 || cStream.avail_in == 0) {
++                break;
++            }
++        }
++        
++        if (last) {
++            compressEnd(out);
++        }
++    }
++
++    private void compressEnd(IOBuffer out) throws IOException {
++        while (true) {
++            ByteBuffer outB = out.getWriteBuffer();
++            cStream.next_out = outB.array();
++        
++            cStream.next_out_index = outB.position();
++            cStream.avail_out = outB.remaining();
++            cStream.deflate(JZlib.Z_FINISH);
++            cStream.deflateEnd();
++            
++            outB.position(cStream.next_out_index);
++            out.releaseWriteBuffer(1);
++            if (cStream.avail_out > 0) {
++                break;
++            }
++        }
++    }
++
++    void decompress(IOBuffer in, IOBuffer out) throws IOException {
++        decompress(in, out, in.available());
++    }
++    
++    void decompress(IOBuffer in, IOBuffer out, int len) throws IOException {
++        BBucket bb = in.peekFirst();
++        
++        while (bb != null && len > 0) {
++            dStream.next_in = bb.array();
++            dStream.next_in_index = bb.position();
++            int rd = Math.min(bb.remaining(), len);
++            dStream.avail_in = rd;
++
++            while (true) {
++                ByteBuffer outB = out.getWriteBuffer();
++                
++                dStream.next_out = outB.array();
++                dStream.next_out_index = outB.position();
++                dStream.avail_out = outB.remaining();
++                
++                int err = dStream.inflate(JZlib.Z_SYNC_FLUSH);
++                if (err == JZlib.Z_NEED_DICT && dict != null) {
++                    // dStream.adler has the dict id - not sure how to check
++                    if (dictId != 0 && dStream.adler != dictId) {
++                        throw new IOException("Invalid dictionary");
++                    }
++                    if (dictId == 0) {
++                        // initDict should pass a real dict id.
++                        System.err.println("Missing dict ID: " + dStream.adler);
++                    }
++                    dStream.inflateSetDictionary(dict, dict.length);
++                    err = dStream.inflate(JZlib.Z_SYNC_FLUSH);
++                }
++                outB.position(dStream.next_out_index);
++                out.releaseWriteBuffer(1);
++
++                if (err == JZlib.Z_STREAM_END) {
++                    err = dStream.inflateEnd();
++                    out.close();
++                    check(err, dStream);
++                    // move in back, not consummed
++                    bb.position(dStream.next_in_index);
++                    return;
++                }
++                check(err, dStream);
++
++                if (dStream.avail_out > 0 || dStream.avail_in == 0) {
++                    break;
++                }
++            }
++            
++            in.advance(rd); // consummed 
++            len -= rd;
++            bb = in.peekFirst();
++        }
++        
++        if (in.isClosedAndEmpty()) {
++            // Shouldn't happen - input was not properly closed..
++            // This should throw an exception, inflateEnd will check the CRC
++            int err = dStream.inflateEnd();
++            out.close();
++            check(err, dStream);
++            out.close();
++        }
++    }
++    
++    private void check(int err, ZStream stream) throws IOException {
++        if (err != JZlib.Z_OK) {
++            throw new IOException(err + " " + stream.msg);
++        }
++    }
++    
++    boolean isCompressed(HttpMessage http) {
++        return false;
++    }
++
++    boolean needsCompression(HttpMessage in, HttpMessage out) {
++        return false;
++    }
++    
++    
++}
++
+
+==================================================
+HttpChannel.java
+index 220e453a80..2e704a8365 100644
+--- a/modules/tomcat-lite/java/org/apache/tomcat/lite/http/Http11Connection.java
++++ b/modules/tomcat-lite/java/org/apache/tomcat/lite/http/Http11Connection.java
+@@ -16,9 +16,6 @@ import org.apache.tomcat.lite.io.FastHttpDateFormat;
+ import org.apache.tomcat.lite.io.Hex;
+ import org.apache.tomcat.lite.io.IOBuffer;
+ import org.apache.tomcat.lite.io.IOChannel;
+-import org.apache.tomcat.lite.io.IOConnector;
+-import org.apache.tomcat.lite.io.NioThread;
+-import org.apache.tomcat.lite.io.SocketIOChannel;
+ 
+ public class Http11Connection extends HttpConnection {
+     public static final String CHUNKED = "chunked";
+@@ -35,7 +32,7 @@ public class Http11Connection extends HttpConnection {
+     protected static Logger log = Logger.getLogger("Http11Connection");
+     static final byte COLON = (byte) ':';
+ 
+-    // net is the 'socket' connector
++    // super.net is the socket 
+ 
+     HttpChannel activeHttp;
+     boolean debug;
+@@ -673,7 +670,7 @@ public class Http11Connection extends HttpConnection {
+                     if (first == null) {
+                         break; // will go back to check if done.
+                     } else {
+-                        body.queue(first);
++                        received(body, first);
+                     }
+                 }
+             } else {
+@@ -714,13 +711,13 @@ public class Http11Connection extends HttpConnection {
+                     // To buffer has more data than we need.
+                     int lenToConsume = (int) bodys.remaining;
+                     BBucket sb = rawReceiveBuffers.popLen(lenToConsume);
+-                    body.queue(sb);
++                    received(body, sb);
+                     //log.info("Queue received buffer " + this + " " + lenToConsume);
+                     bodys.remaining = 0;
+                 } else {
+                     BBucket first = rawReceiveBuffers.popFirst();
+                     bodys.remaining -= first.remaining();
+-                    body.queue(first);
++                    received(body, first);
+                     //log.info("Queue full received buffer " + this + " RAW: " + rawReceiveBuffers);
+                 }
+                 if (bodys.contentLength >= 0 && bodys.remaining == 0) {
+@@ -731,7 +728,10 @@ public class Http11Connection extends HttpConnection {
+             }
+         }
+     }
+-    
++
++    private void received(IOBuffer body, BBucket bb) throws IOException {
++        body.queue(bb);
++    }
+ 
+     
+     protected void sendRequest(HttpChannel http) 
+
+==================================================
+HttpConnector.java
+index 25815cc75c..f293b08d21 100644
+--- a/modules/tomcat-lite/java/org/apache/tomcat/lite/http/HttpChannel.java
++++ b/modules/tomcat-lite/java/org/apache/tomcat/lite/http/HttpChannel.java
+@@ -22,9 +22,9 @@ import java.util.logging.Logger;
+ import org.apache.tomcat.lite.http.HttpConnector.HttpConnection;
+ import org.apache.tomcat.lite.io.BBucket;
+ import org.apache.tomcat.lite.io.BBuffer;
+-import org.apache.tomcat.lite.io.CBuffer;
+ import org.apache.tomcat.lite.io.IOBuffer;
+ import org.apache.tomcat.lite.io.IOChannel;
++import org.apache.tomcat.lite.io.IOConnector;
+ 
+ /**
+  * HTTP async client and server, based on tomcat NIO/APR connectors
+@@ -205,6 +205,14 @@ public class HttpChannel extends IOChannel {
+         }        
+     }
+     
++    public IOChannel getSink() {
++        if (conn == null) {
++            return null;
++        }
++        return conn.getSink();
++    }
++
++    
+     /**
+      * Called when the request is done. Need to send remaining byte.
+      * 
+@@ -340,6 +348,9 @@ public class HttpChannel extends IOChannel {
+      * 
+      */
+     protected void handleEndSendReceive() throws IOException {
++        // make sure the callback was called ( needed for abort )
++        handleHeadersReceived(inMessage);
++        
+         this.doneLock.signal(this);
+         synchronized (this) {
+             if (doneCallbackCalled) {
+@@ -803,5 +814,11 @@ public class HttpChannel extends IOChannel {
+     };
+     
+ 
++    IOConnector.ConnectedCallback connectedCallback = new IOConnector.ConnectedCallback() {
++        @Override
++        public void handleConnected(IOChannel ch) throws IOException {
++            httpConnector.handleConnected(ch, HttpChannel.this);
++        }
++    };
+     
+ }
+\ No newline at end of file
+
+==================================================
+HttpRequest.java
+index e53b544314..11e06e06ec 100644
+--- a/modules/tomcat-lite/java/org/apache/tomcat/lite/http/HttpConnector.java
++++ b/modules/tomcat-lite/java/org/apache/tomcat/lite/http/HttpConnector.java
+@@ -19,6 +19,8 @@ import org.apache.tomcat.lite.io.DumpChannel;
+ import org.apache.tomcat.lite.io.IOBuffer;
+ import org.apache.tomcat.lite.io.IOChannel;
+ import org.apache.tomcat.lite.io.IOConnector;
++import org.apache.tomcat.lite.io.SslChannel;
++import org.apache.tomcat.lite.io.SslConnector;
+ import org.apache.tomcat.lite.io.IOConnector.DataReceivedCallback;
+ 
+ /**
+@@ -64,6 +66,9 @@ public class HttpConnector {
+ 
+     protected IOConnector ioConnector;
+     
++    // for https connections
++    protected SslConnector sslConnector = new SslConnector();
++    
+     boolean debugHttp = false;
+     boolean debug = false;
+     
+@@ -323,55 +328,10 @@ public class HttpConnector {
+     }
+     
+     protected void connectAndSend(HttpChannel httpCh) throws IOException {
+-        String target = httpCh.getTarget();
+-        // TODO: SSL 
+-        HttpConnection ch = cpool.getChannel(target);
++        cpool.send(httpCh);
+ 
+-        if (ch == null) {
+-            if (debug) {
+-                httpCh.trace("HTTP_CONNECT: New connection " + target);
+-            }
+-            IOConnector.ConnectedCallback connected =
+-                new HttpConnectedCallback(this, httpCh);
+-            
+-            // will call sendRequestHeaders
+-            String[] hostPort = target.split(":");
+-            int targetPort = hostPort.length > 1 ? 
+-                    Integer.parseInt(hostPort[1]) : 80;
+-            getIOConnector().connect(hostPort[0], targetPort,
+-                    connected);
+-        } else {
+-            if (debug) {
+-                httpCh.trace("HTTP_CONNECT: Reuse connection " + target + " " + this);
+-            }
+-            // TODO retry if closed
+-            ch.beforeRequest();
+-            httpCh.setConnection(ch);
+-            ch.sendRequest(httpCh);
+-        }
+     }
+     
+-    static class HttpConnectedCallback implements IOConnector.ConnectedCallback {
+-        HttpConnector httpCon;
+-        HttpChannel httpCh;
+-        
+-        public HttpConnectedCallback(HttpConnector httpConnector,
+-                HttpChannel httpCh2) {
+-            this.httpCh = httpCh2;
+-            this.httpCon = httpConnector;
+-        }
+-
+-        @Override
+-        public void handleConnected(IOChannel ch) throws IOException {
+-            if (httpCon.debugHttp) {
+-                IOChannel ch1 = new DumpChannel("");
+-                ch.addFilterAfter(ch1);
+-                ch = ch1;                        
+-            }
+-            httpCon.handleConnected(ch, httpCh);
+-        }
+-    }
+-
+     HttpConnection newConnection() {
+         return conManager.newConnection(this);
+     }
+@@ -413,6 +373,20 @@ public class HttpConnector {
+     
+     public void handleConnected(IOChannel net, HttpChannel httpCh) 
+             throws IOException {
++        boolean ssl = httpCh.getRequest().isSecure();
++        if (ssl) {
++            SslChannel ch1 = new SslChannel();
++            ch1.setSslContext(sslConnector.getSSLContext());
++            ch1.setSink(net);
++            net.addFilterAfter(ch1);
++            net = ch1;
++        }
++        if (debugHttp) {
++            IOChannel ch1 = new DumpChannel("");
++            net.addFilterAfter(ch1);
++            net = ch1;                        
++        }
++        
+         if (!net.isOpen()) {
+             httpCh.abort("Can't connect");
+             return;
+@@ -447,7 +421,7 @@ public class HttpConnector {
+         protected boolean serverMode = false;
+ 
+         protected BBuffer headRecvBuf = BBuffer.allocate(8192);
+-        
++        protected CompressFilter compress = new CompressFilter();
+ 
+         @Override
+         public void handleReceived(IOChannel ch) throws IOException {
+@@ -535,7 +509,6 @@ public class HttpConnector {
+      * for example if a server has multiple IPs or LB replicas - any would work.   
+      */
+     public static class RemoteServer {
+-        public ConnectionPool pool;
+         public ArrayList<HttpConnection> connections = new ArrayList<HttpConnection>();
+     }
+ 
+@@ -569,15 +542,6 @@ public class HttpConnector {
+             return closedSockets.get();
+         }
+ 
+-        public String dumpSockets() {
+-            StringBuffer sb = new StringBuffer();
+-            for (CharSequence k: hosts.keySet()) {
+-                RemoteServer t = hosts.get(k);
+-                sb.append(k).append("=").append(t.connections.size()).append("\n");
+-            }
+-            return sb.toString();
+-        }
+-
+         public Set<CharSequence> getKeepAliveTargets() {
+             return hosts.keySet();
+         }
+@@ -585,41 +549,68 @@ public class HttpConnector {
+         /** 
+          * @param key host:port, or some other key if multiple hosts:ips
+          * are connected to equivalent servers ( LB ) 
++         * @param httpCh 
+          * @throws IOException 
+          */
+-        public HttpConnection getChannel(CharSequence key) throws IOException {
++        public HttpConnection send(HttpChannel httpCh) 
++                throws IOException {
++            String target = httpCh.getTarget();
++            HttpConnection con = null;
++            // TODO: check ssl on connection - now if a second request 
++            // is received on a ssl connection - we just send it
++            boolean ssl = httpCh.getRequest().isSecure();
++            
+             RemoteServer t = null;
+             synchronized (hosts) {
+-                t = hosts.get(key);
++                t = hosts.get(target);
+                 if (t == null) {
+                     misses.incrementAndGet();
+-                    return null;
+                 }
+             }
+-            HttpConnection res = null;
+-            synchronized (t) {
+-                if (t.connections.size() == 0) {
+-                    misses.incrementAndGet();
+-                    return null;
+-                } // one may be added - no harm.
+-                
+-                res = conManager.getFromPool(t);
+-                
+-                if (!res.isOpen()) {
+-                    res.setDataReceivedCallback(null);
+-                    res.close();
+-                    log.fine("Already closed " + res);
+-                    res = null;
+-                    misses.incrementAndGet();
+-                    return null;
++            if (t != null) {
++                synchronized (t) {
++                    if (t.connections.size() == 0) {
++                        misses.incrementAndGet();
++                    } else {
++                        con = conManager.getFromPool(t);
++
++                        if (!con.isOpen()) {
++                            con.setDataReceivedCallback(null);
++                            con.close();
++                            log.fine("Already closed " + con);
++                            con = null;
++                            misses.incrementAndGet();
++                        } else {
++                            hits.incrementAndGet();
++                            if (debug) {
++                                httpCh.trace("HTTP_CONNECT: Reuse connection " + target + " " + this);
++                            }
++                        }
++                    }
+                 }
+-                waitingSockets.decrementAndGet();
+             }
+-            hits.incrementAndGet();
+-            if (debug) {
+-                log.info("REUSE channel ..." + key + " " + res);
++            
++            if (con == null) {
++                if (debug) {
++                    httpCh.trace("HTTP_CONNECT: New connection " + target);
++                }
++                String[] hostPort = target.split(":");
++                
++                int targetPort = ssl ? 443 : 80;
++                if (hostPort.length > 1) {
++                    targetPort = Integer.parseInt(hostPort[1]);
++                }
++                
++                getIOConnector().connect(hostPort[0], targetPort,
++                        httpCh.connectedCallback);
++            } else {
++                con.beforeRequest();
++                httpCh.setConnection(con);
++                con.sendRequest(httpCh);
+             }
+-            return res;      
++            
++            
++            return con;      
+         }
+ 
+         /**
+@@ -649,7 +640,6 @@ public class HttpConnector {
+                 t = hosts.get(key);
+                 if (t == null) {
+                     t = new RemoteServer();
+-                    t.pool = this;
+                     hosts.put(key, t);
+                 }
+             }
+
+==================================================
+SpdyConnection.java
+index 2f126c0778..bbc6707862 100644
+--- a/modules/tomcat-lite/java/org/apache/tomcat/lite/http/HttpRequest.java
++++ b/modules/tomcat-lite/java/org/apache/tomcat/lite/http/HttpRequest.java
+@@ -842,6 +842,26 @@ public class HttpRequest extends HttpMessage {
+      * Server mode, request just received.
+      */
+     protected void processReceivedHeaders() throws IOException {
++        BBuffer url = getMsgBytes().url();
++        if (url.get(0) == 'h') {
++            int firstSlash = url.indexOf('/', 0);
++            schemeMB.appendAscii(url.array(), 
++                    url.getStart(), firstSlash + 2);
++            if (!schemeMB.equals("http://") && 
++                    !schemeMB.equals("https://")) {
++                httpCh.getResponse().setStatus(400);
++                httpCh.abort("Error normalizing url " + 
++                        getMsgBytes().url());
++                return;                                
++            }
++            
++            int urlStart = url.indexOf('/', firstSlash + 2);
++            serverNameMB.recycle();
++            serverNameMB.appendAscii(url.array(), 
++                    url.getStart() + firstSlash + 2, urlStart - firstSlash - 2);
++            
++            url.position(url.getStart() + urlStart);
++        }
+         if (!httpCh.normalize(getMsgBytes().url())) {
+             httpCh.getResponse().setStatus(400);
+             httpCh.abort("Error normalizing url " + 
+@@ -983,4 +1003,13 @@ public class HttpRequest extends HttpMessage {
+             return "Invalid request";
+         }
+     }
++    
++    public boolean isSecure() {
++        return ssl;
++    }
++    
++    public HttpRequest setSecure(boolean ssl) {
++        this.ssl = ssl;
++        return this;
++    }
+ }
+
+==================================================
+CBuffer.java
+index 10436157d6..0d4d1f55a5 100644
+--- a/modules/tomcat-lite/java/org/apache/tomcat/lite/http/SpdyConnection.java
++++ b/modules/tomcat-lite/java/org/apache/tomcat/lite/http/SpdyConnection.java
+@@ -20,6 +20,11 @@ import org.apache.tomcat.lite.io.IOBuffer;
+  * TODO: expectations ? 
+  * Fix docs - order matters
+  * Crashes in chrome
++ * 
++ * Test with unit tests or:
++ *  google-chrome --use-flip=no-ssl 
++ *    --user-data-dir=/home/$USER/.config/google-chrome/Test 
++ *    http://localhost:8802/hello
+  */
+ 
+ public class SpdyConnection extends HttpConnector.HttpConnection  {
+@@ -40,6 +45,33 @@ public class SpdyConnection extends HttpConnector.HttpConnection  {
+         
+     }
+     
++    /** Use compression for headers. Will magically turn to false
++     * if the first request doesn't have x8xx ( i.e. compress header )
++     */
++    boolean headerCompression = true;
++    boolean firstFrame = true;
++    
++    public static long DICT_ID = 3751956914L;
++    private static String SPDY_DICT_S = 
++        "optionsgetheadpostputdeletetraceacceptaccept-charsetaccept-encodingaccept-" +
++        "languageauthorizationexpectfromhostif-modified-sinceif-matchif-none-matchi" +
++        "f-rangeif-unmodifiedsincemax-forwardsproxy-authorizationrangerefererteuser" + 
++        "-agent10010120020120220320420520630030130230330430530630740040140240340440" + 
++        "5406407408409410411412413414415416417500501502503504505accept-rangesageeta" + 
++        "glocationproxy-authenticatepublicretry-afterservervarywarningwww-authentic" + 
++        "ateallowcontent-basecontent-encodingcache-controlconnectiondatetrailertran" + 
++        "sfer-encodingupgradeviawarningcontent-languagecontent-lengthcontent-locati" + 
++        "oncontent-md5content-rangecontent-typeetagexpireslast-modifiedset-cookieMo" + 
++        "ndayTuesdayWednesdayThursdayFridaySaturdaySundayJanFebMarAprMayJunJulAugSe" + 
++        "pOctNovDecchunkedtext/htmlimage/pngimage/jpgimage/gifapplication/xmlapplic" + 
++        "ation/xhtmltext/plainpublicmax-agecharset=iso-8859-1utf-8gzipdeflateHTTP/1" + 
++        ".1statusversionurl ";
++    public static byte[] SPDY_DICT = SPDY_DICT_S.getBytes();
++    // C code uses this - not in the spec
++    static {
++        SPDY_DICT[SPDY_DICT.length - 1] = (byte) 0;
++    }
++
+ 
+     protected static Logger log = Logger.getLogger("SpdyConnection");
+     
+@@ -65,6 +97,12 @@ public class SpdyConnection extends HttpConnector.HttpConnection  {
+ 
+     BBuffer headW = BBuffer.wrapper();
+     
++    CompressFilter headCompressIn = new CompressFilter()
++        .setDictionary(SPDY_DICT, DICT_ID);
++    CompressFilter headCompressOut = new CompressFilter()
++        .setDictionary(SPDY_DICT, DICT_ID);
++    IOBuffer headerCompressBuffer = new IOBuffer();
++
+     // TODO: detect if it's spdy or http based on bit 8
+ 
+     @Override
+@@ -194,15 +232,33 @@ public class SpdyConnection extends HttpConnector.HttpConnection  {
+                 ch.handleEndReceive();
+             }
+         }
++        firstFrame = false;
+     }
+ 
+     private BBuffer processHeaders(IOBuffer iob, HttpChannel ch,
+             HttpMessageBytes reqBytes) throws IOException {
+-        int nvCount = SpdyConnection.readShort(iob);
+-        int read = 8;
+-
+-        iob.read(headRecvBuf, currentInFrame.length - 8);
+-
++        int res = iob.peek() & 0xFF;
++        int nvCount = 0;
++        if (firstFrame && (res & 0x0F) !=  8) {
++            headerCompression = false;
++        }
++        headRecvBuf.recycle();
++        if (headerCompression) {
++            // 0x800 headers seems a bit too much - assume compressed.
++            // I wish this was a flag...
++            headerCompressBuffer.recycle();
++            // stream id ( 4 ) + unused ( 2 ) 
++            // nvCount is compressed in impl - spec is different
++            headCompressIn.decompress(iob, headerCompressBuffer, 
++                    currentInFrame.length - 6);
++            headerCompressBuffer.copyAll(headRecvBuf);
++            headerCompressBuffer.recycle();
++            nvCount = readShort(headRecvBuf);
++        } else {
++            nvCount = readShort(iob);
++            // 8 = stream Id (4) + pri/unused (2) + nvCount (2)
++            iob.read(headRecvBuf, currentInFrame.length - 8);
++        }
+         // Wrapper - so we don't change position in head
+         headRecvBuf.wrapTo(headW);
+         
+@@ -213,14 +269,12 @@ public class SpdyConnection extends HttpConnector.HttpConnection  {
+ 
+             int nameLen = SpdyConnection.readShort(headW);
+ 
+-            nameBuf
+-                    .setBytes(headW.array(), headW.position(),
++            nameBuf.setBytes(headW.array(), headW.position(),
+                             nameLen);
+             headW.advance(nameLen);
+ 
+             int valueLen = SpdyConnection.readShort(headW);
+-            valBuf
+-                    .setBytes(headW.array(), headW.position(),
++            valBuf.setBytes(headW.array(), headW.position(),
+                             valueLen);
+             headW.advance(valueLen);
+ 
+@@ -241,8 +295,6 @@ public class SpdyConnection extends HttpConnector.HttpConnection  {
+             }
+ 
+             // TODO: repeated values are separated by a 0
+-            // pretty weird...
+-            read += nameLen + valueLen + 4;
+         }
+         return headW;
+     }
+@@ -272,7 +324,7 @@ public class SpdyConnection extends HttpConnector.HttpConnection  {
+         // TODO: url
+         SpdyConnection.appendAsciiHead(headBuf, http.getRequest().requestURL());
+         
+-        
++        // Frame head - 8
+         BBuffer out = BBuffer.allocate();
+         // Syn-reply 
+         out.putByte(0x80); 
+@@ -285,7 +337,10 @@ public class SpdyConnection extends HttpConnector.HttpConnection  {
+         } else {
+             out.putByte(0x00); 
+         }
+-        SpdyConnection.append24(out, headBuf.remaining() + http.getOut().available() + 4);
++        
++        // Length, channel id (4) + unused (2) - headBuf has header count 
++        // and headers
++        SpdyConnection.append24(out, headBuf.remaining() + 6);
+         
+         if (serverMode) {
+             http.channelId = 2 * lastOutStream.incrementAndGet();
+@@ -302,11 +357,11 @@ public class SpdyConnection extends HttpConnector.HttpConnection  {
+         sendFrame(out, headBuf); 
+ 
+         // Any existing data
+-        sendData(http);
++        //sendData(http);
+     }
+     
+     @Override
+-    protected void sendResponseHeaders(HttpChannel http) throws IOException {
++    protected synchronized void sendResponseHeaders(HttpChannel http) throws IOException {
+         if (!serverMode) {
+             throw new IOException("Only in server mode");
+         }
+@@ -320,39 +375,54 @@ public class SpdyConnection extends HttpConnector.HttpConnection  {
+ 
+         BBuffer headBuf = BBuffer.allocate();
+ 
+-        SpdyConnection.appendInt(headBuf, http.channelId);
+-        headBuf.putByte(0);
+-        headBuf.putByte(0);
+ 
+         //mimeHeaders.remove("content-length");
+-        
+-        SpdyConnection.appendShort(headBuf, mimeHeaders.size() + 2);
++        BBuffer headers = headBuf;
++        if (headerCompression) {
++            headers = BBuffer.allocate();
++        }
++
++        //SpdyConnection.appendInt(headers, http.channelId);
++        //headers.putByte(0);
++        //headers.putByte(0);
++        SpdyConnection.appendShort(headers, mimeHeaders.size() + 2);        
+         
+         // chrome will crash if we don't send the header
+-        serializeMime(mimeHeaders, headBuf);
++        serializeMime(mimeHeaders, headers);
+ 
+         // Must be at the end
+-        SpdyConnection.appendAsciiHead(headBuf, "status");
+-        SpdyConnection.appendAsciiHead(headBuf, 
++        SpdyConnection.appendAsciiHead(headers, "status");
++        SpdyConnection.appendAsciiHead(headers, 
+                 Integer.toString(http.getResponse().getStatus()));
+ 
+-        SpdyConnection.appendAsciiHead(headBuf, "version");
+-        SpdyConnection.appendAsciiHead(headBuf, "HTTP/1.1");
++        SpdyConnection.appendAsciiHead(headers, "version");
++        SpdyConnection.appendAsciiHead(headers, "HTTP/1.1");
+ 
++        if (headerCompression) {
++            headerCompressBuffer.recycle();
++            headCompressOut.compress(headers, headerCompressBuffer, false);
++            headerCompressBuffer.copyAll(headBuf);
++            headerCompressBuffer.recycle();
++        }
+         
+-        BBuffer out = BBuffer.allocate();
++        BBuffer frameHead = BBuffer.allocate();
+         // Syn-reply 
+-        out.putByte(0x80); // Control
+-        out.putByte(0x01); // version
+-        out.putByte(0x00); // 00 02 - SYN_REPLY
+-        out.putByte(0x02);
++        frameHead.putByte(0x80); // Control
++        frameHead.putByte(0x01); // version
++        frameHead.putByte(0x00); // 00 02 - SYN_REPLY
++        frameHead.putByte(0x02);
+         
+         // It seems piggibacking data is not allowed
+-        out.putByte(0x00); 
++        frameHead.putByte(0x00); 
+ 
+-        SpdyConnection.append24(out, headBuf.remaining());
+-        
+-        sendFrame(out, headBuf);
++        SpdyConnection.append24(frameHead, headBuf.remaining() + 6);
++
++//        // Stream-Id, unused
++        SpdyConnection.appendInt(frameHead, http.channelId);
++        frameHead.putByte(0);
++        frameHead.putByte(0);
++
++        sendFrame(frameHead, headBuf);
+     }
+     
+     
+@@ -542,6 +612,7 @@ public class SpdyConnection extends HttpConnector.HttpConnection  {
+      */
+     public void abort(HttpChannel http, String t) throws IOException {
+         // TODO: send interrupt signal
++        
+     }
+ 
+ 
+
+==================================================
+DumpChannel.java
+index d94b451bc0..9784a48b6b 100644
+--- a/modules/tomcat-lite/java/org/apache/tomcat/lite/io/CBuffer.java
++++ b/modules/tomcat-lite/java/org/apache/tomcat/lite/io/CBuffer.java
+@@ -173,6 +173,9 @@ public class CBuffer extends CBucket implements Cloneable,
+      */
+     public CBuffer append(char src[], int srcStart, int srcEnd)  {
+         int len = srcEnd - srcStart;
++        if (len == 0) {
++            return this;
++        }
+         // will grow, up to limit
+         makeSpace(len);
+ 
+@@ -187,6 +190,9 @@ public class CBuffer extends CBucket implements Cloneable,
+      */
+     public CBuffer append(StringBuffer sb) {
+         int len = sb.length();
++        if (len == 0) {
++            return this;
++        }
+         makeSpace(len);
+         sb.getChars(0, len, value, end);
+         end += len;
+@@ -197,7 +203,7 @@ public class CBuffer extends CBucket implements Cloneable,
+      * Append a string to the buffer
+      */
+     public CBuffer append(String s) {
+-        if (s == null) {
++        if (s == null || s.length() == 0) {
+             return this;
+         }
+         append(s, 0, s.length());
+
+==================================================
+IOBuffer.java
+index b3eee1c24e..1319b271d7 100644
+--- a/modules/tomcat-lite/java/org/apache/tomcat/lite/io/DumpChannel.java
++++ b/modules/tomcat-lite/java/org/apache/tomcat/lite/io/DumpChannel.java
+@@ -2,7 +2,6 @@
+  */
+ package org.apache.tomcat.lite.io;
+ 
+-import java.io.FileNotFoundException;
+ import java.io.FileOutputStream;
+ import java.io.IOException;
+ import java.io.OutputStream;
+
+==================================================
+NioChannel.java
+index e645a65771..a273816714 100644
+--- a/modules/tomcat-lite/java/org/apache/tomcat/lite/io/IOBuffer.java
++++ b/modules/tomcat-lite/java/org/apache/tomcat/lite/io/IOBuffer.java
+@@ -111,6 +111,7 @@ public class IOBuffer {
+                 first.position(first.limit());
+             } else {
+                 first.position(first.position() + len);                
++                len = 0;
+             }
+         }
+     }
+@@ -631,7 +632,7 @@ public class IOBuffer {
+                 throw new IOException("Not appending");
+             }
+             if (writeBuffer != null) {
+-                if (read > 0) {
++                if (appendable.limit() != writeBuffer.position()) {
+                     appendable.limit(writeBuffer.position());
+                     // We have some more data.
+                     if (buffers.size() == 0 || 
+
+==================================================
+SslChannel.java
+index 4a0e657658..c8a136b1f3 100644
+--- a/modules/tomcat-lite/java/org/apache/tomcat/lite/io/NioChannel.java
++++ b/modules/tomcat-lite/java/org/apache/tomcat/lite/io/NioChannel.java
+@@ -152,7 +152,7 @@ public class NioChannel implements ByteChannel {
+     @Override
+     public void close() throws IOException {
+         shutdownOutput();
+-        sel.close(this, null);
++        inputClosed();
+     }
+ 
+     /**
+
+==================================================
+SslConnector.java
+index 618f686434..163228ac6b 100644
+--- a/modules/tomcat-lite/java/org/apache/tomcat/lite/io/SslChannel.java
++++ b/modules/tomcat-lite/java/org/apache/tomcat/lite/io/SslChannel.java
+@@ -8,12 +8,10 @@ import java.security.GeneralSecurityException;
+ import java.util.logging.Level;
+ import java.util.logging.Logger;
+ 
+-import javax.net.ssl.KeyManager;
+ import javax.net.ssl.SSLContext;
+ import javax.net.ssl.SSLEngine;
+ import javax.net.ssl.SSLEngineResult;
+ import javax.net.ssl.SSLSession;
+-import javax.net.ssl.TrustManager;
+ import javax.net.ssl.SSLEngineResult.HandshakeStatus;
+ import javax.net.ssl.SSLEngineResult.Status;
+ 
+
+==================================================
+HttpProxyService.java
+index 39a3139915..04acbeefed 100644
+--- a/modules/tomcat-lite/java/org/apache/tomcat/lite/io/SslConnector.java
++++ b/modules/tomcat-lite/java/org/apache/tomcat/lite/io/SslConnector.java
+@@ -78,6 +78,7 @@ public class SslConnector extends IOConnector {
+     private TrustManager[] trustManagers;
+     
+     Executor handshakeExecutor;
++    static int id = 0;
+     
+     public SslConnector() {
+     }
+@@ -86,8 +87,8 @@ public class SslConnector extends IOConnector {
+         
+     }
+     
+-    public IOConnector getNet() {
+-        if (net == null) {
++    public SSLContext getSSLContext() {
++        if (sslCtx == null) {
+             try {
+                 sslCtx = SSLContext.getInstance("TLS");
+                 if (trustManagers == null) {
+@@ -102,13 +103,18 @@ public class SslConnector extends IOConnector {
+                 // TODO Auto-generated catch block
+                 e.printStackTrace();
+             }
+-            
++        }
++        return sslCtx;
++    }
++    
++    public IOConnector getNet() {
++        if (net == null) {
++            getSSLContext();
+             net = new SocketConnector();
+         }
+         return net;
+     }
+     
+-    static int id = 0;
+     
+     @Override
+     public void acceptor(final ConnectedCallback sc, CharSequence port, Object extra) 
+
+==================================================
+ServletRequestImpl.java
+index be8f185db1..63b17375ae 100644
+--- a/modules/tomcat-lite/java/org/apache/tomcat/lite/proxy/HttpProxyService.java
++++ b/modules/tomcat-lite/java/org/apache/tomcat/lite/proxy/HttpProxyService.java
+@@ -150,26 +150,26 @@ public class HttpProxyService implements HttpService {
+         
+         
+         CBuffer origURIx = serverHttpReq.requestURI();
+-        String origURI = origURIx.toString();
+-        if (origURI.startsWith("http://")) {
+-            // Real proxy - extract client address, modify the uri.
+-            // TODO: optimize the strings.
+-            int start = origURI.indexOf('/', 7);
+-            String hostPortS = (start == -1) ?
+-                    origURI.subSequence(7, origURI.length()).toString() :
+-                    origURI.subSequence(7, start).toString();
+-            String[] hostPort = hostPortS.split(":");
+-
+-            dstHost = hostPort[0];
+-            dstPort = (hostPort.length > 1) ? Integer.parseInt(hostPort[1]) : 
+-                80;
+-
+-            if (start >= 0) {
+-                serverHttpReq.requestURI().set(origURI.substring(start));
+-            } else {
+-                serverHttpReq.requestURI().set("/");
+-            }
+-        } else {
++//        String origURI = origURIx.toString();
++//        if (origURI.startsWith("http://")) {
++//            // Real proxy - extract client address, modify the uri.
++//            // TODO: optimize the strings.
++//            int start = origURI.indexOf('/', 7);
++//            String hostPortS = (start == -1) ?
++//                    origURI.subSequence(7, origURI.length()).toString() :
++//                    origURI.subSequence(7, start).toString();
++//            String[] hostPort = hostPortS.split(":");
++//
++//            dstHost = hostPort[0];
++//            dstPort = (hostPort.length > 1) ? Integer.parseInt(hostPort[1]) : 
++//                80;
++//
++//            if (start >= 0) {
++//                serverHttpReq.requestURI().set(origURI.substring(start));
++//            } else {
++//                serverHttpReq.requestURI().set("/");
++//            }
++//        } else {
+             // Adjust the host header.
+             CBuffer hostHdr = 
+                 serverHttpReq.getMimeHeaders().getHeader("host");
+@@ -182,7 +182,7 @@ public class HttpProxyService implements HttpService {
+                     cb.appendInt(dstPort);
+                 }
+             }
+-        }
++//        }
+         if (debug) {
+             HttpChannel server = serverHttpReq.getHttpChannel();
+             log.info("START: " + server.getId() + " " + dstHost + " "  + 
+
+==================================================
+TestMain.java
+index a381ef74e9..a2e430c21f 100644
+--- a/modules/tomcat-lite/java/org/apache/tomcat/lite/servlet/ServletRequestImpl.java
++++ b/modules/tomcat-lite/java/org/apache/tomcat/lite/servlet/ServletRequestImpl.java
+@@ -1655,17 +1655,6 @@ public abstract class ServletRequestImpl implements HttpServletRequest {
+ 
+     }
+ 
+-
+-    /**
+-     * Set the value to be returned by <code>isSecure()</code>
+-     * for this Request.
+-     *
+-     * @param secure The new isSecure value
+-     */
+-    public void setSecure(boolean secure) {
+-        this.secure = secure;
+-    }
+-
+     /**
+      * Set the servlet path for this Request.  This will normally be called
+      * when the associated Context is mapping the Request to a particular
+
+==================================================
+ClientTest.java
+index 7c67b22001..755bc3e0c8 100644
+--- a/modules/tomcat-lite/test/org/apache/tomcat/lite/TestMain.java
++++ b/modules/tomcat-lite/test/org/apache/tomcat/lite/TestMain.java
+@@ -7,10 +7,6 @@ import java.io.IOException;
+ import java.io.InputStream;
+ import java.net.HttpURLConnection;
+ import java.net.URL;
+-import java.util.List;
+-import java.util.Map;
+-
+-import javax.net.ssl.SSLContext;
+ 
+ import org.apache.tomcat.integration.simple.Main;
+ import org.apache.tomcat.integration.simple.SimpleObjectManager;
+@@ -20,7 +16,8 @@ import org.apache.tomcat.lite.http.Dispatcher;
+ import org.apache.tomcat.lite.http.HttpChannel;
+ import org.apache.tomcat.lite.http.HttpConnector;
+ import org.apache.tomcat.lite.http.HttpRequest;
+-import org.apache.tomcat.lite.http.BaseMapper.ContextMapping;
++import org.apache.tomcat.lite.http.HttpResponse;
++import org.apache.tomcat.lite.http.HttpChannel.HttpService;
+ import org.apache.tomcat.lite.http.HttpConnector.HttpChannelEvents;
+ import org.apache.tomcat.lite.http.services.EchoCallback;
+ import org.apache.tomcat.lite.http.services.SleepCallback;
+@@ -40,38 +37,40 @@ import org.apache.tomcat.util.buf.ByteChunk;
+  * @author Costin Manolache
+  */
+ public class TestMain {
++
++    static {
++        SslConnector.fixUrlConnection();
++    }
++
+     static TestMain defaultServer;
+     
+-    SimpleObjectManager om;
++    private SimpleObjectManager om;
+ 
+-    static SocketConnector serverCon = new SocketConnector();
++    private SocketConnector serverCon = new SocketConnector();
+     
+-    public static HttpConnector testClient = DefaultHttpConnector.get();
+-    public static HttpConnector testServer = new HttpConnector(serverCon);
+-    public static HttpConnector testProxy = new HttpConnector(serverCon);
+-
+-    static Dispatcher mcb;
+-    static HttpProxyService proxy;
++    private HttpConnector testClient = DefaultHttpConnector.get();
++    private HttpConnector testServer = new HttpConnector(serverCon);
++    private HttpConnector testProxy = new HttpConnector(serverCon);
+ 
++    private HttpProxyService proxy;
+    
+-    public static HttpConnector initTestEnv() {
++    public static TestMain shared() {
+         if (defaultServer == null) {
+             defaultServer = new TestMain();
+             defaultServer.run();
+         }
+-        return defaultServer.testServer;
++        return defaultServer;
+     }
+-
+-    public static HttpConnector getClientAndInit() {
+-        if (defaultServer == null) {
+-            defaultServer = new TestMain();
+-            defaultServer.run();
+-        }
+-        return defaultServer.testClient;
++    
++    public static HttpConnector getTestServer() {
++        return shared().testServer;
+     }
+ 
++    public HttpConnector getClient() {
++        return shared().testClient;
++    }
+ 
+-    public static void initTestCallback(Dispatcher d) {
++    public void initTestCallback(Dispatcher d) {
+         BaseMapper.ContextMapping mCtx = d.addContext(null, "", null, null, null, null);
+         
+         d.addWrapper(mCtx, "/", new StaticContentService()
+@@ -95,114 +94,32 @@ public class TestMain {
+         d.addWrapper(mCtx, "/proc/cpool/client", new IOStatus(testClient.cpool));
+         d.addWrapper(mCtx, "/proc/cpool/proxy", new IOStatus(testProxy.cpool));
+         d.addWrapper(mCtx, "/proc/cpool/server", new IOStatus(testServer.cpool));
+-    }
+ 
+-    static boolean RELEASE = true;
+-    /**
+-     * Blocking get, returns when the body has been read.
+-     */
+-    public static BBuffer get(String url) throws IOException {
+-
+-        BBuffer out = BBuffer.allocate();
++        d.addWrapper(mCtx, "/helloClose", new HttpService() {
++            @Override
++            public void service(HttpRequest httpReq, HttpResponse httpRes)
++                    throws IOException {
++                httpRes.setHeader("Connection", "close");
++                httpRes.getBodyWriter().write("Hello");
++            }
++        });
+ 
+-        HttpRequest aclient = DefaultHttpConnector.get().request(url);
+-        aclient.send();
+-        aclient.readAll(out, 
+-                //Long.MAX_VALUE);//
+-                2000000);
+-        if (RELEASE) {
+-            aclient.release(); // return connection to pool
+-        }
+-        return out;
+     }
+ 
+     public void run() {
+-        String cfgFile = "org/apache/tomcat/lite/test.properties";
+         try {
+-            startAll(cfgFile, 8000);
++            startAll(8000);
+         } catch (Throwable t) {
+             t.printStackTrace();
+         }
+     } 
+     
+-    protected void startAll(String cfgFile, int basePort) {
+-        if (om == null) {
+-            om = new SimpleObjectManager();
+-        }
+-
+-        om.loadResource(cfgFile);
+-
+-        //        // Override the port - don't want on 8080, Watchdog may run in same 
+-//        // process
+-//        om.getProperties().put("org.apache.tomcat.lite.Connector.port", 
+-//                Integer.toString(basePort + 800));
+-        
+-        // From Main:
+-        String run = (String) om.getProperty("RUN");
+-        String[] runNames = run == null ? new String[] {} : run.split(",");
+-        
+-        for (String name: runNames) {
+-            Object main = om.get(name);
+-            
+-            if (main instanceof Runnable) {
+-                ((Runnable) main).run();
+-            }
+-        }
+-
+-        om.bind("HttpConnector-TestServer", testServer);
+-        om.bind("HttpConnector", testClient);
+-        om.bind("HttpConnector-Proxy", testProxy);
+-        
+-        testServer.setOnCreate(new HttpChannelEvents() {
+-            @Override
+-            public void onCreate(HttpChannel data, HttpConnector extraData)
+-                    throws IOException {
+-                //data.trace("BIND");
+-                om.bind("AsyncHttp-" + data.getId(), data);
+-            }
+-            @Override
+-            public void onDestroy(HttpChannel data, HttpConnector extraData)
+-                    throws IOException {
+-                //data.trace("UNBIND");
+-                om.unbind("AsyncHttp-" + data.getId());
+-            }
+-        });
+-        
+-//        ioConnector.setOnCreate(new IOConnector.ConnectedCallback() {
+-//            AtomicInteger ser = new AtomicInteger();
+-//            @Override
+-//            public void handleConnected(IOChannel data)
+-//                    throws IOException {
+-//                data.setId("IOChannel-" + data.getTarget() + "-" + 
+-//                        ser.incrementAndGet());
+-//                om.bind(data.getId(), data);
+-//            }
+-//        });
+-//        ioConnector.setOnClose(new IOConnector.ClosedCallback() {
+-//            @Override
+-//            public void handleClosed(IOChannel data)
+-//                    throws IOException {
+-//               System.err.println("UNBIND " + data.getId() + " " + data);
+-//               om.unbind(data.getId());
+-//            }
+-//        });
+-//        ioConnector.onNewWorker = new Callback<NioThread>() {
+-//            @Override
+-//            public void handle(NioThread data, Object extraData)
+-//                    throws IOException {
+-//                om.bind((String) extraData, data);
+-//            }
+-//        };
+-        
++    protected void startAll(int basePort) throws IOException {
+         int port = basePort + 903;
+         if (proxy == null) {
+             proxy = new HttpProxyService()
+                 .withHttpClient(testClient);
+             testProxy.setPort(port);
+-//            testProxy.setDebugHttp(true);
+-//            testProxy.setDebug(true);
+-//            testClient.setDebug(true);
+-//            testClient.setDebugHttp(true);
+ 
+             // dispatcher rejects 'http://'
+             testProxy.setHttpService(proxy);
+@@ -223,9 +140,23 @@ public class TestMain {
+                 e.printStackTrace();
+             }
+             
++            SslConnector sslCon = new SslConnector()
++                .setKeysResource("org/apache/tomcat/lite/http/test.keystore", 
++                    "changeit");
++            HttpConnector sslServer = new HttpConnector(sslCon);
++            initTestCallback(sslServer.getDispatcher());            
++            sslServer.setPort(basePort + 443);
++            sslServer.start();
++            
++//          testProxy.setDebugHttp(true);
++//          testProxy.setDebug(true);
++//          testClient.setDebug(true);
++//          testClient.setDebugHttp(true);
+ //            testServer.setDebugHttp(true);
+ //            testServer.setDebug(true);
+-
++//            sslServer.setDebug(true);
++//            sslServer.setDebugHttp(true);
++            
+         }   
+         
+         Runtime.getRuntime().addShutdownHook(new Thread() {
+@@ -236,52 +167,75 @@ public class TestMain {
+                 System.err.println("Done1");
+             }
+         });
++    }
+ 
+-        
+-//        try {
+-//            ServletContextImpl ctx = (ServletContextImpl) tomcat.addServletContext(null, null, "/jmx");
+-//            // tomcat is already started, need to call init explicitely
+-//            ((ServletContextImpl) ctx).loadConfig();
+-//            
+-//            Servlet servlet = new JMXProxyServlet();
+-//            ServletRegistration.Dynamic jmxServlet = ctx.addServlet("jmx", 
+-//                    servlet);
+-//            jmxServlet.addMapping("/jmx");
+-//            // TODO: init servlet 
+-//            servlet.init(new ServletConfigImpl(ctx, null, null));
+-//
+-//            ctx.start();
+-//            
+-//        } catch (ServletException e) {
+-//            // TODO Auto-generated catch block
+-//            e.printStackTrace();
+-//        }
++    private void initObjectManager(String cfgFile) {
++        if (om == null) {
++            om = new SimpleObjectManager();
++        }
+ 
++        om.loadResource(cfgFile);
++        String run = (String) om.getProperty("RUN");
++        String[] runNames = run == null ? new String[] {} : run.split(",");
++        for (String name: runNames) {
++            Object main = om.get(name);
++            
++            if (main instanceof Runnable) {
++                ((Runnable) main).run();
++            }
++        }
++
++        om.bind("HttpConnector-TestServer", testServer);
++        om.bind("HttpConnector", testClient);
++        om.bind("HttpConnector-Proxy", testProxy);
++        
++        testServer.setOnCreate(new HttpChannelEvents() {
++            @Override
++            public void onCreate(HttpChannel data, HttpConnector extraData)
++                    throws IOException {
++                //data.trace("BIND");
++                om.bind("AsyncHttp-" + data.getId(), data);
++            }
++            @Override
++            public void onDestroy(HttpChannel data, HttpConnector extraData)
++                    throws IOException {
++                //data.trace("UNBIND");
++                om.unbind("AsyncHttp-" + data.getId());
++            }
++        });
+     }
++    
+ 
+-    static {
+-        SslConnector.fixUrlConnection();
++    /**
++     * Blocking get, returns when the body has been read.
++     */
++    public static BBuffer get(String url) throws IOException {
++
++        BBuffer out = BBuffer.allocate();
++
++        HttpRequest aclient = DefaultHttpConnector.get().request(url);
++        aclient.send();
++        aclient.readAll(out, 
++                //Long.MAX_VALUE);//
++                2000000);
++        aclient.release(); // return connection to pool
++        return out;
+     }
+     
+     public static ByteChunk getUrl(String path) throws IOException {
+         ByteChunk out = new ByteChunk();
+-        getUrl(path, out, null);
++        getUrl(path, out);
+         return out;
+     }
+ 
+-    public static int getUrl(String path, 
+-                             ByteChunk out, 
+-                             Map<String, List<String>> resHead) throws IOException {
++    public static HttpURLConnection getUrl(String path, 
++                             ByteChunk out) throws IOException {
+         URL url = new URL(path);
+         HttpURLConnection connection = 
+             (HttpURLConnection) url.openConnection();
+        // connection.setReadTimeout(100000);
+         connection.connect();
+         int rc = connection.getResponseCode();
+-        if (resHead != null) {
+-            Map<String, List<String>> head = connection.getHeaderFields();
+-            resHead.putAll(head);
+-        }
+         InputStream is = connection.getInputStream();
+         BufferedInputStream bis = new BufferedInputStream(is);
+         byte[] buf = new byte[2048];
+@@ -289,7 +243,7 @@ public class TestMain {
+         while((rd = bis.read(buf)) > 0) {
+             out.append(buf, 0, rd);
+         }
+-        return rc;
++        return connection;
+     }
+     
+     
+@@ -297,6 +251,7 @@ public class TestMain {
+         TestMain testMain = new TestMain();
+         TestMain.defaultServer = testMain;
+         testMain.om = new SimpleObjectManager(args);
++        testMain.initObjectManager("org/apache/tomcat/lite/test.properties");
+         testMain.run();
+         Main.waitStop();
+     }
+
+==================================================
+CompressFilterTest.java
+index 4bf0a02722..d1ba8a56de 100644
+--- a/modules/tomcat-lite/test/org/apache/tomcat/lite/http/ClientTest.java
++++ b/modules/tomcat-lite/test/org/apache/tomcat/lite/http/ClientTest.java
+@@ -28,7 +28,7 @@ public class ClientTest extends TestCase {
+      * Start a http server, runs on 8802 - shared by all tests.
+      * Will use /echo handler. 
+      */
+-    static HttpConnector testServer = TestMain.initTestEnv();
++    static HttpConnector testServer = TestMain.getTestServer();
+ 
+     
+     public void testSimpleBlocking() throws IOException {
+
+==================================================
+HttpsTest.java
+new file mode 100644
+index 0000000000..915702c7f2
+--- /dev/null
++++ b/modules/tomcat-lite/test/org/apache/tomcat/lite/http/CompressFilterTest.java
+@@ -0,0 +1,82 @@
++/*
++ */
++package org.apache.tomcat.lite.http;
++
++import java.util.Random;
++
++import junit.framework.TestCase;
++
++import org.apache.tomcat.lite.io.IOBuffer;
++
++public class CompressFilterTest extends TestCase {
++
++    CompressFilter cf = new CompressFilter();
++    
++    private void check(String clear, String xtra) throws Exception {
++        IOBuffer in = new IOBuffer();
++        IOBuffer out = new IOBuffer();
++        
++        in.append(clear);
++        in.close();
++        
++        cf.compress(in, out);
++        
++//        BBuffer bb = out.copyAll(null);
++//        String hd = Hex.getHexDump(bb.array(), bb.position(), 
++//                bb.remaining(), true);
++//        System.err.println(hd);
++
++        if (xtra != null) {
++            out.append(xtra);
++        }
++        in.recycle();
++        out.close();
++        cf.decompress(out, in);
++        
++        assertEquals(in.copyAll(null).toString(), clear);
++        assertTrue(in.isAppendClosed());
++        
++        if (xtra != null) {
++            assertEquals(out.copyAll(null).toString(), xtra);            
++        }
++    }
++
++    public void test1() throws Exception {
++        check("X1Y2Z3", null);
++    }
++        
++    public void testXtra() throws Exception {
++        check("X1Y2Z3", "GET /");
++    }
++        
++    public void testLarge() throws Exception {
++        StringBuffer sb = new StringBuffer();
++        for (int i = 0; i < 2 * 1024; i++) {
++            sb.append("0123456789012345"); 
++        }
++        check(sb.toString(), null);
++    }
++
++    public void testLarge100() throws Exception {
++        for (int i = 0; i < 100; i++) {
++            testLargeIn();
++            cf.recycle();
++        }
++    }
++    
++    public void testLargeIn() throws Exception {
++        StringBuffer sb = new StringBuffer();
++        Random r = new Random();
++        for (int i = 0; i < 16 * 2 * 1024; i++) {
++            sb.append(' ' + r.nextInt(32)); 
++        }
++        check(sb.toString(), null);
++    }
++        
++    
++    public void testSpdy() throws Exception {
++        cf.setDictionary(SpdyConnection.SPDY_DICT, SpdyConnection.DICT_ID);
++        check("connection: close\n", null);
++    }
++
++}
+
+==================================================
+LiveHttp1Test.java
+index 7be1955505..ed87256e65 100644
+--- a/modules/tomcat-lite/test/org/apache/tomcat/lite/http/HttpsTest.java
++++ b/modules/tomcat-lite/test/org/apache/tomcat/lite/http/HttpsTest.java
+@@ -17,7 +17,6 @@
+ 
+ package org.apache.tomcat.lite.http;
+ 
+-import java.io.IOException;
+ import java.util.logging.Level;
+ import java.util.logging.Logger;
+ 
+@@ -25,7 +24,6 @@ import junit.framework.TestCase;
+ 
+ import org.apache.commons.codec.binary.Base64;
+ import org.apache.tomcat.lite.TestMain;
+-import org.apache.tomcat.lite.http.HttpChannel.HttpService;
+ import org.apache.tomcat.lite.io.BBuffer;
+ import org.apache.tomcat.lite.io.SslConnector;
+ import org.apache.tomcat.util.buf.ByteChunk;
+@@ -33,70 +31,26 @@ import org.apache.tomcat.util.buf.ByteChunk;
+ public class HttpsTest extends TestCase {
+     
+     static int port = 8443;
+-    HttpConnector con;
+-    HttpConnector httpClient;
++    final HttpConnector httpClient = TestMain.shared().getClient();
+     
+     public void setUp() {
+         Logger.getLogger("SSL").setLevel(Level.FINEST);
+     }
+ 
+-    public void tearDown() {
+-        if (con != null) {
+-            con.stop();
+-        }
+-        if (httpClient != null) {
+-            httpClient.stop();
+-        }
+-    }
+-    
+-    static HttpConnector initServer(int port) throws IOException {
+-        SslConnector sslCon = new SslConnector()
+-            .setKeysResource("org/apache/tomcat/lite/http/test.keystore", "changeit");
+-        
+-        HttpConnector con = new HttpConnector(sslCon);
+-        con.setPort(port);
+-
+-        addService(con);
+-        return con;
+-    }
+-    
+-    private static void addService(HttpConnector con) throws IOException {
+-        con.setMaxHttpPoolSize(0);
+-//        con.setDebug(true);
+-//        con.setDebugHttp(true);
+-        
+-        con.getDispatcher().setDefaultService(new HttpService() {
+-            @Override
+-            public void service(HttpRequest httpReq, HttpResponse httpRes)
+-                    throws IOException {
+-                httpRes.setHeader("Connection", "close");
+-                httpRes.getBodyWriter().write("Hello");
+-            }
+-        });
+-        con.start();
+-    }
+-
+     public void testSimpleClient() throws Exception {
+-        SslConnector sslCon = new SslConnector();
+-        httpClient = new HttpConnector(sslCon);
+-//        httpClient.setDebug(true);
+-//        httpClient.setDebugHttp(true);
+-        httpClient.setMaxHttpPoolSize(0);
+-        con = initServer(++port);
+         checkResponse(httpClient);
+     }
+     
+     
+     public void testSimpleServer() throws Exception {
+-        con = initServer(++port);
+-        ByteChunk res = TestMain.getUrl("https://localhost:" + port +
+-            "/examples/servlets/servlet/HelloWorldExample");
++        ByteChunk res = TestMain.getUrl("https://localhost:8443/hello");
+         assertTrue(res.toString().indexOf("Hello") >= 0);
+     }       
+ 
+     
+     private void checkResponse(HttpConnector httpCon) throws Exception {
+-        HttpRequest ch = httpCon.request("localhost", port);
++        HttpRequest ch = httpCon.request("localhost", port).setSecure(true);
++        
+         ch.setRequestURI("/hello");
+         ch.setProtocol("HTTP/1.0");
+         ch.send();
+@@ -106,21 +60,14 @@ public class HttpsTest extends TestCase {
+     }    
+     
+     public void testSimpleClient20() throws Exception {
+-        SslConnector sslCon = new SslConnector();
+-        httpClient = new HttpConnector(sslCon);
+-//        httpClient.setDebug(true);
+-//        httpClient.setDebugHttp(true);
+-
+-        con = initServer(++port);
+         for (int i = 0; i < 20; i++) {
+             checkResponse(httpClient);
+         }
+     }
+     
+     public void testSimpleRequestGoogle() throws Exception {
+-        SslConnector sslCon = new SslConnector();
+-        httpClient = new HttpConnector(sslCon);
+-        HttpRequest client = httpClient.request("www.google.com", 443);
++        HttpRequest client = httpClient.request("www.google.com", 443).
++            setSecure(true);
+         client.getHttpChannel().setIOTimeout(2000);
+         client.setRequestURI("/accounts/ServiceLogin");
+         client.send();
+@@ -140,19 +87,19 @@ public class HttpsTest extends TestCase {
+      */
+     public void testSeverWithKeys() throws Exception {
+         Base64 b64 = new Base64();
+-
+-        
+         byte[] keyBytes = b64.decode(PRIVATE_KEY);
+ 
+         SslConnector sslCon = new SslConnector()
+             .setKeys(CERTIFICATE, keyBytes);
+             
+         HttpConnector con = new HttpConnector(sslCon);
+-        con.setPort(++port);
+-        addService(con);
++        con.setPort(8444);
++        
++        TestMain.shared().initTestCallback(con.getDispatcher());
++        con.start();
+         
+-        ByteChunk res = TestMain.getUrl("https://localhost:" + port +
+-            "/examples/servlets/servlet/HelloWorldExample");
++        ByteChunk res = TestMain.getUrl("https://localhost:8444" + 
++            "/hello");
+         assertTrue(res.toString().indexOf("Hello") >= 0);
+         
+     }
+
+==================================================
+SpdyTest.java
+index 74c70771e9..01822499a2 100644
+--- a/modules/tomcat-lite/test/org/apache/tomcat/lite/http/LiveHttp1Test.java
++++ b/modules/tomcat-lite/test/org/apache/tomcat/lite/http/LiveHttp1Test.java
+@@ -37,7 +37,7 @@ public class LiveHttp1Test extends TestCase {
+     public void setUp() throws IOException {
+         // DefaultHttpConnector.get().setDebug(true);
+         // DefaultHttpConnector.get().setDebugHttp(true);
+-        TestMain.initTestEnv();
++        TestMain.getTestServer();
+ 
+         httpClient = DefaultHttpConnector.get().request("localhost", clientPort);
+ 
+@@ -59,6 +59,15 @@ public class LiveHttp1Test extends TestCase {
+         assertEquals("Hello world", bodyRecvBuffer.toString());
+     }
+ 
++    public void testSimpleRequestClose() throws Exception {
++        httpClient.requestURI().set("/hello");
++        httpClient.setHeader("Connection", "close");
++
++        httpClient.send();
++        httpClient.readAll(bodyRecvBuffer, to);
++        assertEquals("Hello world", bodyRecvBuffer.toString());
++    }
++
+     public void testPoolGetRelease() throws Exception {
+         HttpConnector con = new HttpConnector(new SocketConnector());
+         con.setMaxHttpPoolSize(10);
+
+==================================================
+OneTest.java
+new file mode 100644
+index 0000000000..3507ff91c1
+Binary files /dev/null and b/modules/tomcat-lite/test/org/apache/tomcat/lite/http/spdyreqCompressed differ
+
+==================================================
+LiveHttpThreadedTest.java
+index 9cfce1117b..74470cd3f0 100644
+--- a/modules/tomcat-lite/test/org/apache/tomcat/lite/io/OneTest.java
++++ b/modules/tomcat-lite/test/org/apache/tomcat/lite/io/OneTest.java
+@@ -14,7 +14,7 @@ import junit.framework.TestCase;
+ public class OneTest extends TestCase {
+  
+     public void setUp() throws Exception {
+-        TestMain.initTestEnv();
++        TestMain.getTestServer();
+     }
+     
+     public void tearDown() throws IOException {
+
+==================================================
+ProxyTest.java
+index 035879cf71..ad2e45424b 100644
+--- a/modules/tomcat-lite/test/org/apache/tomcat/lite/load/LiveHttpThreadedTest.java
++++ b/modules/tomcat-lite/test/org/apache/tomcat/lite/load/LiveHttpThreadedTest.java
+@@ -21,7 +21,6 @@ import java.io.File;
+ import java.io.IOException;
+ import java.lang.management.ManagementFactory;
+ import java.net.HttpURLConnection;
+-import java.net.URL;
+ import java.util.HashMap;
+ import java.util.Map;
+ import java.util.concurrent.atomic.AtomicInteger;
+@@ -39,9 +38,9 @@ import org.apache.tomcat.lite.TestMain;
+ import org.apache.tomcat.lite.http.HttpChannel;
+ import org.apache.tomcat.lite.http.HttpConnector;
+ import org.apache.tomcat.lite.http.HttpRequest;
++import org.apache.tomcat.lite.http.SpdyConnection;
+ import org.apache.tomcat.lite.http.HttpChannel.RequestCompleted;
+-import org.apache.tomcat.lite.io.BBuffer;
+-import org.apache.tomcat.lite.io.IOBuffer;
++import org.apache.tomcat.util.buf.ByteChunk;
+ 
+ /*
+   Notes on memory use ( from heap dumps ): 
+@@ -69,7 +68,7 @@ import org.apache.tomcat.lite.io.IOBuffer;
+  * it seems there is a bug as well.
+  */
+ public class LiveHttpThreadedTest extends TestCase {
+-  HttpConnector clientCon = TestMain.getClientAndInit();
++  HttpConnector clientCon = TestMain.shared().getClient();
+   ThreadRunner tr;
+   static MBeanServer server;
+   
+@@ -79,25 +78,46 @@ public class LiveHttpThreadedTest extends TestCase {
+ 
+   Map<HttpRequest, HttpRequest> active = new HashMap();
+   
+-  public void xtest1000Async() throws Exception {
++  public void test1000Async() throws Exception {
+       try {
+-          asyncRequest(10, 100);
++          asyncRequest(10, 100, false);
+       } finally {
+           dumpHeap("heapAsync.bin");
+       }
+       
+   }
+ 
+-  public void xtest10000Async() throws Exception {
++  public void test10000Async() throws Exception {
+       try {
+-          asyncRequest(20, 500);
++          asyncRequest(20, 500, false);
+       } finally {
+           dumpHeap("heapAsync.bin");
+       }
+   }
+   
+-  public void asyncRequest(int thr, int perthr) throws Exception {
++  public void xtest1000AsyncSpdy() throws Exception {
++      try {
++          asyncRequest(10, 20, true);
++      } finally {
++          dumpHeap("heapAsync.bin");
++      }
++      
++  }
++
++  public void xtest10000AsyncSpdy() throws Exception {
++      try {
++          asyncRequest(20, 500, true);
++      } finally {
++          dumpHeap("heapAsync.bin");
++      }
++  }
++  
++  public void asyncRequest(int thr, int perthr, boolean spdy) throws Exception {
+       reqCnt = thr * perthr;
++      if (spdy) {
++          // TODO: simpler API ( 'allowSpdy', etc ) - after negotiation is impl
++          clientCon.withConnectionManager(new SpdyConnection.SpdyConnectionManager());
++      }
+       long t0 = System.currentTimeMillis();
+       tr = new ThreadRunner(thr, perthr) {
+           public void makeRequest(int i) throws Exception {
+@@ -123,32 +143,34 @@ public class LiveHttpThreadedTest extends TestCase {
+       System.err.println(reqCnt + " Async requests: " + (System.currentTimeMillis() - t0));
+   }
+   
+-  public void xtestURLRequest() throws Exception {
+-      urlRequest(10, 200);
++  public void testURLRequest() throws Exception {
++      urlRequest(10, 100);
+   }
+ 
+   public void testURLRequest2() throws Exception {
+-      urlRequest(40, 500);
++      urlRequest(20, 500);
++
+   }
+   
++  /** 
++   * HttpURLConnection client against lite.http server.
++   */
+   public void urlRequest(int thr, int cnt) throws Exception {
++      long t0 = System.currentTimeMillis();
+           
+       
+       try {
+-          HttpConnector testServer = TestMain.testServer;
++          HttpConnector testServer = TestMain.getTestServer();
+           
+           tr = new ThreadRunner(thr, cnt) {
+ 
+               public void makeRequest(int i) throws Exception {
+                   try {
+-                      URL url = new URL("http://localhost:8802/hello");
+-                      HttpURLConnection con = (HttpURLConnection) url.openConnection();
+-                      con.setReadTimeout(4000000);
+-                      con.connect();
++                      ByteChunk out = new ByteChunk();
++                      HttpURLConnection con = TestMain.getUrl("http://localhost:8802/hello", out);
+                       if (con.getResponseCode() != 200) {
+                           errors.incrementAndGet();
+                       }
+-                      BBuffer out = new IOBuffer().append(con.getInputStream()).copyAll(null);
+                       if (!"Hello world".equals(out.toString())) {
+                           errors.incrementAndGet();
+                           System.err.println("bad result " + out);
+@@ -161,7 +183,10 @@ public class LiveHttpThreadedTest extends TestCase {
+           };
+           tr.run();
+           assertEquals(0, tr.errors.get());
+-          
++       
++          System.err.println(thr + " threads, " + (thr * cnt) + " total blocking URL requests: " + 
++                  (System.currentTimeMillis() - t0));
++
+           //assertEquals(testServer., actual)
+       } finally {
+           dumpHeap("heapURLReq.bin");
+
+==================================================
+WatchdogTestImpl.java
+index e59883ea57..1c40a2dfcd 100644
+--- a/modules/tomcat-lite/test/org/apache/tomcat/lite/proxy/ProxyTest.java
++++ b/modules/tomcat-lite/test/org/apache/tomcat/lite/proxy/ProxyTest.java
+@@ -28,7 +28,7 @@ public class ProxyTest extends TestCase {
+   String resStr;
+     
+   public void setUp() throws Exception {
+-      TestMain.initTestEnv();
++      TestMain.getTestServer();
+   }
+   
+   public void tearDown() throws IOException {
+
+==================================================

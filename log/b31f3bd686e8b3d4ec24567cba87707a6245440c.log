@@ -1,0 +1,179 @@
+b31f3bd686e8b3d4ec24567cba87707a6245440c
+==================================================
+Add a new Context option, enabled by default, that enables an additional check that a client provided session ID is in use in at least one other web application before allowing it to be used as the ID for a new session in the current web application.
+==================================================
+Mark Thomas
+==================================================
+Tue Nov 10 11:55:45 2015 +0000
+==================================================
+Context.java
+Add a new Context option, enabled by default, that enables an additional check that a client provided session ID is in use in at least one other web application before allowing it to be used as the ID for a new session in the current web application.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1713618 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Request.java
+index 8cc14cb000..b7b076305d 100644
+--- a/java/org/apache/catalina/Context.java
++++ b/java/org/apache/catalina/Context.java
+@@ -1680,4 +1680,32 @@ public interface Context extends Container {
+      * for this Context.
+      */
+     public CookieProcessor getCookieProcessor();
++
++    /**
++     * When a client provides the ID for a new session, should that ID be
++     * validated? The only use case for using a client provided session ID is to
++     * have a common session ID across multiple web applications. Therefore,
++     * any client provided session ID should already exist in another web
++     * application. If this check is enabled, the client provided session ID
++     * will only be used if the session ID exists in at least one other web
++     * application for the current host. Note that the following additional
++     * tests are always applied, irrespective of this setting:
++     * <ul>
++     * <li>The session ID is provided by a cookie</li>
++     * <li>The session cookie has a path of {@code /}</li>
++     * </ul>
++     *
++     * @param validateClientProvidedNewSessionId
++     *          {@code true} if validation should be applied
++     */
++    public void setValidateClientProvidedNewSessionId(boolean validateClientProvidedNewSessionId);
++
++    /**
++     * Will client provided session IDs be validated (see {@link
++     * #setValidateClientProvidedNewSessionId(boolean)}) before use?
++     *
++     * @return {@code true} if validation will be applied. Otherwise, {@code
++     *         false}
++     */
++    public boolean getValidateClientProvidedNewSessionId();
+ }
+
+==================================================
+StandardContext.java
+index 2072fa82ad..b324de4915 100644
+--- a/java/org/apache/catalina/connector/Request.java
++++ b/java/org/apache/catalina/connector/Request.java
+@@ -65,6 +65,7 @@ import javax.servlet.http.HttpUpgradeHandler;
+ import javax.servlet.http.Part;
+ import javax.servlet.http.PushBuilder;
+ 
++import org.apache.catalina.Container;
+ import org.apache.catalina.Context;
+ import org.apache.catalina.Globals;
+ import org.apache.catalina.Host;
+@@ -2827,16 +2828,49 @@ public class Request implements HttpServletRequest {
+                     sm.getString("coyoteRequest.sessionCreateCommitted"));
+         }
+ 
+-        // Attempt to reuse session id if one was submitted in a cookie
+-        // Do not reuse the session id if it is from a URL, to prevent possible
+-        // phishing attacks
+-        // Use the SSL session ID if one is present.
+-        if (("/".equals(context.getSessionCookiePath())
+-                && isRequestedSessionIdFromCookie()) || requestedSessionSSL ) {
+-            session = manager.createSession(getRequestedSessionId());
++        // Re-use session IDs provided by the client in very limited
++        // circumstances.
++        String sessionId = getRequestedSessionId();
++        if (requestedSessionSSL) {
++            // If the session ID has been obtained from the SSL handshake then
++            // use it.
++        } else if (("/".equals(context.getSessionCookiePath())
++                && isRequestedSessionIdFromCookie())) {
++            /* This is the common(ish) use case: using the same session ID with
++             * multiple web applications on the same host. Typically this is
++             * used by Portlet implementations. It only works if sessions are
++             * tracked via cookies. The cookie must have a path of "/" else it
++             * won't be provided to for requests to all web applications.
++             *
++             * Any session ID provided by the client should be for a session
++             * that already exists somewhere on the host. Check if the context
++             * is configured for this to be confirmed.
++             */
++            if (context.getValidateClientProvidedNewSessionId()) {
++                boolean found = false;
++                for (Container container : getHost().findChildren()) {
++                    Manager m = ((Context) container).getManager();
++                    if (m != null) {
++                        try {
++                            if (m.findSession(sessionId) != null) {
++                                found = true;
++                                break;
++                            }
++                        } catch (IOException e) {
++                            // Ignore. Problems with this manager will be
++                            // handled elsewhere.
++                        }
++                    }
++                }
++                if (!found) {
++                    sessionId = null;
++                }
++                sessionId = getRequestedSessionId();
++            }
+         } else {
+-            session = manager.createSession(null);
++            sessionId = null;
+         }
++        session = manager.createSession(sessionId);
+ 
+         // Creating a new session cookie based on that session
+         if (session != null
+
+==================================================
+FailedContext.java
+index d562d87f93..d8c8425118 100644
+--- a/java/org/apache/catalina/core/StandardContext.java
++++ b/java/org/apache/catalina/core/StandardContext.java
+@@ -814,9 +814,25 @@ public class StandardContext extends ContainerBase
+ 
+     private CookieProcessor cookieProcessor;
+ 
++    private boolean validateClientProvidedNewSessionId = true;
+ 
+     // ----------------------------------------------------- Context Properties
+ 
++    @Override
++    public void setValidateClientProvidedNewSessionId(boolean validateClientProvidedNewSessionId) {
++        this.validateClientProvidedNewSessionId = validateClientProvidedNewSessionId;
++    }
++
++    /**
++     * {@inheritDoc}
++     * <p>
++     * The default value for this implementation is {@code true}.
++     */
++    @Override
++    public boolean getValidateClientProvidedNewSessionId() {
++        return validateClientProvidedNewSessionId;
++    }
++
+     @Override
+     public void setCookieProcessor(CookieProcessor cookieProcessor) {
+         if (cookieProcessor == null) {
+
+==================================================
+TesterContext.java
+index 8993885600..f2383ff5a4 100644
+--- a/java/org/apache/catalina/startup/FailedContext.java
++++ b/java/org/apache/catalina/startup/FailedContext.java
+@@ -761,4 +761,12 @@ public class FailedContext extends LifecycleMBeanBase implements Context {
+ 
+     @Override
+     public CookieProcessor getCookieProcessor() { return null; }
++
++    @Override
++    public void setValidateClientProvidedNewSessionId(boolean validateClientProvidedNewSessionId) {
++        //NO-OP
++    }
++
++    @Override
++    public boolean getValidateClientProvidedNewSessionId() { return false; }
+ }
+\ No newline at end of file
+
+==================================================

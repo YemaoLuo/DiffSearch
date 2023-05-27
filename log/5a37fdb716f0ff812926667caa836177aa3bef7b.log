@@ -1,0 +1,890 @@
+5a37fdb716f0ff812926667caa836177aa3bef7b
+==================================================
+A further round of refactoring of writes. Primary change is the
+==================================================
+Mark Thomas
+==================================================
+Mon Jan 12 08:59:42 2015 +0000
+==================================================
+AjpProcessor.java
+A further round of refactoring of writes. Primary change is the
+use of socketWriteBuffer by default for all writes
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1651043 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+UpgradeServletOutputStream.java
+index 9584d669fc..5ac60dc67f 100644
+--- a/java/org/apache/coyote/ajp/AjpProcessor.java
++++ b/java/org/apache/coyote/ajp/AjpProcessor.java
+@@ -737,6 +737,7 @@ public class AjpProcessor<S> extends AbstractProcessor<S> {
+                     cping = true;
+                     try {
+                         socketWrapper.write(true, pongMessageArray, 0, pongMessageArray.length);
++                        socketWrapper.flush(true);
+                     } catch (IOException e) {
+                         setErrorState(ErrorState.CLOSE_NOW, e);
+                     }
+@@ -1035,6 +1036,7 @@ public class AjpProcessor<S> extends AbstractProcessor<S> {
+         // Request more data immediately
+         if (!waitingForBodyMessage) {
+             socketWrapper.write(true, getBodyMessageArray, 0, getBodyMessageArray.length);
++            socketWrapper.flush(true);
+             waitingForBodyMessage = true;
+         }
+ 
+@@ -1442,6 +1444,7 @@ public class AjpProcessor<S> extends AbstractProcessor<S> {
+         // Write to buffer
+         responseMessage.end();
+         socketWrapper.write(true, responseMessage.getBuffer(), 0, responseMessage.getLen());
++        socketWrapper.flush(true);
+     }
+ 
+ 
+@@ -1455,6 +1458,7 @@ public class AjpProcessor<S> extends AbstractProcessor<S> {
+         if (explicit && !finished) {
+             // Send the flush message
+             socketWrapper.write(true, flushMessageArray, 0, flushMessageArray.length);
++            socketWrapper.flush(true);
+         }
+     }
+ 
+@@ -1490,6 +1494,7 @@ public class AjpProcessor<S> extends AbstractProcessor<S> {
+         } else {
+             socketWrapper.write(true, endMessageArray, 0, endMessageArray.length);
+         }
++        socketWrapper.flush(true);
+     }
+ 
+ 
+@@ -1556,6 +1561,7 @@ public class AjpProcessor<S> extends AbstractProcessor<S> {
+             responseMessage.appendBytes(chunk.getBytes(), chunk.getOffset() + off, thisTime);
+             responseMessage.end();
+             socketWrapper.write(blocking, responseMessage.getBuffer(), 0, responseMessage.getLen());
++            socketWrapper.flush(blocking);
+ 
+             len -= thisTime;
+             off += thisTime;
+
+==================================================
+AprEndpoint.java
+index 8418bfd2b3..fae322aa8a 100644
+--- a/java/org/apache/coyote/http11/upgrade/UpgradeServletOutputStream.java
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeServletOutputStream.java
+@@ -122,6 +122,12 @@ public class UpgradeServletOutputStream extends ServletOutputStream {
+     }
+ 
+ 
++    @Override
++    public void flush() throws IOException {
++        socketWrapper.flush(listener == null);
++    }
++
++
+     @Override
+     public void close() throws IOException {
+         closeRequired = true;
+@@ -130,7 +136,7 @@ public class UpgradeServletOutputStream extends ServletOutputStream {
+ 
+ 
+     private void preWriteChecks() {
+-        if (listener != null && socketWrapper.hasDataToWrite()) {
++        if (listener != null && !socketWrapper.canWrite()) {
+             throw new IllegalStateException(sm.getString("upgrade.sis.write.ise"));
+         }
+     }
+
+==================================================
+Nio2Endpoint.java
+index 1f7806b297..27fab2584b 100644
+--- a/java/org/apache/tomcat/util/net/AprEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AprEndpoint.java
+@@ -2509,8 +2509,7 @@ public class AprEndpoint extends AbstractEndpoint<Long> {
+ 
+ 
+         @Override
+-        protected int doWrite(ByteBuffer bytebuffer, boolean block, boolean flip)
+-                throws IOException {
++        protected int doWrite(boolean block, boolean flip) throws IOException {
+             if (closed) {
+                 throw new IOException(sm.getString("apr.closed", getSocket()));
+             }
+@@ -2521,7 +2520,7 @@ public class AprEndpoint extends AbstractEndpoint<Long> {
+             readLock.lock();
+             try {
+                 if (getBlockingStatus() == block) {
+-                    return doWriteInternal(bytebuffer, flip);
++                    return doWriteInternal(flip);
+                 }
+             } finally {
+                 readLock.unlock();
+@@ -2541,7 +2540,7 @@ public class AprEndpoint extends AbstractEndpoint<Long> {
+                 readLock.lock();
+                 try {
+                     writeLock.unlock();
+-                    return doWriteInternal(bytebuffer, flip);
++                    return doWriteInternal(flip);
+                 } finally {
+                     readLock.unlock();
+                 }
+@@ -2555,10 +2554,9 @@ public class AprEndpoint extends AbstractEndpoint<Long> {
+         }
+ 
+ 
+-        private int doWriteInternal(ByteBuffer bytebuffer, boolean flip)
+-                throws IOException {
++        private int doWriteInternal(boolean flip) throws IOException {
+             if (flip) {
+-                bytebuffer.flip();
++                socketWriteBuffer.flip();
+                 writeBufferFlipped = true;
+             }
+ 
+@@ -2571,7 +2569,7 @@ public class AprEndpoint extends AbstractEndpoint<Long> {
+                     if (sslOutputBuffer.remaining() == 0) {
+                         // Buffer was fully written last time around
+                         sslOutputBuffer.clear();
+-                        transfer(bytebuffer, sslOutputBuffer);
++                        transfer(socketWriteBuffer, sslOutputBuffer);
+                         sslOutputBuffer.flip();
+                     } else {
+                         // Buffer still has data from previous attempt to write
+@@ -2585,8 +2583,9 @@ public class AprEndpoint extends AbstractEndpoint<Long> {
+                                 sslOutputBuffer.position() + sslWritten);
+                     }
+                 } else {
+-                    thisTime = Socket.sendb(getSocket().longValue(), bytebuffer,
+-                            bytebuffer.position(), bytebuffer.limit() - bytebuffer.position());
++                    thisTime = Socket.sendb(getSocket().longValue(),
++                            socketWriteBuffer, socketWriteBuffer.position(),
++                            socketWriteBuffer.limit() - socketWriteBuffer.position());
+                 }
+                 if (Status.APR_STATUS_IS_EAGAIN(-thisTime)) {
+                     thisTime = 0;
+@@ -2601,11 +2600,11 @@ public class AprEndpoint extends AbstractEndpoint<Long> {
+                             Integer.valueOf(-thisTime), getSocket(), this));
+                 }
+                 written += thisTime;
+-                bytebuffer.position(bytebuffer.position() + thisTime);
+-            } while (thisTime > 0 && bytebuffer.hasRemaining());
++                socketWriteBuffer.position(socketWriteBuffer.position() + thisTime);
++            } while (thisTime > 0 && socketWriteBuffer.hasRemaining());
+ 
+-            if (bytebuffer.remaining() == 0) {
+-                bytebuffer.clear();
++            if (socketWriteBuffer.remaining() == 0) {
++                socketWriteBuffer.clear();
+                 writeBufferFlipped = false;
+             }
+             // If there is data left in the buffer the socket will be registered for
+
+==================================================
+NioEndpoint.java
+index df1604ca32..9c6391dc47 100644
+--- a/java/org/apache/tomcat/util/net/Nio2Endpoint.java
++++ b/java/org/apache/tomcat/util/net/Nio2Endpoint.java
+@@ -1064,7 +1064,10 @@ public class Nio2Endpoint extends AbstractEndpoint<Nio2Channel> {
+ 
+         @Override
+         public void close() throws IOException {
+-            getSocket().close();
++            Nio2Channel socket = getSocket();
++            if (socket != null) {
++                socket.close();
++            }
+         }
+ 
+ 
+@@ -1107,167 +1110,128 @@ public class Nio2Endpoint extends AbstractEndpoint<Nio2Channel> {
+         }
+ 
+ 
++        /**
++         * {@inheritDoc}
++         * <p>
++         * Overridden for NIO2 to enable a gathering write to be used to write
++         * all of the remaining data in a single additional write should a
++         * non-blocking write leave data in the buffer.
++         */
+         @Override
+-        public void write(boolean block, byte[] buf, int off, int len) throws IOException {
+-            if (len == 0 || getSocket() == null)
+-                return;
+-
+-            if (block) {
+-                try {
+-                    do {
+-                        int thisTime = transfer(buf, off, len, socketWriteBuffer);
+-                        len = len - thisTime;
+-                        off = off + thisTime;
+-                        socketWriteBuffer.flip();
+-                        while (socketWriteBuffer.hasRemaining()) {
+-                            if (getSocket().write(socketWriteBuffer).get(getTimeout(), TimeUnit.MILLISECONDS).intValue() < 0) {
+-                                throw new EOFException(sm.getString("iob.failedwrite"));
+-                            }
+-                        }
+-                        socketWriteBuffer.clear();
+-                    } while (len > 0);
+-                } catch (ExecutionException e) {
+-                    if (e.getCause() instanceof IOException) {
+-                        throw (IOException) e.getCause();
+-                    } else {
+-                        throw new IOException(e);
+-                    }
+-                } catch (InterruptedException e) {
+-                    throw new IOException(e);
+-                } catch (TimeoutException e) {
+-                    throw new SocketTimeoutException();
+-                }
+-            } else {
+-                // FIXME: Possible new behavior:
+-                // If there's non blocking abuse (like a test writing 1MB in a single
+-                // "non blocking" write), then block until the previous write is
+-                // done rather than continue buffering
+-                // Also allows doing autoblocking
+-                // Could be "smart" with coordination with the main CoyoteOutputStream to
+-                // indicate the end of a write
+-                // Uses: if (writePending.tryAcquire(socketWrapper.getTimeout(), TimeUnit.MILLISECONDS))
+-                synchronized (writeCompletionHandler) {
+-                    if (writePending.tryAcquire()) {
+-                        // No pending completion handler, so writing to the main buffer
+-                        // is possible
+-                        int thisTime = transfer(buf, off, len, socketWriteBuffer);
+-                        len = len - thisTime;
+-                        off = off + thisTime;
+-                        if (len > 0) {
+-                            // Remaining data must be buffered
+-                            addToBuffers(buf, off, len);
+-                        }
+-                        flush(false, true);
+-                    } else {
++        protected void writeNonBlocking(byte[] buf, int off, int len) throws IOException {
++            // FIXME: Possible new behavior:
++            // If there's non blocking abuse (like a test writing 1MB in a single
++            // "non blocking" write), then block until the previous write is
++            // done rather than continue buffering
++            // Also allows doing autoblocking
++            // Could be "smart" with coordination with the main CoyoteOutputStream to
++            // indicate the end of a write
++            // Uses: if (writePending.tryAcquire(socketWrapper.getTimeout(), TimeUnit.MILLISECONDS))
++            synchronized (writeCompletionHandler) {
++                if (writePending.tryAcquire()) {
++                    // No pending completion handler, so writing to the main buffer
++                    // is possible
++                    int thisTime = transfer(buf, off, len, socketWriteBuffer);
++                    len = len - thisTime;
++                    off = off + thisTime;
++                    if (len > 0) {
++                        // Remaining data must be buffered
+                         addToBuffers(buf, off, len);
+                     }
++                    flushNonBlocking(true);
++                } else {
++                    addToBuffers(buf, off, len);
+                 }
+             }
+         }
+ 
+ 
+         @Override
+-        protected int doWrite(ByteBuffer buffer, boolean block, boolean flip) throws IOException {
+-            // NO-OP for NIO2 since write(boolean, byte[], int, int)  and
+-            // flush(boolean, boolean) are over-ridden.
+-            return 0;
++        protected int doWrite(boolean block, boolean flip) throws IOException {
++            // Only called in the non-blocking case since
++            // writeNonBlocking(byte[], int, int) and flush(boolean, boolean)
++            // are over-ridden.
++
++            int result = -1;
++            try {
++                socketWriteBuffer.flip();
++                result = socketWriteBuffer.remaining();
++                while (socketWriteBuffer.hasRemaining()) {
++                    if (getSocket().write(socketWriteBuffer).get(getTimeout(), TimeUnit.MILLISECONDS).intValue() < 0) {
++                        throw new EOFException(sm.getString("iob.failedwrite"));
++                    }
++                }
++                socketWriteBuffer.clear();
++                return result;
++            } catch (ExecutionException e) {
++                if (e.getCause() instanceof IOException) {
++                    throw (IOException) e.getCause();
++                } else {
++                    throw new IOException(e);
++                }
++            } catch (InterruptedException e) {
++                throw new IOException(e);
++            } catch (TimeoutException e) {
++                throw new SocketTimeoutException();
++            }
+         }
+ 
+ 
+         @Override
+-        public boolean flush(boolean block) throws IOException {
+-            if (getError() != null) {
+-                throw getError();
++        protected void flushBlocking() throws IOException {
++            // Before doing a blocking flush, make sure that any pending non
++            // blocking write has completed.
++            try {
++                if (writePending.tryAcquire(getTimeout(), TimeUnit.MILLISECONDS)) {
++                    writePending.release();
++                } else {
++                    throw new SocketTimeoutException();
++                }
++            } catch (InterruptedException e) {
++                // Ignore
+             }
+-            return super.flush(block);
+-        }
+ 
++            super.flushBlocking();
++        }
+ 
+         @Override
+-        protected boolean flush(boolean block, boolean hasPermit) throws IOException {
+-            if (getSocket() == null)
+-                return false;
++        protected boolean flushNonBlocking() {
++            return flushNonBlocking(false);
++        }
+ 
+-            if (block) {
+-                try {
+-                    if (writePending.tryAcquire(getTimeout(), TimeUnit.MILLISECONDS)) {
+-                        writePending.release();
+-                    } else {
+-                        // TODO
+-                    }
+-                } catch (InterruptedException e) {
+-                    // Ignore timeout
+-                }
+-                try {
+-                    if (bufferedWrites.size() > 0) {
+-                        for (ByteBufferHolder holder : bufferedWrites) {
+-                            holder.flip();
+-                            ByteBuffer buffer = holder.getBuf();
+-                            while (buffer.hasRemaining()) {
+-                                if (getSocket().write(buffer).get(getTimeout(), TimeUnit.MILLISECONDS).intValue() < 0) {
+-                                    throw new EOFException(sm.getString("iob.failedwrite"));
+-                                }
+-                            }
+-                        }
+-                        bufferedWrites.clear();
+-                    }
++        private boolean flushNonBlocking(boolean hasPermit) {
++            synchronized (writeCompletionHandler) {
++                if (hasPermit || writePending.tryAcquire()) {
+                     if (!writeBufferFlipped) {
+                         socketWriteBuffer.flip();
+                         writeBufferFlipped = true;
+                     }
+-                    while (socketWriteBuffer.hasRemaining()) {
+-                        if (getSocket().write(socketWriteBuffer).get(getTimeout(), TimeUnit.MILLISECONDS).intValue() < 0) {
+-                            throw new EOFException(sm.getString("iob.failedwrite"));
+-                        }
+-                    }
+-                } catch (ExecutionException e) {
+-                    if (e.getCause() instanceof IOException) {
+-                        throw (IOException) e.getCause();
+-                    } else {
+-                        throw new IOException(e);
+-                    }
+-                } catch (InterruptedException e) {
+-                    throw new IOException(e);
+-                } catch (TimeoutException e) {
+-                    throw new SocketTimeoutException();
+-                }
+-                socketWriteBuffer.clear();
+-                writeBufferFlipped = false;
+-                return false;
+-            } else {
+-                synchronized (writeCompletionHandler) {
+-                    if (hasPermit || writePending.tryAcquire()) {
+-                        if (!writeBufferFlipped) {
+-                            socketWriteBuffer.flip();
+-                            writeBufferFlipped = true;
++                    if (bufferedWrites.size() > 0) {
++                        // Gathering write of the main buffer plus all leftovers
++                        ArrayList<ByteBuffer> arrayList = new ArrayList<>();
++                        if (socketWriteBuffer.hasRemaining()) {
++                            arrayList.add(socketWriteBuffer);
+                         }
+-                        if (bufferedWrites.size() > 0) {
+-                            // Gathering write of the main buffer plus all leftovers
+-                            ArrayList<ByteBuffer> arrayList = new ArrayList<>();
+-                            if (socketWriteBuffer.hasRemaining()) {
+-                                arrayList.add(socketWriteBuffer);
+-                            }
+-                            for (ByteBufferHolder buffer : bufferedWrites) {
+-                                buffer.flip();
+-                                arrayList.add(buffer.getBuf());
+-                            }
+-                            bufferedWrites.clear();
+-                            ByteBuffer[] array = arrayList.toArray(new ByteBuffer[arrayList.size()]);
+-                            getSocket().write(array, 0, array.length, getTimeout(),
+-                                    TimeUnit.MILLISECONDS, array, gatheringWriteCompletionHandler);
+-                        } else if (socketWriteBuffer.hasRemaining()) {
+-                            // Regular write
+-                            getSocket().write(socketWriteBuffer, getTimeout(),
+-                                    TimeUnit.MILLISECONDS, socketWriteBuffer, writeCompletionHandler);
+-                        } else {
+-                            // Nothing was written
+-                            writePending.release();
+-                            socketWriteBuffer.clear();
+-                            writeBufferFlipped = false;
++                        for (ByteBufferHolder buffer : bufferedWrites) {
++                            buffer.flip();
++                            arrayList.add(buffer.getBuf());
+                         }
++                        bufferedWrites.clear();
++                        ByteBuffer[] array = arrayList.toArray(new ByteBuffer[arrayList.size()]);
++                        getSocket().write(array, 0, array.length, getTimeout(),
++                                TimeUnit.MILLISECONDS, array, gatheringWriteCompletionHandler);
++                    } else if (socketWriteBuffer.hasRemaining()) {
++                        // Regular write
++                        getSocket().write(socketWriteBuffer, getTimeout(),
++                                TimeUnit.MILLISECONDS, socketWriteBuffer, writeCompletionHandler);
++                    } else {
++                        // Nothing was written
++                        writePending.release();
++                        socketWriteBuffer.clear();
++                        writeBufferFlipped = false;
+                     }
+-                    return hasDataToWrite();
+                 }
++                return hasDataToWrite();
+             }
+         }
+ 
+
+==================================================
+SocketWrapperBase.java
+index b58c1c4b31..be0f981528 100644
+--- a/java/org/apache/tomcat/util/net/NioEndpoint.java
++++ b/java/org/apache/tomcat/util/net/NioEndpoint.java
+@@ -1472,7 +1472,10 @@ public class NioEndpoint extends AbstractEndpoint<NioChannel> {
+ 
+         @Override
+         public void close() throws IOException {
+-            getSocket().close();
++            NioChannel socket = getSocket();
++            if (socket != null) {
++                socket.close();
++            }
+         }
+ 
+ 
+@@ -1509,10 +1512,10 @@ public class NioEndpoint extends AbstractEndpoint<NioChannel> {
+ 
+ 
+         @Override
+-        protected synchronized int doWrite(ByteBuffer bytebuffer, boolean block, boolean flip)
++        protected synchronized int doWrite(boolean block, boolean flip)
+                 throws IOException {
+             if (flip) {
+-                bytebuffer.flip();
++                socketWriteBuffer.flip();
+                 writeBufferFlipped = true;
+             }
+ 
+@@ -1525,7 +1528,7 @@ public class NioEndpoint extends AbstractEndpoint<NioChannel> {
+                 // Ignore
+             }
+             try {
+-                written = pool.write(bytebuffer, getSocket(), selector, writeTimeout, block);
++                written = pool.write(socketWriteBuffer, getSocket(), selector, writeTimeout, block);
+                 // Make sure we are flushed
+                 do {
+                     if (getSocket().flush(true, selector, writeTimeout)) break;
+@@ -1535,8 +1538,8 @@ public class NioEndpoint extends AbstractEndpoint<NioChannel> {
+                     pool.put(selector);
+                 }
+             }
+-            if (bytebuffer.remaining() == 0) {
+-                bytebuffer.clear();
++            if (socketWriteBuffer.remaining() == 0) {
++                socketWriteBuffer.clear();
+                 writeBufferFlipped = false;
+             }
+             // If there is data left in the buffer the socket will be registered for
+
+==================================================
+WsRemoteEndpointImplServer.java
+index b999f8fc46..7fbd4b5e45 100644
+--- a/java/org/apache/tomcat/util/net/SocketWrapperBase.java
++++ b/java/org/apache/tomcat/util/net/SocketWrapperBase.java
+@@ -188,9 +188,9 @@ public abstract class SocketWrapperBase<E> {
+     }
+ 
+     /**
+-     * Checks to see if there is any writes pending and if there is calls
++     * Checks to see if there are any writes pending and if there are calls
+      * {@link #registerWriteInterest()} to trigger a callback once the pending
+-     * write has completed.
++     * writes have completed.
+      * <p>
+      * Note: Once this method has returned <code>false</code> it <b>MUST NOT</b>
+      *       be called again until the pending write has completed and the
+@@ -202,13 +202,19 @@ public abstract class SocketWrapperBase<E> {
+      *         written otherwise <code>false</code>
+      */
+     public boolean isReadyForWrite() {
+-        boolean result = !hasDataToWrite();
++        boolean result = canWrite();
+         if (!result) {
+             registerWriteInterest();
+         }
+         return result;
+     }
+ 
++
++    public boolean canWrite() {
++        return !writeBufferFlipped && socketWriteBuffer.hasRemaining() &&
++                bufferedWrites.size() == 0;
++    }
++
+     public void addDispatch(DispatchType dispatchType) {
+         synchronized (dispatches) {
+             dispatches.add(dispatchType);
+@@ -286,79 +292,116 @@ public abstract class SocketWrapperBase<E> {
+     public abstract void unRead(ByteBuffer input);
+     public abstract void close() throws IOException;
+ 
++
+     /**
+      * Writes the provided data to the socket, buffering any remaining data if
+-     * used in non-blocking mode. If any data remains in the buffers from a
+-     * previous write then that data will be written before this data. It is
+-     * therefore unnecessary to call flush() before calling this method.
++     * used in non-blocking mode.
+      *
+      * @param block <code>true<code> if a blocking write should be used,
+      *                  otherwise a non-blocking write will be used
+-     * @param b     The byte array containing the data to be written
++     * @param buf   The byte array containing the data to be written
+      * @param off   The offset within the byte array of the data to be written
+      * @param len   The length of the data to be written
+      *
+      * @throws IOException If an IO error occurs during the write
+      */
+-    public void write(boolean block, byte[] b, int off, int len) throws IOException {
+-        // Always flush any data remaining in the buffers
+-        boolean dataLeft = flush(block, true);
+-
+-        if (len == 0 || b == null) {
++    public void write(boolean block, byte[] buf, int off, int len) throws IOException {
++        if (len == 0 || buf == null || getSocket() == null) {
+             return;
+         }
+ 
+-        // Keep writing until all the data is written or a non-blocking write
+-        // leaves data in the buffer
+-        while (!dataLeft && len > 0) {
+-            int thisTime = transfer(b, off, len, socketWriteBuffer);
+-            len = len - thisTime;
+-            off = off + thisTime;
+-            int written = doWrite(socketWriteBuffer, block, true);
+-            if (written == 0) {
+-                dataLeft = true;
+-            } else {
+-                dataLeft = flush(block, true);
+-            }
++        // While the implementations for blocking and non-blocking writes are
++        // very similar they have been split into separate methods to allow
++        // sub-classes to override them individually. NIO2, for example,
++        // overrides the non-blocking write but not the blocking write.
++        if (block) {
++            writeBlocking(buf, off, len);
++        } else {
++            writeNonBlocking(buf, off, len);
+         }
+ 
+-        // Prevent timeouts for just doing client writes
++        // Prevent timeouts
+         access();
++    }
+ 
+-        if (!block && len > 0) {
+-            // Remaining data must be buffered
+-            addToBuffers(b, off, len);
++
++    /**
++     * Transfers the data to the socket write buffer (writing that data to the
++     * socket if the buffer fills up using a blocking write) until all the data
++     * has been transferred and space remains in the socket write buffer.
++     *
++     * @param buf   The byte array containing the data to be written
++     * @param off   The offset within the byte array of the data to be written
++     * @param len   The length of the data to be written
++     *
++     * @throws IOException If an IO error occurs during the write
++     */
++    protected void writeBlocking(byte[] buf, int off, int len) throws IOException {
++        // Note: There is an implementation assumption that if the switch from
++        //       non-blocking to blocking has been made then any pending
++        //       non-blocking writes were flushed at the time the switch
++        //       occurred.
++
++        // Keep writing until all the data has been transferred to the socket
++        // write buffer and space remains in that buffer
++        int thisTime = transfer(buf, off, len, socketWriteBuffer);
++        while (socketWriteBuffer.remaining() == 0) {
++            len = len - thisTime;
++            off = off + thisTime;
++            // TODO: There is an assumption here that the blocking write will
++            //       block until all the data is written or the write times out.
++            //       Document this assumption in the Javadoc for doWrite(),
++            //       ensure it is valid for all implementations of doWrite() and
++            //       then review all callers of doWrite() and review what
++            //       simplifications this offers.
++            doWrite(true, true);
++            thisTime = transfer(buf, off, len, socketWriteBuffer);
+         }
+     }
+ 
+ 
+     /**
+-     * Writes as much data as possible from any that remains in the buffers.
++     * Transfers the data to the socket write buffer (writing that data to the
++     * socket if the buffer fills up using a non-blocking write) until either
++     * all the data has been transferred and space remains in the socket write
++     * buffer or a non-blocking write leaves data in the socket write buffer.
+      *
+-     * @param block <code>true<code> if a blocking write should be used,
+-     *                  otherwise a non-blocking write will be used
+-     *
+-     * @return <code>true</code> if data remains to be flushed after this method
+-     *         completes, otherwise <code>false</code>. In blocking mode
+-     *         therefore, the return value should always be <code>false</code>
++     * @param buf   The byte array containing the data to be written
++     * @param off   The offset within the byte array of the data to be written
++     * @param len   The length of the data to be written
+      *
+      * @throws IOException If an IO error occurs during the write
+      */
+-    public boolean flush(boolean block) throws IOException {
+-        return flush(block, false);
++    protected void writeNonBlocking(byte[] buf, int off, int len) throws IOException {
++        if (!writeBufferFlipped) {
++            int thisTime = transfer(buf, off, len, socketWriteBuffer);
++            len = len - thisTime;
++            while (socketWriteBuffer.remaining() == 0) {
++                off = off + thisTime;
++                if (doWrite(false, !writeBufferFlipped) == 0) {
++                    break;
++                }
++                if (writeBufferFlipped) {
++                    thisTime = 0;
++                } else {
++                    thisTime = transfer(buf, off, len, socketWriteBuffer);
++                }
++                len = len - thisTime;
++            }
++        }
++
++        if (len > 0) {
++            // Remaining data must be buffered
++            addToBuffers(buf, off, len);
++        }
+     }
+ 
+ 
+     /**
+      * Writes as much data as possible from any that remains in the buffers.
+-     * This method exists for those implementations (e.g. NIO2) that need
+-     * slightly different behaviour depending on if flush() was called directly
+-     * or by another method in this class or a sub-class.
+      *
+-     * @param block    <code>true<code> if a blocking write should be used,
+-     *                     otherwise a non-blocking write will be used
+-     * @param internal <code>true<code> if flush() was called by another method
+-     *                     in class or sub-class
++     * @param block <code>true<code> if a blocking write should be used,
++     *                  otherwise a non-blocking write will be used
+      *
+      * @return <code>true</code> if data remains to be flushed after this method
+      *         completes, otherwise <code>false</code>. In blocking mode
+@@ -366,16 +409,57 @@ public abstract class SocketWrapperBase<E> {
+      *
+      * @throws IOException If an IO error occurs during the write
+      */
+-    protected boolean flush(boolean block, boolean internal) throws IOException {
++    public boolean flush(boolean block) throws IOException {
++        if (getSocket() == null) {
++            return false;
++        }
+ 
+-        // Prevent timeout for async
++        if (getError() != null) {
++            throw getError();
++        }
++
++        boolean result = false;
++        if (block) {
++            // A blocking flush will always empty the buffer.
++            flushBlocking();
++        } else {
++            result = flushNonBlocking();
++        }
++
++        // Prevent timeouts
+         access();
+ 
++        return result;
++    }
++
++
++    protected void flushBlocking() throws IOException {
++        doWrite(true, !writeBufferFlipped);
++
++        if (bufferedWrites.size() > 0) {
++            Iterator<ByteBufferHolder> bufIter = bufferedWrites.iterator();
++            while (!hasMoreDataToFlush() && bufIter.hasNext()) {
++                ByteBufferHolder buffer = bufIter.next();
++                buffer.flip();
++                while (!hasMoreDataToFlush() && buffer.getBuf().remaining()>0) {
++                    transfer(buffer.getBuf(), socketWriteBuffer);
++                    if (buffer.getBuf().remaining() == 0) {
++                        bufIter.remove();
++                    }
++                    doWrite(true, !writeBufferFlipped);
++                }
++            }
++        }
++
++    }
++
++
++    protected boolean flushNonBlocking() throws IOException {
+         boolean dataLeft = hasMoreDataToFlush();
+ 
+         // Write to the socket, if there is anything to write
+         if (dataLeft) {
+-            doWrite(socketWriteBuffer, block, !writeBufferFlipped);
++            doWrite(false, !writeBufferFlipped);
+         }
+ 
+         dataLeft = hasMoreDataToFlush();
+@@ -385,13 +469,12 @@ public abstract class SocketWrapperBase<E> {
+             while (!hasMoreDataToFlush() && bufIter.hasNext()) {
+                 ByteBufferHolder buffer = bufIter.next();
+                 buffer.flip();
+-                while (!hasMoreDataToFlush() && buffer.getBuf().remaining()>0) {
++                while (!hasMoreDataToFlush() && buffer.getBuf().remaining() > 0) {
+                     transfer(buffer.getBuf(), socketWriteBuffer);
+                     if (buffer.getBuf().remaining() == 0) {
+                         bufIter.remove();
+                     }
+-                    doWrite(socketWriteBuffer, block, true);
+-                    //here we must break if we didn't finish the write
++                    doWrite(false, !writeBufferFlipped);
+                 }
+             }
+         }
+@@ -400,8 +483,7 @@ public abstract class SocketWrapperBase<E> {
+     }
+ 
+ 
+-    protected abstract int doWrite(ByteBuffer buffer, boolean block, boolean flip)
+-            throws IOException;
++    protected abstract int doWrite(boolean block, boolean flip) throws IOException;
+ 
+ 
+     protected void addToBuffers(byte[] buf, int offset, int length) {
+
+==================================================
+TestNonBlockingAPI.java
+index f62f2d4389..58cfe5a5bc 100644
+--- a/java/org/apache/tomcat/websocket/server/WsRemoteEndpointImplServer.java
++++ b/java/org/apache/tomcat/websocket/server/WsRemoteEndpointImplServer.java
+@@ -88,7 +88,7 @@ public class WsRemoteEndpointImplServer extends WsRemoteEndpointImplBase {
+             // was written
+             return;
+         }
+-        boolean complete = true;
++        boolean complete = false;
+         try {
+             // If this is false there will be a call back when it is true
+             while (sos.isReady()) {
+@@ -103,6 +103,7 @@ public class WsRemoteEndpointImplServer extends WsRemoteEndpointImplBase {
+                     }
+                 }
+                 if (complete) {
++                    sos.flush();
+                     wsWriteTimeout.unregister(this);
+                     clearHandler(null, useDispatch);
+                     if (close) {
+@@ -117,9 +118,9 @@ public class WsRemoteEndpointImplServer extends WsRemoteEndpointImplBase {
+             clearHandler(ioe, useDispatch);
+             close();
+         }
++
+         if (!complete) {
+             // Async write is in progress
+-
+             long timeout = getSendTimeout();
+             if (timeout > 0) {
+                 // Register with timeout thread
+
+==================================================
+TestUpgrade.java
+index 532049c21d..c20ffc9406 100644
+--- a/test/org/apache/catalina/nonblocking/TestNonBlockingAPI.java
++++ b/test/org/apache/catalina/nonblocking/TestNonBlockingAPI.java
+@@ -221,19 +221,19 @@ public class TestNonBlockingAPI extends TomcatBaseTest {
+                 boolean found = false;
+                 for (int i = totalBodyRead; i < (totalBodyRead + line.length()); i++) {
+                     if (DATA[i] != resultBytes[lineStart + i - totalBodyRead]) {
+-                        int dataStart = i - 16;
++                        int dataStart = i - 64;
+                         if (dataStart < 0) {
+                             dataStart = 0;
+                         }
+-                        int dataEnd = i + 16;
++                        int dataEnd = i + 64;
+                         if (dataEnd > DATA.length) {
+                             dataEnd = DATA.length;
+                         }
+-                        int resultStart = lineStart + i - totalBodyRead - 16;
++                        int resultStart = lineStart + i - totalBodyRead - 64;
+                         if (resultStart < 0) {
+                             resultStart = 0;
+                         }
+-                        int resultEnd = lineStart + i - totalBodyRead + 16;
++                        int resultEnd = lineStart + i - totalBodyRead + 64;
+                         if (resultEnd > resultString.length()) {
+                             resultEnd = resultString.length();
+                         }
+@@ -492,25 +492,21 @@ public class TestNonBlockingAPI extends TomcatBaseTest {
+                 @Override
+                 public void onTimeout(AsyncEvent event) throws IOException {
+                     log.info("onTimeout");
+-
+                 }
+ 
+                 @Override
+                 public void onStartAsync(AsyncEvent event) throws IOException {
+                     log.info("onStartAsync");
+-
+                 }
+ 
+                 @Override
+                 public void onError(AsyncEvent event) throws IOException {
+                     log.info("AsyncListener.onError");
+-
+                 }
+ 
+                 @Override
+                 public void onComplete(AsyncEvent event) throws IOException {
+                     log.info("onComplete");
+-
+                 }
+             });
+             // step 2 - notify on read
+
+==================================================

@@ -1,0 +1,139 @@
+530186ab0cb166e825405b64f3c91a712a6c0544
+==================================================
+Fix an NPE in the Manager web application when displaying ciphers for APR/native
+==================================================
+Mark Thomas
+==================================================
+Sat Jan 30 00:18:19 2016 +0000
+==================================================
+AprEndpoint.java
+Fix an NPE in the Manager web application when displaying ciphers for APR/native
+Align OpenSsl's handling of enabled ciphers/protocols with JSSE
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1727667 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+SSLUtilBase.java
+index cc3067f562..1b179575a9 100644
+--- a/java/org/apache/tomcat/util/net/AprEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AprEndpoint.java
+@@ -24,7 +24,9 @@ import java.nio.channels.CompletionHandler;
+ import java.nio.charset.StandardCharsets;
+ import java.util.ArrayList;
+ import java.util.HashMap;
++import java.util.List;
+ import java.util.Map;
++import java.util.Set;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.Executor;
+ import java.util.concurrent.RejectedExecutionException;
+@@ -54,6 +56,7 @@ import org.apache.tomcat.util.buf.ByteBufferUtils;
+ import org.apache.tomcat.util.net.AbstractEndpoint.Acceptor.AcceptorState;
+ import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
+ import org.apache.tomcat.util.net.SSLHostConfig.Type;
++import org.apache.tomcat.util.net.openssl.OpenSSLEngine;
+ 
+ 
+ /**
+@@ -346,13 +349,32 @@ public class AprEndpoint extends AbstractEndpoint<Long> implements SNICallBack {
+         if (isSSLEnabled()) {
+             for (SSLHostConfig sslHostConfig : sslHostConfigs.values()) {
+ 
+-                for (SSLHostConfigCertificate certificate : sslHostConfig.getCertificates(true)) {
++                Set<SSLHostConfigCertificate> certificates = sslHostConfig.getCertificates(true);
++                boolean firstCertificate = true;
++                for (SSLHostConfigCertificate certificate : certificates) {
+                     if (SSLHostConfig.adjustRelativePath(certificate.getCertificateFile()) == null) {
+                         // This is required
+                         throw new Exception(sm.getString("endpoint.apr.noSslCertFile"));
+                     }
++                    if (firstCertificate) {
++                        // TODO: Duplicates code in SSLUtilBase. Consider
++                        //       refactoring to reduce duplication
++                        firstCertificate = false;
++                        // Configure the enabled protocols
++                        List<String> enabledProtocols = SSLUtilBase.getEnabled("protocols", log,
++                                true, sslHostConfig.getProtocols(),
++                                OpenSSLEngine.IMPLEMENTED_PROTOCOLS_SET);
++                        sslHostConfig.setEnabledProtocols(
++                                enabledProtocols.toArray(new String[enabledProtocols.size()]));
++                        // Configure the enabled ciphers
++                        List<String> enabledCiphers = SSLUtilBase.getEnabled("ciphers", log,
++                                false, sslHostConfig.getJsseCipherNames(),
++                                OpenSSLEngine.AVAILABLE_CIPHER_SUITES);
++                        sslHostConfig.setEnabledCiphers(
++                                enabledCiphers.toArray(new String[enabledCiphers.size()]));
++                    }
+                 }
+-                if (sslHostConfig.getCertificates().size() > 2) {
++                if (certificates.size() > 2) {
+                     // TODO: Can this limitation be removed?
+                     throw new Exception(sm.getString("endpoint.apr.tooManyCertFiles"));
+                 }
+@@ -363,7 +385,7 @@ public class AprEndpoint extends AbstractEndpoint<Long> implements SNICallBack {
+                     // Native fallback used if protocols=""
+                     value = SSL.SSL_PROTOCOL_ALL;
+                 } else {
+-                    for (String protocol : sslHostConfig.getProtocols()) {
++                    for (String protocol : sslHostConfig.getEnabledProtocols()) {
+                         if (Constants.SSL_PROTO_SSLv2Hello.equalsIgnoreCase(protocol)) {
+                             // NO-OP. OpenSSL always supports SSLv2Hello
+                         } else if (Constants.SSL_PROTO_SSLv2.equalsIgnoreCase(protocol)) {
+
+==================================================
+OpenSSLEngine.java
+index a57c3e8d18..f4dd847a60 100644
+--- a/java/org/apache/tomcat/util/net/SSLUtilBase.java
++++ b/java/org/apache/tomcat/util/net/SSLUtilBase.java
+@@ -45,19 +45,19 @@ public abstract class SSLUtilBase implements SSLUtil {
+         Set<String> configuredProtocols = sslHostConfig.getProtocols();
+         Set<String> implementedProtocols = getImplementedProtocols();
+         List<String> enabledProtocols =
+-                getEnabled("protocols", true, configuredProtocols, implementedProtocols);
++                getEnabled("protocols", getLog(), true, configuredProtocols, implementedProtocols);
+         this.enabledProtocols = enabledProtocols.toArray(new String[enabledProtocols.size()]);
+ 
+         // Calculate the enabled ciphers
+         List<String> configuredCiphers = sslHostConfig.getJsseCipherNames();
+         Set<String> implementedCiphers = getImplementedCiphers();
+         List<String> enabledCiphers =
+-                getEnabled("ciphers", false, configuredCiphers, implementedCiphers);
++                getEnabled("ciphers", getLog(), false, configuredCiphers, implementedCiphers);
+         this.enabledCiphers = enabledCiphers.toArray(new String[enabledCiphers.size()]);
+     }
+ 
+ 
+-    private <T> List<T> getEnabled(String name, boolean warnOnSkip, Collection<T> configured,
++    static <T> List<T> getEnabled(String name, Log log, boolean warnOnSkip, Collection<T> configured,
+             Collection<T> implemented) {
+ 
+         List<T> enabled = new ArrayList<>();
+@@ -80,19 +80,19 @@ public abstract class SSLUtilBase implements SSLUtil {
+                 throw new IllegalArgumentException(
+                         sm.getString("sslUtilBase.noneSupported", name, configured));
+             }
+-            if (getLog().isDebugEnabled()) {
+-                getLog().debug(sm.getString("sslUtilBase.active", name, enabled));
++            if (log.isDebugEnabled()) {
++                log.debug(sm.getString("sslUtilBase.active", name, enabled));
+             }
+-            if (getLog().isDebugEnabled() || warnOnSkip) {
++            if (log.isDebugEnabled() || warnOnSkip) {
+                 if (enabled.size() != configured.size()) {
+                     List<T> skipped = new ArrayList<>();
+                     skipped.addAll(configured);
+                     skipped.removeAll(enabled);
+                     String msg = sm.getString("sslUtilBase.skipped", name, skipped);
+                     if (warnOnSkip) {
+-                        getLog().warn(msg);
++                        log.warn(msg);
+                     } else {
+-                        getLog().debug(msg);
++                        log.debug(msg);
+                     }
+                 }
+             }
+
+==================================================

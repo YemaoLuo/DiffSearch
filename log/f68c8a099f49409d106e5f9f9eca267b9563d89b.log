@@ -1,0 +1,198 @@
+f68c8a099f49409d106e5f9f9eca267b9563d89b
+==================================================
+Implement new isFinished() method that identifies when a request body has been fully read. Required since available()==0 != isFinished()
+==================================================
+Mark Emlyn
+==================================================
+Fri May 24 14:08:25 2013 +0000
+==================================================
+Request.java
+Implement new isFinished() method that identifies when a request body has been fully read. Required since available()==0 != isFinished()
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1486060 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+ActionCode.java
+index aea441e285..5c153148b6 100644
+--- a/java/org/apache/catalina/connector/Request.java
++++ b/java/org/apache/catalina/connector/Request.java
+@@ -2443,6 +2443,18 @@ public class Request
+         return (inputBuffer.available() > 0);
+     }
+ 
++
++    /**
++     * Return true if an attempt has been made to read the request body and all
++     * of the request body has been read
++     */
++    public boolean isFinished() {
++        AtomicBoolean result = new AtomicBoolean(false);
++        coyoteRequest.action(ActionCode.REQUEST_BODY_FULLY_READ, result);
++        return result.get();
++    }
++
++
+     /**
+      * Disable swallowing of remaining input if configured
+      */
+
+==================================================
+AbstractHttp11Processor.java
+index 3decdd945a..891e142d0d 100644
+--- a/java/org/apache/coyote/ActionCode.java
++++ b/java/org/apache/coyote/ActionCode.java
+@@ -210,5 +210,10 @@ public enum ActionCode {
+      *Indicator that the Servlet is interested
+      *in being notified when it can write data
+      */
+-    NB_WRITE_INTEREST
++    NB_WRITE_INTEREST,
++
++    /**
++     * Indicates if the request body has been fully read.
++     */
++    REQUEST_BODY_FULLY_READ
+ }
+
+==================================================
+AbstractInputBuffer.java
+index f84a0244d1..cbfef970bd 100644
+--- a/java/org/apache/coyote/http11/AbstractHttp11Processor.java
++++ b/java/org/apache/coyote/http11/AbstractHttp11Processor.java
+@@ -822,6 +822,9 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+             httpUpgradeHandler = (HttpUpgradeHandler) param;
+             // Stop further HTTP output
+             getOutputBuffer().finished = true;
++        } else if (actionCode == ActionCode.REQUEST_BODY_FULLY_READ) {
++            AtomicBoolean result = (AtomicBoolean) param;
++            result.set(getInputBuffer().isFinished());
+         } else {
+             actionInternal(actionCode, param);
+         }
+
+==================================================
+InputFilter.java
+index 94441e2315..1cb7f2ee10 100644
+--- a/java/org/apache/coyote/http11/AbstractInputBuffer.java
++++ b/java/org/apache/coyote/http11/AbstractInputBuffer.java
+@@ -344,6 +344,37 @@ public abstract class AbstractInputBuffer<S> implements InputBuffer{
+     }
+ 
+ 
++    /**
++     * Has all of the request body been read? There are subtle differences
++     * between this and available() > 0 primarily because of having to handle
++     * faking non-blocking reads with the blocking IO connector.
++     */
++    public boolean isFinished() {
++        if (lastValid > pos) {
++            // Data to read in the buffer so not finished
++            return false;
++        }
++
++        /*
++         * Don't use fill(false) here because in the following circumstances
++         * BIO will block - possibly indefinitely
++         * - client is using keep-alive and connection is still open
++         * - client has sent the complete request
++         * - client has not sent any of the next request (i.e. no pipelining)
++         * - application has read the complete request
++         */
++
++        // Check the InputFilters
++
++        if (lastActiveFilter >= 0) {
++            return activeFilters[lastActiveFilter].isFinished();
++        } else {
++            // No filters. Assume request is not finished. EOF will signal end of
++            // request.
++            return false;
++        }
++    }
++
+     // ---------------------------------------------------- InputBuffer Methods
+ 
+     /**
+
+==================================================
+BufferedInputFilter.java
+index a90c88bf80..2fc2f7a504 100644
+--- a/java/org/apache/coyote/http11/InputFilter.java
++++ b/java/org/apache/coyote/http11/InputFilter.java
+@@ -85,4 +85,8 @@ public interface InputFilter extends InputBuffer {
+     public int available();
+ 
+ 
++    /**
++     * Has the request body been read fully?
++     */
++    public boolean isFinished();
+ }
+
+==================================================
+ChunkedInputFilter.java
+index 46cb32f683..2418cadc63 100644
+--- a/java/org/apache/coyote/http11/filters/BufferedInputFilter.java
++++ b/java/org/apache/coyote/http11/filters/BufferedInputFilter.java
+@@ -138,4 +138,9 @@ public class BufferedInputFilter implements InputFilter {
+         return buffered.getLength();
+     }
+ 
++
++    @Override
++    public boolean isFinished() {
++        return hasRead || buffered.getLength() <= 0;
++    }
+ }
+
+==================================================
+IdentityInputFilter.java
+index 11d5ada5c9..a953bd5f9a 100644
+--- a/java/org/apache/coyote/http11/filters/ChunkedInputFilter.java
++++ b/java/org/apache/coyote/http11/filters/ChunkedInputFilter.java
+@@ -537,4 +537,9 @@ public class ChunkedInputFilter implements InputFilter {
+ 
+         return true;
+     }
++
++    @Override
++    public boolean isFinished() {
++        return endChunk;
++    }
+ }
+
+==================================================
+SavedRequestInputFilter.java
+index 6053cfb43a..80e9fd0d61 100644
+--- a/java/org/apache/coyote/http11/filters/IdentityInputFilter.java
++++ b/java/org/apache/coyote/http11/filters/IdentityInputFilter.java
+@@ -195,4 +195,10 @@ public class IdentityInputFilter implements InputFilter {
+     }
+ 
+ 
++    @Override
++    public boolean isFinished() {
++        // Only finished if a content length is defined and there is no data
++        // remaining
++        return contentLength > -1 && remaining == 0;
++    }
+ }
+
+==================================================
+VoidInputFilter.java
+index ab371b25dc..814dbe3cca 100644
+--- a/java/org/apache/coyote/http11/filters/SavedRequestInputFilter.java
++++ b/java/org/apache/coyote/http11/filters/SavedRequestInputFilter.java
+@@ -115,4 +115,8 @@ public class SavedRequestInputFilter implements InputFilter {
+         return 0;
+     }
+ 
++    @Override
++    public boolean isFinished() {
++        return input.getOffset() >= input.getEnd();
++    }
+ }
+
+==================================================

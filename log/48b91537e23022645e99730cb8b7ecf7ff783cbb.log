@@ -1,0 +1,162 @@
+48b91537e23022645e99730cb8b7ecf7ff783cbb
+==================================================
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=53087.
+==================================================
+Keiichi Fujino
+==================================================
+Tue Apr 17 06:06:51 2012 +0000
+==================================================
+DeltaSession.java
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=53087.
+In order to avoid that a backup node expire a session, replicate session access time in BackupManager.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1326938 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AbstractReplicatedMap.java
+index 1ac7ed81ba..bdceabc253 100644
+--- a/java/org/apache/catalina/ha/session/DeltaSession.java
++++ b/java/org/apache/catalina/ha/session/DeltaSession.java
+@@ -222,6 +222,30 @@ public class DeltaSession extends StandardSession implements Externalizable,Clus
+                 this.endAccess();
+             }
+         }
++
++        /**
++         * If this returns true, to replicate that an object has been accessed
++         * @return boolean
++         */
++        @Override
++        public boolean isAccessReplicate() {
++            long replDelta = System.currentTimeMillis() - getLastTimeReplicated();
++            if (maxInactiveInterval >=0 && replDelta > (maxInactiveInterval * 1000)) {
++                return true;
++            }
++            return false;
++        }
++
++        /**
++         * Access to an existing object.
++         */
++        @Override
++        public void accessEntry() {
++            this.access();
++            this.setPrimarySession(false);
++            this.endAccess();
++        }
++
+     // ----------------------------------------------------- Session Properties
+ 
+     /**
+@@ -843,7 +867,8 @@ public class DeltaSession extends StandardSession implements Externalizable,Clus
+         }
+     }
+ 
+-    protected long getLastTimeReplicated() {
++    @Override
++    public long getLastTimeReplicated() {
+         return lastTimeReplicated;
+     }
+ 
+@@ -852,7 +877,8 @@ public class DeltaSession extends StandardSession implements Externalizable,Clus
+         return version;
+     }
+ 
+-    protected void setLastTimeReplicated(long lastTimeReplicated) {
++    @Override
++    public void setLastTimeReplicated(long lastTimeReplicated) {
+         this.lastTimeReplicated = lastTimeReplicated;
+     }
+ 
+
+==================================================
+ReplicatedMapEntry.java
+index 06017cfbe0..705582dd79 100644
+--- a/java/org/apache/catalina/tribes/tipis/AbstractReplicatedMap.java
++++ b/java/org/apache/catalina/tribes/tipis/AbstractReplicatedMap.java
+@@ -408,8 +408,10 @@ public abstract class AbstractReplicatedMap<K,V>
+         if ( !entry.isSerializable() ) return;
+         if (entry.isPrimary() && entry.getBackupNodes()!= null && entry.getBackupNodes().length > 0) {
+             Object value = entry.getValue();
+-            //check to see if we need to replicate this object isDirty()||complete
+-            boolean repl = complete || ( (value instanceof ReplicatedMapEntry) && ( (ReplicatedMapEntry) value).isDirty());
++            //check to see if we need to replicate this object isDirty()||complete || isAccessReplicate()
++            boolean isDirty = ((value instanceof ReplicatedMapEntry) && ((ReplicatedMapEntry) value).isDirty());
++            boolean isAccess = ((value instanceof ReplicatedMapEntry) && ((ReplicatedMapEntry) value).isAccessReplicate());
++            boolean repl = complete || isDirty || isAccess;
+ 
+             if (!repl) {
+                 if ( log.isTraceEnabled() )
+@@ -418,9 +420,9 @@ public abstract class AbstractReplicatedMap<K,V>
+                 return;
+             }
+             //check to see if the message is diffable
+-            boolean diff = ( (value instanceof ReplicatedMapEntry) && ( (ReplicatedMapEntry) value).isDiffable());
++            boolean diff = ((value instanceof ReplicatedMapEntry) && ((ReplicatedMapEntry) value).isDiffable());
+             MapMessage msg = null;
+-            if (diff) {
++            if (diff && isDirty) {
+                 ReplicatedMapEntry rentry = (ReplicatedMapEntry)entry.getValue();
+                 try {
+                     rentry.lock();
+@@ -438,6 +440,12 @@ public abstract class AbstractReplicatedMap<K,V>
+                 }
+ 
+             }
++            if (msg == null && isAccess) {
++                //construct a access message
++                msg = new MapMessage(mapContextName, MapMessage.MSG_ACCESS,
++                        false, (Serializable) entry.getKey(), null, null, entry.getPrimary(),
++                        entry.getBackupNodes());
++            }
+             if (msg == null) {
+                 //construct a complete
+                 msg = new MapMessage(mapContextName, MapMessage.MSG_BACKUP,
+@@ -448,6 +456,9 @@ public abstract class AbstractReplicatedMap<K,V>
+             }
+             try {
+                 if ( channel!=null && entry.getBackupNodes()!= null && entry.getBackupNodes().length > 0 ) {
++                    if ((entry.getValue() instanceof ReplicatedMapEntry)) {
++                        ((ReplicatedMapEntry)entry.getValue()).setLastTimeReplicated(System.currentTimeMillis());
++                    }
+                     channel.send(entry.getBackupNodes(), msg, channelSendOptions);
+                 }
+             } catch (ChannelException x) {
+@@ -677,6 +688,17 @@ public abstract class AbstractReplicatedMap<K,V>
+             } //end if
+             innerMap.put(entry.getKey(), entry);
+         } //end if
++
++        if (mapmsg.getMsgType() == MapMessage.MSG_ACCESS) {
++            MapEntry<K, V> entry = innerMap.get(mapmsg.getKey());
++            if (entry != null) {
++                entry.setBackupNodes(mapmsg.getBackupNodes());
++                entry.setPrimary(mapmsg.getPrimary());
++                if (entry.getValue() instanceof ReplicatedMapEntry) {
++                    ((ReplicatedMapEntry) entry.getValue()).accessEntry();
++                }
++            }
++        }
+     }
+ 
+     @Override
+@@ -1287,6 +1309,7 @@ public abstract class AbstractReplicatedMap<K,V>
+         public static final int MSG_INIT = 8;
+         public static final int MSG_COPY = 9;
+         public static final int MSG_STATE_COPY = 10;
++        public static final int MSG_ACCESS = 11;
+ 
+         private byte[] mapId;
+         private int msgtype;
+@@ -1324,6 +1347,7 @@ public abstract class AbstractReplicatedMap<K,V>
+                 case MSG_INIT: return "MSG_INIT";
+                 case MSG_STATE_COPY: return "MSG_STATE_COPY";
+                 case MSG_COPY: return "MSG_COPY";
++                case MSG_ACCESS: return "MSG_ACCESS";
+                 default : return "UNKNOWN";
+             }
+         }
+
+==================================================

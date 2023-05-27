@@ -1,0 +1,206 @@
+c6cf74737c62399010f9abead54b8ec5a6f104a3
+==================================================
+More close fixes
+==================================================
+remm remm@apache.org
+==================================================
+Thu May 16 11:28:36 2019 +0200
+==================================================
+AprEndpoint.java
+More close fixes
+
+Fix a NIO2 problem where sockets were discarded on close, now it
+processes a STOP instead (NIO does that in one case). Also use the
+return value of processSocket when it is using the executor. Three
+sockets are not getting closed in
+catalina.authenticator.TestSSOnonLoginAndBasicAuthenticator for some
+unknown reason (a read is pending, but the completion handler is never
+called on shutdown - it should get a AsynchronousCloseException).
+Fix the 3 unclosed sockets for NIO, apparently caused by using the key
+attachment being null. Redo cancelledKey without it and simplify.
+
+
+==================================================
+Nio2Endpoint.java
+index 9551b7ec1b..984452e5f2 100644
+--- a/java/org/apache/tomcat/util/net/AprEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AprEndpoint.java
+@@ -674,30 +674,26 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
+     @Override
+     protected boolean setSocketOptions(Long socket) {
+         try {
+-            // During shutdown, executor may be null - avoid NPE
+-            if (running) {
+-                if (log.isDebugEnabled()) {
+-                    log.debug(sm.getString("endpoint.debug.socket", socket));
+-                }
+-                AprSocketWrapper wrapper = new AprSocketWrapper(socket, this);
+-                wrapper.setKeepAliveLeft(getMaxKeepAliveRequests());
+-                wrapper.setSecure(isSSLEnabled());
+-                wrapper.setReadTimeout(getConnectionTimeout());
+-                wrapper.setWriteTimeout(getConnectionTimeout());
+-                connections.put(socket, wrapper);
+-                getExecutor().execute(new SocketWithOptionsProcessor(wrapper));
+-            }
++            if (log.isDebugEnabled()) {
++                log.debug(sm.getString("endpoint.debug.socket", socket));
++            }
++            AprSocketWrapper wrapper = new AprSocketWrapper(socket, this);
++            wrapper.setKeepAliveLeft(getMaxKeepAliveRequests());
++            wrapper.setSecure(isSSLEnabled());
++            wrapper.setReadTimeout(getConnectionTimeout());
++            wrapper.setWriteTimeout(getConnectionTimeout());
++            connections.put(socket, wrapper);
++            getExecutor().execute(new SocketWithOptionsProcessor(wrapper));
++            return true;
+         } catch (RejectedExecutionException x) {
+             log.warn(sm.getString("endpoint.rejectedExecution", socket), x);
+-            return false;
+         } catch (Throwable t) {
+             ExceptionUtils.handleThrowable(t);
+             // This means we got an OOM or similar creating a thread, or that
+             // the pool and its queue are full
+             log.error(sm.getString("endpoint.process.fail"), t);
+-            return false;
+         }
+-        return true;
++        return false;
+     }
+ 
+ 
+@@ -2337,6 +2333,9 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
+ 
+         @Override
+         protected void doClose() {
++            if (log.isDebugEnabled()) {
++                log.debug("Calling [" + getEndpoint() + "].closeSocket([" + this + "])", new Exception());
++            }
+             try {
+                 getEndpoint().getHandler().release(this);
+             } catch (Throwable e) {
+@@ -2760,7 +2759,7 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
+                     timeout, unit, attachment, check, handler, semaphore, completion);
+         }
+ 
+-        private class AprOperationState<A>  extends OperationState<A> {
++        private class AprOperationState<A> extends OperationState<A> {
+             private volatile boolean inline = true;
+             private AprOperationState(boolean read, ByteBuffer[] buffers, int offset, int length,
+                     BlockingMode block, long timeout, TimeUnit unit, A attachment, CompletionCheck check,
+
+==================================================
+NioEndpoint.java
+index 613f0578de..c5a3328c54 100644
+--- a/java/org/apache/tomcat/util/net/Nio2Endpoint.java
++++ b/java/org/apache/tomcat/util/net/Nio2Endpoint.java
+@@ -507,8 +507,9 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel,AsynchronousS
+                                 break;
+                             }
+                             case PIPELINED: {
+-                                getEndpoint().processSocket(Nio2SocketWrapper.this,
+-                                        SocketEvent.OPEN_READ, true);
++                                if (!getEndpoint().processSocket(Nio2SocketWrapper.this, SocketEvent.OPEN_READ, true)) {
++                                    close();
++                                }
+                                 break;
+                             }
+                             case OPEN: {
+@@ -602,9 +603,10 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel,AsynchronousS
+                         // notify/dispatch to do the release.
+                         readPending.release();
+                         // If already closed, don't call onError and close again
+-                        return;
++                        getEndpoint().processSocket(Nio2SocketWrapper.this, SocketEvent.STOP, false);
++                    } else if (!getEndpoint().processSocket(Nio2SocketWrapper.this, SocketEvent.ERROR, true)) {
++                        close();
+                     }
+-                    getEndpoint().processSocket(Nio2SocketWrapper.this, SocketEvent.ERROR, true);
+                 }
+             };
+ 
+@@ -641,7 +643,9 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel,AsynchronousS
+                         }
+                     }
+                     if (notify) {
+-                        endpoint.processSocket(Nio2SocketWrapper.this, SocketEvent.OPEN_WRITE, true);
++                        if (!endpoint.processSocket(Nio2SocketWrapper.this, SocketEvent.OPEN_WRITE, true)) {
++                            close();
++                        }
+                     }
+                 }
+                 @Override
+@@ -654,7 +658,9 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel,AsynchronousS
+                     }
+                     setError(ioe);
+                     writePending.release();
+-                    endpoint.processSocket(Nio2SocketWrapper.this, SocketEvent.ERROR, true);
++                    if (!endpoint.processSocket(Nio2SocketWrapper.this, SocketEvent.ERROR, true)) {
++                        close();
++                    }
+                 }
+             };
+ 
+@@ -687,7 +693,9 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel,AsynchronousS
+                         }
+                     }
+                     if (notify) {
+-                        endpoint.processSocket(Nio2SocketWrapper.this, SocketEvent.OPEN_WRITE, true);
++                        if (!endpoint.processSocket(Nio2SocketWrapper.this, SocketEvent.OPEN_WRITE, true)) {
++                            close();
++                        }
+                     }
+                 }
+                 @Override
+@@ -700,7 +708,9 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel,AsynchronousS
+                     }
+                     setError(ioe);
+                     writePending.release();
+-                    endpoint.processSocket(Nio2SocketWrapper.this, SocketEvent.ERROR, true);
++                    if (!endpoint.processSocket(Nio2SocketWrapper.this, SocketEvent.ERROR, true)) {
++                        close();
++                    }
+                }
+             };
+ 
+@@ -918,8 +928,6 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel,AsynchronousS
+                     if (getSocket().isOpen()) {
+                         getSocket().close(true);
+                     }
+-                    socketBufferHandler = SocketBufferHandler.EMPTY;
+-                    nonBlockingWriteBuffer.clear();
+                     if (getEndpoint().running && !getEndpoint().paused) {
+                         if (nioChannels == null || !nioChannels.push(getSocket())) {
+                             getSocket().free();
+@@ -932,6 +940,8 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel,AsynchronousS
+                     log.error(sm.getString("endpoint.debug.channelCloseFail"), e);
+                 }
+             } finally {
++                socketBufferHandler = SocketBufferHandler.EMPTY;
++                nonBlockingWriteBuffer.clear();
+                 reset(Nio2Channel.CLOSED_NIO2_CHANNEL);
+             }
+             try {
+@@ -1363,7 +1373,9 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel,AsynchronousS
+                         if (fillReadBuffer(false) > 0) {
+                             // Special case where the read completed inline, there is no notification
+                             // in that case so it has to be done here
+-                            getEndpoint().processSocket(this, SocketEvent.OPEN_READ, true);
++                            if (!getEndpoint().processSocket(this, SocketEvent.OPEN_READ, true)) {
++                                close();
++                            }
+                         }
+                     } catch (IOException e) {
+                         // Will never happen
+@@ -1384,7 +1396,9 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel,AsynchronousS
+                 writeInterest = true;
+                 if (writePending.availablePermits() == 1) {
+                     // If no write is pending, notify that writing is possible
+-                    getEndpoint().processSocket(this, SocketEvent.OPEN_WRITE, true);
++                    if (!getEndpoint().processSocket(this, SocketEvent.OPEN_WRITE, true)) {
++                        close();
++                    }
+                 }
+             }
+         }
+
+==================================================

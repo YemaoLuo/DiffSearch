@@ -1,0 +1,258 @@
+b7b5c63a932f6c1ea05f9b65ad9054247bb5af57
+==================================================
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=12428
+==================================================
+Mark Emlyn
+==================================================
+Fri Apr 1 10:49:43 2011 +0000
+==================================================
+Context.java
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=12428
+Add optional support for preemptive authentication on a per context basis
+Based on a patch suggested by Werner Donn
+This includes the fix for CVE-2011-1183
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1087643 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AuthenticatorBase.java
+index 35db590dcc..6adfed8b8f 100644
+--- a/java/org/apache/catalina/Context.java
++++ b/java/org/apache/catalina/Context.java
+@@ -1349,5 +1349,18 @@ public interface Context extends Container {
+      */
+     public boolean getFireRequestListenersOnForwards();
+     
++    /**
++     * Configures if a user presents authentication credentials, whether the
++     * context will process them when the request is for a non-protected
++     * resource.
++     */
++    public void setPreemptiveAuthentication(boolean enable);
++
++    /**
++     * Determines if a user presents authentication credentials, will the
++     * context will process them when the request is for a non-protected
++     * resource.
++     */
++    public boolean getPreemptiveAuthentication();
+ }
+ 
+
+==================================================
+StandardContext.java
+index cf42e29cfc..baf6e5a112 100644
+--- a/java/org/apache/catalina/authenticator/AuthenticatorBase.java
++++ b/java/org/apache/catalina/authenticator/AuthenticatorBase.java
+@@ -21,6 +21,7 @@ package org.apache.catalina.authenticator;
+ 
+ import java.io.IOException;
+ import java.security.Principal;
++import java.security.cert.X509Certificate;
+ import java.text.SimpleDateFormat;
+ import java.util.Date;
+ import java.util.Locale;
+@@ -32,6 +33,7 @@ import javax.servlet.http.HttpServletResponse;
+ import org.apache.catalina.Authenticator;
+ import org.apache.catalina.Container;
+ import org.apache.catalina.Context;
++import org.apache.catalina.Globals;
+ import org.apache.catalina.LifecycleException;
+ import org.apache.catalina.Manager;
+ import org.apache.catalina.Realm;
+@@ -454,8 +456,7 @@ public abstract class AuthenticatorBase extends ValveBase
+         SecurityConstraint [] constraints
+             = realm.findSecurityConstraints(request, this.context);
+        
+-        if ((constraints == null) /* &&
+-            (!Constants.FORM_METHOD.equals(config.getAuthMethod())) */ ) {
++        if (constraints == null && !context.getPreemptiveAuthentication()) {
+             if (log.isDebugEnabled())
+                 log.debug(" Not subject to any constraint");
+             getNext().invoke(request, response);
+@@ -464,7 +465,7 @@ public abstract class AuthenticatorBase extends ValveBase
+ 
+         // Make sure that constrained resources are not cached by web proxies
+         // or browsers as caching can provide a security hole
+-        if (disableProxyCaching && 
++        if (constraints != null && disableProxyCaching && 
+             // FIXME: Disabled for Mozilla FORM support over SSL 
+             // (improper caching issue)
+             //!request.isSecure() &&
+@@ -482,36 +483,55 @@ public abstract class AuthenticatorBase extends ValveBase
+         }
+ 
+         int i;
+-        // Enforce any user data constraint for this security constraint
+-        if (log.isDebugEnabled()) {
+-            log.debug(" Calling hasUserDataPermission()");
+-        }
+-        if (!realm.hasUserDataPermission(request, response,
+-                                         constraints)) {
++        if (constraints != null) {
++            // Enforce any user data constraint for this security constraint
+             if (log.isDebugEnabled()) {
+-                log.debug(" Failed hasUserDataPermission() test");
++                log.debug(" Calling hasUserDataPermission()");
++            }
++            if (!realm.hasUserDataPermission(request, response,
++                                             constraints)) {
++                if (log.isDebugEnabled()) {
++                    log.debug(" Failed hasUserDataPermission() test");
++                }
++                /*
++                 * ASSERT: Authenticator already set the appropriate
++                 * HTTP status code, so we do not have to do anything special
++                 */
++                return;
+             }
+-            /*
+-             * ASSERT: Authenticator already set the appropriate
+-             * HTTP status code, so we do not have to do anything special
+-             */
+-            return;
+         }
+ 
+         // Since authenticate modifies the response on failure,
+         // we have to check for allow-from-all first.
+-        boolean authRequired = true;
+-        for(i=0; i < constraints.length && authRequired; i++) {
+-            if(!constraints[i].getAuthConstraint()) {
+-                authRequired = false;
+-            } else if(!constraints[i].getAllRoles()) {
+-                String [] roles = constraints[i].findAuthRoles();
+-                if(roles == null || roles.length == 0) {
++        boolean authRequired;
++        if (constraints == null) {
++            authRequired = false;
++        } else {
++            authRequired = true;
++            for(i=0; i < constraints.length && authRequired; i++) {
++                if(!constraints[i].getAuthConstraint()) {
+                     authRequired = false;
++                } else if(!constraints[i].getAllRoles()) {
++                    String [] roles = constraints[i].findAuthRoles();
++                    if(roles == null || roles.length == 0) {
++                        authRequired = false;
++                    }
+                 }
+             }
+         }
+-             
++
++        if (!authRequired) {
++            authRequired =
++                request.getCoyoteRequest().getMimeHeaders().getValue(
++                        "authorization") != null;
++        }
++
++        if (!authRequired) {
++            X509Certificate[] certs = (X509Certificate[]) request.getAttribute(
++                    Globals.CERTIFICATES_ATTR);
++            authRequired = certs != null && certs.length > 0;
++        }
++
+         if(authRequired) {  
+             if (log.isDebugEnabled()) {
+                 log.debug(" Calling authenticate()");
+@@ -530,21 +550,23 @@ public abstract class AuthenticatorBase extends ValveBase
+             
+         }
+     
+-        if (log.isDebugEnabled()) {
+-            log.debug(" Calling accessControl()");
+-        }
+-        if (!realm.hasResourcePermission(request, response,
+-                                         constraints,
+-                                         this.context)) {
++        if (constraints != null) {
+             if (log.isDebugEnabled()) {
+-                log.debug(" Failed accessControl() test");
++                log.debug(" Calling accessControl()");
++            }
++            if (!realm.hasResourcePermission(request, response,
++                                             constraints,
++                                             this.context)) {
++                if (log.isDebugEnabled()) {
++                    log.debug(" Failed accessControl() test");
++                }
++                /*
++                 * ASSERT: AccessControl method has already set the
++                 * appropriate HTTP status code, so we do not have to do
++                 * anything special
++                 */
++                return;
+             }
+-            /*
+-             * ASSERT: AccessControl method has already set the
+-             * appropriate HTTP status code, so we do not have to do
+-             * anything special
+-             */
+-            return;
+         }
+     
+         // Any and all specified constraints have been satisfied
+
+==================================================
+ContextConfig.java
+index 231ad3b5a1..9ec970eab4 100644
+--- a/java/org/apache/catalina/core/StandardContext.java
++++ b/java/org/apache/catalina/core/StandardContext.java
+@@ -849,9 +849,23 @@ public class StandardContext extends ContainerBase
+      */
+     private Set<Servlet> createdServlets = new HashSet<Servlet>();
+ 
++    private boolean preemptiveAuthentication = false;
++
+     // ----------------------------------------------------- Context Properties
+ 
+ 
++    @Override
++    public boolean getPreemptiveAuthentication() {
++        return preemptiveAuthentication;
++    }
++
++
++    @Override
++    public void setPreemptiveAuthentication(boolean preemptiveAuthentication) {
++        this.preemptiveAuthentication = preemptiveAuthentication;
++    }
++
++
+     @Override
+     public void setFireRequestListenersOnForwards(boolean enable) {
+         fireRequestListenersOnForwards = enable;
+
+==================================================
+TestStandardWrapper.java
+index 76fec6ca84..da468b92e4 100644
+--- a/java/org/apache/catalina/startup/ContextConfig.java
++++ b/java/org/apache/catalina/startup/ContextConfig.java
+@@ -367,12 +367,17 @@ public class ContextConfig
+     protected synchronized void authenticatorConfig() {
+ 
+         LoginConfig loginConfig = context.getLoginConfig();
+-        if (loginConfig == null) {
+-            if (context.getIgnoreAnnotations())  {
+-                return;
+-            } else {
+-                // Not metadata-complete, need an authenticator to support
+-                // @ServletSecurity annotations
++
++        SecurityConstraint constraints[] = context.findConstraints();
++        if (context.getIgnoreAnnotations() &&
++                (constraints == null || constraints.length ==0) &&
++                !context.getPreemptiveAuthentication())  {
++            return;
++        } else {
++            if (loginConfig == null) {
++                // Not metadata-complete or security constraints present, need
++                // an authenticator to support @ServletSecurity annotations
++                // and/or constraints
+                 loginConfig = DUMMY_LOGIN_CONFIG;
+                 context.setLoginConfig(loginConfig);
+             }
+
+==================================================

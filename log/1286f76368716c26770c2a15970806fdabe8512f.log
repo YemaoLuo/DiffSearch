@@ -1,0 +1,192 @@
+1286f76368716c26770c2a15970806fdabe8512f
+==================================================
+Correctly handle the case when the request passes through one or more trustedProxies but no internalProxies.
+==================================================
+Mark Thomas
+==================================================
+Mon Jun 4 18:57:59 2018 +0000
+==================================================
+RemoteIpFilter.java
+Correctly handle the case when the request passes through one or more trustedProxies but no internalProxies.
+Based on a patch by zhanhb
+This closes #45
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1832882 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+RemoteIpValve.java
+index 79deb3a609..df329b3e35 100644
+--- a/java/org/apache/catalina/filters/RemoteIpFilter.java
++++ b/java/org/apache/catalina/filters/RemoteIpFilter.java
+@@ -67,7 +67,8 @@ import org.apache.juli.logging.LogFactory;
+  * This servlet filter proceeds as follows:
+  * </p>
+  * <p>
+- * If the incoming <code>request.getRemoteAddr()</code> matches the servlet filter's list of internal proxies :
++ * If the incoming <code>request.getRemoteAddr()</code> matches the servlet
++ * filter's list of internal or trusted proxies:
+  * </p>
+  * <ul>
+  * <li>Loop on the comma delimited list of IPs and hostnames passed by the preceding load balancer or proxy in the given request's Http
+@@ -761,8 +762,11 @@ public class RemoteIpFilter extends GenericFilter {
+ 
+     public void doFilter(HttpServletRequest request, HttpServletResponse response, FilterChain chain) throws IOException, ServletException {
+ 
+-        if (internalProxies != null &&
+-                internalProxies.matcher(request.getRemoteAddr()).matches()) {
++        boolean isInternal = internalProxies != null &&
++                internalProxies.matcher(request.getRemoteAddr()).matches();
++
++        if (isInternal || (trustedProxies != null &&
++                trustedProxies.matcher(request.getRemoteAddr()).matches())) {
+             String remoteIp = null;
+             // In java 6, proxiesHeaderValue should be declared as a java.util.Deque
+             LinkedList<String> proxiesHeaderValue = new LinkedList<>();
+@@ -778,11 +782,14 @@ public class RemoteIpFilter extends GenericFilter {
+ 
+             String[] remoteIpHeaderValue = commaDelimitedListToStringArray(concatRemoteIpHeaderValue.toString());
+             int idx;
++            if (!isInternal) {
++                proxiesHeaderValue.addFirst(request.getRemoteAddr());
++            }
+             // loop on remoteIpHeaderValue to find the first trusted remote ip and to build the proxies chain
+             for (idx = remoteIpHeaderValue.length - 1; idx >= 0; idx--) {
+                 String currentRemoteIp = remoteIpHeaderValue[idx];
+                 remoteIp = currentRemoteIp;
+-                if (internalProxies.matcher(currentRemoteIp).matches()) {
++                if (internalProxies !=null && internalProxies.matcher(currentRemoteIp).matches()) {
+                     // do nothing, internalProxies IPs are not appended to the
+                 } else if (trustedProxies != null &&
+                         trustedProxies.matcher(currentRemoteIp).matches()) {
+
+==================================================
+TestRemoteIpFilter.java
+index c3aab95d3e..f9ea0e577e 100644
+--- a/java/org/apache/catalina/valves/RemoteIpValve.java
++++ b/java/org/apache/catalina/valves/RemoteIpValve.java
+@@ -47,7 +47,8 @@ import org.apache.tomcat.util.http.MimeHeaders;
+  * This valve proceeds as follows:
+  * </p>
+  * <p>
+- * If the incoming <code>request.getRemoteAddr()</code> matches the valve's list of internal proxies :
++ * If the incoming <code>request.getRemoteAddr()</code> matches the valve's list
++ * of internal or trusted proxies:
+  * </p>
+  * <ul>
+  * <li>Loop on the comma delimited list of IPs and hostnames passed by the preceding load balancer or proxy in the given request's Http
+@@ -572,9 +573,11 @@ public class RemoteIpValve extends ValveBase {
+         final int originalServerPort = request.getServerPort();
+         final String originalProxiesHeader = request.getHeader(proxiesHeader);
+         final String originalRemoteIpHeader = request.getHeader(remoteIpHeader);
++        boolean isInternal = internalProxies != null &&
++                internalProxies.matcher(originalRemoteAddr).matches();
+ 
+-        if (internalProxies !=null &&
+-                internalProxies.matcher(originalRemoteAddr).matches()) {
++        if (isInternal || (trustedProxies != null &&
++                trustedProxies.matcher(originalRemoteAddr).matches())) {
+             String remoteIp = null;
+             // In java 6, proxiesHeaderValue should be declared as a java.util.Deque
+             LinkedList<String> proxiesHeaderValue = new LinkedList<>();
+@@ -590,11 +593,14 @@ public class RemoteIpValve extends ValveBase {
+ 
+             String[] remoteIpHeaderValue = commaDelimitedListToStringArray(concatRemoteIpHeaderValue.toString());
+             int idx;
++            if (!isInternal) {
++                proxiesHeaderValue.addFirst(originalRemoteAddr);
++            }
+             // loop on remoteIpHeaderValue to find the first trusted remote ip and to build the proxies chain
+             for (idx = remoteIpHeaderValue.length - 1; idx >= 0; idx--) {
+                 String currentRemoteIp = remoteIpHeaderValue[idx];
+                 remoteIp = currentRemoteIp;
+-                if (internalProxies.matcher(currentRemoteIp).matches()) {
++                if (internalProxies !=null && internalProxies.matcher(currentRemoteIp).matches()) {
+                     // do nothing, internalProxies IPs are not appended to the
+                 } else if (trustedProxies != null &&
+                         trustedProxies.matcher(currentRemoteIp).matches()) {
+
+==================================================
+TestRemoteIpValve.java
+index 0f6d8345eb..f7f20934d2 100644
+--- a/test/org/apache/catalina/filters/TestRemoteIpFilter.java
++++ b/test/org/apache/catalina/filters/TestRemoteIpFilter.java
+@@ -347,6 +347,75 @@ public class TestRemoteIpFilter extends TomcatBaseTest {
+         Assert.assertEquals("remoteHost", "140.211.11.130", actualRemoteHost);
+     }
+ 
++    @Test
++    public void testInvokeAllProxiesAreTrustedEmptyInternal() throws Exception {
++
++        // PREPARE
++        RemoteIpFilter remoteIpFilter = new RemoteIpFilter();
++        FilterDef filterDef = new FilterDef();
++        filterDef.addInitParameter("internalProxies", "");
++        filterDef.addInitParameter("trustedProxies", "proxy1|proxy2|proxy3");
++        filterDef.addInitParameter("remoteIpHeader", "x-forwarded-for");
++        filterDef.addInitParameter("proxiesHeader", "x-forwarded-by");
++
++        filterDef.setFilter(remoteIpFilter);
++        MockHttpServletRequest request = new MockHttpServletRequest();
++
++        request.setRemoteAddr("proxy3");
++        request.setRemoteHost("remote-host-original-value");
++        request.setHeader("x-forwarded-for", "140.211.11.130, proxy1, proxy2");
++
++        // TEST
++        HttpServletRequest actualRequest = testRemoteIpFilter(filterDef, request).getRequest();
++
++        // VERIFY
++        String actualXForwardedFor = actualRequest.getHeader("x-forwarded-for");
++        Assert.assertNull("all proxies are trusted, x-forwarded-for must be null", actualXForwardedFor);
++
++        String actualXForwardedBy = actualRequest.getHeader("x-forwarded-by");
++        Assert.assertEquals("all proxies are trusted, they must appear in x-forwarded-by", "proxy1, proxy2, proxy3", actualXForwardedBy);
++
++        String actualRemoteAddr = actualRequest.getRemoteAddr();
++        Assert.assertEquals("remoteAddr", "140.211.11.130", actualRemoteAddr);
++
++        String actualRemoteHost = actualRequest.getRemoteHost();
++        Assert.assertEquals("remoteHost", "140.211.11.130", actualRemoteHost);
++    }
++
++    @Test
++    public void testInvokeAllProxiesAreTrustedUnusedInternal() throws Exception {
++
++        // PREPARE
++        RemoteIpFilter remoteIpFilter = new RemoteIpFilter();
++        FilterDef filterDef = new FilterDef();
++        filterDef.addInitParameter("trustedProxies", "proxy1|proxy2|proxy3");
++        filterDef.addInitParameter("remoteIpHeader", "x-forwarded-for");
++        filterDef.addInitParameter("proxiesHeader", "x-forwarded-by");
++
++        filterDef.setFilter(remoteIpFilter);
++        MockHttpServletRequest request = new MockHttpServletRequest();
++
++        request.setRemoteAddr("proxy3");
++        request.setRemoteHost("remote-host-original-value");
++        request.setHeader("x-forwarded-for", "140.211.11.130, proxy1, proxy2");
++
++        // TEST
++        HttpServletRequest actualRequest = testRemoteIpFilter(filterDef, request).getRequest();
++
++        // VERIFY
++        String actualXForwardedFor = actualRequest.getHeader("x-forwarded-for");
++        Assert.assertNull("all proxies are trusted, x-forwarded-for must be null", actualXForwardedFor);
++
++        String actualXForwardedBy = actualRequest.getHeader("x-forwarded-by");
++        Assert.assertEquals("all proxies are trusted, they must appear in x-forwarded-by", "proxy1, proxy2, proxy3", actualXForwardedBy);
++
++        String actualRemoteAddr = actualRequest.getRemoteAddr();
++        Assert.assertEquals("remoteAddr", "140.211.11.130", actualRemoteAddr);
++
++        String actualRemoteHost = actualRequest.getRemoteHost();
++        Assert.assertEquals("remoteHost", "140.211.11.130", actualRemoteHost);
++    }
++
+     @Test
+     public void testInvokeAllProxiesAreTrustedAndRemoteAddrMatchRegexp() throws Exception {
+ 
+
+==================================================

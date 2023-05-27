@@ -1,0 +1,237 @@
+3eb795a35731a302afb1e3ce52eb6ab1afb020ce
+==================================================
+Pull up processSocket and definition of processorCache
+==================================================
+Mark Thomas
+==================================================
+Wed Jun 1 22:25:02 2016 +0000
+==================================================
+AbstractEndpoint.java
+Pull up processSocket and definition of processorCache
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1746505 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AprEndpoint.java
+index 025df0d867..d534bd13ba 100644
+--- a/java/org/apache/tomcat/util/net/AbstractEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AbstractEndpoint.java
+@@ -26,10 +26,13 @@ import java.util.Map;
+ import java.util.Set;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.Executor;
++import java.util.concurrent.RejectedExecutionException;
+ import java.util.concurrent.TimeUnit;
+ 
+ import org.apache.juli.logging.Log;
++import org.apache.tomcat.util.ExceptionUtils;
+ import org.apache.tomcat.util.IntrospectionUtils;
++import org.apache.tomcat.util.collections.SynchronizedStack;
+ import org.apache.tomcat.util.net.AbstractEndpoint.Acceptor.AcceptorState;
+ import org.apache.tomcat.util.res.StringManager;
+ import org.apache.tomcat.util.threads.LimitLatch;
+@@ -178,6 +181,10 @@ public abstract class AbstractEndpoint<S> {
+      */
+     protected Acceptor[] acceptors;
+ 
++    /**
++     * Cache for SocketProcessor objects
++     */
++    protected SynchronizedStack<SocketProcessorBase<S>> processorCache;
+ 
+     // ----------------------------------------------------------------- Properties
+ 
+@@ -771,14 +778,46 @@ public abstract class AbstractEndpoint<S> {
+      * selected the socket.
+      *
+      * @param socketWrapper The socket wrapper to process
+-     * @param socketStatus  The input status to the processing
++     * @param event         The socket event to be processed
+      * @param dispatch      Should the processing be performed on a new
+      *                          container thread
+      *
+      * @return if processing was triggered successfully
+      */
+-    public abstract boolean processSocket(SocketWrapperBase<S> socketWrapper,
+-            SocketEvent socketStatus, boolean dispatch);
++    public boolean processSocket(SocketWrapperBase<S> socketWrapper,
++            SocketEvent event, boolean dispatch) {
++        try {
++            if (socketWrapper == null) {
++                return false;
++            }
++            SocketProcessorBase<S> sc = processorCache.pop();
++            if (sc == null) {
++                sc = createSocketProcessor(socketWrapper, event);
++            } else {
++                sc.reset(socketWrapper, event);
++            }
++            Executor executor = getExecutor();
++            if (dispatch && executor != null) {
++                executor.execute(sc);
++            } else {
++                sc.run();
++            }
++        } catch (RejectedExecutionException ree) {
++            getLog().warn(sm.getString("endpoint.executor.fail", socketWrapper) , ree);
++            return false;
++        } catch (Throwable t) {
++            ExceptionUtils.handleThrowable(t);
++            // This means we got an OOM or similar creating a thread, or that
++            // the pool and its queue are full
++            getLog().error(sm.getString("endpoint.process.fail"), t);
++            return false;
++        }
++        return true;
++    }
++
++
++    protected abstract SocketProcessorBase<S> createSocketProcessor(
++            SocketWrapperBase<S> socketWrapper, SocketEvent event);
+ 
+ 
+     // ------------------------------------------------------- Lifecycle methods
+
+==================================================
+Nio2Endpoint.java
+index 686521b057..8340632169 100644
+--- a/java/org/apache/tomcat/util/net/AprEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AprEndpoint.java
+@@ -27,7 +27,6 @@ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+ import java.util.concurrent.ConcurrentHashMap;
+-import java.util.concurrent.Executor;
+ import java.util.concurrent.RejectedExecutionException;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.locks.Lock;
+@@ -107,10 +106,6 @@ public class AprEndpoint extends AbstractEndpoint<Long> implements SNICallBack {
+ 
+     private final Map<Long,AprSocketWrapper> connections = new ConcurrentHashMap<>();
+ 
+-    /**
+-     * Cache for SocketProcessor objects
+-     */
+-    private SynchronizedStack<SocketProcessor> processorCache;
+ 
+     // ------------------------------------------------------------ Constructor
+ 
+@@ -821,37 +816,12 @@ public class AprEndpoint extends AbstractEndpoint<Long> implements SNICallBack {
+ 
+ 
+     @Override
+-    public boolean processSocket(SocketWrapperBase<Long> socketWrapper,
+-            SocketEvent event, boolean dispatch) {
+-        try {
+-            if (socketWrapper == null) {
+-                return false;
+-            }
+-            SocketProcessor sc = processorCache.pop();
+-            if (sc == null) {
+-                sc = new SocketProcessor(socketWrapper, event);
+-            } else {
+-                sc.reset(socketWrapper, event);
+-            }
+-            Executor executor = getExecutor();
+-            if (dispatch && executor != null) {
+-                executor.execute(sc);
+-            } else {
+-                sc.run();
+-            }
+-        } catch (RejectedExecutionException ree) {
+-            log.warn(sm.getString("endpoint.executor.fail", socketWrapper) , ree);
+-            return false;
+-        } catch (Throwable t) {
+-            ExceptionUtils.handleThrowable(t);
+-            // This means we got an OOM or similar creating a thread, or that
+-            // the pool and its queue are full
+-            log.error(sm.getString("endpoint.process.fail"), t);
+-            return false;
+-        }
+-        return true;
++    protected SocketProcessorBase<Long> createSocketProcessor(
++            SocketWrapperBase<Long> socketWrapper, SocketEvent event) {
++        return new SocketProcessor(socketWrapper, event);
+     }
+ 
++
+     private void closeSocket(long socket) {
+         // Once this is called, the mapping from socket to wrapper will no
+         // longer be required.
+
+==================================================
+NioEndpoint.java
+index 4707a85218..42b1e0c302 100644
+--- a/java/org/apache/tomcat/util/net/Nio2Endpoint.java
++++ b/java/org/apache/tomcat/util/net/Nio2Endpoint.java
+@@ -35,10 +35,8 @@ import java.nio.channels.WritePendingException;
+ import java.nio.file.StandardOpenOption;
+ import java.util.ArrayList;
+ import java.util.concurrent.ExecutionException;
+-import java.util.concurrent.Executor;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Future;
+-import java.util.concurrent.RejectedExecutionException;
+ import java.util.concurrent.Semaphore;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.TimeoutException;
+@@ -86,11 +84,6 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel> {
+ 
+     private volatile boolean allClosed;
+ 
+-    /**
+-     * Cache for SocketProcessor objects
+-     */
+-    private SynchronizedStack<SocketProcessor> processorCache;
+-
+     /**
+      * Bytebuffer cache, each channel holds a set of buffers (two, except for SSL holds four)
+      */
+@@ -376,38 +369,14 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel> {
+         return true;
+     }
+ 
++
+     @Override
+-    public boolean  processSocket(SocketWrapperBase<Nio2Channel> socketWrapper,
+-            SocketEvent event, boolean dispatch) {
+-        try {
+-            if (socketWrapper == null) {
+-                return false;
+-            }
+-            SocketProcessor sc = processorCache.pop();
+-            if (sc == null) {
+-                sc = new SocketProcessor(socketWrapper, event);
+-            } else {
+-                sc.reset(socketWrapper, event);
+-            }
+-            Executor executor = getExecutor();
+-            if (dispatch && executor != null) {
+-                executor.execute(sc);
+-            } else {
+-                sc.run();
+-            }
+-        } catch (RejectedExecutionException ree) {
+-            log.warn(sm.getString("endpoint.executor.fail", socketWrapper), ree);
+-            return false;
+-        } catch (Throwable t) {
+-            ExceptionUtils.handleThrowable(t);
+-            // This means we got an OOM or similar creating a thread, or that
+-            // the pool and its queue are full
+-            log.error(sm.getString("endpoint.process.fail"), t);
+-            return false;
+-        }
+-        return true;
++    protected SocketProcessorBase<Nio2Channel> createSocketProcessor(
++            SocketWrapperBase<Nio2Channel> socketWrapper, SocketEvent event) {
++        return new SocketProcessor(socketWrapper, event);
+     }
+ 
++
+     public void closeSocket(SocketWrapperBase<Nio2Channel> socket) {
+         if (log.isDebugEnabled()) {
+             log.debug("Calling [" + this + "].closeSocket([" + socket + "],[" + socket.getSocket() + "])",
+
+==================================================

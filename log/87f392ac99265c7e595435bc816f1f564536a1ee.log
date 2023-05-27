@@ -1,0 +1,1325 @@
+87f392ac99265c7e595435bc816f1f564536a1ee
+==================================================
+First pass at switching to Jar abstract from Jar scanning code that
+==================================================
+Mark Emlyn
+==================================================
+Mon Nov 4 23:51:27 2013 +0000
+==================================================
+JspCompilationContext.java
+First pass at switching to Jar abstract from Jar scanning code that
+handles accessing resources in JARs in packed WARs.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1538805 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Compiler.java
+index 393f1b5eaf..dd36c2733c 100644
+--- a/java/org/apache/jasper/JspCompilationContext.java
++++ b/java/org/apache/jasper/JspCompilationContext.java
+@@ -33,7 +33,6 @@ import javax.servlet.ServletContext;
+ import javax.servlet.jsp.tagext.TagInfo;
+ 
+ import org.apache.jasper.compiler.Compiler;
+-import org.apache.jasper.compiler.JarResource;
+ import org.apache.jasper.compiler.JspRuntimeContext;
+ import org.apache.jasper.compiler.JspUtil;
+ import org.apache.jasper.compiler.Localizer;
+@@ -43,6 +42,7 @@ import org.apache.jasper.servlet.JasperLoader;
+ import org.apache.jasper.servlet.JspServletWrapper;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
++import org.apache.tomcat.util.scan.Jar;
+ 
+ /**
+  * A place holder for various things that are used through out the JSP
+@@ -62,7 +62,7 @@ public class JspCompilationContext {
+ 
+     private final Log log = LogFactory.getLog(JspCompilationContext.class); // must not be static
+ 
+-    private final Map<String, JarResource> tagFileJarUrls;
++    private final Map<String, Jar> tagFileJars;
+ 
+     private String className;
+     private final String jspUri;
+@@ -93,27 +93,24 @@ public class JspCompilationContext {
+     private final boolean isTagFile;
+     private boolean protoTypeMode;
+     private TagInfo tagInfo;
+-    private final JarResource tagJarResource;
++    private final Jar tagJar;
+ 
+     // jspURI _must_ be relative to the context
+     public JspCompilationContext(String jspUri, Options options,
+             ServletContext context, JspServletWrapper jsw,
+             JspRuntimeContext rctxt) {
+-
+         this(jspUri, null, options, context, jsw, rctxt, null, false);
+     }
+ 
+     public JspCompilationContext(String tagfile, TagInfo tagInfo,
+             Options options, ServletContext context, JspServletWrapper jsw,
+-            JspRuntimeContext rctxt, JarResource tagJarResource) {
+-        this(tagfile, tagInfo, options, context, jsw, rctxt, tagJarResource,
+-                true);
++            JspRuntimeContext rctxt, Jar tagJar) {
++        this(tagfile, tagInfo, options, context, jsw, rctxt, tagJar, true);
+     }
+ 
+     private JspCompilationContext(String jspUri, TagInfo tagInfo,
+             Options options, ServletContext context, JspServletWrapper jsw,
+-            JspRuntimeContext rctxt, JarResource tagJarResource,
+-            boolean isTagFile) {
++            JspRuntimeContext rctxt, Jar tagJar, boolean isTagFile) {
+ 
+         this.jspUri = canonicalURI(jspUri);
+         this.options = options;
+@@ -135,11 +132,11 @@ public class JspCompilationContext {
+         this.baseURI = baseURI;
+ 
+         this.rctxt = rctxt;
+-        this.tagFileJarUrls = new HashMap<>();
++        this.tagFileJars = new HashMap<>();
+         this.basePackageName = Constants.JSP_PACKAGE_NAME;
+ 
+         this.tagInfo = tagInfo;
+-        this.tagJarResource = tagJarResource;
++        this.tagJar = tagJar;
+         this.isTagFile = isTagFile;
+     }
+ 
+@@ -293,12 +290,12 @@ public class JspCompilationContext {
+ 
+         if (res.startsWith("/META-INF/")) {
+             // This is a tag file packaged in a jar that is being compiled
+-            JarResource jarResource = tagFileJarUrls.get(res);
+-            if (jarResource == null) {
+-                jarResource = tagJarResource;
++            Jar jar = tagFileJars.get(res);
++            if (jar == null) {
++                jar = tagJar;
+             }
+-            if (jarResource != null) {
+-                result = jarResource.getEntry(res.substring(1));
++            if (jar != null) {
++                result = new URL(jar.getURL(res.substring(1)));
+             } else {
+                 // May not be in a JAR in some IDE environments
+                 result = context.getResource(canonicalURI(res));
+@@ -338,12 +335,12 @@ public class JspCompilationContext {
+      * The map is populated when parsing the tag-file elements of the TLDs
+      * of any imported taglibs.
+      */
+-    public JarResource getTagFileJarResource(String tagFile) {
+-        return this.tagFileJarUrls.get(tagFile);
++    public Jar getTagFileJar(String tagFile) {
++        return this.tagFileJars.get(tagFile);
+     }
+ 
+-    public void setTagFileJarResource(String tagFile, JarResource jarResource) {
+-        this.tagFileJarUrls.put(tagFile, jarResource);
++    public void setTagFileJarResource(String tagFile, Jar jar) {
++        this.tagFileJars.put(tagFile, jar);
+     }
+ 
+     /**
+@@ -352,8 +349,8 @@ public class JspCompilationContext {
+      * JspCompilationContext does not correspond to a tag file, or if the
+      * corresponding tag file is not packaged in a JAR.
+      */
+-    public JarResource getTagFileJarResource() {
+-        return this.tagJarResource;
++    public Jar getTagFileJar() {
++        return this.tagJar;
+     }
+ 
+     /* ==================== Common implementation ==================== */
+
+==================================================
+ImplicitTagLibraryInfo.java
+index 70fdc9cc3c..26495cde11 100644
+--- a/java/org/apache/jasper/compiler/Compiler.java
++++ b/java/org/apache/jasper/compiler/Compiler.java
+@@ -36,6 +36,8 @@ import org.apache.jasper.Options;
+ import org.apache.jasper.servlet.JspServletWrapper;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
++import org.apache.tomcat.util.scan.Jar;
++import org.apache.tomcat.util.scan.JarFactory;
+ 
+ /**
+  * Main JSP compiler class. This class uses Ant for compiling.
+@@ -496,24 +498,31 @@ public abstract class Compiler {
+             try {
+                 String key = include.getKey();
+                 URL includeUrl;
+-                if (key.startsWith("jar:") || key.startsWith("file:")) {
+-                    includeUrl = new URL(key);
+-                } else {
+-                    includeUrl = ctxt.getResource(include.getKey());
+-                }
+-                if (includeUrl == null) {
+-                    return true;
+-                }
+-
+-                URLConnection iuc = includeUrl.openConnection();
+                 long includeLastModified = 0;
+-                if (iuc instanceof JarURLConnection) {
+-                    includeLastModified =
+-                        ((JarURLConnection) iuc).getJarEntry().getTime();
++                if (key.startsWith("jar:jar:")) {
++                    // Assume we constructed this correctly
++                    int entryStart = key.lastIndexOf("!/");
++                    String entry = key.substring(entryStart + 2);
++                    Jar jar = JarFactory.newInstance(new URL(key.substring(4, entryStart)));
++                    includeLastModified = jar.getLastModified(entry);
+                 } else {
+-                    includeLastModified = iuc.getLastModified();
++                    if (key.startsWith("jar:") || key.startsWith("file:")) {
++                        includeUrl = new URL(key);
++                    } else {
++                        includeUrl = ctxt.getResource(include.getKey());
++                    }
++                    if (includeUrl == null) {
++                        return true;
++                    }
++                    URLConnection iuc = includeUrl.openConnection();
++                    if (iuc instanceof JarURLConnection) {
++                        includeLastModified =
++                            ((JarURLConnection) iuc).getJarEntry().getTime();
++                    } else {
++                        includeLastModified = iuc.getLastModified();
++                    }
++                    iuc.getInputStream().close();
+                 }
+-                iuc.getInputStream().close();
+ 
+                 if (includeLastModified != include.getValue().longValue()) {
+                     return true;
+
+==================================================
+JarResource.java
+index ddd003f07a..b59499a84c 100644
+--- a/java/org/apache/jasper/compiler/ImplicitTagLibraryInfo.java
++++ b/java/org/apache/jasper/compiler/ImplicitTagLibraryInfo.java
+@@ -197,7 +197,7 @@ class ImplicitTagLibraryInfo extends TagLibraryInfo {
+                 tagInfo = TagFileProcessor.parseTagFileDirectives(pc,
+                         shortName,
+                         path,
+-                        pc.getJspCompilationContext().getTagFileJarResource(path),
++                        pc.getJspCompilationContext().getTagFileJar(path),
+                         this);
+             } catch (JasperException je) {
+                 throw new RuntimeException(je.toString(), je);
+
+==================================================
+JarURLResource.java
+deleted file mode 100644
+index ea738554e0..0000000000
+--- a/java/org/apache/jasper/compiler/JarResource.java
++++ /dev/null
+@@ -1,45 +0,0 @@
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.jasper.compiler;
+-
+-import java.io.IOException;
+-import java.net.URL;
+-import java.util.jar.JarFile;
+-
+-public interface JarResource {
+-
+-    /**
+-     * @return The JarFile for this resource. A new instance of JarFile
+-     *         should be returned on each call.
+-     * @throws IOException
+-     */
+-    JarFile getJarFile() throws IOException;
+-
+-    /**
+-     * @return The URL of this resource. May or may not point
+-     *         to the actual Jar file.
+-     */
+-    String getUrl();
+-
+-    /**
+-     * @param name
+-     * @return The URL for the entry within this resource.
+-     */
+-    URL getEntry(String name);
+-
+-}
+
+==================================================
+JspDocumentParser.java
+deleted file mode 100644
+index c151b56b6c..0000000000
+--- a/java/org/apache/jasper/compiler/JarURLResource.java
++++ /dev/null
+@@ -1,56 +0,0 @@
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.jasper.compiler;
+-
+-import java.io.IOException;
+-import java.net.JarURLConnection;
+-import java.net.MalformedURLException;
+-import java.net.URL;
+-import java.util.jar.JarFile;
+-
+-public class JarURLResource implements JarResource {
+-
+-    private final String jarUrl;
+-
+-    public JarURLResource(String jarUrl) {
+-        this.jarUrl = jarUrl;
+-    }
+-
+-    @Override
+-    public JarFile getJarFile() throws IOException {
+-        URL jarFileUrl = new URL("jar:" + jarUrl + "!/");
+-        JarURLConnection conn = (JarURLConnection) jarFileUrl.openConnection();
+-        conn.setUseCaches(false);
+-        conn.connect();
+-        return conn.getJarFile();
+-    }
+-
+-    @Override
+-    public String getUrl() {
+-        return jarUrl;
+-    }
+-
+-    @Override
+-    public URL getEntry(String name) {
+-        try {
+-            return new URL("jar:" + jarUrl + "!/" + name);
+-        } catch (MalformedURLException e) {
+-            throw new RuntimeException("", e);
+-        }
+-    }
+-}
+
+==================================================
+JspReader.java
+index 9b86f5e95f..bc7e8f0f7b 100644
+--- a/java/org/apache/jasper/compiler/JspDocumentParser.java
++++ b/java/org/apache/jasper/compiler/JspDocumentParser.java
+@@ -22,7 +22,6 @@ import java.io.IOException;
+ import java.io.InputStream;
+ import java.util.Collection;
+ import java.util.Iterator;
+-import java.util.jar.JarFile;
+ 
+ import javax.servlet.jsp.tagext.TagFileInfo;
+ import javax.servlet.jsp.tagext.TagInfo;
+@@ -32,6 +31,7 @@ import javax.xml.parsers.SAXParserFactory;
+ 
+ import org.apache.jasper.JasperException;
+ import org.apache.jasper.JspCompilationContext;
++import org.apache.tomcat.util.scan.Jar;
+ import org.xml.sax.Attributes;
+ import org.xml.sax.InputSource;
+ import org.xml.sax.Locator;
+@@ -130,7 +130,7 @@ class JspDocumentParser
+     public static Node.Nodes parse(
+         ParserController pc,
+         String path,
+-        JarFile jarFile,
++        Jar jar,
+         Node parent,
+         boolean isTagFile,
+         boolean directivesOnly,
+@@ -166,8 +166,7 @@ class JspDocumentParser
+             SAXParser saxParser = getSAXParser(false, jspDocParser);
+             InputStream inStream = null;
+             try {
+-                inStream = JspUtil.getInputStream(path, jarFile,
+-                                                  jspDocParser.ctxt);
++                inStream = JspUtil.getInputStream(path, jar, jspDocParser.ctxt);
+                 saxParser.parse(new InputSource(inStream), jspDocParser);
+             } catch (EnableDTDValidationException e) {
+                 saxParser = getSAXParser(true, jspDocParser);
+@@ -178,8 +177,7 @@ class JspDocumentParser
+                     } catch (Exception any) {
+                     }
+                 }
+-                inStream = JspUtil.getInputStream(path, jarFile,
+-                                                  jspDocParser.ctxt);
++                inStream = JspUtil.getInputStream(path, jar, jspDocParser.ctxt);
+                 saxParser.parse(new InputSource(inStream), jspDocParser);
+             } finally {
+                 if (inStream != null) {
+
+==================================================
+JspUtil.java
+index 00ad2cef75..09b2e9db3b 100644
+--- a/java/org/apache/jasper/compiler/JspReader.java
++++ b/java/org/apache/jasper/compiler/JspReader.java
+@@ -14,7 +14,6 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+-
+ package org.apache.jasper.compiler;
+ 
+ import java.io.CharArrayWriter;
+@@ -23,13 +22,13 @@ import java.io.IOException;
+ import java.io.InputStreamReader;
+ import java.util.List;
+ import java.util.Vector;
+-import java.util.jar.JarFile;
+ 
+ import org.apache.jasper.JasperException;
+ import org.apache.jasper.JspCompilationContext;
+ import org.apache.jasper.util.ExceptionUtils;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
++import org.apache.tomcat.util.scan.Jar;
+ 
+ /**
+  * JspReader is an input buffer for the JSP parser. It should allow
+@@ -97,7 +96,7 @@ class JspReader {
+      * @param ctxt The compilation context
+      * @param fname The file name
+      * @param encoding The file encoding
+-     * @param jarFile ?
++     * @param jar ?
+      * @param err The error dispatcher
+      * @throws JasperException If a Jasper-internal error occurs
+      * @throws FileNotFoundException If the JSP file is not found (or is unreadable)
+@@ -106,12 +105,11 @@ class JspReader {
+     public JspReader(JspCompilationContext ctxt,
+                      String fname,
+                      String encoding,
+-                     JarFile jarFile,
++                     Jar jar,
+                      ErrorDispatcher err)
+             throws JasperException, FileNotFoundException, IOException {
+ 
+-        this(ctxt, fname,
+-             JspUtil.getReader(fname, encoding, jarFile, ctxt, err),
++        this(ctxt, fname, JspUtil.getReader(fname, encoding, jar, ctxt, err),
+              err);
+     }
+ 
+
+==================================================
+Parser.java
+index 454494d98e..6228d69d87 100644
+--- a/java/org/apache/jasper/compiler/JspUtil.java
++++ b/java/org/apache/jasper/compiler/JspUtil.java
+@@ -14,7 +14,6 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+-
+ package org.apache.jasper.compiler;
+ 
+ import java.io.FileNotFoundException;
+@@ -23,12 +22,11 @@ import java.io.InputStream;
+ import java.io.InputStreamReader;
+ import java.io.UnsupportedEncodingException;
+ import java.util.Vector;
+-import java.util.jar.JarFile;
+-import java.util.zip.ZipEntry;
+ 
+ import org.apache.jasper.Constants;
+ import org.apache.jasper.JasperException;
+ import org.apache.jasper.JspCompilationContext;
++import org.apache.tomcat.util.scan.Jar;
+ import org.xml.sax.Attributes;
+ 
+ /**
+@@ -652,19 +650,14 @@ public class JspUtil {
+         }
+     }
+ 
+-    public static InputStream getInputStream(String fname, JarFile jarFile,
++    public static InputStream getInputStream(String fname, Jar jar,
+             JspCompilationContext ctxt) throws IOException {
+ 
+         InputStream in = null;
+ 
+-        if (jarFile != null) {
++        if (jar != null) {
+             String jarEntryName = fname.substring(1, fname.length());
+-            ZipEntry jarEntry = jarFile.getEntry(jarEntryName);
+-            if (jarEntry == null) {
+-                throw new FileNotFoundException(Localizer.getMessage(
+-                        "jsp.error.file.not.found", fname));
+-            }
+-            in = jarFile.getInputStream(jarEntry);
++            in = jar.getInputStream(jarEntryName);
+         } else {
+             in = ctxt.getResourceAsStream(fname);
+         }
+@@ -883,18 +876,18 @@ public class JspUtil {
+     }
+ 
+     static InputStreamReader getReader(String fname, String encoding,
+-            JarFile jarFile, JspCompilationContext ctxt, ErrorDispatcher err)
++            Jar jar, JspCompilationContext ctxt, ErrorDispatcher err)
+             throws JasperException, IOException {
+ 
+-        return getReader(fname, encoding, jarFile, ctxt, err, 0);
++        return getReader(fname, encoding, jar, ctxt, err, 0);
+     }
+ 
+     static InputStreamReader getReader(String fname, String encoding,
+-            JarFile jarFile, JspCompilationContext ctxt, ErrorDispatcher err,
+-            int skip) throws JasperException, IOException {
++            Jar jar, JspCompilationContext ctxt, ErrorDispatcher err, int skip)
++            throws JasperException, IOException {
+ 
+         InputStreamReader reader = null;
+-        InputStream in = getInputStream(fname, jarFile, ctxt);
++        InputStream in = getInputStream(fname, jar, ctxt);
+         for (int i = 0; i < skip; i++) {
+             in.read();
+         }
+
+==================================================
+ParserController.java
+index 21708d273b..695e88db93 100644
+--- a/java/org/apache/jasper/compiler/Parser.java
++++ b/java/org/apache/jasper/compiler/Parser.java
+@@ -29,6 +29,7 @@ import javax.servlet.jsp.tagext.TagLibraryInfo;
+ import org.apache.jasper.JasperException;
+ import org.apache.jasper.JspCompilationContext;
+ import org.apache.jasper.util.UniqueAttributesImpl;
++import org.apache.tomcat.util.scan.Jar;
+ import org.xml.sax.Attributes;
+ import org.xml.sax.helpers.AttributesImpl;
+ 
+@@ -60,7 +61,7 @@ class Parser implements TagConstants {
+ 
+     private final boolean directivesOnly;
+ 
+-    private final JarResource jarResource;
++    private final Jar jar;
+ 
+     private final PageInfo pageInfo;
+ 
+@@ -86,7 +87,7 @@ class Parser implements TagConstants {
+      * The constructor
+      */
+     private Parser(ParserController pc, JspReader reader, boolean isTagFile,
+-            boolean directivesOnly, JarResource jarResource) {
++            boolean directivesOnly, Jar jar) {
+         this.parserController = pc;
+         this.ctxt = pc.getJspCompilationContext();
+         this.pageInfo = pc.getCompiler().getPageInfo();
+@@ -95,7 +96,7 @@ class Parser implements TagConstants {
+         this.scriptlessCount = 0;
+         this.isTagFile = isTagFile;
+         this.directivesOnly = directivesOnly;
+-        this.jarResource = jarResource;
++        this.jar = jar;
+         start = reader.mark();
+     }
+ 
+@@ -113,12 +114,11 @@ class Parser implements TagConstants {
+      */
+     public static Node.Nodes parse(ParserController pc, JspReader reader,
+             Node parent, boolean isTagFile, boolean directivesOnly,
+-            JarResource jarResource, String pageEnc, String jspConfigPageEnc,
++            Jar jar, String pageEnc, String jspConfigPageEnc,
+             boolean isDefaultPageEncoding, boolean isBomPresent)
+             throws JasperException {
+ 
+-        Parser parser = new Parser(pc, reader, isTagFile, directivesOnly,
+-                jarResource);
++        Parser parser = new Parser(pc, reader, isTagFile, directivesOnly, jar);
+ 
+         Node.Root root = new Node.Root(reader.mark(), parent, false);
+         root.setPageEncoding(pageEnc);
+@@ -317,7 +317,7 @@ class Parser implements TagConstants {
+         }
+ 
+         try {
+-            parserController.parse(file, parent, jarResource);
++            parserController.parse(file, parent, jar);
+         } catch (FileNotFoundException ex) {
+             err.jspError(start, "jsp.error.file.not.found", file);
+         } catch (Exception ex) {
+@@ -418,7 +418,7 @@ class Parser implements TagConstants {
+                         // tag files
+                         for (TagFileInfo info : impl.getTagFiles()) {
+                             ctxt.setTagFileJarResource(info.getPath(),
+-                                    ctxt.getTagFileJarResource());
++                                    ctxt.getTagFileJar());
+                         }
+                     }
+                     pageInfo.addTaglib(uri, impl);
+
+==================================================
+TagFileProcessor.java
+index 8173ddbfc4..bea4e6aef2 100644
+--- a/java/org/apache/jasper/compiler/ParserController.java
++++ b/java/org/apache/jasper/compiler/ParserController.java
+@@ -14,19 +14,18 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+-
+ package org.apache.jasper.compiler;
+ 
+ import java.io.FileNotFoundException;
+ import java.io.IOException;
+ import java.io.InputStreamReader;
+ import java.util.Stack;
+-import java.util.jar.JarFile;
+ 
+ import org.apache.jasper.JasperException;
+ import org.apache.jasper.JspCompilationContext;
+ import org.apache.jasper.util.ExceptionUtils;
+ import org.apache.jasper.xmlparser.XMLEncodingDetector;
++import org.apache.tomcat.util.scan.Jar;
+ import org.xml.sax.Attributes;
+ 
+ /**
+@@ -99,7 +98,7 @@ class ParserController implements TagConstants {
+         // respectively.
+         isTagFile = ctxt.isTagFile();
+         directiveOnly = false;
+-        return doParse(inFileName, null, ctxt.getTagFileJarResource());
++        return doParse(inFileName, null, ctxt.getTagFileJar());
+     }
+ 
+     /**
+@@ -116,7 +115,7 @@ class ParserController implements TagConstants {
+         // respectively.
+         isTagFile = ctxt.isTagFile();
+         directiveOnly = true;
+-        return doParse(inFileName, null, ctxt.getTagFileJarResource());
++        return doParse(inFileName, null, ctxt.getTagFileJar());
+     }
+ 
+ 
+@@ -125,15 +124,14 @@ class ParserController implements TagConstants {
+      *
+      * @param inFileName The path to the resource to be included.
+      * @param parent The parent node of the include directive.
+-     * @param jarResource The JAR file from which to read the included resource,
++     * @param jar The JAR file from which to read the included resource,
+      * or null of the included resource is to be read from the filesystem
+      */
+-    public Node.Nodes parse(String inFileName, Node parent,
+-            JarResource jarResource)
++    public Node.Nodes parse(String inFileName, Node parent, Jar jar)
+     throws FileNotFoundException, JasperException, IOException {
+         // For files that are statically included, isTagfile and directiveOnly
+         // remain unchanged.
+-        return doParse(inFileName, parent, jarResource);
++        return doParse(inFileName, parent, jar);
+     }
+ 
+     /**
+@@ -142,16 +140,15 @@ class ParserController implements TagConstants {
+      * This is invoked by the compiler
+      *
+      * @param inFileName    The name of the tag file to be parsed.
+-     * @param jarResource The location of the tag file.
++     * @param jar The location of the tag file.
+      */
+-    public Node.Nodes parseTagFileDirectives(String inFileName,
+-            JarResource jarResource)
++    public Node.Nodes parseTagFileDirectives(String inFileName, Jar jar)
+             throws FileNotFoundException, JasperException, IOException {
+         boolean isTagFileSave = isTagFile;
+         boolean directiveOnlySave = directiveOnly;
+         isTagFile = true;
+         directiveOnly = true;
+-        Node.Nodes page = doParse(inFileName, null, jarResource);
++        Node.Nodes page = doParse(inFileName, null, jar);
+         directiveOnly = directiveOnlySave;
+         isTagFile = isTagFileSave;
+         return page;
+@@ -168,38 +165,33 @@ class ParserController implements TagConstants {
+      * @param directivesOnly true if the file to be parsed is a tag file and
+      * we are only interested in the directives needed for constructing a
+      * TagFileInfo.
+-     * @param jarResource The JAR file from which to read the JSP page or tag file,
++     * @param jar  The JAR file from which to read the JSP page or tag file,
+      * or null if the JSP page or tag file is to be read from the filesystem
+      */
+-    @SuppressWarnings("null") // jarResource can't be null
+-    private Node.Nodes doParse(String inFileName,
+-            Node parent,
+-            JarResource jarResource)
+-    throws FileNotFoundException, JasperException, IOException {
++    private Node.Nodes doParse(String inFileName, Node parent, Jar jar)
++            throws FileNotFoundException, JasperException, IOException {
+ 
+         Node.Nodes parsedPage = null;
+         isEncodingSpecifiedInProlog = false;
+         isBomPresent = false;
+         isDefaultPageEncoding = false;
+ 
+-        JarFile jarFile = (jarResource == null) ? null : jarResource.getJarFile();
+         String absFileName = resolveFileName(inFileName);
+         String jspConfigPageEnc = getJspConfigPageEncoding(absFileName);
+ 
+         // Figure out what type of JSP document and encoding type we are
+         // dealing with
+-        determineSyntaxAndEncoding(absFileName, jarFile, jspConfigPageEnc);
++        determineSyntaxAndEncoding(absFileName, jar, jspConfigPageEnc);
+ 
+         if (parent != null) {
+             // Included resource, add to dependent list
+-            if (jarFile == null) {
++            if (jar == null) {
+                 compiler.getPageInfo().addDependant(absFileName,
+                         ctxt.getLastModified(absFileName));
+             } else {
+                 String entry = absFileName.substring(1);
+-                compiler.getPageInfo().addDependant(
+-                        jarResource.getEntry(entry).toString(),
+-                        Long.valueOf(jarFile.getEntry(entry).getTime()));
++                compiler.getPageInfo().addDependant(jar.getURL(entry),
++                        Long.valueOf(jar.getLastModified(entry)));
+ 
+             }
+         }
+@@ -224,24 +216,19 @@ class ParserController implements TagConstants {
+             // JSP document (XML syntax)
+             // InputStream for jspx page is created and properly closed in
+             // JspDocumentParser.
+-            parsedPage = JspDocumentParser.parse(this, absFileName,
+-                    jarFile, parent,
+-                    isTagFile, directiveOnly,
+-                    sourceEnc,
+-                    jspConfigPageEnc,
+-                    isEncodingSpecifiedInProlog,
+-                    isBomPresent);
++            parsedPage = JspDocumentParser.parse(this, absFileName, jar, parent,
++                    isTagFile, directiveOnly, sourceEnc, jspConfigPageEnc,
++                    isEncodingSpecifiedInProlog, isBomPresent);
+         } else {
+             // Standard syntax
+             InputStreamReader inStreamReader = null;
+             try {
+                 inStreamReader = JspUtil.getReader(absFileName, sourceEnc,
+-                        jarFile, ctxt, err, skip);
++                        jar, ctxt, err, skip);
+                 JspReader jspReader = new JspReader(ctxt, absFileName,
+                         inStreamReader, err);
+                 parsedPage = Parser.parse(this, jspReader, parent, isTagFile,
+-                        directiveOnly, jarResource,
+-                        sourceEnc, jspConfigPageEnc,
++                        directiveOnly, jar, sourceEnc, jspConfigPageEnc,
+                         isDefaultPageEncoding, isBomPresent);
+             } finally {
+                 if (inStreamReader != null) {
+@@ -253,9 +240,9 @@ class ParserController implements TagConstants {
+             }
+         }
+ 
+-        if (jarFile != null) {
++        if (jar != null) {
+             try {
+-                jarFile.close();
++                jar.close();
+             } catch (Throwable t) {
+                 ExceptionUtils.handleThrowable(t);
+             }
+@@ -289,8 +276,7 @@ class ParserController implements TagConstants {
+      * for the given file, and stores them in the 'isXml' and 'sourceEnc'
+      * instance variables, respectively.
+      */
+-    private void determineSyntaxAndEncoding(String absFileName,
+-            JarFile jarFile,
++    private void determineSyntaxAndEncoding(String absFileName, Jar jar,
+             String jspConfigPageEnc)
+     throws JasperException, IOException {
+ 
+@@ -333,8 +319,8 @@ class ParserController implements TagConstants {
+             sourceEnc = "ISO-8859-1";
+         } else {
+             // XML syntax or unknown, (auto)detect encoding ...
+-            Object[] ret = XMLEncodingDetector.getEncoding(absFileName,
+-                    jarFile, ctxt, err);
++            Object[] ret = XMLEncodingDetector.getEncoding(absFileName, jar,
++                    ctxt, err);
+             sourceEnc = (String) ret[0];
+             if (((Boolean) ret[1]).booleanValue()) {
+                 isEncodingSpecifiedInProlog = true;
+@@ -384,8 +370,7 @@ class ParserController implements TagConstants {
+          */
+         JspReader jspReader = null;
+         try {
+-            jspReader = new JspReader(ctxt, absFileName, sourceEnc, jarFile,
+-                    err);
++            jspReader = new JspReader(ctxt, absFileName, sourceEnc, jar, err);
+         } catch (FileNotFoundException ex) {
+             throw new JasperException(ex);
+         }
+
+==================================================
+TagLibraryInfoImpl.java
+index 5513c8f12f..17c0c440b5 100644
+--- a/java/org/apache/jasper/compiler/TagFileProcessor.java
++++ b/java/org/apache/jasper/compiler/TagFileProcessor.java
+@@ -37,6 +37,7 @@ import org.apache.jasper.JasperException;
+ import org.apache.jasper.JspCompilationContext;
+ import org.apache.jasper.runtime.JspSourceDependent;
+ import org.apache.jasper.servlet.JspServletWrapper;
++import org.apache.tomcat.util.scan.Jar;
+ 
+ /**
+  * 1. Processes and extracts the directive info in a tag file. 2. Compiles and
+@@ -477,7 +478,7 @@ class TagFileProcessor {
+      *            the tag name as specified in the TLD
+      * @param path
+      *            the path for the tagfile
+-     * @param jarResource
++     * @param jar
+      *            the Jar resource containing the tag file
+      * @param tagLibInfo
+      *            the TagLibraryInfo object associated with this TagInfo
+@@ -485,7 +486,7 @@ class TagFileProcessor {
+      */
+     @SuppressWarnings("null") // page can't be null
+     public static TagInfo parseTagFileDirectives(ParserController pc,
+-            String name, String path, JarResource jarResource, TagLibraryInfo tagLibInfo)
++            String name, String path, Jar jar, TagLibraryInfo tagLibInfo)
+             throws JasperException {
+ 
+ 
+@@ -493,7 +494,7 @@ class TagFileProcessor {
+ 
+         Node.Nodes page = null;
+         try {
+-            page = pc.parseTagFileDirectives(path, jarResource);
++            page = pc.parseTagFileDirectives(path, jar);
+         } catch (FileNotFoundException e) {
+             err.jspError("jsp.error.file.not.found", path);
+         } catch (IOException e) {
+@@ -514,17 +515,16 @@ class TagFileProcessor {
+     private Class<?> loadTagFile(Compiler compiler, String tagFilePath,
+             TagInfo tagInfo, PageInfo parentPageInfo) throws JasperException {
+ 
+-        JarResource tagJarResouce = null;
++        Jar tagJar = null;
+         if (tagFilePath.startsWith("/META-INF/")) {
+-            tagJarResouce =
+-                compiler.getCompilationContext().getTldLocation(
+-                        tagInfo.getTagLibrary().getURI()).getJarResource();
++            tagJar= compiler.getCompilationContext().getTldLocation(
++                        tagInfo.getTagLibrary().getURI()).getJar();
+         }
+         String wrapperUri;
+-        if (tagJarResouce == null) {
++        if (tagJar == null) {
+             wrapperUri = tagFilePath;
+         } else {
+-            wrapperUri = tagJarResouce.getEntry(tagFilePath).toString();
++            wrapperUri = tagJar.getURL(tagFilePath);
+         }
+ 
+         JspCompilationContext ctxt = compiler.getCompilationContext();
+@@ -535,7 +535,7 @@ class TagFileProcessor {
+             if (wrapper == null) {
+                 wrapper = new JspServletWrapper(ctxt.getServletContext(), ctxt
+                         .getOptions(), tagFilePath, tagInfo, ctxt
+-                        .getRuntimeContext(), tagJarResouce);
++                        .getRuntimeContext(), tagJar);
+                 rctxt.addWrapper(wrapperUri, wrapper);
+ 
+                 // Use same classloader and classpath for compiling tag files
+@@ -562,7 +562,7 @@ class TagFileProcessor {
+                     JspServletWrapper tempWrapper = new JspServletWrapper(ctxt
+                             .getServletContext(), ctxt.getOptions(),
+                             tagFilePath, tagInfo, ctxt.getRuntimeContext(),
+-                            ctxt.getTagFileJarResource(tagFilePath));
++                            ctxt.getTagFileJar(tagFilePath));
+                     // Use same classloader and classpath for compiling tag files
+                     tempWrapper.getJspEngineContext().setClassLoader(
+                             ctxt.getClassLoader());
+@@ -625,15 +625,15 @@ class TagFileProcessor {
+                     TldLocation location =
+                         compiler.getCompilationContext().getTldLocation(
+                             tagFileInfo.getTagInfo().getTagLibrary().getURI());
+-                    JarResource jarResource = location.getJarResource();
+-                    if (jarResource != null) {
++                    Jar jar = location.getJar();
++                    if (jar != null) {
+                         try {
+                             // Add TLD
+-                            pageInfo.addDependant(jarResource.getEntry(location.getName()).toString(),
+-                                    Long.valueOf(jarResource.getJarFile().getEntry(location.getName()).getTime()));
++                            pageInfo.addDependant(jar.getURL(location.getName()),
++                                    Long.valueOf(jar.getLastModified(location.getName())));
+                             // Add Tag
+-                            pageInfo.addDependant(jarResource.getEntry(tagFilePath.substring(1)).toString(),
+-                                    Long.valueOf(jarResource.getJarFile().getEntry(tagFilePath.substring(1)).getTime()));
++                            pageInfo.addDependant(jar.getURL(tagFilePath.substring(1)),
++                                    Long.valueOf(jar.getLastModified(tagFilePath.substring(1))));
+                         } catch (IOException ioe) {
+                             throw new JasperException(ioe);
+                         }
+
+==================================================
+TldLocation.java
+index 5cffe17891..71e024403b 100644
+--- a/java/org/apache/jasper/compiler/TagLibraryInfoImpl.java
++++ b/java/org/apache/jasper/compiler/TagLibraryInfoImpl.java
+@@ -20,6 +20,7 @@ package org.apache.jasper.compiler;
+ import java.io.File;
+ import java.io.FileInputStream;
+ import java.io.FileNotFoundException;
++import java.io.IOException;
+ import java.io.InputStream;
+ import java.io.PrintWriter;
+ import java.io.StringWriter;
+@@ -52,6 +53,7 @@ import org.apache.jasper.xmlparser.ParserUtils;
+ import org.apache.jasper.xmlparser.TreeNode;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
++import org.apache.tomcat.util.scan.Jar;
+ 
+ /**
+  * Implementation of the TagLibraryInfo class from the JSP spec.
+@@ -163,9 +165,9 @@ class TagLibraryInfoImpl extends TagLibraryInfo implements TagConstants {
+         }
+ 
+         String tldName = location.getName();
+-        JarResource jarResource = location.getJarResource();
++        Jar jar = location.getJar();
+         try {
+-            if (jarResource == null) {
++            if (jar == null) {
+                 // Location points directly to TLD file
+                 try {
+                     in = getResourceAsStream(tldName);
+@@ -186,11 +188,12 @@ class TagLibraryInfoImpl extends TagLibraryInfo implements TagConstants {
+             } else {
+                 // Tag library is packaged in JAR file
+                 try {
+-                    in = jarResource.getEntry(tldName).openStream();
+-                    parseTLD(jarResource.getUrl(), in, jarResource);
++                    in = jar.getInputStream(tldName);
++                    parseTLD(jar.getJarFileURL().toExternalForm(), in, jar);
+                 } catch (Exception ex) {
+-                    err.jspError(mark, "jsp.error.tld.unable_to_read", jarResource.getUrl(),
+-                            tldName, ex.toString());
++                    err.jspError(mark, "jsp.error.tld.unable_to_read",
++                            jar.getJarFileURL().toExternalForm(), tldName,
++                            ex.toString());
+                 }
+             }
+         } finally {
+@@ -216,7 +219,7 @@ class TagLibraryInfoImpl extends TagLibraryInfo implements TagConstants {
+      * in The TLD's input stream @param jarFileUrl The JAR file containing the
+      * TLD, or null if the tag library is not packaged in a JAR
+      */
+-    private void parseTLD(String uri, InputStream in, JarResource jarResource)
++    private void parseTLD(String uri, InputStream in, Jar jar)
+             throws JasperException {
+         Vector<TagInfo> tagVector = new Vector<>();
+         Vector<TagFileInfo> tagFileVector = new Vector<>();
+@@ -255,8 +258,7 @@ class TagLibraryInfoImpl extends TagLibraryInfo implements TagConstants {
+             else if ("tag".equals(tname))
+                 tagVector.addElement(createTagInfo(element, jspversion));
+             else if ("tag-file".equals(tname)) {
+-                TagFileInfo tagFileInfo = createTagFileInfo(element,
+-                        jarResource);
++                TagFileInfo tagFileInfo = createTagFileInfo(element, jar);
+                 tagFileVector.addElement(tagFileInfo);
+             } else if ("function".equals(tname)) { // JSP2.0
+                 FunctionInfo funcInfo = createFunctionInfo(element);
+@@ -311,7 +313,6 @@ class TagLibraryInfoImpl extends TagLibraryInfo implements TagConstants {
+      *
+      * @return the location of the TLD identified by the uri
+      */
+-    @SuppressWarnings("null") // url can't be null
+     private TldLocation generateTLDLocation(String uri, JspCompilationContext ctxt)
+             throws JasperException {
+ 
+@@ -336,7 +337,11 @@ class TagLibraryInfoImpl extends TagLibraryInfo implements TagConstants {
+             if (url == null) {
+                 err.jspError("jsp.error.tld.missing_jar", uri);
+             }
+-            return new TldLocation("META-INF/taglib.tld", url.toString());
++            try {
++                return new TldLocation("META-INF/taglib.tld", url);
++            } catch (IOException ioe) {
++                throw new JasperException(ioe);
++            }
+         } else {
+             return new TldLocation(uri);
+         }
+@@ -450,7 +455,7 @@ class TagLibraryInfoImpl extends TagLibraryInfo implements TagConstants {
+      *
+      * @return TagInfo corresponding to tag file directives
+      */
+-    private TagFileInfo createTagFileInfo(TreeNode elem, JarResource jarResource)
++    private TagFileInfo createTagFileInfo(TreeNode elem, Jar jar)
+             throws JasperException {
+ 
+         String name = null;
+@@ -488,13 +493,13 @@ class TagLibraryInfoImpl extends TagLibraryInfo implements TagConstants {
+             // See https://issues.apache.org/bugzilla/show_bug.cgi?id=46471
+             // This needs to be removed once all the broken code that depends on
+             // it has been removed
+-            ctxt.setTagFileJarResource(path, jarResource);
++            ctxt.setTagFileJarResource(path, jar);
+         } else if (!path.startsWith("/WEB-INF/tags")) {
+             err.jspError("jsp.error.tagfile.illegalPath", path);
+         }
+ 
+         TagInfo tagInfo = TagFileProcessor.parseTagFileDirectives(
+-                parserController, name, path, jarResource, this);
++                parserController, name, path, jar, this);
+         return new TagFileInfo(name, path, tagInfo);
+     }
+ 
+
+==================================================
+TldLocationsCache.java
+index c1d797ae41..8528001644 100644
+--- a/java/org/apache/jasper/compiler/TldLocation.java
++++ b/java/org/apache/jasper/compiler/TldLocation.java
+@@ -17,21 +17,27 @@
+ 
+ package org.apache.jasper.compiler;
+ 
++import java.io.IOException;
++import java.net.URL;
++
++import org.apache.tomcat.util.scan.Jar;
++import org.apache.tomcat.util.scan.JarFactory;
++
+ @Deprecated
+ public class TldLocation {
+ 
+     private final String entryName;
+-    private final JarResource jar;
++    private final Jar jar;
+ 
+     public TldLocation(String entryName) {
+-        this(entryName, (JarResource)null);
++        this(entryName, (Jar)null);
+     }
+ 
+-    public TldLocation(String entryName, String resourceUrl) {
+-        this(entryName, getJarResource(resourceUrl));
++    public TldLocation(String entryName, URL url) throws IOException {
++        this(entryName, JarFactory.newInstance(url));
+     }
+ 
+-    public TldLocation(String entryName, JarResource jarResource) {
++    public TldLocation(String entryName, Jar jarResource) {
+         if (entryName == null) {
+             throw new IllegalArgumentException("Tld name is required");
+         }
+@@ -39,10 +45,6 @@ public class TldLocation {
+         this.jar = jarResource;
+     }
+ 
+-    private static JarResource getJarResource(String resourceUrl) {
+-        return (resourceUrl != null) ? new JarURLResource(resourceUrl) : null;
+-    }
+-
+     /**
+      * @return The name of the tag library.
+      */
+@@ -55,7 +57,7 @@ public class TldLocation {
+      * @return The jar resource the tag library is contained in.
+      *         Might return null if the tag library is not contained in jar resource.
+      */
+-    public JarResource getJarResource() {
++    public Jar getJar() {
+         return jar;
+     }
+ }
+
+==================================================
+JasperInitializer.java
+index 25dd153152..0073b63985 100644
+--- a/java/org/apache/jasper/compiler/TldLocationsCache.java
++++ b/java/org/apache/jasper/compiler/TldLocationsCache.java
+@@ -16,6 +16,8 @@
+  */
+ package org.apache.jasper.compiler;
+ 
++import java.io.IOException;
++import java.net.URL;
+ import java.util.Hashtable;
+ import java.util.Map;
+ 
+@@ -63,16 +65,17 @@ public class TldLocationsCache {
+ 
+     private final Hashtable<String, TldLocation> mappings;
+ 
+-    public TldLocationsCache(Map<String, TldResourcePath> taglibMap) {
++    public TldLocationsCache(Map<String, TldResourcePath> taglibMap)
++            throws IOException {
+         mappings = new Hashtable<>(taglibMap.size());
+         for (Map.Entry<String, TldResourcePath> entry : taglibMap.entrySet()) {
+             String uri = entry.getKey();
+             TldResourcePath tldResourcePath = entry.getValue();
+-            String url = tldResourcePath.getUrl().toExternalForm();
++            URL url = tldResourcePath.getUrl();
+             String entryName = tldResourcePath.getEntryName();
+             TldLocation tldLocation;
+             if (entryName == null) {
+-                tldLocation = new TldLocation(url);
++                tldLocation = new TldLocation(url.toExternalForm());
+             } else {
+                 tldLocation = new TldLocation(entryName, url);
+             }
+
+==================================================
+JspServletWrapper.java
+index e08344c4de..09feb15802 100644
+--- a/java/org/apache/jasper/servlet/JasperInitializer.java
++++ b/java/org/apache/jasper/servlet/JasperInitializer.java
+@@ -65,6 +65,10 @@ public class JasperInitializer implements ServletContainerInitializer {
+         }
+ 
+         Map<String, TldResourcePath> taglibMap = scanner.getTaglibMap();
+-        context.setAttribute(TldLocationsCache.KEY, new TldLocationsCache(taglibMap));
++        try {
++            context.setAttribute(TldLocationsCache.KEY, new TldLocationsCache(taglibMap));
++        } catch (IOException ioe) {
++            throw new ServletException(ioe);
++        }
+     }
+ }
+
+==================================================
+XMLEncodingDetector.java
+index 6a9ba4cb32..3edec16218 100644
+--- a/java/org/apache/jasper/servlet/JspServletWrapper.java
++++ b/java/org/apache/jasper/servlet/JspServletWrapper.java
+@@ -38,7 +38,6 @@ import org.apache.jasper.JasperException;
+ import org.apache.jasper.JspCompilationContext;
+ import org.apache.jasper.Options;
+ import org.apache.jasper.compiler.ErrorDispatcher;
+-import org.apache.jasper.compiler.JarResource;
+ import org.apache.jasper.compiler.JavacErrorDetail;
+ import org.apache.jasper.compiler.JspRuntimeContext;
+ import org.apache.jasper.compiler.Localizer;
+@@ -49,6 +48,7 @@ import org.apache.jasper.util.FastRemovalDequeue;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.InstanceManager;
++import org.apache.tomcat.util.scan.Jar;
+ 
+ /**
+  * The JSP engine (a.k.a Jasper).
+@@ -130,7 +130,7 @@ public class JspServletWrapper {
+                              String tagFilePath,
+                              TagInfo tagInfo,
+                              JspRuntimeContext rctxt,
+-                             JarResource tagJarResource) {
++                             Jar tagJar) {
+ 
+         this.isTagFile = true;
+         this.config = null;        // not used
+@@ -142,7 +142,7 @@ public class JspServletWrapper {
+         unloadAllowed = unloadByCount || unloadByIdle ? true : false;
+         ctxt = new JspCompilationContext(jspUri, tagInfo, options,
+                                          servletContext, this, rctxt,
+-                                         tagJarResource);
++                                         tagJar);
+     }
+ 
+     public JspCompilationContext getJspEngineContext() {
+
+==================================================
+FileUrlJar.java
+index ae5917035d..6edd4419de 100644
+--- a/java/org/apache/jasper/xmlparser/XMLEncodingDetector.java
++++ b/java/org/apache/jasper/xmlparser/XMLEncodingDetector.java
+@@ -22,7 +22,6 @@
+  * information on the Apache Software Foundation, please see
+  * <http://www.apache.org/>.
+  */
+-
+ package org.apache.jasper.xmlparser;
+ 
+ import java.io.EOFException;
+@@ -31,13 +30,13 @@ import java.io.InputStream;
+ import java.io.InputStreamReader;
+ import java.io.Reader;
+ import java.util.Locale;
+-import java.util.jar.JarFile;
+ 
+ import org.apache.jasper.JasperException;
+ import org.apache.jasper.JspCompilationContext;
+ import org.apache.jasper.compiler.ErrorDispatcher;
+ import org.apache.jasper.compiler.JspUtil;
+ import org.apache.jasper.compiler.Localizer;
++import org.apache.tomcat.util.scan.Jar;
+ 
+ public class XMLEncodingDetector {
+ 
+@@ -95,12 +94,12 @@ public class XMLEncodingDetector {
+      * encoding was specified using the 'encoding' attribute of an XML prolog
+      * (TRUE) or autodetected (FALSE).
+      */
+-    public static Object[] getEncoding(String fname, JarFile jarFile,
++    public static Object[] getEncoding(String fname, Jar jar,
+                                        JspCompilationContext ctxt,
+                                        ErrorDispatcher err)
+         throws IOException, JasperException
+     {
+-        InputStream inStream = JspUtil.getInputStream(fname, jarFile, ctxt);
++        InputStream inStream = JspUtil.getInputStream(fname, jar, ctxt);
+         XMLEncodingDetector detector = new XMLEncodingDetector();
+         Object[] ret = detector.getEncoding(inStream, err);
+         inStream.close();
+
+==================================================
+FileUrlNestedJar.java
+index 0c42b56f87..3c33b14da1 100644
+--- a/java/org/apache/tomcat/util/scan/FileUrlJar.java
++++ b/java/org/apache/tomcat/util/scan/FileUrlJar.java
+@@ -66,6 +66,26 @@ public class FileUrlJar implements Jar {
+         }
+     }
+ 
++    @Override
++    public long getLastModified(String name) throws IOException {
++        ZipEntry entry = jarFile.getEntry(name);
++        if (entry == null) {
++            return -1;
++        } else {
++            return entry.getTime();
++        }
++    }
++
++    @Override
++    public String getURL(String entry) {
++        StringBuilder result = new StringBuilder("jar:");
++        result.append(getJarFileURL().toExternalForm());
++        result.append("!/");
++        result.append(entry);
++
++        return result.toString();
++    }
++
+     @Override
+     public void close() {
+         if (jarFile != null) {
+
+==================================================
+Jar.java
+index e77fbe3f17..270a0e09a1 100644
+--- a/java/org/apache/tomcat/util/scan/FileUrlNestedJar.java
++++ b/java/org/apache/tomcat/util/scan/FileUrlNestedJar.java
+@@ -91,6 +91,33 @@ public class FileUrlNestedJar implements Jar {
+     }
+ 
+ 
++    @Override
++    public long getLastModified(String name) throws IOException {
++        JarEntry entry = jarInputStream.getNextJarEntry();
++        while (entry != null) {
++            if (name.equals(entry.getName())) {
++                break;
++            }
++            entry = jarInputStream.getNextJarEntry();
++        }
++
++        if (entry == null) {
++            return -1;
++        } else {
++            return entry.getTime();
++        }
++    }
++
++    @Override
++    public String getURL(String entry) {
++        StringBuilder result = new StringBuilder("jar:");
++        result.append(getJarFileURL().toExternalForm());
++        result.append("!/");
++        result.append(entry);
++
++        return result.toString();
++    }
++
+     @Override
+     public void close() {
+         closeInner();
+
+==================================================
+UrlJar.java
+index 954740967a..378dbffb41 100644
+--- a/java/org/apache/tomcat/util/scan/Jar.java
++++ b/java/org/apache/tomcat/util/scan/Jar.java
+@@ -56,6 +56,17 @@ public interface Jar {
+      */
+     InputStream getInputStream(String name) throws IOException;
+ 
++    /**
++     * Obtain the last modified time for the given resource in the JAR.
++     *
++     * @param name  Entry to obtain the modification time for
++     *
++     * @return The time (in the same format as
++     *         {@link System#currentTimeMillis()} that the resource was last
++     *         modified. Returns -1 if the entry does not exist
++     */
++    long getLastModified(String name) throws IOException;
++
+     /**
+      * Close any resources associated with this JAR.
+      */
+@@ -81,6 +92,20 @@ public interface Jar {
+      */
+     InputStream getEntryInputStream() throws IOException;
+ 
++    /**
++     * Obtain, in String form, the URL for an entry in this JAR. Note that for
++     * JARs nested in WAR files, the Tomact specific war:file:... form will not
++     * be used, rather the jar:jar:file:... form (that the JRE does not
++     * understand will be used). Note that this means that any code using these
++     * URLs will need to understand the jar;jar:file:... form and use the
++     * {@link JarFactory} to ensure resources are accessed correctly.
++     *
++     * @param entry The entry to generate the URL for
++     *
++     * @return a URL for the specified entry in the JAR
++     */
++    String getURL(String entry);
++
+     /**
+      * Resets the internal pointer used to track JAR entries to the beginning of
+      * the JAR.
+
+==================================================

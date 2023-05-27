@@ -1,0 +1,433 @@
+66b63464ac57cbb3c915fd93a6d1caf3948030de
+==================================================
+Use SocketWrapper for reads with AJP. Only NIO working at this point.
+==================================================
+Mark Thomas
+==================================================
+Sun Nov 23 22:49:36 2014 +0000
+==================================================
+AbstractAjpProcessor.java
+Use SocketWrapper for reads with AJP. Only NIO working at this point.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1641268 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AjpAprProcessor.java
+index dcfab7df66..dd6ea8fadb 100644
+--- a/java/org/apache/coyote/ajp/AbstractAjpProcessor.java
++++ b/java/org/apache/coyote/ajp/AbstractAjpProcessor.java
+@@ -925,25 +925,6 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+     protected abstract void setupSocket(SocketWrapperBase<S> socketWrapper)
+             throws IOException;
+ 
+-    // Methods used by readMessage
+-    /**
+-     * Read at least the specified amount of bytes, and place them
+-     * in the input buffer. Note that if any data is available to read then this
+-     * method will always block until at least the specified number of bytes
+-     * have been read.
+-     *
+-     * @param buf   Buffer to read data into
+-     * @param pos   Start position
+-     * @param n     The minimum number of bytes to read
+-     * @param block If there is no data available to read when this method is
+-     *              called, should this call block until data becomes available?
+-     * @return  <code>true</code> if the requested number of bytes were read
+-     *          else <code>false</code>
+-     * @throws IOException
+-     */
+-    protected abstract boolean read(byte[] buf, int pos, int n, boolean block)
+-            throws IOException;
+-
+     // Methods used by SocketInputBuffer
+     /**
+      * Read an AJP body message. Used to read both the 'special' packet in ajp13
+@@ -1559,6 +1540,31 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+     }
+ 
+ 
++    /**
++     * Read at least the specified amount of bytes, and place them
++     * in the input buffer. Note that if any data is available to read then this
++     * method will always block until at least the specified number of bytes
++     * have been read.
++     *
++     * @param buf   Buffer to read data into
++     * @param pos   Start position
++     * @param n     The minimum number of bytes to read
++     * @param block If there is no data available to read when this method is
++     *              called, should this call block until data becomes available?
++     * @return  <code>true</code> if the requested number of bytes were read
++     *          else <code>false</code>
++     * @throws IOException
++     */
++    private boolean read(byte[] buf, int pos, int n, boolean block) throws IOException {
++        int read = socketWrapper.read(block, buf, pos, n);
++        if (!block && read > 0 && read < n) {
++            socketWrapper.read(true, buf, pos + n, n - read);
++        }
++
++        return read > 0;
++    }
++
++
+     private void writeData(ByteChunk chunk) throws IOException {
+         // Prevent timeout
+         socketWrapper.access();
+
+==================================================
+AjpNio2Processor.java
+index 362fb68351..a400d174a4 100644
+--- a/java/org/apache/coyote/ajp/AjpAprProcessor.java
++++ b/java/org/apache/coyote/ajp/AjpAprProcessor.java
+@@ -16,16 +16,11 @@
+  */
+ package org.apache.coyote.ajp;
+ 
+-import java.io.IOException;
+-import java.net.SocketTimeoutException;
+ import java.nio.ByteBuffer;
+-import java.util.concurrent.locks.Lock;
+-import java.util.concurrent.locks.ReentrantReadWriteLock.WriteLock;
+ 
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.jni.Socket;
+-import org.apache.tomcat.jni.Status;
+ import org.apache.tomcat.util.net.AprEndpoint;
+ import org.apache.tomcat.util.net.SocketWrapperBase;
+ 
+@@ -80,103 +75,6 @@ public class AjpAprProcessor extends AbstractAjpProcessor<Long> {
+     }
+ 
+ 
+-    @Override
+-    protected boolean read(byte[] buf, int pos, int n, boolean block)
+-            throws IOException {
+-
+-        boolean nextReadBlocks = block;
+-
+-        if (!block && inputBuffer.remaining() > 0) {
+-            nextReadBlocks = true;
+-        }
+-
+-        if (inputBuffer.capacity() - inputBuffer.limit() <=
+-                n - inputBuffer.remaining()) {
+-            inputBuffer.compact();
+-            inputBuffer.limit(inputBuffer.position());
+-            inputBuffer.position(0);
+-        }
+-        int nRead;
+-        while (inputBuffer.remaining() < n) {
+-            nRead = readSocket(inputBuffer.limit(),
+-                    inputBuffer.capacity() - inputBuffer.limit(),
+-                    nextReadBlocks);
+-            if (nRead == 0) {
+-                // Must be a non-blocking read
+-                return false;
+-            } else if (-nRead == Status.EAGAIN) {
+-                return false;
+-            } else if ((-nRead) == Status.ETIMEDOUT || (-nRead) == Status.TIMEUP) {
+-                if (block) {
+-                    throw new SocketTimeoutException(
+-                            sm.getString("ajpprocessor.readtimeout"));
+-                } else {
+-                    // Attempting to read from the socket when the poller
+-                    // has not signalled that there is data to read appears
+-                    // to behave like a blocking read with a short timeout
+-                    // on OSX rather than like a non-blocking read. If no
+-                    // data is read, treat the resulting timeout like a
+-                    // non-blocking read that returned no data.
+-                    return false;
+-                }
+-            } else if (nRead > 0) {
+-                inputBuffer.limit(inputBuffer.limit() + nRead);
+-                nextReadBlocks = true;
+-            } else {
+-                throw new IOException(sm.getString("ajpprocessor.failedread"));
+-            }
+-        }
+-
+-        inputBuffer.get(buf, pos, n);
+-        return true;
+-    }
+-
+-
+-    private int readSocket(int pos, int len, boolean block) {
+-
+-        Lock readLock = socketWrapper.getBlockingStatusReadLock();
+-        WriteLock writeLock = socketWrapper.getBlockingStatusWriteLock();
+-        long socket = socketWrapper.getSocket().longValue();
+-
+-        boolean readDone = false;
+-        int result = 0;
+-        readLock.lock();
+-        try {
+-            if (socketWrapper.getBlockingStatus() == block) {
+-                result = Socket.recvbb(socket, pos, len);
+-                readDone = true;
+-            }
+-        } finally {
+-            readLock.unlock();
+-        }
+-
+-        if (!readDone) {
+-            writeLock.lock();
+-            try {
+-                socketWrapper.setBlockingStatus(block);
+-                // Set the current settings for this socket
+-                Socket.optSet(socket, Socket.APR_SO_NONBLOCK, (block ? 0 : 1));
+-                // Downgrade the lock
+-                readLock.lock();
+-                try {
+-                    writeLock.unlock();
+-                    result = Socket.recvbb(socket, pos, len);
+-                } finally {
+-                    readLock.unlock();
+-                }
+-            } finally {
+-                // Should have been released above but may not have been on some
+-                // exception paths
+-                if (writeLock.isHeldByCurrentThread()) {
+-                    writeLock.unlock();
+-                }
+-            }
+-        }
+-
+-        return result;
+-    }
+-
+-
+     /**
+      * Recycle the processor.
+      */
+
+==================================================
+AjpNio2Protocol.java
+index c17384017e..479d06ff2c 100644
+--- a/java/org/apache/coyote/ajp/AjpNio2Processor.java
++++ b/java/org/apache/coyote/ajp/AjpNio2Processor.java
+@@ -17,10 +17,6 @@
+ package org.apache.coyote.ajp;
+ 
+ import java.io.IOException;
+-import java.nio.ByteBuffer;
+-import java.util.concurrent.ExecutionException;
+-import java.util.concurrent.TimeUnit;
+-import java.util.concurrent.TimeoutException;
+ 
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+@@ -67,91 +63,4 @@ public class AjpNio2Processor extends AbstractAjpProcessor<Nio2Channel> {
+             throws IOException {
+         // NO-OP
+     }
+-
+-
+-    @Override
+-    protected boolean read(byte[] buf, int pos, int n, boolean blockFirstRead)
+-        throws IOException {
+-
+-        int read = 0;
+-        int res = 0;
+-        boolean block = blockFirstRead;
+-
+-        while (read < n) {
+-            res = readSocket(buf, read + pos, n - read, block);
+-            if (res > 0) {
+-                read += res;
+-            } else if (res == 0 && !block) {
+-                return false;
+-            } else {
+-                throw new IOException(sm.getString("ajpprocessor.failedread"));
+-            }
+-            block = true;
+-        }
+-        return true;
+-    }
+-
+-
+-    private int readSocket(byte[] buf, int pos, int n, boolean block)
+-            throws IOException {
+-        int nRead = 0;
+-        ByteBuffer readBuffer =
+-                socketWrapper.getSocket().getBufHandler().getReadBuffer();
+-
+-        if (block) {
+-            if (!flipped) {
+-                readBuffer.flip();
+-                flipped = true;
+-            }
+-            if (readBuffer.remaining() > 0) {
+-                nRead = Math.min(n, readBuffer.remaining());
+-                readBuffer.get(buf, pos, nRead);
+-                if (readBuffer.remaining() == 0) {
+-                    readBuffer.clear();
+-                    flipped = false;
+-                }
+-            } else {
+-                readBuffer.clear();
+-                flipped = false;
+-                readBuffer.limit(n);
+-                try {
+-                    nRead = socketWrapper.getSocket().read(readBuffer)
+-                            .get(socketWrapper.getTimeout(), TimeUnit.MILLISECONDS).intValue();
+-                } catch (InterruptedException | ExecutionException
+-                        | TimeoutException e) {
+-                    throw new IOException(sm.getString("ajpprocessor.failedread"), e);
+-                }
+-                if (nRead > 0) {
+-                    if (!flipped) {
+-                        readBuffer.flip();
+-                        flipped = true;
+-                    }
+-                    nRead = Math.min(n, readBuffer.remaining());
+-                    readBuffer.get(buf, pos, nRead);
+-                    if (readBuffer.remaining() == 0) {
+-                        readBuffer.clear();
+-                        flipped = false;
+-                    }
+-                }
+-            }
+-        } else {
+-            if (!flipped) {
+-                readBuffer.flip();
+-                flipped = true;
+-            }
+-            if (readBuffer.remaining() > 0) {
+-                nRead = Math.min(n, readBuffer.remaining());
+-                readBuffer.get(buf, pos, nRead);
+-                if (readBuffer.remaining() == 0) {
+-                    readBuffer.clear();
+-                    flipped = false;
+-                }
+-            } else {
+-                readBuffer.clear();
+-                flipped = false;
+-                readBuffer.limit(n);
+-            }
+-        }
+-        return nRead;
+-    }
+ }
+
+==================================================
+AjpNioProcessor.java
+index 9d3c3619bd..ce1ef88bc7 100644
+--- a/java/org/apache/coyote/ajp/AjpNio2Protocol.java
++++ b/java/org/apache/coyote/ajp/AjpNio2Protocol.java
+@@ -136,6 +136,8 @@ public class AjpNio2Protocol extends AbstractAjpProtocol<Nio2Channel> {
+             processor.recycle(isSocketClosing);
+             recycledProcessors.push(processor);
+             if (addToPoller) {
++                //Exception e = new Exception ("Nio2 add to poller");
++                //e.printStackTrace();
+                 ((Nio2Endpoint) proto.endpoint).awaitBytes(socket);
+             }
+         }
+
+==================================================
+NioChannel.java
+index 71e84a5e56..5d498bf592 100644
+--- a/java/org/apache/coyote/ajp/AjpNioProcessor.java
++++ b/java/org/apache/coyote/ajp/AjpNioProcessor.java
+@@ -16,11 +16,8 @@
+  */
+ package org.apache.coyote.ajp;
+ 
+-import java.io.EOFException;
+ import java.io.IOException;
+-import java.nio.ByteBuffer;
+ import java.nio.channels.SelectionKey;
+-import java.nio.channels.Selector;
+ 
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+@@ -82,69 +79,4 @@ public class AjpNioProcessor extends AbstractAjpProcessor<NioChannel> {
+             throws IOException {
+         // NO-OP
+     }
+-
+-
+-    @Override
+-    protected boolean read(byte[] buf, int pos, int n, boolean blockFirstRead)
+-        throws IOException {
+-
+-        int read = 0;
+-        int res = 0;
+-        boolean block = blockFirstRead;
+-
+-        while (read < n) {
+-            res = readSocket(buf, read + pos, n - read, block);
+-            if (res > 0) {
+-                read += res;
+-            } else if (res == 0 && !block) {
+-                return false;
+-            } else {
+-                throw new IOException(sm.getString("ajpprocessor.failedread"));
+-            }
+-            block = true;
+-        }
+-        return true;
+-    }
+-
+-
+-    private int readSocket(byte[] buf, int pos, int n, boolean block)
+-            throws IOException {
+-        int nRead = 0;
+-        ByteBuffer readBuffer =
+-                socketWrapper.getSocket().getBufHandler().getReadBuffer();
+-        readBuffer.clear();
+-        readBuffer.limit(n);
+-        if ( block ) {
+-            Selector selector = null;
+-            try {
+-                selector = pool.get();
+-            } catch ( IOException x ) {
+-                // Ignore
+-            }
+-            try {
+-                NioEndpoint.NioSocketWrapper att =
+-                        (NioEndpoint.NioSocketWrapper) socketWrapper.getSocket().getAttachment(false);
+-                if ( att == null ) throw new IOException("Key must be cancelled.");
+-                nRead = pool.read(readBuffer, socketWrapper.getSocket(),
+-                        selector, att.getTimeout());
+-            } catch ( EOFException eof ) {
+-                nRead = -1;
+-            } finally {
+-                if ( selector != null ) pool.put(selector);
+-            }
+-        } else {
+-            nRead = socketWrapper.getSocket().read(readBuffer);
+-        }
+-        if (nRead > 0) {
+-            readBuffer.flip();
+-            readBuffer.limit(nRead);
+-            readBuffer.get(buf, pos, nRead);
+-            return nRead;
+-        } else if (nRead == -1) {
+-            //return false;
+-            throw new EOFException(sm.getString("iib.eof.error"));
+-        } else {
+-            return 0;
+-        }
+-    }
+ }
+
+==================================================
+NioEndpoint.java
+index a933ef701b..e8da5292ec 100644
+--- a/java/org/apache/tomcat/util/net/NioChannel.java
++++ b/java/org/apache/tomcat/util/net/NioChannel.java
+@@ -62,6 +62,7 @@ public class NioChannel implements ByteChannel {
+      */
+     public void reset() throws IOException {
+         bufHandler.getReadBuffer().clear();
++        bufHandler.getReadBuffer().limit(0);
+         bufHandler.getWriteBuffer().clear();
+         this.sendFile = false;
+     }
+
+==================================================

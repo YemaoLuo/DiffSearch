@@ -1,0 +1,191 @@
+c760349e41d26b3bde61699e568a8178f9b6ed10
+==================================================
+Expand on fix for BZ 65757 - check for specific request thread
+==================================================
+Mark Thomas
+==================================================
+Mon Jan 10 13:40:58 2022 +0000
+==================================================
+AbstractProtocol.java
+Expand on fix for BZ 65757 - check for specific request thread
+
+Previous check was for any container thread. New check looks for the
+specific container thread currently assigned to the request/response.
+
+
+==================================================
+AsyncStateMachine.java
+index c8af0d2833..c286a23773 100644
+--- a/java/org/apache/coyote/AbstractProtocol.java
++++ b/java/org/apache/coyote/AbstractProtocol.java
+@@ -798,8 +798,6 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+                 return SocketState.CLOSED;
+             }
+ 
+-            ContainerThreadMarker.set();
+-
+             try {
+                 if (processor == null) {
+                     String negotiatedProtocol = wrapper.getNegotiatedProtocol();
+@@ -1017,8 +1015,6 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+                 // with "ERROR" level, so it will show up even on
+                 // less-than-verbose logs.
+                 getLog().error(sm.getString("abstractConnectionHandler.error"), e);
+-            } finally {
+-                ContainerThreadMarker.clear();
+             }
+ 
+             // Make sure socket/processor is removed from the list of current
+
+==================================================
+ContainerThreadMarker.java
+index 3176246d0b..472a48b18e 100644
+--- a/java/org/apache/coyote/AsyncStateMachine.java
++++ b/java/org/apache/coyote/AsyncStateMachine.java
+@@ -305,7 +305,8 @@ class AsyncStateMachine {
+ 
+ 
+     synchronized boolean asyncComplete() {
+-        if (!ContainerThreadMarker.isContainerThread() &&
++        Request request = processor.getRequest();
++        if ((request == null || !request.isRequestThread()) &&
+                 (state == AsyncState.STARTING || state == AsyncState.READ_WRITE_OP)) {
+             updateState(AsyncState.COMPLETE_PENDING);
+             return false;
+@@ -367,7 +368,8 @@ class AsyncStateMachine {
+ 
+ 
+     synchronized boolean asyncDispatch() {
+-        if (!ContainerThreadMarker.isContainerThread() &&
++        Request request = processor.getRequest();
++        if ((request == null || !request.isRequestThread()) &&
+                 (state == AsyncState.STARTING || state == AsyncState.READ_WRITE_OP)) {
+             updateState(AsyncState.DISPATCH_PENDING);
+             return false;
+@@ -436,7 +438,9 @@ class AsyncStateMachine {
+         } else {
+             updateState(AsyncState.ERROR);
+         }
+-        return !ContainerThreadMarker.isContainerThread();
++
++        Request request = processor.getRequest();
++        return request == null || !request.isRequestThread();
+     }
+ 
+ 
+
+==================================================
+UpgradeServletInputStream.java
+index 0ba2ef0c66..2d651b3e7d 100644
+--- a/java/org/apache/coyote/ContainerThreadMarker.java
++++ b/java/org/apache/coyote/ContainerThreadMarker.java
+@@ -21,7 +21,10 @@ package org.apache.coyote;
+  * data from an incoming connection. Application created threads are not
+  * container threads and neither are threads taken from the container thread
+  * pool to execute AsyncContext.start(Runnable).
++ *
++ * @deprecated Unused. Will be removed in Tomcat 10.1.x
+  */
++@Deprecated
+ public class ContainerThreadMarker {
+ 
+     public static boolean isContainerThread() {
+
+==================================================
+UpgradeServletOutputStream.java
+index b3b7fb5e02..63ad3f473d 100644
+--- a/java/org/apache/coyote/http11/upgrade/UpgradeServletInputStream.java
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeServletInputStream.java
+@@ -21,7 +21,7 @@ import java.io.IOException;
+ import jakarta.servlet.ReadListener;
+ import jakarta.servlet.ServletInputStream;
+ 
+-import org.apache.coyote.ContainerThreadMarker;
++import org.apache.coyote.Request;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.ExceptionUtils;
+@@ -106,7 +106,8 @@ public class UpgradeServletInputStream extends ServletInputStream {
+         this.listener = listener;
+ 
+         // Container is responsible for first call to onDataAvailable().
+-        if (ContainerThreadMarker.isContainerThread()) {
++        Request request = processor.getRequest();
++        if (request != null && request.isRequestThread()) {
+             processor.addDispatch(DispatchType.NON_BLOCKING_READ);
+         } else {
+             socketWrapper.registerReadInterest();
+
+==================================================
+StreamProcessor.java
+index c9dff361e3..62d44eb05f 100644
+--- a/java/org/apache/coyote/http11/upgrade/UpgradeServletOutputStream.java
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeServletOutputStream.java
+@@ -21,7 +21,7 @@ import java.io.IOException;
+ import jakarta.servlet.ServletOutputStream;
+ import jakarta.servlet.WriteListener;
+ 
+-import org.apache.coyote.ContainerThreadMarker;
++import org.apache.coyote.Request;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.ExceptionUtils;
+@@ -119,7 +119,8 @@ public class UpgradeServletOutputStream extends ServletOutputStream {
+         synchronized (registeredLock) {
+             registered = true;
+             // Container is responsible for first call to onDataAvailable().
+-            if (ContainerThreadMarker.isContainerThread()) {
++            Request request = processor.getRequest();
++            if (request != null && request.isRequestThread()) {
+                 processor.addDispatch(DispatchType.NON_BLOCKING_WRITE);
+             } else {
+                 socketWrapper.registerWriteInterest();
+
+==================================================
+ContainerThreadMarker.java
+index 68621cb76d..b3597c4855 100644
+--- a/java/org/apache/coyote/http2/StreamProcessor.java
++++ b/java/org/apache/coyote/http2/StreamProcessor.java
+@@ -27,7 +27,6 @@ import jakarta.servlet.http.HttpServletResponse;
+ import org.apache.coyote.AbstractProcessor;
+ import org.apache.coyote.ActionCode;
+ import org.apache.coyote.Adapter;
+-import org.apache.coyote.ContainerThreadMarker;
+ import org.apache.coyote.ContinueResponseTiming;
+ import org.apache.coyote.ErrorState;
+ import org.apache.coyote.Request;
+@@ -73,7 +72,6 @@ class StreamProcessor extends AbstractProcessor {
+             synchronized (this) {
+                 // HTTP/2 equivalent of AbstractConnectionHandler#process() without the
+                 // socket <-> processor mapping
+-                ContainerThreadMarker.set();
+                 SocketState state = SocketState.CLOSED;
+                 try {
+                     state = process(socketWrapper, event);
+@@ -125,7 +123,6 @@ class StreamProcessor extends AbstractProcessor {
+                     if (state == SocketState.CLOSED) {
+                         recycle();
+                     }
+-                    ContainerThreadMarker.clear();
+                 }
+             }
+         } finally {
+
+==================================================
+TestNonBlockingAPI.java
+index 2ab6f682d8..7149945c03 100644
+--- a/java/org/apache/tomcat/util/net/ContainerThreadMarker.java
++++ b/java/org/apache/tomcat/util/net/ContainerThreadMarker.java
+@@ -21,7 +21,10 @@ package org.apache.tomcat.util.net;
+  * data from an incoming connection. Application created threads are not
+  * container threads and neither are threads taken from the container thread
+  * pool to execute AsyncContext.start(Runnable).
++ *
++ * @deprecated Unused. Will be removed in Tomcat 10.1.x
+  */
++@Deprecated
+ public class ContainerThreadMarker {
+ 
+     private static final ThreadLocal<Boolean> marker = new ThreadLocal<>();
+
+==================================================

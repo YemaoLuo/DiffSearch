@@ -1,0 +1,740 @@
+a6c64efe64349b4af9cb9c035c5bf251a10c77f6
+==================================================
+Refactor async timeouts
+==================================================
+Mark Thomas
+==================================================
+Tue Oct 20 12:11:18 2015 +0000
+==================================================
+AbstractProcessor.java
+Refactor async timeouts
+Move async timeout thread to Protocol
+Move tracking of timeout setting to Processor
+Move tracking of last asycn start to AsyncStateMachine
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1709578 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AbstractProtocol.java
+index ff250c5f05..201be13600 100644
+--- a/java/org/apache/coyote/AbstractProcessor.java
++++ b/java/org/apache/coyote/AbstractProcessor.java
+@@ -40,6 +40,7 @@ public abstract class AbstractProcessor extends AbstractProcessorLight implement
+ 
+     protected Adapter adapter;
+     protected final AsyncStateMachine asyncStateMachine;
++    private volatile long asyncTimeout = -1;
+     protected final AbstractEndpoint<?> endpoint;
+     protected final Request request;
+     protected final Response response;
+@@ -242,6 +243,39 @@ public abstract class AbstractProcessor extends AbstractProcessorLight implement
+     }
+ 
+ 
++    @Override
++    public void timeoutAsync(long now) {
++        if (now < 0) {
++            doTimeoutAsync();
++        } else {
++            long asyncTimeout = getAsyncTimeout();
++            if (asyncTimeout > 0) {
++                long asyncStart = asyncStateMachine.getLastAsyncStart();
++                if ((now - asyncStart) > asyncTimeout) {
++                    doTimeoutAsync();
++                }
++            }
++        }
++    }
++
++
++    private void doTimeoutAsync() {
++        // Avoid multiple timeouts
++        setAsyncTimeout(-1);
++        socketWrapper.processSocket(SocketStatus.TIMEOUT, true);
++    }
++
++
++    public void setAsyncTimeout(long timeout) {
++        asyncTimeout = timeout;
++    }
++
++
++    public long getAsyncTimeout() {
++        return asyncTimeout;
++    }
++
++
+     @Override
+     public void recycle() {
+         errorState = ErrorState.NONE;
+
+==================================================
+AsyncStateMachine.java
+index 0875fc4e37..ed91a27bb0 100644
+--- a/java/org/apache/coyote/AbstractProtocol.java
++++ b/java/org/apache/coyote/AbstractProtocol.java
+@@ -19,6 +19,8 @@ package org.apache.coyote;
+ import java.io.IOException;
+ import java.net.InetAddress;
+ import java.nio.ByteBuffer;
++import java.util.Collections;
++import java.util.Set;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.Executor;
+ import java.util.concurrent.atomic.AtomicInteger;
+@@ -86,9 +88,20 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+      */
+     private final AbstractEndpoint<S> endpoint;
+ 
++
+     private Handler<S> handler;
+ 
+ 
++    private final Set<Processor> waitingProcessors =
++            Collections.newSetFromMap(new ConcurrentHashMap<Processor, Boolean>());
++
++
++    /**
++     * The async timeout thread.
++     */
++    private AsyncTimeout asyncTimeout = null;
++
++
+     public AbstractProtocol(AbstractEndpoint<S> endpoint) {
+         this.endpoint = endpoint;
+         setSoLinger(Constants.DEFAULT_CONNECTION_LINGER);
+@@ -182,6 +195,11 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+     }
+ 
+ 
++    public AsyncTimeout getAsyncTimeout() {
++        return asyncTimeout;
++    }
++
++
+     // ---------------------- Properties that are passed through to the EndPoint
+ 
+     @Override
+@@ -338,6 +356,16 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+     }
+ 
+ 
++    public void addWaitingProcessor(Processor processor) {
++        waitingProcessors.add(processor);
++    }
++
++
++    public void removeWaitingProcessor(Processor processor) {
++        waitingProcessors.remove(processor);
++    }
++
++
+     // ----------------------------------------------- Accessors for sub-classes
+ 
+     protected AbstractEndpoint<S> getEndpoint() {
+@@ -514,6 +542,14 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+                     getName()), ex);
+             throw ex;
+         }
++
++
++        // Start async timeout thread
++        asyncTimeout = new AsyncTimeout();
++        Thread timeoutThread = new Thread(asyncTimeout, getName() + "-AsyncTimeout");
++        timeoutThread.setPriority(endpoint.getThreadPriority());
++        timeoutThread.setDaemon(true);
++        timeoutThread.start();
+     }
+ 
+ 
+@@ -551,6 +587,9 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+         if(getLog().isInfoEnabled())
+             getLog().info(sm.getString("abstractProtocolHandler.stop",
+                     getName()));
++
++        asyncTimeout.stop();
++
+         try {
+             endpoint.stop();
+         } catch (Exception ex) {
+@@ -648,7 +687,6 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+                 return SocketState.CLOSED;
+             }
+ 
+-            wrapper.setAsync(false);
+             ContainerThreadMarker.set();
+ 
+             try {
+@@ -684,6 +722,8 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+ 
+                 // Associate the processor with the connection
+                 connections.put(socket, processor);
++                // Make sure an async timeout doesn't fire
++                getProtocol().removeWaitingProcessor(processor);
+ 
+                 SocketState state = SocketState.CLOSED;
+                 do {
+@@ -719,6 +759,9 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+                     // depend on type of long poll
+                     connections.put(socket, processor);
+                     longPoll(wrapper, processor);
++                    if (processor.isAsync()) {
++                        getProtocol().addWaitingProcessor(processor);
++                    }
+                 } else if (state == SocketState.OPEN) {
+                     // In keep-alive but between requests. OK to recycle
+                     // processor. Continue to poll for the next request.
+@@ -791,11 +834,8 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+ 
+ 
+         protected void longPoll(SocketWrapperBase<?> socket, Processor processor) {
+-            if (processor.isAsync()) {
+-                // Async
+-                socket.setAsync(true);
+-            } else {
+-                // This branch is currently only used with HTTP
++            if (!processor.isAsync()) {
++                // This is currently only used with HTTP
+                 // Either:
+                 //  - this is an upgraded connection
+                 //  - the request line/headers have not been completely
+@@ -964,4 +1004,53 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+             size.set(0);
+         }
+     }
++
++
++    /**
++     * Async timeout thread
++     */
++    protected class AsyncTimeout implements Runnable {
++
++        private volatile boolean asyncTimeoutRunning = true;
++
++        /**
++         * The background thread that checks async requests and fires the
++         * timeout if there has been no activity.
++         */
++        @Override
++        public void run() {
++
++            // Loop until we receive a shutdown command
++            while (asyncTimeoutRunning) {
++                try {
++                    Thread.sleep(1000);
++                } catch (InterruptedException e) {
++                    // Ignore
++                }
++                long now = System.currentTimeMillis();
++                for (Processor processor : waitingProcessors) {
++                   processor.timeoutAsync(now);
++                }
++
++                // Loop if endpoint is paused
++                while (endpoint.isPaused() && asyncTimeoutRunning) {
++                    try {
++                        Thread.sleep(1000);
++                    } catch (InterruptedException e) {
++                        // Ignore
++                    }
++                }
++            }
++        }
++
++
++        protected void stop() {
++            asyncTimeoutRunning = false;
++
++            // Timeout any pending async request
++            for (Processor processor : waitingProcessors) {
++                processor.timeoutAsync(-1);
++            }
++        }
++    }
+ }
+
+==================================================
+Processor.java
+index 6926c73c09..37a3904c72 100644
+--- a/java/org/apache/coyote/AsyncStateMachine.java
++++ b/java/org/apache/coyote/AsyncStateMachine.java
+@@ -154,6 +154,7 @@ public class AsyncStateMachine {
+ 
+ 
+     private volatile AsyncState state = AsyncState.DISPATCHED;
++    private volatile long lastAsyncStart = 0;
+     // Need this to fire listener on complete
+     private AsyncContextCallback asyncCtxt = null;
+     private final AbstractProcessor processor;
+@@ -188,10 +189,22 @@ public class AsyncStateMachine {
+         return state.isCompleting();
+     }
+ 
++    /**
++     * Obtain the time that this connection last transitioned to async
++     * processing.
++     *
++     * @return The time (as returned by {@link System#currentTimeMillis()}) that
++     *         this connection last transitioned to async
++     */
++    public long getLastAsyncStart() {
++        return lastAsyncStart;
++    }
++
+     public synchronized void asyncStart(AsyncContextCallback asyncCtxt) {
+         if (state == AsyncState.DISPATCHED) {
+             state = AsyncState.STARTING;
+             this.asyncCtxt = asyncCtxt;
++            lastAsyncStart = System.currentTimeMillis();
+         } else {
+             throw new IllegalStateException(
+                     sm.getString("asyncStateMachine.invalidAsyncState",
+
+==================================================
+AjpProcessor.java
+index 076783a06c..85d1bfa67b 100644
+--- a/java/org/apache/coyote/Processor.java
++++ b/java/org/apache/coyote/Processor.java
+@@ -49,8 +49,19 @@ public interface Processor {
+ 
+     HttpUpgradeHandler getHttpUpgradeHandler();
+ 
+-    boolean isAsync();
+     boolean isUpgrade();
++    boolean isAsync();
++
++    /**
++     * Check this processor to see if the async timeout has expired and process
++     * a timeout if that is that case.
++     *
++     * @param now The time (as returned by {@link System#currentTimeMillis()} to
++     *            use as the current time to determine whether the async timeout
++     *            has expired. If negative, the timeout will always be treated
++     *            as if it has expired.
++     */
++    void timeoutAsync(long now);
+ 
+     Request getRequest();
+ 
+
+==================================================
+Http11Processor.java
+index fa19f62019..cff5011ba4 100644
+--- a/java/org/apache/coyote/ajp/AjpProcessor.java
++++ b/java/org/apache/coyote/ajp/AjpProcessor.java
+@@ -517,7 +517,7 @@ public class AjpProcessor extends AbstractProcessor {
+         case ASYNC_SETTIMEOUT: {
+             if (param == null) return;
+             long timeout = ((Long)param).longValue();
+-            socketWrapper.setAsyncTimeout(timeout);
++            setAsyncTimeout(timeout);
+             break;
+         }
+         case ASYNC_TIMEOUT: {
+
+==================================================
+UpgradeProcessorBase.java
+index 89c65ae211..d5eed393c1 100644
+--- a/java/org/apache/coyote/http11/Http11Processor.java
++++ b/java/org/apache/coyote/http11/Http11Processor.java
+@@ -742,7 +742,7 @@ public class Http11Processor extends AbstractProcessor {
+                 return;
+             }
+             long timeout = ((Long) param).longValue();
+-            socketWrapper.setAsyncTimeout(timeout);
++            setAsyncTimeout(timeout);
+             break;
+         }
+         case ASYNC_DISPATCH: {
+
+==================================================
+AbstractEndpoint.java
+index 51f4324a57..3c8b1d273a 100644
+--- a/java/org/apache/coyote/http11/upgrade/UpgradeProcessorBase.java
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeProcessorBase.java
+@@ -95,4 +95,10 @@ public abstract class UpgradeProcessorBase extends AbstractProcessorLight implem
+     public ByteBuffer getLeftoverInput() {
+         return null;
+     }
++
++
++    @Override
++    public void timeoutAsync(long now) {
++        // NO-OP
++    }
+ }
+
+==================================================
+AprEndpoint.java
+index c33997dc06..38ea051680 100644
+--- a/java/org/apache/tomcat/util/net/AbstractEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AbstractEndpoint.java
+@@ -20,11 +20,9 @@ import java.io.OutputStreamWriter;
+ import java.net.InetAddress;
+ import java.net.InetSocketAddress;
+ import java.util.ArrayList;
+-import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
+-import java.util.Set;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.Executor;
+ import java.util.concurrent.TimeUnit;
+@@ -134,62 +132,8 @@ public abstract class AbstractEndpoint<S> {
+     private static final int MAX_ERROR_DELAY = 1600;
+ 
+ 
+-    /**
+-     * Async timeout thread
+-     */
+-    protected class AsyncTimeout implements Runnable {
+-
+-        private volatile boolean asyncTimeoutRunning = true;
+-
+-        /**
+-         * The background thread that checks async requests and fires the
+-         * timeout if there has been no activity.
+-         */
+-        @Override
+-        public void run() {
+-
+-            // Loop until we receive a shutdown command
+-            while (asyncTimeoutRunning) {
+-                try {
+-                    Thread.sleep(1000);
+-                } catch (InterruptedException e) {
+-                    // Ignore
+-                }
+-                long now = System.currentTimeMillis();
+-                for (SocketWrapperBase<S> socket : waitingRequests) {
+-                    long asyncTimeout = socket.getAsyncTimeout();
+-                    if (asyncTimeout > 0) {
+-                        long asyncStart = socket.getLastAsyncStart();
+-                        if ((now - asyncStart) > asyncTimeout) {
+-                            // Avoid multiple timeouts
+-                            socket.setAsyncTimeout(-1);
+-                            processSocket(socket, SocketStatus.TIMEOUT, true);
+-                        }
+-                    }
+-                }
+-
+-                // Loop if endpoint is paused
+-                while (paused && asyncTimeoutRunning) {
+-                    try {
+-                        Thread.sleep(1000);
+-                    } catch (InterruptedException e) {
+-                        // Ignore
+-                    }
+-                }
+-
+-            }
+-        }
+-
+-
+-        protected void stop() {
+-            asyncTimeoutRunning = false;
+-        }
+-    }
+-
+-
+     // ----------------------------------------------------------------- Fields
+ 
+-
+     /**
+      * Running state of the endpoint.
+      */
+@@ -962,25 +906,6 @@ public abstract class AbstractEndpoint<S> {
+         } else {
+             return MAX_ERROR_DELAY;
+         }
+-
+-    }
+-
+-
+-    protected final Set<SocketWrapperBase<S>> waitingRequests = Collections
+-            .newSetFromMap(new ConcurrentHashMap<SocketWrapperBase<S>, Boolean>());
+-    public void removeWaitingRequest(SocketWrapperBase<S> socketWrapper) {
+-        waitingRequests.remove(socketWrapper);
+-    }
+-
+-    /**
+-     * The async timeout thread.
+-     */
+-    private AsyncTimeout asyncTimeout = null;
+-    public AsyncTimeout getAsyncTimeout() {
+-        return asyncTimeout;
+-    }
+-    public void setAsyncTimeout(AsyncTimeout asyncTimeout) {
+-        this.asyncTimeout = asyncTimeout;
+     }
+ }
+ 
+
+==================================================
+Nio2Endpoint.java
+index fde2290dec..2b918cadee 100644
+--- a/java/org/apache/tomcat/util/net/AprEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AprEndpoint.java
+@@ -598,13 +598,6 @@ public class AprEndpoint extends AbstractEndpoint<Long> implements SNICallBack {
+             }
+ 
+             startAcceptorThreads();
+-
+-            // Start async timeout thread
+-            setAsyncTimeout(new AsyncTimeout());
+-            Thread timeoutThread = new Thread(getAsyncTimeout(), getName() + "-AsyncTimeout");
+-            timeoutThread.setPriority(threadPriority);
+-            timeoutThread.setDaemon(true);
+-            timeoutThread.start();
+         }
+     }
+ 
+@@ -629,7 +622,6 @@ public class AprEndpoint extends AbstractEndpoint<Long> implements SNICallBack {
+                     // Ignore
+                 }
+             }
+-            getAsyncTimeout().stop();
+             for (AbstractEndpoint.Acceptor acceptor : acceptors) {
+                 long waitLeft = 10000;
+                 while (waitLeft > 0 &&
+@@ -874,7 +866,6 @@ public class AprEndpoint extends AbstractEndpoint<Long> implements SNICallBack {
+             // result of calling AsyncContext.dispatch() from a non-container
+             // thread
+             synchronized (socket) {
+-                waitingRequests.remove(socket);
+                 SocketProcessor proc = new SocketProcessor(socket, status);
+                 Executor executor = getExecutor();
+                 if (dispatch && executor != null) {
+@@ -1724,45 +1715,38 @@ public class AprEndpoint extends AbstractEndpoint<Long> implements SNICallBack {
+                                 if (((desc[n*2] & Poll.APR_POLLHUP) == Poll.APR_POLLHUP)
+                                         || ((desc[n*2] & Poll.APR_POLLERR) == Poll.APR_POLLERR)
+                                         || ((desc[n*2] & Poll.APR_POLLNVAL) == Poll.APR_POLLNVAL)) {
+-                                    if (wrapper.isAsync() || wrapper.isUpgraded()) {
+-                                        // Must be using non-blocking IO for the socket to be in the
+-                                        // poller during async processing. Need to trigger error
+-                                        // handling. Poller may return error codes plus the flags it
+-                                        // was waiting for or it may just return an error code. We
+-                                        // could return ASYNC_[WRITE|READ]_ERROR here but if we do,
+-                                        // there will be no exception associated with the error in
+-                                        // application code. By signalling read/write is possible, a
+-                                        // read/write will be attempted, fail and that will trigger
+-                                        // an exception the application will see.
+-                                        // Check the return flags first, followed by what the socket
+-                                        // was registered for
+-                                        if ((desc[n*2] & Poll.APR_POLLIN) == Poll.APR_POLLIN) {
+-                                            // Error probably occurred during a non-blocking read
+-                                            if (!processSocket(desc[n*2+1], SocketStatus.OPEN_READ)) {
+-                                                // Close socket and clear pool
+-                                                closeSocket(desc[n*2+1]);
+-                                            }
+-                                        } else if ((desc[n*2] & Poll.APR_POLLOUT) == Poll.APR_POLLOUT) {
+-                                            // Error probably occurred during a non-blocking write
+-                                            if (!processSocket(desc[n*2+1], SocketStatus.OPEN_WRITE)) {
+-                                                // Close socket and clear pool
+-                                                closeSocket(desc[n*2+1]);
+-                                            }
+-                                        } else if ((wrapper.pollerFlags & Poll.APR_POLLIN) == Poll.APR_POLLIN) {
+-                                            // Can't tell what was happening when the error occurred but the
+-                                            // socket is registered for non-blocking read so use that
+-                                            if (!processSocket(desc[n*2+1], SocketStatus.OPEN_READ)) {
+-                                                // Close socket and clear pool
+-                                                closeSocket(desc[n*2+1]);
+-                                            }
+-                                        } else if ((wrapper.pollerFlags & Poll.APR_POLLOUT) == Poll.APR_POLLOUT) {
+-                                            // Can't tell what was happening when the error occurred but the
+-                                            // socket is registered for non-blocking write so use that
+-                                            if (!processSocket(desc[n*2+1], SocketStatus.OPEN_WRITE)) {
+-                                                // Close socket and clear pool
+-                                                closeSocket(desc[n*2+1]);
+-                                            }
+-                                        } else {
++                                    // Need to trigger error handling. Poller may return error
++                                    // codes plus the flags it was waiting for or it may just
++                                    // return an error code. We could handle the error here but
++                                    // if we do, there will be no exception associated with the
++                                    // error in application code. By signalling read/write is
++                                    // possible, a read/write will be attempted, fail and that
++                                    // will trigger an exception the application will see.
++                                    // Check the return flags first, followed by what the socket
++                                    // was registered for
++                                    if ((desc[n*2] & Poll.APR_POLLIN) == Poll.APR_POLLIN) {
++                                        // Error probably occurred during a non-blocking read
++                                        if (!processSocket(desc[n*2+1], SocketStatus.OPEN_READ)) {
++                                            // Close socket and clear pool
++                                            closeSocket(desc[n*2+1]);
++                                        }
++                                    } else if ((desc[n*2] & Poll.APR_POLLOUT) == Poll.APR_POLLOUT) {
++                                        // Error probably occurred during a non-blocking write
++                                        if (!processSocket(desc[n*2+1], SocketStatus.OPEN_WRITE)) {
++                                            // Close socket and clear pool
++                                            closeSocket(desc[n*2+1]);
++                                        }
++                                    } else if ((wrapper.pollerFlags & Poll.APR_POLLIN) == Poll.APR_POLLIN) {
++                                        // Can't tell what was happening when the error occurred but the
++                                        // socket is registered for non-blocking read so use that
++                                        if (!processSocket(desc[n*2+1], SocketStatus.OPEN_READ)) {
++                                            // Close socket and clear pool
++                                            closeSocket(desc[n*2+1]);
++                                        }
++                                    } else if ((wrapper.pollerFlags & Poll.APR_POLLOUT) == Poll.APR_POLLOUT) {
++                                        // Can't tell what was happening when the error occurred but the
++                                        // socket is registered for non-blocking write so use that
++                                        if (!processSocket(desc[n*2+1], SocketStatus.OPEN_WRITE)) {
+                                             // Close socket and clear pool
+                                             closeSocket(desc[n*2+1]);
+                                         }
+@@ -2272,10 +2256,6 @@ public class AprEndpoint extends AbstractEndpoint<Long> implements SNICallBack {
+                         // Close socket and pool
+                         closeSocket(socket.getSocket().longValue());
+                         socket = null;
+-                    } else if (state == Handler.SocketState.LONG) {
+-                        if (socket.isAsync()) {
+-                            waitingRequests.add(socket);
+-                        }
+                     }
+                 }
+             }
+@@ -2317,10 +2297,6 @@ public class AprEndpoint extends AbstractEndpoint<Long> implements SNICallBack {
+                 if (state == Handler.SocketState.CLOSED) {
+                     // Close socket and pool
+                     closeSocket(socket.getSocket().longValue());
+-                } else if (state == Handler.SocketState.LONG) {
+-                    if (socket.isAsync()) {
+-                        waitingRequests.add(socket);
+-                    }
+                 } else if (state == Handler.SocketState.ASYNC_END) {
+                     SocketProcessor proc = new SocketProcessor(socket,
+                             SocketStatus.OPEN_READ);
+
+==================================================
+NioEndpoint.java
+index 822b2084b8..9c51824d85 100644
+--- a/java/org/apache/tomcat/util/net/Nio2Endpoint.java
++++ b/java/org/apache/tomcat/util/net/Nio2Endpoint.java
+@@ -230,12 +230,6 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel> {
+ 
+             initializeConnectionLatch();
+             startAcceptorThreads();
+-
+-            setAsyncTimeout(new AsyncTimeout());
+-            Thread timeoutThread = new Thread(getAsyncTimeout(), getName() + "-AsyncTimeout");
+-            timeoutThread.setPriority(threadPriority);
+-            timeoutThread.setDaemon(true);
+-            timeoutThread.start();
+         }
+     }
+ 
+@@ -251,17 +245,12 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel> {
+         }
+         if (running) {
+             running = false;
+-            getAsyncTimeout().stop();
+             unlockAccept();
+             // Use the executor to avoid binding the main thread if something bad
+             // occurs and unbind will also wait for a bit for it to complete
+             getExecutor().execute(new Runnable() {
+                 @Override
+                 public void run() {
+-                    // Timeout any pending async request
+-                    for (SocketWrapperBase<Nio2Channel> socket : waitingRequests) {
+-                        processSocket(socket, SocketStatus.TIMEOUT, false);
+-                    }
+                     // Then close all active connections if any remain
+                     try {
+                         handler.closeAll();
+@@ -393,7 +382,6 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel> {
+ 
+     protected boolean processSocket0(SocketWrapperBase<Nio2Channel> socketWrapper, SocketStatus status, boolean dispatch) {
+         try {
+-            waitingRequests.remove(socketWrapper);
+             SocketProcessor sc = processorCache.pop();
+             if (sc == null) {
+                 sc = new SocketProcessor(socketWrapper, status);
+@@ -1688,10 +1676,6 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel> {
+                                     socket.getSocket().free();
+                                 }
+                             }
+-                        } else if (state == Handler.SocketState.LONG) {
+-                            if (socket.isAsync()) {
+-                                waitingRequests.add(socket);
+-                            }
+                         } else if (state == SocketState.UPGRADING) {
+                             socket.setKeptAlive(true);
+                             launch = true;
+
+==================================================
+SocketWrapperBase.java
+index a74567d338..4ca46ce8f7 100644
+--- a/java/org/apache/tomcat/util/net/NioEndpoint.java
++++ b/java/org/apache/tomcat/util/net/NioEndpoint.java
+@@ -1068,45 +1068,31 @@ public class NioEndpoint extends AbstractJsseEndpoint<NioChannel> {
+                         NioSocketWrapper ka = (NioSocketWrapper) key.attachment();
+                         if ( ka == null ) {
+                             cancelledKey(key); //we don't support any keys without attachments
++                        } else if (close) {
++                            key.interestOps(0);
++                            ka.interestOps(0); //avoid duplicate stop calls
++                            processKey(key,ka);
+                         } else if ((ka.interestOps()&SelectionKey.OP_READ) == SelectionKey.OP_READ ||
+                                   (ka.interestOps()&SelectionKey.OP_WRITE) == SelectionKey.OP_WRITE) {
+-                            if (close) {
+-                                key.interestOps(0);
+-                                ka.interestOps(0); //avoid duplicate stop calls
+-                                processKey(key,ka);
+-                            } else {
+-                                boolean isTimedOut = false;
+-                                // Check for read timeout
+-                                if ((ka.interestOps() & SelectionKey.OP_READ) == SelectionKey.OP_READ) {
+-                                    long delta = now - ka.getLastRead();
+-                                    long timeout = ka.getReadTimeout();
+-                                    isTimedOut = timeout > 0 && delta > timeout;
+-                                }
+-                                // Check for write timeout
+-                                if (!isTimedOut && (ka.interestOps() & SelectionKey.OP_WRITE) == SelectionKey.OP_WRITE) {
+-                                    long delta = now - ka.getLastWrite();
+-                                    long timeout = ka.getWriteTimeout();
+-                                    isTimedOut = timeout > 0 && delta > timeout;
+-                                }
+-                                if (isTimedOut) {
+-                                    key.interestOps(0);
+-                                    ka.interestOps(0); //avoid duplicate timeout calls
+-                                    cancelledKey(key);
+-                                }
++                            boolean isTimedOut = false;
++                            // Check for read timeout
++                            if ((ka.interestOps() & SelectionKey.OP_READ) == SelectionKey.OP_READ) {
++                                long delta = now - ka.getLastRead();
++                                long timeout = ka.getReadTimeout();
++                                isTimedOut = timeout > 0 && delta > timeout;
++                            }
++                            // Check for write timeout
++                            if (!isTimedOut && (ka.interestOps() & SelectionKey.OP_WRITE) == SelectionKey.OP_WRITE) {
++                                long delta = now - ka.getLastWrite();
++                                long timeout = ka.getWriteTimeout();
++                                isTimedOut = timeout > 0 && delta > timeout;
+                             }
+-                        } else if (ka.isAsync()) {
+-                            if (close) {
++                            if (isTimedOut) {
+                                 key.interestOps(0);
+-                                ka.interestOps(0); //avoid duplicate stop calls
+-                                processKey(key,ka);
+-                            } else if (ka.getAsyncTimeout() > 0) {
+-                                if ((now - ka.getLastAsyncStart()) > ka.getAsyncTimeout()) {
+-                                    // Prevent subsequent timeouts if the timeout event takes a while to process
+-                                    ka.setAsyncTimeout(0);
+-                                    processSocket(ka, SocketStatus.TIMEOUT, true);
+-                                }
++                                ka.interestOps(0); //avoid duplicate timeout calls
++                                cancelledKey(key);
+                             }
+-                        }//end if
++                        }
+                     }catch ( CancelledKeyException ckx ) {
+                         cancelledKey(key);
+                     }
+
+==================================================

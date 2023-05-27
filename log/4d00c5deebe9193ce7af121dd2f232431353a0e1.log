@@ -1,0 +1,373 @@
+4d00c5deebe9193ce7af121dd2f232431353a0e1
+==================================================
+- Add resource injection (note: most annotations are not supported, including web services,
+==================================================
+Remy Maucherat
+==================================================
+Sun Apr 9 16:38:09 2006 +0000
+==================================================
+ApplicationFilterConfig.java
+- Add resource injection (note: most annotations are not supported, including web services,
+  JPA, EJB, etc), as well as PostCreate and PreDestroy.
+- If I understand the spec correctly, if using metadata-complete = true, then even PostCreate and
+  PreDestroy must be ignored.
+- Not tested yet (but it doesn't break when not using annotations).
+- Based on a patch submitted by Fabien Carrion.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/tc6.0.x/trunk@392775 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+NamingContextListener.java
+index 749c949bec..9c431b12f5 100644
+--- a/java/org/apache/catalina/core/ApplicationFilterConfig.java
++++ b/java/org/apache/catalina/core/ApplicationFilterConfig.java
+@@ -19,10 +19,12 @@ package org.apache.catalina.core;
+ 
+ 
+ import java.io.Serializable;
++import java.lang.reflect.InvocationTargetException;
+ import java.util.ArrayList;
+ import java.util.Enumeration;
+ import java.util.Map;
+ 
++import javax.naming.NamingException;
+ import javax.servlet.Filter;
+ import javax.servlet.FilterConfig;
+ import javax.servlet.ServletContext;
+@@ -31,6 +33,7 @@ import javax.servlet.ServletException;
+ import org.apache.catalina.Context;
+ import org.apache.catalina.deploy.FilterDef;
+ import org.apache.catalina.security.SecurityUtil;
++import org.apache.catalina.util.AnnotationProcessor;
+ import org.apache.catalina.util.Enumerator;
+ import org.apache.tomcat.util.log.SystemLogHandler;
+ 
+@@ -66,11 +69,13 @@ final class ApplicationFilterConfig implements FilterConfig, Serializable {
+      * @exception InstantiationException if an exception occurs while
+      *  instantiating the filter object
+      * @exception ServletException if thrown by the filter's init() method
++     * @throws NamingException 
++     * @throws InvocationTargetException 
+      */
+     public ApplicationFilterConfig(Context context, FilterDef filterDef)
+         throws ClassCastException, ClassNotFoundException,
+                IllegalAccessException, InstantiationException,
+-               ServletException {
++               ServletException, InvocationTargetException, NamingException {
+ 
+         super();
+         this.context = context;
+@@ -186,9 +191,12 @@ final class ApplicationFilterConfig implements FilterConfig, Serializable {
+      * @exception InstantiationException if an exception occurs while
+      *  instantiating the filter object
+      * @exception ServletException if thrown by the filter's init() method
++     * @throws NamingException 
++     * @throws InvocationTargetException 
+      */
+     Filter getFilter() throws ClassCastException, ClassNotFoundException,
+-        IllegalAccessException, InstantiationException, ServletException {
++        IllegalAccessException, InstantiationException, ServletException, 
++        InvocationTargetException, NamingException {
+ 
+         // Return the existing filter instance, if any
+         if (this.filter != null)
+@@ -208,8 +216,16 @@ final class ApplicationFilterConfig implements FilterConfig, Serializable {
+         // Instantiate a new instance of this filter and return it
+         Class clazz = classLoader.loadClass(filterClass);
+         this.filter = (Filter) clazz.newInstance();
++        if (!context.getIgnoreAnnotations()) {
++            if (context instanceof StandardContext 
++                    && ((StandardContext) context).getNamingContextListener() != null) {
++                AnnotationProcessor.injectNamingResources
++                    (((StandardContext) context).getNamingContextListener().getEnvContext(), this.filter);
++            }
++            AnnotationProcessor.postConstruct(this.filter);
++        }
+         if (context instanceof StandardContext &&
+-            ((StandardContext)context).getSwallowOutput()) {
++            ((StandardContext) context).getSwallowOutput()) {
+             try {
+                 SystemLogHandler.startCapture();
+                 filter.init(this);
+@@ -244,8 +260,8 @@ final class ApplicationFilterConfig implements FilterConfig, Serializable {
+     void release() {
+ 
+         if (this.filter != null){
+-             if( System.getSecurityManager() != null) {
+-                try{
++            if (System.getSecurityManager() != null) {
++                try {
+                     SecurityUtil.doAsPrivilege("destroy", filter); 
+                 } catch(java.lang.Exception ex){                    
+                     context.getLogger().error("ApplicationFilterConfig.doAsPrivilege", ex);
+@@ -254,6 +270,13 @@ final class ApplicationFilterConfig implements FilterConfig, Serializable {
+             } else { 
+                 filter.destroy();
+             }
++            if (!context.getIgnoreAnnotations()) {
++                try {
++                    AnnotationProcessor.preDestroy(this.filter);
++                } catch (Exception e) {
++                    context.getLogger().error("ApplicationFilterConfig.preDestroy", e);
++                }
++            }
+         }
+         this.filter = null;
+ 
+@@ -274,18 +297,20 @@ final class ApplicationFilterConfig implements FilterConfig, Serializable {
+      * @exception InstantiationException if an exception occurs while
+      *  instantiating the filter object
+      * @exception ServletException if thrown by the filter's init() method
++     * @throws NamingException 
++     * @throws InvocationTargetException 
+      */
+     void setFilterDef(FilterDef filterDef)
+         throws ClassCastException, ClassNotFoundException,
+                IllegalAccessException, InstantiationException,
+-               ServletException {
++               ServletException, InvocationTargetException, NamingException {
+ 
+         this.filterDef = filterDef;
+         if (filterDef == null) {
+ 
+             // Release any previously allocated filter instance
+             if (this.filter != null){
+-                 if( System.getSecurityManager() != null) {
++                if( System.getSecurityManager() != null) {
+                     try{
+                         SecurityUtil.doAsPrivilege("destroy", filter);  
+                     } catch(java.lang.Exception ex){    
+@@ -295,6 +320,13 @@ final class ApplicationFilterConfig implements FilterConfig, Serializable {
+                 } else { 
+                     filter.destroy();
+                 }
++                if (!context.getIgnoreAnnotations()) {
++                    try {
++                        AnnotationProcessor.preDestroy(this.filter);
++                    } catch (Exception e) {
++                        context.getLogger().error("ApplicationFilterConfig.preDestroy", e);
++                    }
++                }
+             }
+             this.filter = null;
+ 
+
+==================================================
+StandardContext.java
+index c5a9d35c73..108c047f2a 100644
+--- a/java/org/apache/catalina/core/NamingContextListener.java
++++ b/java/org/apache/catalina/core/NamingContextListener.java
+@@ -165,6 +165,14 @@ public class NamingContextListener
+             log.debug( "setName " + name);
+     }
+ 
++    
++    /**
++     * Return the env context.
++     */
++    public javax.naming.Context getEnvContext() {
++        return this.envCtx;
++    }
++    
+ 
+     /**
+      * Return the associated naming context.
+
+==================================================
+StandardWrapper.java
+index bf33c1808c..711570392b 100644
+--- a/java/org/apache/catalina/core/StandardContext.java
++++ b/java/org/apache/catalina/core/StandardContext.java
+@@ -84,6 +84,7 @@ import org.apache.catalina.loader.WebappLoader;
+ import org.apache.catalina.session.StandardManager;
+ import org.apache.catalina.startup.ContextConfig;
+ import org.apache.catalina.startup.TldConfig;
++import org.apache.catalina.util.AnnotationProcessor;
+ import org.apache.catalina.util.CharsetMapper;
+ import org.apache.catalina.util.ExtensionValidator;
+ import org.apache.catalina.util.RequestUtil;
+@@ -3710,6 +3711,14 @@ public class StandardContext
+             try {
+                 Class clazz = loader.loadClass(listeners[i]);
+                 results[i] = clazz.newInstance();
++                // Annotation processing
++                if (!getIgnoreAnnotations()) {
++                    if (getNamingContextListener() != null) {
++                        AnnotationProcessor.injectNamingResources
++                            (getNamingContextListener().getEnvContext(), results[i]);
++                    }
++                    AnnotationProcessor.postConstruct(results[i]);
++                }
+             } catch (Throwable t) {
+                 getLogger().error
+                     (sm.getString("standardContext.applicationListener",
+@@ -3787,31 +3796,60 @@ public class StandardContext
+ 
+         boolean ok = true;
+         Object listeners[] = getApplicationLifecycleListeners();
+-        if (listeners == null)
+-            return (ok);
+-        ServletContextEvent event =
+-          new ServletContextEvent(getServletContext());
+-        for (int i = 0; i < listeners.length; i++) {
+-            int j = (listeners.length - 1) - i;
+-            if (listeners[j] == null)
+-                continue;
+-            if (!(listeners[j] instanceof ServletContextListener))
+-                continue;
+-            ServletContextListener listener =
+-                (ServletContextListener) listeners[j];
+-            try {
+-                fireContainerEvent("beforeContextDestroyed", listener);
+-                listener.contextDestroyed(event);
+-                fireContainerEvent("afterContextDestroyed", listener);
+-            } catch (Throwable t) {
+-                fireContainerEvent("afterContextDestroyed", listener);
+-                getLogger().error
+-                    (sm.getString("standardContext.listenerStop",
+-                                  listeners[j].getClass().getName()), t);
+-                ok = false;
++        if (listeners != null) {
++            ServletContextEvent event =
++                new ServletContextEvent(getServletContext());
++            for (int i = 0; i < listeners.length; i++) {
++                int j = (listeners.length - 1) - i;
++                if (listeners[j] == null)
++                    continue;
++                if (listeners[j] instanceof ServletContextListener) {
++                    ServletContextListener listener =
++                        (ServletContextListener) listeners[j];
++                    try {
++                        fireContainerEvent("beforeContextDestroyed", listener);
++                        listener.contextDestroyed(event);
++                        fireContainerEvent("afterContextDestroyed", listener);
++                    } catch (Throwable t) {
++                        fireContainerEvent("afterContextDestroyed", listener);
++                        getLogger().error
++                            (sm.getString("standardContext.listenerStop",
++                                listeners[j].getClass().getName()), t);
++                        ok = false;
++                    }
++                }
++                // Annotation processing
++                if (!getIgnoreAnnotations()) {
++                    try {
++                        AnnotationProcessor.preDestroy(listeners[j]);
++                    } catch (Throwable t) {
++                        getLogger().error
++                            (sm.getString("standardContext.listenerStop",
++                                listeners[j].getClass().getName()), t);
++                        ok = false;
++                    }
++                }
+             }
+         }
+ 
++        // Annotation processing
++        listeners = getApplicationEventListeners();
++        if (!getIgnoreAnnotations() && listeners != null) {
++            for (int i = 0; i < listeners.length; i++) {
++                int j = (listeners.length - 1) - i;
++                if (listeners[j] == null)
++                    continue;
++                try {
++                    AnnotationProcessor.preDestroy(listeners[j]);
++                } catch (Throwable t) {
++                    getLogger().error
++                        (sm.getString("standardContext.listenerStop",
++                            listeners[j].getClass().getName()), t);
++                    ok = false;
++                }
++            }
++        }
++        
+         setApplicationEventListeners(null);
+         setApplicationLifecycleListeners(null);
+ 
+@@ -4794,6 +4832,14 @@ public class StandardContext
+     return namingContextName;
+     }
+ 
++    
++    /**
++     * Naming context listener accessor.
++     */
++    public NamingContextListener getNamingContextListener() {
++        return namingContextListener;
++    }
++    
+ 
+     /**
+      * Return the request processing paused flag for this Context.
+
+==================================================
+AnnotationProcessor.java
+index 96b8734c57..c107ef80df 100644
+--- a/java/org/apache/catalina/core/StandardWrapper.java
++++ b/java/org/apache/catalina/core/StandardWrapper.java
+@@ -53,6 +53,7 @@ import org.apache.catalina.LifecycleException;
+ import org.apache.catalina.Loader;
+ import org.apache.catalina.Wrapper;
+ import org.apache.catalina.security.SecurityUtil;
++import org.apache.catalina.util.AnnotationProcessor;
+ import org.apache.catalina.util.Enumerator;
+ import org.apache.catalina.util.InstanceSupport;
+ import org.apache.tomcat.util.IntrospectionUtils;
+@@ -1053,6 +1054,15 @@ public class StandardWrapper
+             // Instantiate and initialize an instance of the servlet class itself
+             try {
+                 servlet = (Servlet) classClass.newInstance();
++                // Annotation processing
++                if (!((Context) getParent()).getIgnoreAnnotations()) {
++                    if (getParent() instanceof StandardContext 
++                            && ((StandardContext) getParent()).getNamingContextListener() != null) {
++                        AnnotationProcessor.injectNamingResources
++                            (((StandardContext) getParent()).getNamingContextListener().getEnvContext(), servlet);
++                    }
++                    AnnotationProcessor.postConstruct(servlet);
++                }
+             } catch (ClassCastException e) {
+                 unavailable(null);
+                 // Restore the context ClassLoader
+@@ -1330,9 +1340,15 @@ public class StandardWrapper
+             } else {
+                 instance.destroy();
+             }
+-
++            
+             instanceSupport.fireInstanceEvent
+               (InstanceEvent.AFTER_DESTROY_EVENT, instance);
++
++            // Annotation processing
++            if (!((Context) getParent()).getIgnoreAnnotations()) {
++                AnnotationProcessor.preDestroy(instance);
++            }
++
+         } catch (Throwable t) {
+             instanceSupport.fireInstanceEvent
+               (InstanceEvent.AFTER_DESTROY_EVENT, instance, t);
+@@ -1367,12 +1383,16 @@ public class StandardWrapper
+             try {
+                 Thread.currentThread().setContextClassLoader(classLoader);
+                 while (!instancePool.isEmpty()) {
+-                    if( System.getSecurityManager() != null) {
+-                        SecurityUtil.doAsPrivilege("destroy",
+-                                                   ((Servlet) instancePool.pop()));
++                    Servlet s = (Servlet) instancePool.pop();
++                    if (System.getSecurityManager() != null) {
++                        SecurityUtil.doAsPrivilege("destroy", s);
+                         SecurityUtil.remove(instance);                           
+                     } else {
+-                        ((Servlet) instancePool.pop()).destroy();
++                        s.destroy();
++                    }
++                    // Annotation processing
++                    if (!((Context) getParent()).getIgnoreAnnotations()) {
++                        AnnotationProcessor.preDestroy(s);
+                     }
+                 }
+             } catch (Throwable t) {
+
+==================================================

@@ -1,0 +1,174 @@
+2859ac3eae132383cb6f3f2042e25d7a4a281b0d
+==================================================
+When adding and removing ResourceLinks dynamically, ensure
+==================================================
+Mark Thomas
+==================================================
+Mon Aug 22 20:48:39 2016 +0000
+==================================================
+NamingContextListener.java
+When adding and removing ResourceLinks dynamically, ensure
+that the global resource is only visible via the
+ResourceLinkFactory when it is meant to be.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1757271 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+ResourceLinkFactory.java
+index ead954d3a0..ebfbc4a2c3 100644
+--- a/java/org/apache/catalina/core/NamingContextListener.java
++++ b/java/org/apache/catalina/core/NamingContextListener.java
+@@ -40,6 +40,7 @@ import javax.naming.StringRefAddr;
+ import org.apache.catalina.ContainerEvent;
+ import org.apache.catalina.ContainerListener;
+ import org.apache.catalina.Context;
++import org.apache.catalina.Engine;
+ import org.apache.catalina.Host;
+ import org.apache.catalina.Lifecycle;
+ import org.apache.catalina.LifecycleEvent;
+@@ -58,6 +59,7 @@ import org.apache.naming.ResourceLinkRef;
+ import org.apache.naming.ResourceRef;
+ import org.apache.naming.ServiceRef;
+ import org.apache.naming.TransactionRef;
++import org.apache.naming.factory.ResourceLinkFactory;
+ import org.apache.tomcat.util.descriptor.web.ContextEjb;
+ import org.apache.tomcat.util.descriptor.web.ContextEnvironment;
+ import org.apache.tomcat.util.descriptor.web.ContextHandler;
+@@ -316,6 +318,11 @@ public class NamingContextListener
+                         registry.unregisterComponent(objectName);
+                     }
+                 }
++
++                javax.naming.Context global = getGlobalNamingContext();
++                if (global != null) {
++                    ResourceLinkFactory.deregisterGlobalResourceAccess(global);
++                }
+             } finally {
+                 objectNames.clear();
+ 
+@@ -1152,6 +1159,17 @@ public class NamingContextListener
+             log.error(sm.getString("naming.bindFailed", e));
+         }
+ 
++        ResourceLinkFactory.registerGlobalResourceAccess(
++                getGlobalNamingContext(), resourceLink.getName(), resourceLink.getGlobal());
++    }
++
++
++    private javax.naming.Context getGlobalNamingContext() {
++        if (container instanceof Context) {
++            Engine e = (Engine) ((Context) container).getParent().getParent();
++            return e.getService().getServer().getGlobalNamingContext();
++        }
++        return null;
+     }
+ 
+ 
+@@ -1269,6 +1287,7 @@ public class NamingContextListener
+             log.error(sm.getString("naming.unbindFailed", e));
+         }
+ 
++        ResourceLinkFactory.deregisterGlobalResourceAccess(getGlobalNamingContext(), name);
+     }
+ 
+ 
+
+==================================================
+TestNamingContext.java
+index 006e6f4d76..b68c4d5880 100644
+--- a/java/org/apache/naming/factory/ResourceLinkFactory.java
++++ b/java/org/apache/naming/factory/ResourceLinkFactory.java
+@@ -16,7 +16,10 @@
+  */
+ package org.apache.naming.factory;
+ 
++import java.util.HashMap;
+ import java.util.Hashtable;
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
+ 
+ import javax.naming.Context;
+ import javax.naming.Name;
+@@ -41,6 +44,8 @@ public class ResourceLinkFactory implements ObjectFactory {
+      */
+     private static Context globalContext = null;
+ 
++    private static Map<ClassLoader,Map<String,String>> globalResourceRegistrations =
++            new ConcurrentHashMap<>();
+ 
+     // --------------------------------------------------------- Public Methods
+ 
+@@ -59,6 +64,56 @@ public class ResourceLinkFactory implements ObjectFactory {
+     }
+ 
+ 
++    public static void registerGlobalResourceAccess(Context globalContext, String localName,
++            String globalName) {
++        validateGlobalContext(globalContext);
++        ClassLoader cl = Thread.currentThread().getContextClassLoader();
++        Map<String,String> registrations = globalResourceRegistrations.get(cl);
++        if (registrations == null) {
++            // Web application initialization is single threaded so this is
++            // safe.
++            registrations = new HashMap<>();
++            globalResourceRegistrations.put(cl, registrations);
++        }
++        registrations.put(localName, globalName);
++    }
++
++
++    public static void deregisterGlobalResourceAccess(Context globalContext, String localName) {
++        validateGlobalContext(globalContext);
++        ClassLoader cl = Thread.currentThread().getContextClassLoader();
++        Map<String,String> registrations = globalResourceRegistrations.get(cl);
++        if (registrations != null) {
++            registrations.remove(localName);
++        }
++    }
++
++
++    public static void deregisterGlobalResourceAccess(Context globalContext) {
++        validateGlobalContext(globalContext);
++        ClassLoader cl = Thread.currentThread().getContextClassLoader();
++        globalResourceRegistrations.remove(cl);
++    }
++
++
++    private static void validateGlobalContext(Context globalContext) {
++        if (ResourceLinkFactory.globalContext != null &&
++                ResourceLinkFactory.globalContext != globalContext) {
++            throw new SecurityException("Caller provided invalid global context");
++        }
++    }
++
++
++    private static boolean validateGlobalResourceAccess(String globalName) {
++        ClassLoader cl = Thread.currentThread().getContextClassLoader();
++        Map<String,String> registrations = globalResourceRegistrations.get(cl);
++        if (registrations != null && registrations.containsValue(globalName)) {
++            return true;
++        }
++        return false;
++    }
++
++
+     // -------------------------------------------------- ObjectFactory Methods
+ 
+     /**
+@@ -82,6 +137,12 @@ public class ResourceLinkFactory implements ObjectFactory {
+         RefAddr refAddr = ref.get(ResourceLinkRef.GLOBALNAME);
+         if (refAddr != null) {
+             globalName = refAddr.getContent().toString();
++            // When running under a security manager confirm that the current
++            // web application has really been configured to access the specified
++            // global resource
++            if (!validateGlobalResourceAccess(globalName)) {
++                return null;
++            }
+             Object result = null;
+             result = globalContext.lookup(globalName);
+             // Check the expected type
+
+==================================================

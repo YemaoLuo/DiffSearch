@@ -1,0 +1,175 @@
+a8575efbc1de64fe58c8fd99e53a0011b59a8e86
+==================================================
+Change access log time argument to use nanosecond
+==================================================
+remm remm@apache.org
+==================================================
+Fri Feb 28 12:28:26 2020 +0100
+==================================================
+AccessLog.java
+Change access log time argument to use nanosecond
+
+Clear up the %T discrepancies with the usual access log format.
+
+
+==================================================
+CoyoteAdapter.java
+index 138f9f4860..6674309d9e 100644
+--- a/java/org/apache/catalina/AccessLog.java
++++ b/java/org/apache/catalina/AccessLog.java
+@@ -76,7 +76,7 @@ public interface AccessLog {
+      * @param request   Request (associated with the response) to log
+      * @param response  Response (associated with the request) to log
+      * @param time      Time taken to process the request/response in
+-     *                  milliseconds (use 0 if not known)
++     *                  nanoseconds (use 0 if not known)
+      */
+     public void log(Request request, Response response, long time);
+ 
+
+==================================================
+AbstractAccessLogValve.java
+index 18b8025bb4..f448f8fab0 100644
+--- a/java/org/apache/catalina/connector/CoyoteAdapter.java
++++ b/java/org/apache/catalina/connector/CoyoteAdapter.java
+@@ -20,7 +20,6 @@ import java.io.IOException;
+ import java.nio.charset.Charset;
+ import java.nio.charset.StandardCharsets;
+ import java.util.EnumSet;
+-import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ import jakarta.servlet.ReadListener;
+@@ -275,7 +274,7 @@ public class CoyoteAdapter implements Adapter {
+             if (!success || !request.isAsync()) {
+                 long time = 0;
+                 if (req.getStartTimeNanos() != -1) {
+-                    time = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - req.getStartTimeNanos());
++                    time = System.nanoTime() - req.getStartTimeNanos();
+                 }
+                 Context context = request.getContext();
+                 if (context != null) {
+@@ -403,7 +402,7 @@ public class CoyoteAdapter implements Adapter {
+                 // The other possibility is that an error occurred early in
+                 // processing and the request could not be mapped to a Context.
+                 // Log via the host or engine in that case.
+-                long time = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - req.getStartTimeNanos());
++                long time = System.nanoTime() - req.getStartTimeNanos();
+                 if (context != null) {
+                     context.logAccess(request, response, time, false);
+                 } else if (response.isError()) {
+
+==================================================
+ExtendedAccessLogValve.java
+index 5cc1f031ca..1f00595be9 100644
+--- a/java/org/apache/catalina/valves/AbstractAccessLogValve.java
++++ b/java/org/apache/catalina/valves/AbstractAccessLogValve.java
+@@ -700,9 +700,8 @@ public abstract class AbstractAccessLogValve extends ValveBase implements Access
+             return;
+         }
+ 
+-        long elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - request.getCoyoteRequest().getStartTimeNanos());
+         // Date for access log should be the beginning of the request
+-        Date date = getDate(System.currentTimeMillis() - elapsed);
++        Date date = getDate(request.getCoyoteRequest().getStartTime());
+ 
+         CharArrayWriter result = charArrayWriters.pop();
+         if (result == null) {
+@@ -1109,8 +1108,8 @@ public abstract class AbstractAccessLogValve extends ValveBase implements Access
+                 Response response, long time) {
+             long timestamp = date.getTime();
+             long frac;
+-            if (usesBegin) {
+-                timestamp -= time;
++            if (!usesBegin) {
++                timestamp += TimeUnit.NANOSECONDS.toMillis(time);
+             }
+             /*  Implementation note: This is deliberately not implemented using
+              *  switch. If a switch is used the compiler (at least the Oracle
+@@ -1330,30 +1329,29 @@ public abstract class AbstractAccessLogValve extends ValveBase implements Access
+      * write time taken to process the request - %D, %T
+      */
+     protected static class ElapsedTimeElement implements AccessLogElement {
++        private final boolean micros;
+         private final boolean millis;
+ 
+         /**
+-         * @param millis <code>true</code>, write time in millis - %D,
+-         * if <code>false</code>, write time in seconds - %T
++         * @param micros <code>true</code>, write time in micros - %D
++         * @param millis <code>true</code>, write time in millis,
++         * if both arguments are <code>false</code>, write time in seconds - %T
+          */
+-        public ElapsedTimeElement(boolean millis) {
++        public ElapsedTimeElement(boolean micros, boolean millis) {
++            this.micros = micros;
+             this.millis = millis;
+         }
+ 
+         @Override
+         public void addElement(CharArrayWriter buf, Date date, Request request,
+                 Response response, long time) {
+-            if (millis) {
+-                buf.append(Long.toString(time));
++            if (micros) {
++                buf.append(Long.toString(TimeUnit.NANOSECONDS.toMicros(time)));
++            } else if (millis) {
++                buf.append(Long.toString(TimeUnit.NANOSECONDS.toMillis(time)));
+             } else {
+                 // second
+-                buf.append(Long.toString(time / 1000));
+-                buf.append('.');
+-                int remains = (int) (time % 1000);
+-                buf.append(Long.toString(remains / 100));
+-                remains = remains % 100;
+-                buf.append(Long.toString(remains / 10));
+-                buf.append(Long.toString(remains % 10));
++                buf.append(Long.toString(TimeUnit.NANOSECONDS.toSeconds(time)));
+             }
+         }
+     }
+@@ -1364,7 +1362,7 @@ public abstract class AbstractAccessLogValve extends ValveBase implements Access
+     protected static class FirstByteTimeElement implements AccessLogElement {
+         @Override
+         public void addElement(CharArrayWriter buf, Date date, Request request, Response response, long time) {
+-            long commitTime = response.getCoyoteResponse().getCommitTime();
++            long commitTime = response.getCoyoteResponse().getCommitTimeNanos();
+             if (commitTime == -1) {
+                 buf.append('-');
+             } else {
+@@ -1745,6 +1743,15 @@ public abstract class AbstractAccessLogValve extends ValveBase implements Access
+             return new SessionAttributeElement(name);
+         case 't':
+             return new DateAndTimeElement(name);
++        case 'T':
++            // ms for milliseconds, us for microseconds, and s for seconds
++            if ("ms".equals(name)) {
++                return new ElapsedTimeElement(false, true);
++            } else if ("us".equals(name)) {
++                return new ElapsedTimeElement(true, false);
++            } else {
++                return new ElapsedTimeElement(false, false);
++            }
+         default:
+             return new StringElement("???");
+         }
+@@ -1766,7 +1773,7 @@ public abstract class AbstractAccessLogValve extends ValveBase implements Access
+         case 'B':
+             return new ByteSentElement(false);
+         case 'D':
+-            return new ElapsedTimeElement(true);
++            return new ElapsedTimeElement(true, false);
+         case 'F':
+             return new FirstByteTimeElement();
+         case 'h':
+@@ -1790,7 +1797,7 @@ public abstract class AbstractAccessLogValve extends ValveBase implements Access
+         case 't':
+             return new DateAndTimeElement();
+         case 'T':
+-            return new ElapsedTimeElement(false);
++            return new ElapsedTimeElement(false, false);
+         case 'u':
+             return new UserElement();
+         case 'U':
+
+==================================================

@@ -1,0 +1,509 @@
+c63185eb33118df626139cf9776de8f3da1a65ce
+==================================================
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=56848
+==================================================
+Mark Emlyn
+==================================================
+Fri Aug 15 12:47:56 2014 +0000
+==================================================
+Request.java
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=56848
+Improve handling of <code>accept-language</code> headers.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1618166 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AcceptLanguage.java
+index 38daac7a88..72c9df6fe7 100644
+--- a/java/org/apache/catalina/connector/Request.java
++++ b/java/org/apache/catalina/connector/Request.java
+@@ -21,6 +21,7 @@ import java.io.BufferedReader;
+ import java.io.File;
+ import java.io.IOException;
+ import java.io.InputStream;
++import java.io.StringReader;
+ import java.io.UnsupportedEncodingException;
+ import java.lang.reflect.InvocationTargetException;
+ import java.nio.charset.Charset;
+@@ -76,7 +77,6 @@ import org.apache.catalina.core.ApplicationSessionCookieConfig;
+ import org.apache.catalina.core.AsyncContextImpl;
+ import org.apache.catalina.mapper.MappingData;
+ import org.apache.catalina.util.ParameterMap;
+-import org.apache.catalina.util.StringParser;
+ import org.apache.coyote.ActionCode;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+@@ -95,6 +95,7 @@ import org.apache.tomcat.util.http.fileupload.FileUploadException;
+ import org.apache.tomcat.util.http.fileupload.disk.DiskFileItemFactory;
+ import org.apache.tomcat.util.http.fileupload.servlet.ServletFileUpload;
+ import org.apache.tomcat.util.http.fileupload.servlet.ServletRequestContext;
++import org.apache.tomcat.util.http.parser.AcceptLanguage;
+ import org.apache.tomcat.util.res.StringManager;
+ import org.ietf.jgss.GSSCredential;
+ import org.ietf.jgss.GSSException;
+@@ -366,12 +367,6 @@ public class Request
+     protected boolean localesParsed = false;
+ 
+ 
+-    /**
+-     * The string parser we will use for parsing request lines.
+-     */
+-    private final StringParser parser = new StringParser();
+-
+-
+     /**
+      * Local port
+      */
+@@ -3114,99 +3109,24 @@ public class Request
+      */
+     protected void parseLocalesHeader(String value, TreeMap<Double, ArrayList<Locale>> locales) {
+ 
+-        // Preprocess the value to remove all whitespace
+-        int white = value.indexOf(' ');
+-        if (white < 0) {
+-            white = value.indexOf('\t');
+-        }
+-        if (white >= 0) {
+-            StringBuilder sb = new StringBuilder();
+-            int len = value.length();
+-            for (int i = 0; i < len; i++) {
+-                char ch = value.charAt(i);
+-                if ((ch != ' ') && (ch != '\t')) {
+-                    sb.append(ch);
+-                }
+-            }
+-            parser.setString(sb.toString());
+-        } else {
+-            parser.setString(value);
++        List<AcceptLanguage> acceptLanguages;
++        try {
++            acceptLanguages = AcceptLanguage.parse(new StringReader(value));
++        } catch (IOException e) {
++            // Mal-formed headers are ignore. Do the same in the unlikely event
++            // of an IOException.
++            return;
+         }
+ 
+-        // Process each comma-delimited language specification
+-        int length = parser.getLength();
+-        while (true) {
+-
+-            // Extract the next comma-delimited entry
+-            int start = parser.getIndex();
+-            if (start >= length) {
+-                break;
+-            }
+-            int end = parser.findChar(',');
+-            String entry = parser.extract(start, end).trim();
+-            parser.advance();   // For the following entry
+-
+-            // Extract the quality factor for this entry
+-            double quality = 1.0;
+-            int semi = entry.indexOf(";q=");
+-            if (semi >= 0) {
+-                try {
+-                    String strQuality = entry.substring(semi + 3);
+-                    if (strQuality.length() <= 5) {
+-                        quality = Double.parseDouble(strQuality);
+-                    } else {
+-                        quality = 0.0;
+-                    }
+-                } catch (NumberFormatException e) {
+-                    quality = 0.0;
+-                }
+-                entry = entry.substring(0, semi);
+-            }
+-
+-            // Skip entries we are not going to keep track of
+-            if (quality < 0.00005)
+-             {
+-                continue;       // Zero (or effectively zero) quality factors
+-            }
+-            if ("*".equals(entry))
+-             {
+-                continue;       // FIXME - "*" entries are not handled
+-            }
+-
+-            // Extract the language and country for this entry
+-            String language = null;
+-            String country = null;
+-            String variant = null;
+-            int dash = entry.indexOf('-');
+-            if (dash < 0) {
+-                language = entry;
+-                country = "";
+-                variant = "";
+-            } else {
+-                language = entry.substring(0, dash);
+-                country = entry.substring(dash + 1);
+-                int vDash = country.indexOf('-');
+-                if (vDash > 0) {
+-                    String cTemp = country.substring(0, vDash);
+-                    variant = country.substring(vDash + 1);
+-                    country = cTemp;
+-                } else {
+-                    variant = "";
+-                }
+-            }
+-            if (!isAlpha(language) || !isAlpha(country) || !isAlpha(variant)) {
+-                continue;
+-            }
+-
++        for (AcceptLanguage acceptLanguage : acceptLanguages) {
+             // Add a new Locale to the list of Locales for this quality level
+-            Locale locale = new Locale(language, country, variant);
+-            Double key = new Double(-quality);  // Reverse the order
++            Double key = new Double(-acceptLanguage.getQuality());  // Reverse the order
+             ArrayList<Locale> values = locales.get(key);
+             if (values == null) {
+                 values = new ArrayList<>();
+                 locales.put(key, values);
+             }
+-            values.add(locale);
++            values.add(acceptLanguage.getLocale());
+         }
+     }
+ 
+
+==================================================
+Authorization.java
+new file mode 100644
+index 0000000000..97f5e64a3f
+--- /dev/null
++++ b/java/org/apache/tomcat/util/http/parser/AcceptLanguage.java
+@@ -0,0 +1,76 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.tomcat.util.http.parser;
++
++import java.io.IOException;
++import java.io.StringReader;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Locale;
++
++public class AcceptLanguage {
++
++    private final Locale locale;
++    private final double quality;
++
++    protected AcceptLanguage(Locale locale, double quality) {
++        this.locale = locale;
++        this.quality = quality;
++    }
++
++    public Locale getLocale() {
++        return locale;
++    }
++
++    public double getQuality() {
++        return quality;
++    }
++
++
++    public static List<AcceptLanguage> parse(StringReader input) throws IOException {
++
++        List<AcceptLanguage> result = new ArrayList<>();
++
++        do {
++            // Token is broader than what is permitted in a language tag
++            // (alphanumeric + '-') but any invalid values that slip through
++            // will be caught later
++            String languageTag = HttpParser.readToken(input);
++            if (languageTag == null) {
++                // Invalid tag, skip to the next one
++                HttpParser.skipUntil(input, 0, ',');
++                continue;
++            }
++
++            if (languageTag.length() == 0) {
++                // No more data to read
++                break;
++            }
++
++            // See if a quality has been provided
++            double quality = 1;
++            HttpParser.SkipResult lookForSemiColon = HttpParser.skipConstant(input, ";");
++            if (lookForSemiColon == HttpParser.SkipResult.FOUND) {
++                quality = HttpParser.readWeight(input, ',');
++            }
++
++            result.add(new AcceptLanguage(Locale.forLanguageTag(languageTag), quality));
++        } while (true);
++
++        return result;
++    }
++}
+
+==================================================
+HttpParser.java
+index 1a4d2e96ba..865b2f82f9 100644
+--- a/java/org/apache/tomcat/util/http/parser/Authorization.java
++++ b/java/org/apache/tomcat/util/http/parser/Authorization.java
+@@ -78,7 +78,7 @@ public class Authorization {
+ 
+         Map<String,String> result = new HashMap<>();
+ 
+-        if (HttpParser.skipConstant(input, "Digest") != HttpParser.SkipConstantResult.FOUND) {
++        if (HttpParser.skipConstant(input, "Digest") != HttpParser.SkipResult.FOUND) {
+             return null;
+         }
+         // All field names are valid tokens
+@@ -87,7 +87,7 @@ public class Authorization {
+             return null;
+         }
+         while (!field.equals("")) {
+-            if (HttpParser.skipConstant(input, "=") != HttpParser.SkipConstantResult.FOUND) {
++            if (HttpParser.skipConstant(input, "=") != HttpParser.SkipResult.FOUND) {
+                 return null;
+             }
+             String value;
+@@ -127,7 +127,7 @@ public class Authorization {
+             }
+             result.put(field, value);
+ 
+-            if (HttpParser.skipConstant(input, ",") == HttpParser.SkipConstantResult.NOT_FOUND) {
++            if (HttpParser.skipConstant(input, ",") == HttpParser.SkipResult.NOT_FOUND) {
+                 return null;
+             }
+             field = HttpParser.readToken(input);
+
+==================================================
+MediaType.java
+index ef077264f2..6f20c08fe3 100644
+--- a/java/org/apache/tomcat/util/http/parser/HttpParser.java
++++ b/java/org/apache/tomcat/util/http/parser/HttpParser.java
+@@ -118,24 +118,24 @@ public class HttpParser {
+         return c;
+     }
+ 
+-    static SkipConstantResult skipConstant(StringReader input, String constant) throws IOException {
++    static SkipResult skipConstant(StringReader input, String constant) throws IOException {
+         int len = constant.length();
+ 
+         int c = skipLws(input, false);
+ 
+         for (int i = 0; i < len; i++) {
+             if (i == 0 && c == -1) {
+-                return SkipConstantResult.EOF;
++                return SkipResult.EOF;
+             }
+             if (c != constant.charAt(i)) {
+                 input.skip(-(i + 1));
+-                return SkipConstantResult.NOT_FOUND;
++                return SkipResult.NOT_FOUND;
+             }
+             if (i != (len - 1)) {
+                 c = input.read();
+             }
+         }
+-        return SkipConstantResult.FOUND;
++        return SkipResult.FOUND;
+     }
+ 
+     /**
+@@ -321,7 +321,85 @@ public class HttpParser {
+         }
+     }
+ 
+-    static enum SkipConstantResult {
++    static double readWeight(StringReader input, char delimiter) throws IOException {
++        int c = skipLws(input, false);
++        if (c == -1 || c == delimiter) {
++            // No q value just whitespace
++            return 1;
++        } else if (c != 'q') {
++            // Malformed. Use quality of zero so it is dropped.
++            skipUntil(input, c, delimiter);
++            return 0;
++        }
++        // RFC 7231 does not allow whitespace here but be tolerant
++        c = skipLws(input, false);
++        if (c != '=') {
++            // Malformed. Use quality of zero so it is dropped.
++            skipUntil(input, c, delimiter);
++            return 0;
++        }
++
++        // RFC 7231 does not allow whitespace here but be tolerant
++        c = skipLws(input, false);
++
++        // Should be no more than 3 decimal places
++        StringBuilder value = new StringBuilder(5);
++        int decimalPlacesRead = 0;
++        if (c == '0' || c == '1') {
++            value.append((char) c);
++            c = input.read();
++            if (c == '.') {
++                value.append('.');
++            } else if (c < '0' || c > '9') {
++                decimalPlacesRead = 3;
++            }
++            while (true) {
++                c = input.read();
++                if (c >= '0' && c <= '9') {
++                    if (decimalPlacesRead < 3) {
++                        value.append((char) c);
++                        decimalPlacesRead++;
++                    }
++                } else if (c == delimiter || c == 9 || c == 32 || c == -1) {
++                    break;
++                } else {
++                    // Go back so character is available for next read
++                    input.skip(-1);
++                    return 0;
++                }
++            }
++        } else {
++            // Malformed. Use quality of zero so it is dropped and skip until
++            // EOF or the next delimiter
++            skipUntil(input, c, delimiter);
++            return 0;
++        }
++
++        double result = Double.parseDouble(value.toString());
++        if (result > 1) {
++            return 0;
++        }
++        return result;
++    }
++
++
++    /**
++     * Skips all characters until EOF or the specified target is found. Normally
++     * used to skip invalid input until the next separator.
++     */
++    static SkipResult skipUntil(StringReader input, int c, char target) throws IOException {
++        while (c != -1 && c != target) {
++            c = input.read();
++        }
++        if (c == -1) {
++            return SkipResult.EOF;
++        } else {
++            return SkipResult.FOUND;
++        }
++    }
++
++
++    static enum SkipResult {
+         FOUND,
+         NOT_FOUND,
+         EOF
+
+==================================================
+TestRequest.java
+index c5b546ef29..91638dd516 100644
+--- a/java/org/apache/tomcat/util/http/parser/MediaType.java
++++ b/java/org/apache/tomcat/util/http/parser/MediaType.java
+@@ -138,7 +138,7 @@ public class MediaType {
+             return null;
+         }
+ 
+-        if (HttpParser.skipConstant(input, "/") == HttpParser.SkipConstantResult.NOT_FOUND) {
++        if (HttpParser.skipConstant(input, "/") == HttpParser.SkipResult.NOT_FOUND) {
+             return null;
+         }
+ 
+@@ -150,15 +150,15 @@ public class MediaType {
+ 
+         LinkedHashMap<String,String> parameters = new LinkedHashMap<>();
+ 
+-        HttpParser.SkipConstantResult lookForSemiColon = HttpParser.skipConstant(input, ";");
+-        if (lookForSemiColon == HttpParser.SkipConstantResult.NOT_FOUND) {
++        HttpParser.SkipResult lookForSemiColon = HttpParser.skipConstant(input, ";");
++        if (lookForSemiColon == HttpParser.SkipResult.NOT_FOUND) {
+             return null;
+         }
+-        while (lookForSemiColon == HttpParser.SkipConstantResult.FOUND) {
++        while (lookForSemiColon == HttpParser.SkipResult.FOUND) {
+             String attribute = HttpParser.readToken(input);
+ 
+             String value = "";
+-            if (HttpParser.skipConstant(input, "=") == HttpParser.SkipConstantResult.FOUND) {
++            if (HttpParser.skipConstant(input, "=") == HttpParser.SkipResult.FOUND) {
+                 value = HttpParser.readTokenOrQuotedString(input, true);
+             }
+ 
+@@ -167,7 +167,7 @@ public class MediaType {
+             }
+ 
+             lookForSemiColon = HttpParser.skipConstant(input, ";");
+-            if (lookForSemiColon == HttpParser.SkipConstantResult.NOT_FOUND) {
++            if (lookForSemiColon == HttpParser.SkipResult.NOT_FOUND) {
+                 return null;
+             }
+         }
+
+==================================================
+TesterRequest.java
+index e6314bd636..173810795c 100644
+--- a/test/org/apache/catalina/connector/TestRequest.java
++++ b/test/org/apache/catalina/connector/TestRequest.java
+@@ -41,6 +41,7 @@ import static org.junit.Assert.assertTrue;
+ import static org.junit.Assert.fail;
+ 
+ import org.junit.Assert;
++import org.junit.Ignore;
+ import org.junit.Test;
+ import org.apache.catalina.Context;
+ import org.apache.catalina.authenticator.BasicAuthenticator;
+@@ -827,4 +828,24 @@ public class TestRequest extends TomcatBaseTest {
+         Assert.assertEquals(expected, actual);
+     }
+ 
++
++    @Test
++    @Ignore("Used to check performance of different parsing approaches")
++    public void localeParsePerformance() throws Exception {
++        TesterRequest req = new TesterRequest();
++        req.addHeader("accept-encoding", "en-gb,en");
++
++        long start = System.nanoTime();
++
++        // Takes about 0.3s on a quad core 2.7Ghz 2013 MacBook
++        for (int i = 0; i < 10000000; i++) {
++            req.parseLocales();
++            req.localesParsed = false;
++            req.locales.clear();
++        }
++
++        long time = System.nanoTime() - start;
++
++        System.out.println(time);
++    }
+ }
+
+==================================================
+TestAcceptLanguage.java
+index ffe42b799a..3d0dc77f74 100644
+--- a/test/org/apache/catalina/connector/TesterRequest.java
++++ b/test/org/apache/catalina/connector/TesterRequest.java
+@@ -72,6 +72,10 @@ public class TesterRequest extends Request {
+     }
+     @Override
+     public Enumeration<String> getHeaders(String name) {
++        List<String> values = headers.get(name);
++        if (values == null || values.size() == 0) {
++            return Collections.emptyEnumeration();
++        }
+         return Collections.enumeration(headers.get(name));
+     }
+ 
+
+==================================================

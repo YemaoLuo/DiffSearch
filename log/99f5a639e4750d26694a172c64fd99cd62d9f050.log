@@ -1,0 +1,2454 @@
+99f5a639e4750d26694a172c64fd99cd62d9f050
+==================================================
+Remove the remaining SPDY code and associated references
+==================================================
+Mark Thomas
+==================================================
+Fri May 22 12:10:25 2015 +0000
+==================================================
+SpdyProcessor.java
+index 2e3d4d9f9b..ff4a09d187 100644
+--- a/conf/catalina.properties
++++ b/conf/catalina.properties
+@@ -112,7 +112,7 @@ catalina.jar,catalina-ant.jar,catalina-ha.jar,catalina-storeconfig.jar,\
+ catalina-tribes.jar,\
+ jasper.jar,jasper-el.jar,ecj-*.jar,\
+ tomcat-api.jar,tomcat-util.jar,tomcat-util-scan.jar,tomcat-coyote.jar,\
+-tomcat-dbcp.jar,tomcat-jni.jar,tomcat-spdy.jar,tomcat-websocket.jar,\
++tomcat-dbcp.jar,tomcat-jni.jar,tomcat-websocket.jar,\
+ tomcat-i18n-en.jar,tomcat-i18n-es.jar,tomcat-i18n-fr.jar,tomcat-i18n-ja.jar,\
+ tomcat-juli-adapters.jar,catalina-jmx-remote.jar,catalina-ws.jar,\
+ tomcat-jdbc.jar,\
+
+==================================================
+SpdyProxyProtocol.java
+deleted file mode 100644
+index 21b3f674e3..0000000000
+--- a/java/org/apache/coyote/spdy/SpdyProcessor.java
++++ /dev/null
+@@ -1,623 +0,0 @@
+-/*
+- *  Licensed to the Apache Software Foundation (ASF) under one or more
+- *  contributor license agreements.  See the NOTICE file distributed with
+- *  this work for additional information regarding copyright ownership.
+- *  The ASF licenses this file to You under the Apache License, Version 2.0
+- *  (the "License"); you may not use this file except in compliance with
+- *  the License.  You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- *  Unless required by applicable law or agreed to in writing, software
+- *  distributed under the License is distributed on an "AS IS" BASIS,
+- *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- *  See the License for the specific language governing permissions and
+- *  limitations under the License.
+- */
+-package org.apache.coyote.spdy;
+-
+-import java.io.IOException;
+-import java.io.InterruptedIOException;
+-import java.net.InetAddress;
+-import java.nio.ByteBuffer;
+-import java.util.concurrent.Executor;
+-import java.util.concurrent.atomic.AtomicBoolean;
+-
+-import javax.servlet.http.HttpUpgradeHandler;
+-
+-import org.apache.coyote.AbstractProcessor;
+-import org.apache.coyote.ActionCode;
+-import org.apache.coyote.AsyncContextCallback;
+-import org.apache.coyote.ErrorState;
+-import org.apache.coyote.InputBuffer;
+-import org.apache.coyote.OutputBuffer;
+-import org.apache.coyote.RequestInfo;
+-import org.apache.juli.logging.Log;
+-import org.apache.juli.logging.LogFactory;
+-import org.apache.tomcat.spdy.SpdyConnection;
+-import org.apache.tomcat.spdy.SpdyContext;
+-import org.apache.tomcat.spdy.SpdyFrame;
+-import org.apache.tomcat.spdy.SpdyStream;
+-import org.apache.tomcat.util.ExceptionUtils;
+-import org.apache.tomcat.util.buf.Ascii;
+-import org.apache.tomcat.util.buf.ByteChunk;
+-import org.apache.tomcat.util.buf.MessageBytes;
+-import org.apache.tomcat.util.http.HttpMessages;
+-import org.apache.tomcat.util.http.MimeHeaders;
+-import org.apache.tomcat.util.net.AbstractEndpoint;
+-import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
+-import org.apache.tomcat.util.net.SSLSupport;
+-import org.apache.tomcat.util.net.SocketStatus;
+-import org.apache.tomcat.util.net.SocketWrapperBase;
+-
+-/**
+- * A spdy stream ( multiplexed over a spdy tcp connection ) processed by a
+- * tomcat servlet.
+- *
+- * Based on the AJP processor.
+- */
+-public class SpdyProcessor extends AbstractProcessor implements Runnable {
+-
+-    private static final Log log = LogFactory.getLog(SpdyProcessor.class);
+-
+-    // TODO: handle input
+-    // TODO: recycle
+-    // TODO: swallow input ( recycle only after input close )
+-    // TODO: find a way to inject an OutputBuffer, or interecept close() -
+-    // so we can send FIN in the last data packet.
+-
+-    private final SpdyConnection spdy;
+-
+-    // Associated spdy stream
+-    private SpdyStream spdyStream;
+-
+-    private final ByteChunk keyBuffer = new ByteChunk();
+-
+-    private boolean finished;
+-
+-    private SpdyFrame inFrame = null;
+-
+-    private boolean outClosed = false;
+-
+-    private boolean outCommit = false;
+-
+-    public SpdyProcessor(SpdyConnection spdy, AbstractEndpoint<?> endpoint) {
+-        super(endpoint);
+-
+-        this.spdy = spdy;
+-        request.setInputBuffer(new LiteInputBuffer());
+-        response.setOutputBuffer(new LiteOutputBuffer());
+-
+-    }
+-
+-    class LiteInputBuffer implements InputBuffer {
+-        @Override
+-        public int doRead(ByteChunk bchunk) throws IOException {
+-            if (inFrame == null) {
+-                // blocking
+-                inFrame = spdyStream.getDataFrame(endpoint.getSoTimeout());
+-            }
+-            if (inFrame == null) {
+-                return -1; // timeout
+-            }
+-            if (inFrame.remaining() == 0 && inFrame.isHalfClose()) {
+-                return -1;
+-            }
+-
+-            int rd = Math.min(inFrame.remaining(), bchunk.getBytes().length);
+-            System.arraycopy(inFrame.data, inFrame.off, bchunk.getBytes(),
+-                    bchunk.getStart(), rd);
+-            inFrame.advance(rd);
+-            if (inFrame.remaining() == 0) {
+-                if (!inFrame.isHalfClose()) {
+-                    inFrame = null;
+-                }
+-            }
+-            bchunk.setEnd(bchunk.getEnd() + rd);
+-            return rd;
+-        }
+-    }
+-
+-    final class LiteOutputBuffer implements OutputBuffer {
+-        long byteCount;
+-
+-        @Override
+-        public int doWrite(org.apache.tomcat.util.buf.ByteChunk chunk) throws IOException {
+-            if (!response.isCommitted()) {
+-
+-                // Send the connector a request for commit. The connector should
+-                // then validate the headers, send them (using sendHeader) and
+-                // set the filters accordingly.
+-                response.action(ActionCode.COMMIT, null);
+-
+-            }
+-            spdyStream.sendDataFrame(chunk.getBuffer(), chunk.getStart(),
+-                    chunk.getLength(), false);
+-            byteCount += chunk.getLength();
+-            return chunk.getLength();
+-        }
+-
+-        @Override
+-        public long getBytesWritten() {
+-            return byteCount;
+-        }
+-    }
+-
+-    void onRequest() {
+-        Executor exec = spdy.getSpdyContext().getExecutor();
+-        exec.execute(this);
+-    }
+-
+-    /**
+-     * Execute the request.
+-     */
+-    @Override
+-    public void run() {
+-        RequestInfo rp = request.getRequestProcessor();
+-        try {
+-            rp.setStage(org.apache.coyote.Constants.STAGE_SERVICE);
+-            getAdapter().service(request, response);
+-        } catch (InterruptedIOException e) {
+-            setErrorState(ErrorState.CLOSE_NOW, e);
+-        } catch (Throwable t) {
+-            ExceptionUtils.handleThrowable(t);
+-            // log.error(sm.getString("ajpprocessor.request.process"), t);
+-            // 500 - Internal Server Error
+-            // TODO Log this properly
+-            t.printStackTrace();
+-            response.setStatus(500);
+-            getAdapter().log(request, response, 0);
+-            setErrorState(ErrorState.CLOSE_NOW, t);
+-        }
+-
+-        // TODO: async, etc ( detached mode - use a special light protocol)
+-
+-        // Finish the response if not done yet
+-        if (!finished) {
+-            try {
+-                finish();
+-            } catch (Throwable t) {
+-                ExceptionUtils.handleThrowable(t);
+-                setErrorState(ErrorState.CLOSE_NOW, t);
+-            }
+-        }
+-
+-        if (getErrorState().isError()) {
+-            response.setStatus(500);
+-        }
+-
+-        request.updateCounters();
+-        rp.setStage(org.apache.coyote.Constants.STAGE_KEEPALIVE);
+-        // TODO: recycle
+-    }
+-
+-    private void finish() {
+-        if (!response.isCommitted()) {
+-            response.action(ActionCode.COMMIT, response);
+-        }
+-
+-        if (finished)
+-            return;
+-
+-        finished = true;
+-
+-        response.action(ActionCode.CLOSE, null);
+-    }
+-
+-    private static final byte[] EMPTY = new byte[0];
+-
+-    // Processor implementation
+-
+-    private void maybeCommit() {
+-        if (outCommit) {
+-            return;
+-        }
+-        if (!response.isCommitted()) {
+-            // Validate and write response headers
+-            sendSynReply();
+-        }
+-    }
+-
+-    @Override
+-    public void action(ActionCode actionCode, Object param) {
+-        // if (SpdyContext.debug) {
+-        // System.err.println(actionCode);
+-        // }
+-
+-        // TODO: async
+-
+-        switch (actionCode) {
+-        case COMMIT: {
+-            maybeCommit();
+-            break;
+-        }
+-        case CLIENT_FLUSH: {
+-            maybeCommit();
+-
+-            // try {
+-            // flush(true);
+-            // } catch (IOException e) {
+-            // // Set error flag
+-            // error = true;
+-            // }
+-            break;
+-        }
+-        case IS_ERROR: {
+-            ((AtomicBoolean) param).set(getErrorState().isError());
+-            break;
+-        }
+-        case DISABLE_SWALLOW_INPUT: {
+-            // TODO: Do not swallow request input but
+-            // make sure we are closing the connection
+-            setErrorState(ErrorState.CLOSE_CLEAN, null);
+-            break;
+-        }
+-        case CLOSE: {
+-            if (outClosed) {
+-                return;
+-            }
+-            outClosed = true;
+-            // Close
+-            // End the processing of the current request, and stop any further
+-            // transactions with the client
+-            maybeCommit();
+-
+-            spdyStream.sendDataFrame(EMPTY, 0, 0, true);
+-            break;
+-        }
+-        case REQ_SSL_ATTRIBUTE: {
+-            // if (!certificates.isNull()) {
+-            // ByteChunk certData = certificates.getByteChunk();
+-            // X509Certificate jsseCerts[] = null;
+-            // ByteArrayInputStream bais =
+-            // new ByteArrayInputStream(certData.getBytes(),
+-            // certData.getStart(),
+-            // certData.getLength());
+-            // // Fill the elements.
+-            // try {
+-            // CertificateFactory cf;
+-            // if (clientCertProvider == null) {
+-            // cf = CertificateFactory.getInstance("X.509");
+-            // } else {
+-            // cf = CertificateFactory.getInstance("X.509",
+-            // clientCertProvider);
+-            // }
+-            // while(bais.available() > 0) {
+-            // X509Certificate cert = (X509Certificate)
+-            // cf.generateCertificate(bais);
+-            // if(jsseCerts == null) {
+-            // jsseCerts = new X509Certificate[1];
+-            // jsseCerts[0] = cert;
+-            // } else {
+-            // X509Certificate [] temp = new
+-            // X509Certificate[jsseCerts.length+1];
+-            // System.arraycopy(jsseCerts,0,temp,0,jsseCerts.length);
+-            // temp[jsseCerts.length] = cert;
+-            // jsseCerts = temp;
+-            // }
+-            // }
+-            // } catch (java.security.cert.CertificateException e) {
+-            // getLog().error(sm.getString("ajpprocessor.certs.fail"), e);
+-            // return;
+-            // } catch (NoSuchProviderException e) {
+-            // getLog().error(sm.getString("ajpprocessor.certs.fail"), e);
+-            // return;
+-            // }
+-            // request.setAttribute(SSLSupport.CERTIFICATE_KEY, jsseCerts);
+-            // }
+-            break;
+-        }
+-        case REQ_HOST_ATTRIBUTE: {
+-            // Get remote host name using a DNS resolution
+-            if (request.remoteHost().isNull()) {
+-                try {
+-                    request.remoteHost().setString(
+-                            InetAddress.getByName(
+-                                    request.remoteAddr().toString())
+-                                    .getHostName());
+-                } catch (IOException iex) {
+-                    // Ignore
+-                }
+-            }
+-            break;
+-        }
+-        case REQ_LOCALPORT_ATTRIBUTE: {
+-            String configured = (String) endpoint.getAttribute("proxyPort");
+-            int localPort = 0;
+-            if (configured != null) {
+-                localPort = Integer.parseInt(configured);
+-            } else {
+-                localPort = endpoint.getPort();
+-            }
+-            request.setLocalPort(localPort);
+-            break;
+-        }
+-        case REQ_LOCAL_ADDR_ATTRIBUTE: {
+-            InetAddress localAddress = endpoint.getAddress();
+-            String localIp = localAddress == null ? null : localAddress
+-                    .getHostAddress();
+-            if (localIp == null) {
+-                localIp = (String) endpoint.getAttribute("proxyIP");
+-            }
+-            if (localIp == null) {
+-                localIp = "127.0.0.1";
+-            }
+-            request.localAddr().setString(localIp);
+-            break;
+-        }
+-        case REQ_HOST_ADDR_ATTRIBUTE: {
+-            InetAddress localAddress = endpoint.getAddress();
+-            String localH = localAddress == null ? null : localAddress
+-                    .getCanonicalHostName();
+-            if (localH == null) {
+-                localH = (String) endpoint.getAttribute("proxyName");
+-            }
+-            if (localH == null) {
+-                localH = "localhost";
+-            }
+-
+-            request.localAddr().setString(localH);
+-            break;
+-        }
+-        case REQ_SET_BODY_REPLAY: {
+-            // // Set the given bytes as the content
+-            // ByteChunk bc = (ByteChunk) param;
+-            // int length = bc.getLength();
+-            // bodyBytes.setBytes(bc.getBytes(), bc.getStart(), length);
+-            // request.setContentLength(length);
+-            // first = false;
+-            // empty = false;
+-            // replay = true;
+-            break;
+-        }
+-        case ASYNC_START: {
+-            asyncStateMachine.asyncStart((AsyncContextCallback) param);
+-            break;
+-        }
+-        case ASYNC_DISPATCHED: {
+-            asyncStateMachine.asyncDispatched();
+-            break;
+-        }
+-        case ASYNC_TIMEOUT: {
+-            AtomicBoolean result = (AtomicBoolean) param;
+-            result.set(asyncStateMachine.asyncTimeout());
+-            break;
+-        }
+-        case ASYNC_RUN: {
+-            asyncStateMachine.asyncRun((Runnable) param);
+-            break;
+-        }
+-        case ASYNC_ERROR: {
+-            asyncStateMachine.asyncError();
+-            break;
+-        }
+-        case ASYNC_IS_STARTED: {
+-            ((AtomicBoolean) param).set(asyncStateMachine.isAsyncStarted());
+-            break;
+-        }
+-        case ASYNC_IS_DISPATCHING: {
+-            ((AtomicBoolean) param).set(asyncStateMachine.isAsyncDispatching());
+-            break;
+-        }
+-        case ASYNC_IS_ASYNC: {
+-            ((AtomicBoolean) param).set(asyncStateMachine.isAsync());
+-            break;
+-        }
+-        case ASYNC_IS_TIMINGOUT: {
+-            ((AtomicBoolean) param).set(asyncStateMachine.isAsyncTimingOut());
+-            break;
+-        }
+-        case ASYNC_IS_ERROR: {
+-            ((AtomicBoolean) param).set(asyncStateMachine.isAsyncError());
+-            break;
+-        }
+-        case CLOSE_NOW: {
+-            setErrorState(ErrorState.CLOSE_NOW, null);
+-            break;
+-        }
+-        default: {
+-            // TODO:
+-            // actionInternal(actionCode, param);
+-            break;
+-        }
+-        }
+-    }
+-
+-
+-    /**
+-     * When committing the response, we have to validate the set of headers, as
+-     * well as setup the response filters.
+-     */
+-    protected void sendSynReply() {
+-
+-        response.setCommitted(true);
+-
+-        // Special headers
+-        MimeHeaders headers = response.getMimeHeaders();
+-        String contentType = response.getContentType();
+-        if (contentType != null) {
+-            headers.setValue("Content-Type").setString(contentType);
+-        }
+-        String contentLanguage = response.getContentLanguage();
+-        if (contentLanguage != null) {
+-            headers.setValue("Content-Language").setString(contentLanguage);
+-        }
+-        long contentLength = response.getContentLengthLong();
+-        if (contentLength >= 0) {
+-            headers.setValue("Content-Length").setLong(contentLength);
+-        }
+-
+-        sendResponseHead();
+-    }
+-
+-    private void sendResponseHead() {
+-        SpdyFrame rframe = spdy.getFrame(SpdyConnection.TYPE_SYN_REPLY);
+-        rframe.associated = 0;
+-
+-        MimeHeaders headers = response.getMimeHeaders();
+-        for (int i = 0; i < headers.size(); i++) {
+-            MessageBytes mb = headers.getName(i);
+-            mb.toBytes();
+-            ByteChunk bc = mb.getByteChunk();
+-            byte[] bb = bc.getBuffer();
+-            for (int j = bc.getStart(); j < bc.getEnd(); j++) {
+-                bb[j] = (byte) Ascii.toLower(bb[j]);
+-            }
+-            // TODO: filter headers: Connection, Keep-Alive, Proxy-Connection,
+-            rframe.headerName(bc.getBuffer(), bc.getStart(), bc.getLength());
+-            mb = headers.getValue(i);
+-            mb.toBytes();
+-            bc = mb.getByteChunk();
+-            rframe.headerValue(bc.getBuffer(), bc.getStart(), bc.getLength());
+-        }
+-        if (response.getStatus() == 0) {
+-            rframe.addHeader(SpdyFrame.STATUS, SpdyFrame.OK200);
+-        } else {
+-            // HTTP header contents
+-            String message = null;
+-            if (org.apache.coyote.Constants.USE_CUSTOM_STATUS_MSG_IN_HEADER
+-                    && HttpMessages.isSafeInHttpHeader(response.getMessage())) {
+-                message = response.getMessage();
+-            }
+-            if (message == null) {
+-                message = HttpMessages.getInstance(
+-                        response.getLocale()).getMessage(response.getStatus());
+-            }
+-            if (message == null) {
+-                // mod_jk + httpd 2.x fails with a null status message - bug
+-                // 45026
+-                message = Integer.toString(response.getStatus());
+-            }
+-            // TODO: optimize
+-            String status = response.getStatus() + " " + message;
+-            byte[] statusB = status.getBytes();
+-            rframe.headerName(SpdyFrame.STATUS, 0, SpdyFrame.STATUS.length);
+-            rframe.headerValue(statusB, 0, statusB.length);
+-        }
+-        rframe.addHeader(SpdyFrame.VERSION, SpdyFrame.HTTP11);
+-
+-        rframe.streamId = spdyStream.reqFrame.streamId;
+-        spdy.send(rframe, spdyStream);
+-        // we can't reuse the frame - it'll be queued, the coyote processor
+-        // may be reused as well.
+-        outCommit = true;
+-    }
+-
+-    @Override
+-    public SocketState process(SocketWrapperBase<?> socket)
+-            throws IOException {
+-        throw new IOException("Unimplemented");
+-    }
+-
+-    @Override
+-    public boolean isUpgrade() {
+-        return false;
+-    }
+-
+-    @Override
+-    public ByteBuffer getLeftoverInput() {
+-        return null;
+-    }
+-
+-    @Override
+-    public SocketState dispatch(SocketStatus status) {
+-        return null;
+-    }
+-
+-    public void onSynStream(SpdyStream str) throws IOException {
+-        this.spdyStream = str;
+-        SpdyFrame frame = str.reqFrame;
+-        // We need to make a copy - the frame buffer will be reused.
+-        // We use the 'wrap' methods of MimeHeaders - which should be
+-        // lighter on mem in some cases.
+-        RequestInfo rp = request.getRequestProcessor();
+-        rp.setStage(org.apache.coyote.Constants.STAGE_PREPARE);
+-
+-        // Request received.
+-        MimeHeaders mimeHeaders = request.getMimeHeaders();
+-
+-        // Set this every time in case limit has been changed via JMX
+-        mimeHeaders.setLimit(endpoint.getMaxHeaderCount());
+-
+-        for (int i = 0; i < frame.nvCount; i++) {
+-            int nameLen = frame.read16();
+-            if (nameLen > frame.remaining()) {
+-                throw new IOException("Name too long");
+-            }
+-
+-            keyBuffer.setBytes(frame.data, frame.off, nameLen);
+-            if (keyBuffer.equals("method")) {
+-                frame.advance(nameLen);
+-                int valueLen = frame.read16();
+-                if (valueLen > frame.remaining()) {
+-                    throw new IOException("Name too long");
+-                }
+-                request.method().setBytes(frame.data, frame.off, valueLen);
+-                frame.advance(valueLen);
+-            } else if (keyBuffer.equals("url")) {
+-                frame.advance(nameLen);
+-                int valueLen = frame.read16();
+-                if (valueLen > frame.remaining()) {
+-                    throw new IOException("Name too long");
+-                }
+-
+-                int questionPos = -1;
+-                int end = frame.off + valueLen;
+-                for(int k = frame.off; k < end; k ++) {
+-                    if (frame.data[k] == '?') {
+-                        questionPos = k;
+-                        break;
+-                    }
+-                }
+-
+-                if (questionPos >= 0) {
+-                    request.queryString().setBytes(frame.data, questionPos + 1, end - questionPos - 1);
+-                    request.requestURI().setBytes(frame.data, frame.off, questionPos - frame.off);
+-                } else {
+-                    request.requestURI().setBytes(frame.data, frame.off, valueLen);
+-                }
+-                if (SpdyContext.debug) {
+-                    System.err.println("URL= " + request.requestURI());
+-                }
+-                frame.advance(valueLen);
+-            } else if (keyBuffer.equals("version")) {
+-                frame.advance(nameLen);
+-                int valueLen = frame.read16();
+-                if (valueLen > frame.remaining()) {
+-                    throw new IOException("Name too long");
+-                }
+-                frame.advance(valueLen);
+-            } else {
+-                MessageBytes value = mimeHeaders.addValue(frame.data,
+-                        frame.off, nameLen);
+-                frame.advance(nameLen);
+-                int valueLen = frame.read16();
+-                if (valueLen > frame.remaining()) {
+-                    throw new IOException("Name too long");
+-                }
+-                value.setBytes(frame.data, frame.off, valueLen);
+-                frame.advance(valueLen);
+-            }
+-        }
+-
+-        onRequest();
+-    }
+-
+-    @Override
+-    public void recycle() {
+-    }
+-
+-    @Override
+-    public void setSslSupport(SSLSupport sslSupport) {
+-    }
+-
+-    @Override
+-    public HttpUpgradeHandler getHttpUpgradeHandler() {
+-        return null;
+-    }
+-
+-    @Override
+-    protected Log getLog() {
+-        return log;
+-    }
+-}
+
+==================================================
+CompressDeflater6.java
+deleted file mode 100644
+index 4bd8b5e536..0000000000
+--- a/java/org/apache/coyote/spdy/SpdyProxyProtocol.java
++++ /dev/null
+@@ -1,152 +0,0 @@
+-/*
+- *  Licensed to the Apache Software Foundation (ASF) under one or more
+- *  contributor license agreements.  See the NOTICE file distributed with
+- *  this work for additional information regarding copyright ownership.
+- *  The ASF licenses this file to You under the Apache License, Version 2.0
+- *  (the "License"); you may not use this file except in compliance with
+- *  the License.  You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- *  Unless required by applicable law or agreed to in writing, software
+- *  distributed under the License is distributed on an "AS IS" BASIS,
+- *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- *  See the License for the specific language governing permissions and
+- *  limitations under the License.
+- */
+-package org.apache.coyote.spdy;
+-
+-import java.io.IOException;
+-import java.nio.channels.SocketChannel;
+-
+-import org.apache.coyote.AbstractProtocol;
+-import org.apache.coyote.UpgradeProtocol;
+-import org.apache.coyote.ajp.Constants;
+-import org.apache.juli.logging.Log;
+-import org.apache.juli.logging.LogFactory;
+-import org.apache.tomcat.spdy.NetSupportSocket;
+-import org.apache.tomcat.spdy.SpdyConnection;
+-import org.apache.tomcat.spdy.SpdyContext;
+-import org.apache.tomcat.spdy.SpdyContext.SpdyHandler;
+-import org.apache.tomcat.spdy.SpdyStream;
+-import org.apache.tomcat.util.net.NioChannel;
+-import org.apache.tomcat.util.net.NioEndpoint;
+-import org.apache.tomcat.util.net.SSLHostConfig;
+-import org.apache.tomcat.util.net.SocketStatus;
+-import org.apache.tomcat.util.net.SocketWrapperBase;
+-
+-/**
+- * SPDY in 'proxy' mode - no SSL and no header compression.
+- * This doesn't require JNI libraries, SSL/compression are off-loaded to
+- * a reverse proxy ( apache, etc ).
+- *
+- * To configure:
+- * &lt;Connector port="8011" protocol="org.apache.coyote.spdy.SpdyProxyNioProtocol"/&gt;
+- *
+- * To test, use
+- *   chrome  --use-spdy=no-compress,no-ssl [--enable-websocket-over-spdy]
+- *
+- * TODO: Remote information (client ip, certs, etc ) will be sent in X- headers.
+- * TODO: if spdy-&gt;spdy proxy, info about original spdy stream for pushes.
+- *
+- * TODO: This proxy implementation was refactored to use NIO instead of BIO. It
+- *       is untested as SPDY/2 is now obsolete and is not supported by current
+- *       browsers. This code should be reviewed when work starts on the HTTP/2
+- *       implementation.
+- *
+- */
+-public class SpdyProxyProtocol extends AbstractProtocol<NioChannel> {
+-    private static final Log log = LogFactory.getLog(SpdyProxyProtocol.class);
+-
+-    private SpdyContext spdyContext;
+-
+-    private boolean compress = false;
+-
+-    public SpdyProxyProtocol() {
+-        super(new NioEndpoint());
+-        NioEndpoint.Handler cHandler = new TomcatNioHandler();
+-        ((NioEndpoint) getEndpoint()).setHandler(cHandler);
+-        setSoTimeout(Constants.DEFAULT_CONNECTION_TIMEOUT);
+-    }
+-
+-    @Override
+-    protected Log getLog() {
+-        return log;
+-    }
+-
+-    @Override
+-    protected String getNamePrefix() {
+-        return "spdy2-nio";
+-    }
+-
+-    @Override
+-    protected String getProtocolName() {
+-        return "spdy2";
+-    }
+-
+-    @Override
+-    public void start() throws Exception {
+-        super.start();
+-        spdyContext = new SpdyContext();
+-        spdyContext.setTlsCompression(false, compress);
+-        spdyContext.setHandler(new SpdyHandler() {
+-            @Override
+-            public void onStream(SpdyConnection con, SpdyStream ch) throws IOException {
+-                SpdyProcessor sp = new SpdyProcessor(con, getEndpoint());
+-                sp.setAdapter(getAdapter());
+-                sp.onSynStream(ch);
+-            }
+-        });
+-        spdyContext.setNetSupport(new NetSupportSocket());
+-        spdyContext.setExecutor(getEndpoint().getExecutor());
+-    }
+-
+-    public boolean isCompress() {
+-        return compress;
+-    }
+-
+-    public void setCompress(boolean compress) {
+-        this.compress = compress;
+-    }
+-
+-    public class TomcatNioHandler implements NioEndpoint.Handler {
+-
+-        @Override
+-        public Object getGlobal() {
+-            return null;
+-        }
+-
+-        @Override
+-        public void recycle() {
+-        }
+-
+-        @Override
+-        public SocketState process(SocketWrapperBase<NioChannel> socket,
+-                SocketStatus status) {
+-
+-            spdyContext.getNetSupport().onAccept(socket.getSocket());
+-            return SocketState.CLOSED;
+-        }
+-
+-        @Override
+-        public void release(SocketWrapperBase<NioChannel> socket) {
+-            // TODO Auto-generated method stub
+-        }
+-
+-        @Override
+-        public void release(SocketChannel socket) {
+-            // TODO Auto-generated method stub
+-        }
+-    }
+-
+-    @Override
+-    protected UpgradeProtocol getNegotiatedProtocol(String name) {
+-        // TODO Auto-generated method stub
+-        return null;
+-    }
+-
+-    @Override
+-    public void addSslHostConfig(SSLHostConfig sslHostConfig) {
+-        // TODO Auto-generated method stub
+-    }
+-}
+
+==================================================
+NetSupportSocket.java
+deleted file mode 100644
+index 5eb272ef5a..0000000000
+--- a/java/org/apache/tomcat/spdy/CompressDeflater6.java
++++ /dev/null
+@@ -1,178 +0,0 @@
+-/*
+- *  Licensed to the Apache Software Foundation (ASF) under one or more
+- *  contributor license agreements.  See the NOTICE file distributed with
+- *  this work for additional information regarding copyright ownership.
+- *  The ASF licenses this file to You under the Apache License, Version 2.0
+- *  (the "License"); you may not use this file except in compliance with
+- *  the License.  You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- *  Unless required by applicable law or agreed to in writing, software
+- *  distributed under the License is distributed on an "AS IS" BASIS,
+- *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- *  See the License for the specific language governing permissions and
+- *  limitations under the License.
+- */
+-package org.apache.tomcat.spdy;
+-
+-import java.io.IOException;
+-import java.util.zip.DataFormatException;
+-import java.util.zip.Deflater;
+-import java.util.zip.Inflater;
+-
+-import org.apache.tomcat.spdy.SpdyConnection.CompressSupport;
+-
+-/**
+- * Java6 Deflater with the workaround from tomcat http filters.
+- */
+-class CompressDeflater6 implements CompressSupport {
+-    public static final long DICT_ID = 3751956914L;
+-
+-    // Make sure to use the latest from net/spdy/spdy_framer.cc, not from spec
+-    private static final String SPDY_DICT_S =
+-              "optionsgetheadpostputdeletetraceacceptaccept-charsetaccept-encodingaccept-"
+-            + "languageauthorizationexpectfromhostif-modified-sinceif-matchif-none-matchi"
+-            + "f-rangeif-unmodifiedsincemax-forwardsproxy-authorizationrangerefererteuser"
+-            + "-agent10010120020120220320420520630030130230330430530630740040140240340440"
+-            + "5406407408409410411412413414415416417500501502503504505accept-rangesageeta"
+-            + "glocationproxy-authenticatepublicretry-afterservervarywarningwww-authentic"
+-            + "ateallowcontent-basecontent-encodingcache-controlconnectiondatetrailertran"
+-            + "sfer-encodingupgradeviawarningcontent-languagecontent-lengthcontent-locati"
+-            + "oncontent-md5content-rangecontent-typeetagexpireslast-modifiedset-cookieMo"
+-            + "ndayTuesdayWednesdayThursdayFridaySaturdaySundayJanFebMarAprMayJunJulAugSe"
+-            + "pOctNovDecchunkedtext/htmlimage/pngimage/jpgimage/gifapplication/xmlapplic"
+-            + "ation/xhtmltext/plainpublicmax-agecharset=iso-8859-1utf-8gzipdeflateHTTP/1"
+-            + ".1statusversionurl ";
+-
+-    private static final byte[] SPDY_DICT = SPDY_DICT_S.getBytes();
+-    // C code uses this - not in the spec
+-    static {
+-        SPDY_DICT[SPDY_DICT.length - 1] = (byte) 0;
+-    }
+-
+-    private Deflater zipOut;
+-    private Inflater zipIn;
+-
+-    private byte[] decompressBuffer;
+-    private int decMax;
+-
+-    private byte[] compressBuffer;
+-
+-    public CompressDeflater6() {
+-    }
+-
+-    public static CompressDeflater6 get() {
+-        // TODO: code to plug in v7-specific. It is marginally faster.
+-        return new CompressDeflater6();
+-    }
+-
+-    public void recycle() {
+-        // TODO
+-    }
+-
+-    public void init() {
+-        if (zipOut != null) {
+-            return;
+-        }
+-        try {
+-            // false is important - otherwise 'bad method'
+-            zipOut = new Deflater(Deflater.DEFAULT_COMPRESSION, false);
+-            zipOut.setDictionary(SPDY_DICT);
+-            zipIn = new Inflater();
+-        } catch (Exception e) {
+-            e.printStackTrace();
+-        }
+-    }
+-
+-    @Override
+-    public synchronized void compress(SpdyFrame frame, int start)
+-            throws IOException {
+-        init();
+-
+-        if (compressBuffer == null) {
+-            compressBuffer = new byte[frame.data.length];
+-        }
+-
+-        // last byte for flush ?
+-        zipOut.setInput(frame.data, start, frame.endData - start - 1);
+-        int coff = start;
+-        zipOut.setLevel(Deflater.DEFAULT_COMPRESSION);
+-        while (true) {
+-            int rd = zipOut.deflate(compressBuffer, coff, compressBuffer.length - coff);
+-            if (rd == 0) {
+-                // needsInput needs to be called - we're done with this frame ?
+-                zipOut.setInput(frame.data, frame.endData - 1, 1);
+-                zipOut.setLevel(Deflater.BEST_SPEED);
+-                while (true) {
+-                    rd = zipOut.deflate(compressBuffer, coff, compressBuffer.length - coff);
+-                    coff += rd;
+-                    if (rd == 0) {
+-                        break;
+-                    }
+-                    byte[] b = new byte[compressBuffer.length * 2];
+-                    System.arraycopy(compressBuffer, 0, b, 0, coff);
+-                    compressBuffer = b;
+-                }
+-                zipOut.setLevel(Deflater.DEFAULT_COMPRESSION);
+-                break;
+-            }
+-            coff += rd;
+-        }
+-
+-        byte[] tmp = frame.data;
+-        frame.data = compressBuffer;
+-        compressBuffer = tmp;
+-        frame.endData = coff;
+-    }
+-
+-    @Override
+-    public synchronized void decompress(SpdyFrame frame, int start)
+-            throws IOException {
+-        // stream id ( 4 ) + unused ( 2 )
+-        // nvCount is compressed in impl - spec is different
+-        init();
+-
+-
+-        if (decompressBuffer == null) {
+-            decompressBuffer = new byte[frame.data.length];
+-        }
+-
+-        // will read from dec buffer to frame.data
+-        decMax = frame.endData;
+-
+-        int off = start;
+-
+-        zipIn.setInput(frame.data, start, decMax - start);
+-
+-        while (true) {
+-            int rd;
+-            try {
+-                rd = zipIn.inflate(decompressBuffer, off, decompressBuffer.length - off);
+-                if (rd == 0 && zipIn.needsDictionary()) {
+-                    zipIn.setDictionary(SPDY_DICT);
+-                    continue;
+-                }
+-            } catch (DataFormatException e) {
+-                throw new IOException(e);
+-            }
+-            if (rd == 0) {
+-                break;
+-            }
+-            if (rd == -1) {
+-                break;
+-            }
+-            off += rd;
+-            byte[] b = new byte[decompressBuffer.length * 2];
+-            System.arraycopy(decompressBuffer, 0, b, 0, off);
+-            decompressBuffer = b;
+-
+-        }
+-        byte[] tmpBuf = decompressBuffer;
+-        decompressBuffer = frame.data;
+-        frame.data = tmpBuf;
+-
+-        frame.off = start;
+-        frame.endData = off;
+-    }
+-}
+
+==================================================
+SpdyConnection.java
+deleted file mode 100644
+index 71e9fdfd28..0000000000
+--- a/java/org/apache/tomcat/spdy/NetSupportSocket.java
++++ /dev/null
+@@ -1,171 +0,0 @@
+-/*
+- *  Licensed to the Apache Software Foundation (ASF) under one or more
+- *  contributor license agreements.  See the NOTICE file distributed with
+- *  this work for additional information regarding copyright ownership.
+- *  The ASF licenses this file to You under the Apache License, Version 2.0
+- *  (the "License"); you may not use this file except in compliance with
+- *  the License.  You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- *  Unless required by applicable law or agreed to in writing, software
+- *  distributed under the License is distributed on an "AS IS" BASIS,
+- *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- *  See the License for the specific language governing permissions and
+- *  limitations under the License.
+- */
+-package org.apache.tomcat.spdy;
+-
+-import java.io.IOException;
+-import java.net.ServerSocket;
+-import java.net.Socket;
+-import java.net.SocketTimeoutException;
+-import java.security.NoSuchAlgorithmException;
+-
+-import javax.net.ssl.SSLContext;
+-import javax.net.ssl.SSLSocket;
+-
+-
+-public class NetSupportSocket extends SpdyContext.NetSupport {
+-
+-    @Override
+-    public boolean isSpdy(Object socketW) {
+-        return false;
+-    }
+-
+-    @Override
+-    public SpdyConnection getConnection(String host, int port) throws IOException {
+-        try {
+-            Socket sock = getSocket(host, port);
+-
+-            sock.getInputStream();
+-            SpdyConnectionSocket con = new SpdyConnectionSocket(ctx, sock);
+-
+-            ctx.getExecutor().execute(con.inputThread);
+-            return con;
+-        } catch (IOException ex) {
+-            ex.printStackTrace();
+-            throw ex;
+-        }
+-
+-    }
+-
+-
+-    protected Socket getSocket(String host, int port) throws IOException {
+-        try {
+-            if (ctx.tls) {
+-                SSLContext sslCtx = SSLContext.getDefault();
+-                SSLSocket socket = (SSLSocket) sslCtx.getSocketFactory().createSocket(host, port);
+-                //socket.setEnabledProtocols(new String[] {"TLS1"});
+-                socket.startHandshake();
+-                return socket;
+-            } else {
+-                return new Socket(host, port);
+-            }
+-        } catch (NoSuchAlgorithmException e) {
+-            throw new IOException(e);
+-        }
+-
+-    }
+-
+-    private boolean running = true;
+-    private ServerSocket serverSocket;
+-
+-    @Override
+-    public void stop() throws IOException {
+-        running = false;
+-        serverSocket.close();
+-    }
+-
+-    @Override
+-    public void onAccept(Object socket) {
+-        SpdyConnectionSocket ch = new SpdyConnectionSocket(ctx, (Socket) socket);
+-        ch.onBlockingSocket();
+-    }
+-
+-
+-    @Override
+-    public void listen(final int port, String cert, String key) throws IOException {
+-        ctx.getExecutor().execute(new Runnable() {
+-            @Override
+-            public void run() {
+-                accept(port);
+-            }
+-        });
+-    }
+-
+-    private void accept(int port) {
+-        try {
+-            serverSocket = new ServerSocket(port);
+-            while (running) {
+-                final Socket socket = serverSocket.accept();
+-                ctx.getExecutor().execute(new Runnable() {
+-                    @Override
+-                    public void run() {
+-                        onAccept(socket);
+-                        try {
+-                            socket.close();
+-                        } catch (IOException e) {
+-                            e.printStackTrace();
+-                        }
+-                    }
+-                });
+-            }
+-        } catch (IOException ex) {
+-            if (running) {
+-                ex.printStackTrace();
+-            }
+-            running = false;
+-        }
+-    }
+-
+-
+-    private static class SpdyConnectionSocket extends SpdyConnection {
+-        private Socket socket;
+-
+-
+-        Runnable inputThread = new Runnable() {
+-            @Override
+-            public void run() {
+-                onBlockingSocket();
+-                try {
+-                    inClosed = true;
+-                    socket.close();
+-                } catch (IOException e) {
+-                    e.printStackTrace();
+-                }
+-            }
+-        };
+-
+-        public SpdyConnectionSocket(SpdyContext spdyContext) {
+-            super(spdyContext);
+-        }
+-
+-        public SpdyConnectionSocket(SpdyContext spdyContext, Socket socket) {
+-            super(spdyContext);
+-            this.socket = socket;
+-        }
+-
+-        @Override
+-        public void close() throws IOException {
+-            socket.close();
+-        }
+-
+-        @Override
+-        public synchronized int write(byte[] data, int off, int len) throws IOException {
+-            socket.getOutputStream().write(data, off, len);
+-            return len;
+-        }
+-
+-        @Override
+-        public int read(byte[] data, int off, int len) throws IOException {
+-            try {
+-                return socket.getInputStream().read(data, off, len);
+-            } catch (SocketTimeoutException ex) {
+-                return 0;
+-            }
+-        }
+-    }
+-
+-}
+-
+
+==================================================
+SpdyContext.java
+deleted file mode 100644
+index 75d237edc2..0000000000
+--- a/java/org/apache/tomcat/spdy/SpdyConnection.java
++++ /dev/null
+@@ -1,681 +0,0 @@
+-/*
+- *  Licensed to the Apache Software Foundation (ASF) under one or more
+- *  contributor license agreements.  See the NOTICE file distributed with
+- *  this work for additional information regarding copyright ownership.
+- *  The ASF licenses this file to You under the Apache License, Version 2.0
+- *  (the "License"); you may not use this file except in compliance with
+- *  the License.  You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- *  Unless required by applicable law or agreed to in writing, software
+- *  distributed under the License is distributed on an "AS IS" BASIS,
+- *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- *  See the License for the specific language governing permissions and
+- *  limitations under the License.
+- */
+-package org.apache.tomcat.spdy;
+-
+-import java.io.IOException;
+-import java.io.PrintWriter;
+-import java.util.ArrayList;
+-import java.util.HashMap;
+-import java.util.LinkedList;
+-import java.util.List;
+-import java.util.Map;
+-import java.util.logging.Level;
+-import java.util.logging.Logger;
+-
+-/**
+- * Main class implementing SPDY protocol. Works with both blocking and
+- * non-blocking sockets. To simplify integration in various endpoints there is
+- * no 'socket' layer/abstraction, but read/write abstract methods.
+- *
+- * Because SPDY is multiplexing, a blocking socket needs a second thread to
+- * handle writes ( the read thread may be blocked while a servlet is writing ).
+- * The intended use of SPDY with blocking sockets is for frontend(load-balancer)
+- * to tomcat, where each tomcat will have a few spdy connections.
+- *
+- */
+-public abstract class SpdyConnection { // implements Runnable {
+-
+-    // TODO: this can be pooled, to avoid allocation on idle connections
+-    // TODO: override socket timeout
+-
+-    private volatile SpdyFrame inFrame;
+-
+-    private CompressSupport compressSupport;
+-
+-    // Fields stored for each spdy connection
+-    private final Map<Integer, SpdyStream> channels = new HashMap<>();
+-
+-    // --------------
+-    private static final Logger log = Logger.getLogger(SpdyConnection.class
+-            .getName());
+-
+-    public static final int TYPE_SYN_STREAM = 1;
+-
+-    public static final int TYPE_SYN_REPLY = 2;
+-
+-    public static final int TYPE_RST_STREAM = 3;
+-
+-    public static final int TYPE_SETTINGS = 4;
+-
+-    public static final int TYPE_PING = 6;
+-
+-    public static final int TYPE_GOAWAY = 7;
+-
+-    public static final int TYPE_HEADERS = 8;
+-
+-    public static final int TYPE_WINDOW = 8;
+-
+-    public static String[] TYPES = { "SYN_STREAM", "SYN_REPLY", "RST_STREAM",
+-            "SETTINGS", "5", "PING", "GOAWAY", "HEADERS", "WINDOW_UPDATE" };
+-
+-    static final int FLAG_HALF_CLOSE = 1;
+-
+-    private static final String[] RST_ERRORS = {
+-            // This is a generic error, and should only be used if a more
+-            // specific error is not available.
+-            "PROTOCOL_ERROR", "INVALID_STREAM",
+-            // This is returned when a frame is received for a stream which is
+-            // not
+-            // active.
+-            "REFUSED_STREAM",
+-            // Indicates that the stream was refused before any processing has
+-            // been
+-            // done on the stream.
+-            "UNSUPPORTED_VERSION",
+-            // 4 Indicates that the recipient of a stream does not support the
+-            // SPDY version requested.
+-            "CANCEL",
+-            // 5 Used by the creator of a stream to indicate that the stream is
+-            // no longer needed.
+-            "FLOW_CONTROL_ERROR",
+-            // 6 The endpoint detected that its peer violated the flow control
+-            // protocol.
+-            "STREAM_IN_USE",
+-            // 7 The endpoint received a SYN_REPLY for a stream already open.
+-            "STREAM_ALREADY_CLOSED"
+-    // 8 The endpoint received a data or SYN_REPLY frame for a stream which
+-    // is half closed.
+-    };
+-
+-    // protected SpdyFrame currentOutFrame = new SpdyFrame();
+-
+-    protected final SpdyContext spdyContext;
+-
+-    protected boolean inClosed;
+-
+-    private int lastChannel;
+-
+-    private int outStreamId = 1;
+-
+-    // TODO: finer handling of priorities
+-    private final LinkedList<SpdyFrame> prioriyQueue = new LinkedList<>();
+-
+-    private final LinkedList<SpdyFrame> outQueue = new LinkedList<>();
+-
+-    // --------------
+-
+-    public static final int LONG = 1;
+-
+-    public static final int CLOSE = -1;
+-
+-    private SpdyFrame nextFrame;
+-
+-    /**
+-     * Handles the out queue for blocking sockets.
+-     */
+-    private SpdyFrame out;
+-
+-    private int goAway = Integer.MAX_VALUE;
+-
+-    public SpdyConnection(SpdyContext spdyContext) {
+-        this.spdyContext = spdyContext;
+-        if (spdyContext.compression) {
+-            setCompressSupport(CompressDeflater6.get());
+-        }
+-    }
+-
+-    @Override
+-    public String toString() {
+-        return "SpdyCon open=" + channels.size() + " " + lastChannel;
+-    }
+-
+-    public void dump(PrintWriter out) {
+-        out.println("SpdyConnection open=" + channels.size() +
+-                " outQ:" + outQueue.size());
+-        for (SpdyStream str: channels.values()) {
+-            str.dump(out);
+-        }
+-
+-        out.println();
+-
+-    }
+-
+-    /**
+-     * Write.
+-     */
+-    public abstract int write(byte[] data, int off, int len) throws IOException;
+-
+-    /**
+-     * Like read, but may return 0 if no data is available and the channel
+-     * supports polling.
+-     */
+-    public abstract int read(byte[] data, int off, int len) throws IOException;
+-
+-    public abstract void close() throws IOException;
+-
+-    public void setCompressSupport(CompressSupport cs) {
+-        compressSupport = cs;
+-    }
+-
+-    public SpdyFrame getFrame(int type) {
+-        SpdyFrame frame = getSpdyContext().getFrame();
+-        frame.c = true;
+-        frame.type = type;
+-        return frame;
+-    }
+-
+-    public SpdyFrame getDataFrame() {
+-        SpdyFrame frame = getSpdyContext().getFrame();
+-        return frame;
+-    }
+-
+-    /*
+-     * Output requirements: - common case: sendFrame called from a thread ( like
+-     * servlets ), wants to be blocked anyways
+-     *
+-     * - but also need to support 'non-blocking' mode ( ping )
+-     *
+-     * - we need to queue frames when write would block, so we can prioritize.
+-     *
+-     * - for fully non-blocking write: there will be a drain callback.
+-     */
+-
+-    public void drain() {
+-        synchronized (nbDrain) {
+-            _drain();
+-        }
+-    }
+-
+-    /**
+-     * Non blocking if the socket is not blocking.
+-     */
+-    private boolean _drain() {
+-        while (true) {
+-            synchronized (outQueue) {
+-                if (out == null) {
+-                    out = prioriyQueue.poll();
+-                    if (out == null) {
+-                        out = outQueue.poll();
+-                    }
+-                    if (out == null) {
+-                        return false;
+-                    }
+-                    if (goAway < out.streamId) {
+-                        // TODO
+-                    }
+-                    try {
+-                        if (!out.c) {
+-                            // late: IDs are assigned as we send ( priorities may affect
+-                            // the transmission order )
+-                            if (out.stream != null) {
+-                                out.streamId = out.stream.getRequest().streamId;
+-                            }
+-                        } else if (out.type == TYPE_SYN_STREAM) {
+-                            out.fixNV(18);
+-                            if (compressSupport != null) {
+-                                compressSupport.compress(out, 18);
+-                            }
+-                        } else if (out.type == TYPE_SYN_REPLY
+-                                || out.type == TYPE_HEADERS) {
+-                            out.fixNV(14);
+-                            if (compressSupport != null) {
+-                                compressSupport.compress(out, 14);
+-                            }
+-                        }
+-                    } catch (IOException ex) {
+-                        abort("Compress error");
+-                        return false;
+-                    }
+-                    if (out.type == TYPE_SYN_STREAM) {
+-                        out.streamId = outStreamId;
+-                        outStreamId += 2;
+-                        synchronized(channels) {
+-                            channels.put(Integer.valueOf(out.streamId),
+-                                    out.stream);
+-                        }
+-                    }
+-
+-                    out.serializeHead();
+-
+-                }
+-                if (out.endData == out.off) {
+-                    out = null;
+-                    continue;
+-                }
+-            }
+-
+-            if (SpdyContext.debug) {
+-                trace("> " + out);
+-            }
+-
+-            try {
+-                int toWrite = out.endData - out.off;
+-                int wr;
+-                while (toWrite > 0) {
+-                    wr = write(out.data, out.off, toWrite);
+-                    if (wr < 0) {
+-                        return false;
+-                    }
+-                    if (wr == 0) {
+-                        return true; // non blocking or to
+-                    }
+-                    if (wr <= toWrite) {
+-                        out.off += wr;
+-                        toWrite -= wr;
+-                    }
+-                }
+-
+-                synchronized (channels) {
+-                    if (out.stream != null) {
+-                        if (out.isHalfClose()) {
+-                            out.stream.finSent = true;
+-                        }
+-                        if (out.stream.finRcvd && out.stream.finSent) {
+-                            channels.remove(Integer.valueOf(out.streamId));
+-                        }
+-                    }
+-                }
+-                out = null;
+-            } catch (IOException e) {
+-                // connection closed - abort all streams
+-                e.printStackTrace();
+-                onClose();
+-                return false;
+-            }
+-        }
+-    }
+-
+-    /**
+-     * Send as much as possible without blocking.
+-     *
+-     * With a nb transport it should call drain directly.
+-     */
+-    public void nonBlockingSend(SpdyFrame oframe, SpdyStream proc) {
+-        queueFrame(oframe, proc, oframe.pri == 0 ? outQueue : prioriyQueue);
+-        getSpdyContext().getExecutor().execute(nbDrain);
+-    }
+-
+-    private final Runnable nbDrain = new Runnable() {
+-        @Override
+-        public void run() {
+-            drain();
+-        }
+-    };
+-
+-    /**
+-     * Add the frame to the queue and send until the queue is empty.
+-     *
+-     */
+-    public void send(SpdyFrame oframe, SpdyStream proc) {
+-        queueFrame(oframe, proc, oframe.pri == 0 ? outQueue : prioriyQueue);
+-        drain();
+-    }
+-
+-    private void queueFrame(SpdyFrame oframe, SpdyStream proc,
+-            LinkedList<SpdyFrame> queue) {
+-
+-        oframe.endData = oframe.off;
+-        oframe.off = 0;
+-        // We can't assing a stream ID until it is sent - priorities
+-        // we can't compress either - it's stateful.
+-        oframe.stream = proc;
+-
+-        // all sync for adding/removing is on outQueue
+-        synchronized (outQueue) {
+-            queue.add(oframe);
+-        }
+-    }
+-
+-    public void onClose() {
+-        // TODO: abort
+-    }
+-
+-    private void trace(String s) {
+-        System.err.println(s);
+-    }
+-
+-    public SpdyFrame inFrame() {
+-        return inFrame;
+-    }
+-
+-    /**
+-     * Process a SPDY connection using a blocking socket.
+-     */
+-    public int onBlockingSocket() {
+-        try {
+-            if (SpdyContext.debug) {
+-                trace("< onConnection() " + lastChannel);
+-            }
+-            int rc = processInput();
+-
+-            if (SpdyContext.debug) {
+-                trace("< onConnection() " + rc + " " + lastChannel);
+-            }
+-            return rc;
+-        } catch (Throwable t) {
+-            t.printStackTrace();
+-            trace("< onData-ERROR() " + lastChannel);
+-            abort("Error processing socket" + t);
+-            return CLOSE;
+-        }
+-    }
+-
+-    /**
+-     * Non-blocking method, read as much as possible and return.
+-     */
+-    public int processInput() throws IOException {
+-        while (true) {
+-            if (inFrame == null) {
+-                inFrame = getSpdyContext().getFrame();
+-            }
+-
+-            if (inFrame.data == null) {
+-                inFrame.data = new byte[16 * 1024];
+-            }
+-            // we might already have data from previous frame
+-            if (inFrame.endReadData < 8 || // we don't have the header
+-                    inFrame.endReadData < inFrame.endData) {
+-
+-                int rd = read(inFrame.data, inFrame.endReadData,
+-                        inFrame.data.length - inFrame.endReadData);
+-                if (rd == -1) {
+-                    if (channels.size() == 0) {
+-                        return CLOSE;
+-                    } else {
+-                        abort("Closed");
+-                    }
+-                } else if (rd < 0) {
+-                    abort("Closed - read error");
+-                    return CLOSE;
+-                } else if (rd == 0) {
+-                    return LONG;
+-                    // Non-blocking channel - will resume reading at off
+-                }
+-                inFrame.endReadData += rd;
+-            }
+-            if (inFrame.endReadData < 8) {
+-                continue; // keep reading
+-            }
+-            if (inFrame.endData == 0) {
+-                inFrame.parse();
+-                if (inFrame.version != 2) {
+-                    abort("Wrong version");
+-                    return CLOSE;
+-                }
+-
+-                // MAX_FRAME_SIZE
+-                if (inFrame.endData < 0 || inFrame.endData > 32000) {
+-                    abort("Framing error, size = " + inFrame.endData);
+-                    return CLOSE;
+-                }
+-
+-                // TODO: if data, split it in 2 frames
+-                // grow the buffer if needed.
+-                if (inFrame.data.length < inFrame.endData) {
+-                    byte[] tmp = new byte[inFrame.endData];
+-                    System.arraycopy(inFrame.data, 0, tmp, 0, inFrame.endReadData);
+-                    inFrame.data = tmp;
+-                }
+-            }
+-
+-            if (inFrame.endReadData < inFrame.endData) {
+-                continue; // keep reading to fill current frame
+-            }
+-            // else: we have at least the current frame
+-            int extra = inFrame.endReadData - inFrame.endData;
+-            if (extra > 0) {
+-                // and a bit more - to keep things simple for now we
+-                // copy them to next frame, at least we saved reads.
+-                // it is possible to avoid copy - but later.
+-                nextFrame = getSpdyContext().getFrame();
+-                nextFrame.makeSpace(extra);
+-                System.arraycopy(inFrame.data, inFrame.endData,
+-                        nextFrame.data, 0, extra);
+-                nextFrame.endReadData = extra;
+-                inFrame.endReadData = inFrame.endData;
+-            }
+-
+-            // decompress
+-            if (inFrame.type == TYPE_SYN_STREAM) {
+-                inFrame.streamId = inFrame.readInt(); // 4
+-                lastChannel = inFrame.streamId;
+-                inFrame.associated = inFrame.readInt(); // 8
+-                inFrame.pri = inFrame.read16(); // 10 pri and unused
+-                if (compressSupport != null) {
+-                    compressSupport.decompress(inFrame, 18);
+-                }
+-                inFrame.nvCount = inFrame.read16();
+-
+-            } else if (inFrame.type == TYPE_SYN_REPLY
+-                    || inFrame.type == TYPE_HEADERS) {
+-                inFrame.streamId = inFrame.readInt(); // 4
+-                inFrame.read16();
+-                if (compressSupport != null) {
+-                    compressSupport.decompress(inFrame, 14);
+-                }
+-                inFrame.nvCount = inFrame.read16();
+-            }
+-
+-            if (SpdyContext.debug) {
+-                trace("< " + inFrame);
+-            }
+-
+-            try {
+-                int state = handleFrame();
+-                if (state == CLOSE) {
+-                    return state;
+-                }
+-            } catch (Throwable t) {
+-                abort("Error handling frame");
+-                t.printStackTrace();
+-                return CLOSE;
+-            }
+-
+-            if (inFrame != null) {
+-                inFrame.recyle();
+-                if (nextFrame != null) {
+-                    inFrame = nextFrame;
+-                    nextFrame = null;
+-                }
+-            } else {
+-                inFrame = nextFrame;
+-                nextFrame = null;
+-                if (inFrame == null) {
+-                    inFrame = getSpdyContext().getFrame();
+-                }
+-            }
+-        }
+-    }
+-
+-    // Framing error or shutdown- close all streams.
+-    public void abort(String msg) {
+-        System.err.println(msg);
+-        inClosed = true;
+-
+-        List<Integer> ch = new ArrayList<>(channels.keySet());
+-        for (Integer i: ch) {
+-            SpdyStream stream = channels.remove(i);
+-            if (stream != null) {
+-                stream.onReset();
+-            }
+-        }
+-    }
+-
+-    public void abort(String msg, int last) {
+-        System.err.println(msg);
+-        inClosed = true;
+-
+-        List<Integer> ch = new ArrayList<>(channels.keySet());
+-        for (Integer i: ch) {
+-            if (i.intValue() > last) {
+-                SpdyStream stream = channels.remove(i);
+-                if (stream != null) {
+-                    stream.onReset();
+-                }
+-            }
+-        }
+-    }
+-
+-    /**
+-     * Process a SPDY connection. Called in the input thread, should not
+-     * block.
+-     *
+-     * @throws IOException
+-     */
+-    protected int handleFrame() throws IOException {
+-        if (inFrame.c) {
+-            switch (inFrame.type) {
+-            case TYPE_SETTINGS: {
+-                int cnt = inFrame.readInt();
+-                for (int i = 0; i < cnt; i++) {
+-                    inFrame.readByte();
+-                    inFrame.read24();
+-                    inFrame.readInt();
+-                }
+-                // TODO: save/interpret settings
+-                break;
+-            }
+-            case TYPE_GOAWAY: {
+-                int lastStream = inFrame.readInt();
+-                log.info("GOAWAY last=" + lastStream);
+-
+-                // Server will shut down - but will keep processing the current requests,
+-                // up to lastStream. If we sent any new ones - they need to be canceled.
+-                abort("GO_AWAY", lastStream);
+-                goAway  = lastStream;
+-                return CLOSE;
+-            }
+-            case TYPE_RST_STREAM: {
+-                inFrame.streamId = inFrame.read32();
+-                int errCode = inFrame.read32();
+-                if (SpdyContext.debug) {
+-                    trace("> RST "
+-                            + inFrame.streamId
+-                            + " "
+-                            + ((errCode < RST_ERRORS.length) ? RST_ERRORS[errCode]
+-                                    : Integer.valueOf(errCode)));
+-                }
+-                SpdyStream sch;
+-                synchronized(channels) {
+-                        sch = channels.remove(
+-                                Integer.valueOf(inFrame.streamId));
+-                }
+-                // if RST stream is for a closed channel - we can ignore.
+-                if (sch != null) {
+-                    sch.onReset();
+-                }
+-
+-                inFrame = null;
+-                break;
+-            }
+-            case TYPE_SYN_STREAM: {
+-
+-                SpdyStream ch = getSpdyContext().getStream(this);
+-
+-                synchronized (channels) {
+-                    channels.put(Integer.valueOf(inFrame.streamId), ch);
+-                }
+-
+-                try {
+-                    ch.onCtlFrame(inFrame);
+-                    inFrame = null;
+-                } catch (Throwable t) {
+-                    log.log(Level.SEVERE, "Error parsing head SYN_STREAM", t);
+-                    abort("Error reading headers " + t);
+-                    return CLOSE;
+-                }
+-                spdyContext.onStream(this, ch);
+-                break;
+-            }
+-            case TYPE_SYN_REPLY: {
+-                SpdyStream sch;
+-                synchronized(channels) {
+-                    sch = channels.get(Integer.valueOf(inFrame.streamId));
+-                }
+-                if (sch == null) {
+-                    abort("Missing channel");
+-                    return CLOSE;
+-                }
+-                try {
+-                    sch.onCtlFrame(inFrame);
+-                    inFrame = null;
+-                } catch (Throwable t) {
+-                    log.info("Error parsing head SYN_STREAM" + t);
+-                    abort("Error reading headers " + t);
+-                    return CLOSE;
+-                }
+-                break;
+-            }
+-            case TYPE_PING: {
+-
+-                SpdyFrame oframe = getSpdyContext().getFrame();
+-                oframe.type = TYPE_PING;
+-                oframe.c = true;
+-
+-                oframe.append32(inFrame.read32());
+-                oframe.pri = 0x80;
+-
+-                send(oframe, null);
+-                break;
+-            }
+-            }
+-        } else {
+-            // Data frame
+-            SpdyStream sch;
+-            synchronized (channels) {
+-                sch = channels.get(Integer.valueOf(inFrame.streamId));
+-            }
+-            if (sch == null) {
+-                abort("Missing channel");
+-                return CLOSE;
+-            }
+-            sch.onDataFrame(inFrame);
+-            synchronized (channels) {
+-                if (sch.finRcvd && sch.finSent) {
+-                    channels.remove(Integer.valueOf(inFrame.streamId));
+-                }
+-            }
+-            inFrame = null;
+-        }
+-        return LONG;
+-    }
+-
+-    public SpdyContext getSpdyContext() {
+-        return spdyContext;
+-    }
+-
+-    public SpdyStream get(String host, String url) {
+-        SpdyStream sch = new SpdyStream(this);
+-        sch.getRequest().addHeader("host", host);
+-        sch.getRequest().addHeader("url", url);
+-
+-        sch.send();
+-
+-        return sch;
+-    }
+-
+-    /**
+-     * Abstract compression support. When using spdy on intranet ( between load
+-     * balancer and tomcat) there is no need for the compression overhead. There
+-     * are also multiple possible implementations.
+-     */
+-    static interface CompressSupport {
+-        public void compress(SpdyFrame frame, int start) throws IOException;
+-
+-        public void decompress(SpdyFrame frame, int start) throws IOException;
+-    }
+-}
+
+==================================================
+SpdyFrame.java
+deleted file mode 100644
+index 37c59d90ae..0000000000
+--- a/java/org/apache/tomcat/spdy/SpdyContext.java
++++ /dev/null
+@@ -1,216 +0,0 @@
+-/*
+- *  Licensed to the Apache Software Foundation (ASF) under one or more
+- *  contributor license agreements.  See the NOTICE file distributed with
+- *  this work for additional information regarding copyright ownership.
+- *  The ASF licenses this file to You under the Apache License, Version 2.0
+- *  (the "License"); you may not use this file except in compliance with
+- *  the License.  You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- *  Unless required by applicable law or agreed to in writing, software
+- *  distributed under the License is distributed on an "AS IS" BASIS,
+- *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- *  See the License for the specific language governing permissions and
+- *  limitations under the License.
+- */
+-package org.apache.tomcat.spdy;
+-
+-import java.io.IOException;
+-import java.util.concurrent.Executor;
+-import java.util.concurrent.Executors;
+-
+-/**
+- * Will implement polling/reuse of heavy objects, allow additional
+- * configuration.
+- *
+- * The abstract methods allow integration with different libraries (
+- * compression, request handling )
+- *
+- * In 'external' mode it must be used with APR library and compression.
+- *
+- * In 'intranet' mode - it is supposed to be used behind a load balancer that
+- * handles SSL and compression. Test with: --user-data-dir=/tmp/test
+- * --use-spdy=no-compress,no-ssl
+- */
+-public final class SpdyContext {
+-
+-    public static final byte[] SPDY_NPN;
+-
+-    public static final byte[] SPDY_NPN_OUT;
+-    static {
+-        SPDY_NPN = "spdy/2".getBytes();
+-        SPDY_NPN_OUT = new byte[SPDY_NPN.length + 2];
+-        System.arraycopy(SPDY_NPN, 0, SPDY_NPN_OUT, 1, SPDY_NPN.length);
+-        SPDY_NPN_OUT[0] = (byte) SPDY_NPN.length;
+-    }
+-
+-    private Executor executor;
+-
+-    private int defaultFrameSize = 8192;
+-
+-    public static final boolean debug = false;
+-
+-    protected boolean tls = true;
+-    protected boolean compression = true;
+-
+-    private NetSupport netSupport;
+-
+-
+-    public abstract static class NetSupport {
+-        protected SpdyContext ctx;
+-
+-        public void setSpdyContext(SpdyContext ctx) {
+-            this.ctx = ctx;
+-        }
+-
+-        public abstract SpdyConnection getConnection(String host, int port)
+-                throws IOException;
+-
+-        public abstract boolean isSpdy(Object socketW);
+-
+-        public abstract void onAccept(Object socket);
+-
+-        public abstract void listen(int port, String cert, String key)
+-                throws IOException;
+-
+-        public abstract void stop() throws IOException;
+-    }
+-
+-    public SpdyContext() {
+-    }
+-
+-    public void setTlsCompression(boolean tls, boolean compress) {
+-        this.tls = tls;
+-        this.compression = compress;
+-    }
+-
+-    /**
+-     * Get a frame - frames are heavy buffers, may be reused.
+-     */
+-    public SpdyFrame getFrame() {
+-        return new SpdyFrame(defaultFrameSize);
+-    }
+-
+-    /**
+-     * Set the max frame size.
+-     *
+-     * Larger data packets will be split in multiple frames.
+-     *
+-     * ( the code is currently accepting larger control frames - it's not
+-     * clear if we should just reject them, many servers limit header size -
+-     * the http connector also has a 8k limit - getMaxHttpHeaderSize )
+-     */
+-    public void setFrameSize(int frameSize) {
+-        defaultFrameSize = frameSize;
+-    }
+-
+-    /**
+-     * Override for server side to return a custom stream.
+-     */
+-    public SpdyStream getStream(SpdyConnection framer) {
+-        SpdyStream spdyStream = new SpdyStream(framer);
+-        return spdyStream;
+-    }
+-
+-    public void setExecutor(Executor executor) {
+-        this.executor = executor;
+-    }
+-
+-    public void setNetSupport(NetSupport netSupport) {
+-        this.netSupport = netSupport;
+-        netSupport.setSpdyContext(this);
+-    }
+-
+-    public NetSupport getNetSupport() {
+-        if (netSupport == null) {
+-            try {
+-                Class<?> c0 = Class.forName("org.apache.tomcat.spdy.NetSupportOpenSSL");
+-                netSupport = (NetSupport) c0.newInstance();
+-                netSupport.setSpdyContext(this);
+-                return netSupport;
+-            } catch (Throwable t) {
+-                // ignore, openssl not supported
+-            }
+-            try {
+-                Class<?> c1 = Class.forName("org.apache.tomcat.spdy.NetSupportJava7");
+-                netSupport = (NetSupport) c1.newInstance();
+-                netSupport.setSpdyContext(this);
+-                return netSupport;
+-            } catch (Throwable t) {
+-                // ignore, npn not supported
+-            }
+-            // non-ssl mode must be set explicitly
+-            throw new RuntimeException("SSL NextProtoclNegotiation no supported.");
+-        }
+-
+-        return netSupport;
+-    }
+-
+-
+-    /**
+-     * SPDY is a multiplexed protocol - the SpdyProcessors will be executed on
+-     * this executor.
+-     *
+-     * If the context returns null - we'll assume the SpdyProcessors are fully
+-     * non blocking, and will execute them in the spdy thread.
+-     */
+-    public Executor getExecutor() {
+-        if (executor == null) {
+-            executor = Executors.newCachedThreadPool();
+-        }
+-        return executor;
+-    }
+-
+-    SpdyHandler handler;
+-
+-    public SpdyHandler getHandler() {
+-        return handler;
+-    }
+-
+-    public void setHandler(SpdyHandler handler) {
+-        this.handler = handler;
+-    }
+-
+-    public static interface SpdyHandler {
+-        public void onStream(SpdyConnection spdyCon, SpdyStream ch) throws IOException;
+-
+-    }
+-
+-    /**
+-     * A handler implementing this interface will be called in the 'io' thread - the
+-     * thread reading the multiplexed stream, and in the case of non-blocking
+-     * transports also handling polling the socket.
+-     *
+-     */
+-    public static interface NonBlockingSpdyHandler extends SpdyHandler {
+-    }
+-
+-
+-    /**
+-     * Client mode: return a connection for host/port.
+-     * @throws IOException
+-     */
+-    public SpdyConnection getConnection(String host, int port) throws IOException {
+-        return netSupport.getConnection(host, port);
+-    }
+-
+-    public final void listen(final int port, String cert, String key) throws IOException {
+-        netSupport.listen(port, cert, key);
+-    }
+-
+-    /**
+-     * Close all pending connections and free resources.
+-     */
+-    public final void stop() throws IOException {
+-        netSupport.stop();
+-    }
+-
+-    public void onStream(SpdyConnection spdyConnection, SpdyStream ch) throws IOException {
+-        if (handler instanceof NonBlockingSpdyHandler) {
+-            handler.onStream(spdyConnection, ch);
+-        } else {
+-            getExecutor().execute(ch);
+-        }
+-    }
+-}
+
+==================================================
+SpdyStream.java
+deleted file mode 100644
+index 35378c28c7..0000000000
+--- a/java/org/apache/tomcat/spdy/SpdyFrame.java
++++ /dev/null
+@@ -1,354 +0,0 @@
+-/*
+- *  Licensed to the Apache Software Foundation (ASF) under one or more
+- *  contributor license agreements.  See the NOTICE file distributed with
+- *  this work for additional information regarding copyright ownership.
+- *  The ASF licenses this file to You under the Apache License, Version 2.0
+- *  (the "License"); you may not use this file except in compliance with
+- *  the License.  You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- *  Unless required by applicable law or agreed to in writing, software
+- *  distributed under the License is distributed on an "AS IS" BASIS,
+- *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- *  See the License for the specific language governing permissions and
+- *  limitations under the License.
+- */
+-package org.apache.tomcat.spdy;
+-
+-import java.nio.charset.StandardCharsets;
+-import java.util.Map;
+-
+-public class SpdyFrame {
+-    public static final byte[] STATUS = "status".getBytes();
+-
+-    public static final byte[] VERSION = "version".getBytes();
+-
+-    public static final byte[] HTTP11 = "HTTP/1.1".getBytes();
+-
+-    public static final byte[] OK200 = "200 OK".getBytes();
+-
+-
+-    // This is a bit more complicated, to avoid multiple reads/writes.
+-    // We'll read as much as possible - possible past frame end. This may
+-    // cost an extra copy - or even more complexity for dealing with slices
+-    // if we want to save the copy.
+-    public byte[] data;
+-
+-    public int off = 8; // used when reading - current offset
+-
+-    int endReadData; // how much has been read ( may be more or less than a frame )
+-
+-    // On write it is incremented.
+-
+-    /**
+-     *  end of data in the buffer.
+-     */
+-    public int endData;
+-
+-    // Processed data from the frame
+-    boolean c; // for control
+-
+-    int version;
+-
+-    int flags;
+-
+-    public int type;
+-
+-    // For control frames
+-    public int streamId;
+-
+-    public int pri;
+-
+-    public int associated;
+-
+-    public int nvCount;
+-
+-    public SpdyStream stream;
+-
+-    public SpdyFrame(int size) {
+-        data = new byte[size];
+-    }
+-
+-    public int getDataSize() {
+-        return endData - 8;
+-    }
+-
+-    public void recyle() {
+-        type = 0;
+-        c = false;
+-        endReadData = 0;
+-        off = 8;
+-        streamId = 0;
+-        nvCount = 0;
+-        endData = 0;
+-    }
+-
+-    @Override
+-    public String toString() {
+-        if (c) {
+-            if (type == 6) {
+-                return "C PING " + read32(data, 0);
+-            }
+-            return "C" + " S=" + streamId + (flags != 0 ? " F=" + flags : "")
+-                    + (version != 2 ? "  v" + version : "") + " t=" + type
+-                    + " L=" + endData + "/" + off;
+-        } else {
+-            return "D" + " S=" + streamId + (flags != 0 ? " F=" + flags : "")
+-                    + " L=" + endData + "/" + off;
+-        }
+-    }
+-
+-    public int serializeHead() {
+-        if (c) {
+-            data[0] = (byte) 0x80;
+-            data[1] = 2;
+-            data[2] = 0;
+-            data[3] = (byte) type;
+-            data[4] = (byte) flags;
+-            append24(data, 5, endData - 8);
+-            if (type == SpdyConnection.TYPE_SYN_STREAM) {
+-                // nvcount is added before
+-                append32(data, 8, streamId);
+-                append32(data, 12, associated);
+-                data[16] = 0; // TODO: priority
+-                data[17] = 0;
+-                return 18;
+-            } else if (type == SpdyConnection.TYPE_SYN_REPLY) {
+-                append32(data, 8, streamId);
+-                data[12] = 0;
+-                data[13] = 0;
+-                return 14;
+-            } else if (type == SpdyConnection.TYPE_HEADERS) {
+-                append32(data, 8, streamId);
+-                data[12] = 0;
+-                data[13] = 0;
+-                return 14;
+-            }
+-        } else {
+-            append32(data, 0, streamId);
+-            data[4] = (byte) flags;
+-            append24(data, 5, endData - 8);
+-        }
+-        return 8;
+-    }
+-
+-    public boolean parse() {
+-        endData = 0;
+-        streamId = 0;
+-        nvCount = 0;
+-
+-        int b0 = data[0] & 0xFF;
+-        if (b0 < 128) {
+-            // data frame
+-            c = false;
+-            streamId = read32(data, 0);
+-            version = 2;
+-        } else {
+-            c = true;
+-            b0 -= 128;
+-            version = ((b0 << 8) | data[1] & 0xFF);
+-            if (version > 2) {
+-                return false;
+-            }
+-            b0 = data[2] & 0xFF;
+-            type = ((b0 << 8) | (data[3] & 0xFF));
+-        }
+-
+-        flags = data[4] & 0xFF;
+-        for (int i = 5; i < 8; i++) {
+-            b0 = data[i] & 0xFF;
+-            endData = endData << 8 | b0;
+-        }
+-
+-        // size will represent the end of the data ( header is held in same
+-        // buffer)
+-        endData += 8;
+-
+-        return true;
+-    }
+-
+-    public boolean isHalfClose() {
+-        return (flags & SpdyConnection.FLAG_HALF_CLOSE) != 0;
+-    }
+-
+-    public void halfClose() {
+-        flags = SpdyConnection.FLAG_HALF_CLOSE;
+-    }
+-
+-    public boolean closed() {
+-        return (flags & SpdyConnection.FLAG_HALF_CLOSE) != 0;
+-    }
+-
+-    static void append24(byte[] buff, int off, int v) {
+-        buff[off++] = (byte) ((v & 0xFF0000) >> 16);
+-        buff[off++] = (byte) ((v & 0xFF00) >> 8);
+-        buff[off++] = (byte) ((v & 0xFF));
+-    }
+-
+-    static void append32(byte[] buff, int off, int v) {
+-        buff[off++] = (byte) ((v & 0xFF000000) >> 24);
+-        buff[off++] = (byte) ((v & 0xFF0000) >> 16);
+-        buff[off++] = (byte) ((v & 0xFF00) >> 8);
+-        buff[off++] = (byte) ((v & 0xFF));
+-    }
+-
+-    public void append32(int v) {
+-        makeSpace(4);
+-        data[off++] = (byte) ((v & 0xFF000000) >> 24);
+-        data[off++] = (byte) ((v & 0xFF0000) >> 16);
+-        data[off++] = (byte) ((v & 0xFF00) >> 8);
+-        data[off++] = (byte) ((v & 0xFF));
+-    }
+-
+-    public void append16(int v) {
+-        makeSpace(2);
+-        data[off++] = (byte) ((v & 0xFF00) >> 8);
+-        data[off++] = (byte) ((v & 0xFF));
+-    }
+-
+-    void fixNV(int nvPos) {
+-        data[nvPos++] = (byte) ((nvCount & 0xFF00) >> 8);
+-        data[nvPos] = (byte) ((nvCount & 0xFF));
+-    }
+-
+-    public void append(byte[] buf, int soff, int len) {
+-        makeSpace(len + off);
+-        System.arraycopy(buf, soff, data, off, len);
+-        off += len;
+-    }
+-
+-    public void headerValue(byte[] buf, int soff, int len) {
+-        makeSpace(len + 4);
+-        append16(len);
+-        System.arraycopy(buf, soff, data, off, len);
+-        off += len;
+-    }
+-
+-    public void headerName(byte[] buf, int soff, int len) {
+-        // if it's the first header, leave space for extra params and NV count.
+-        // they'll be filled in by send.
+-        if (off == 8) {
+-            if (type == SpdyConnection.TYPE_SYN_REPLY) {
+-                off = 16;
+-            } else if (type == SpdyConnection.TYPE_SYN_STREAM) {
+-                off = 20;
+-            } else if (type != SpdyConnection.TYPE_HEADERS) {
+-                off = 16;
+-            } else {
+-                throw new RuntimeException("Wrong frame type");
+-            }
+-        }
+-        nvCount++;
+-        headerValue(buf, soff, len);
+-    }
+-
+-    public void addHeader(String name, String value) {
+-        byte[] nameB = name.getBytes();
+-        headerName(nameB, 0, nameB.length);
+-        nameB = value.getBytes();
+-        headerValue(nameB, 0, nameB.length);
+-    }
+-
+-    public void addHeader(byte[] nameB, String value) {
+-        headerName(nameB, 0, nameB.length);
+-        nameB = value.getBytes();
+-        headerValue(nameB, 0, nameB.length);
+-    }
+-
+-    public void addHeader(byte[] nameB, byte[] valueB) {
+-        headerName(nameB, 0, nameB.length);
+-        headerValue(valueB, 0, valueB.length);
+-    }
+-
+-    public void getHeaders(Map<String, String> resHeaders) {
+-        for (int i = 0; i < nvCount; i++) {
+-            int len = read16();
+-            String n = new String(data, off, len, StandardCharsets.UTF_8);
+-            advance(len);
+-            len = read16();
+-            String v = new String(data, off, len, StandardCharsets.UTF_8);
+-            advance(len);
+-            resHeaders.put(n, v);
+-        }
+-    }
+-
+-
+-    // TODO: instead of that, use byte[][]
+-    void makeSpace(int len) {
+-        if (len < 256) {
+-            len = 256;
+-        }
+-        if (data == null) {
+-            data = new byte[len];
+-            return;
+-        }
+-        int newEnd = off + len;
+-
+-        if (data.length < newEnd) {
+-            byte[] tmp = new byte[newEnd];
+-            System.err.println("cp " + off + " " + data.length + " " + len
+-                    + " " + tmp.length);
+-            System.arraycopy(data, 0, tmp, 0, off);
+-            data = tmp;
+-        }
+-
+-    }
+-
+-    public int read16() {
+-        int res = data[off++] & 0xFF;
+-        return res << 8 | (data[off++] & 0xFF);
+-    }
+-
+-    int readInt() {
+-        int res = 0;
+-        for (int i = 0; i < 4; i++) {
+-            int b0 = data[off++] & 0xFF;
+-            res = res << 8 | b0;
+-        }
+-        return res;
+-    }
+-
+-    int read24() {
+-        int res = 0;
+-        for (int i = 0; i < 3; i++) {
+-            int b0 = data[off++] & 0xFF;
+-            res = res << 8 | b0;
+-        }
+-        return res;
+-    }
+-
+-    int read32(byte[] data, int off) {
+-        int res = 0;
+-        for (int i = 0; i < 4; i++) {
+-            int b0 = data[off++] & 0xFF;
+-            res = res << 8 | b0;
+-        }
+-        return res;
+-    }
+-
+-    int read32() {
+-        int res = 0;
+-        for (int i = 0; i < 4; i++) {
+-            int b0 = data[off++] & 0xFF;
+-            res = res << 8 | b0;
+-        }
+-        return res;
+-    }
+-
+-    public int readByte() {
+-        return data[off++] & 0xFF;
+-    }
+-
+-    public int remaining() {
+-        return endData - off;
+-    }
+-
+-    public void advance(int cnt) {
+-        off += cnt;
+-    }
+-
+-    public boolean isData() {
+-        return !c;
+-    }
+-}
+
+==================================================

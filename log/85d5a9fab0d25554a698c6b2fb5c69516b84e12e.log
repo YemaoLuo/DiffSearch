@@ -1,0 +1,273 @@
+85d5a9fab0d25554a698c6b2fb5c69516b84e12e
+==================================================
+Additional fix for BZ 64848. Ensure Processor instances are cleaned up
+==================================================
+Mark Thomas
+==================================================
+Mon Nov 2 14:52:24 2020 +0000
+==================================================
+AbstractProtocol.java
+Additional fix for BZ 64848. Ensure Processor instances are cleaned up
+
+
+==================================================
+TestWebSocketFrameClient.java
+index e3ce9d75d8..e6fbaed7c8 100644
+--- a/java/org/apache/coyote/AbstractProtocol.java
++++ b/java/org/apache/coyote/AbstractProtocol.java
+@@ -40,7 +40,6 @@ import jakarta.servlet.http.HttpUpgradeHandler;
+ import jakarta.servlet.http.WebConnection;
+ 
+ import org.apache.coyote.http11.upgrade.InternalHttpUpgradeHandler;
+-import org.apache.coyote.http11.upgrade.UpgradeProcessorInternal;
+ import org.apache.juli.logging.Log;
+ import org.apache.tomcat.InstanceManager;
+ import org.apache.tomcat.util.ExceptionUtils;
+@@ -385,6 +384,15 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+     }
+ 
+ 
++    /*
++     * Primarily for debugging and testing. Could be exposed via JMX if
++     * considered useful.
++     */
++    public int getWaitingProcessorCount() {
++        return waitingProcessors.size();
++    }
++
++
+     // ----------------------------------------------- Accessors for sub-classes
+ 
+     protected AbstractEndpoint<S,?> getEndpoint() {
+@@ -1038,15 +1046,14 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+             if (processor != null) {
+                 processor.recycle();
+                 if (processor.isUpgrade()) {
+-                    // UpgradeProcessorInternal instances can utilise AsyncIO.
+-                    // If they do, the processor will not pass through the
+-                    // process() method and be removed from waitingProcessors
+-                    // so do that here.
+-                    if (processor instanceof UpgradeProcessorInternal) {
+-                        if (((UpgradeProcessorInternal) processor).hasAsyncIO()) {
+-                            getProtocol().removeWaitingProcessor(processor);
+-                        }
+-                    }
++                    // While UpgradeProcessor instances should not normally be
++                    // present in waitingProcessors there are various scenarios
++                    // where this can happen. E.g.:
++                    // - when AsyncIO is used
++                    // - WebSocket I/O error on non-container thread
++                    // Err on the side of caution and always try and remove any
++                    // UpgradeProcessor instances from waitingProcessors
++                    getProtocol().removeWaitingProcessor(processor);
+                 } else {
+                     // After recycling, only instances of UpgradeProcessorBase
+                     // will return true for isUpgrade().
+
+==================================================
+TestWebSocketFrameClientSSL.java
+index aa7036a52a..f9ad65613a 100644
+--- a/test/org/apache/tomcat/websocket/TestWebSocketFrameClient.java
++++ b/test/org/apache/tomcat/websocket/TestWebSocketFrameClient.java
+@@ -57,7 +57,7 @@ public class TestWebSocketFrameClient extends WebSocketBaseTest {
+         Tomcat tomcat = getTomcatInstance();
+         // No file system docBase required
+         Context ctx = tomcat.addContext("", null);
+-        ctx.addApplicationListener(TesterFirehoseServer.Config.class.getName());
++        ctx.addApplicationListener(TesterFirehoseServer.ConfigInline.class.getName());
+         Tomcat.addServlet(ctx, "default", new DefaultServlet());
+         ctx.addServletMappingDecoded("/", "default");
+ 
+@@ -80,7 +80,7 @@ public class TestWebSocketFrameClient extends WebSocketBaseTest {
+                 TesterProgrammaticEndpoint.class,
+                 clientEndpointConfig,
+                 new URI("ws://localhost:" + getPort() +
+-                        TesterFirehoseServer.Config.PATH));
++                        TesterFirehoseServer.PATH));
+         CountDownLatch latch =
+                 new CountDownLatch(TesterFirehoseServer.MESSAGE_COUNT);
+         BasicText handler = new BasicText(latch);
+
+==================================================
+TesterFirehoseServer.java
+index d27e4dd6a8..be84b5e854 100644
+--- a/test/org/apache/tomcat/websocket/TestWebSocketFrameClientSSL.java
++++ b/test/org/apache/tomcat/websocket/TestWebSocketFrameClientSSL.java
+@@ -45,7 +45,7 @@ public class TestWebSocketFrameClientSSL extends WebSocketBaseTest {
+         Tomcat tomcat = getTomcatInstance();
+         // No file system docBase required
+         Context ctx = tomcat.addContext("", null);
+-        ctx.addApplicationListener(TesterFirehoseServer.Config.class.getName());
++        ctx.addApplicationListener(TesterFirehoseServer.ConfigInline.class.getName());
+         Tomcat.addServlet(ctx, "default", new DefaultServlet());
+         ctx.addServletMappingDecoded("/", "default");
+ 
+@@ -64,7 +64,7 @@ public class TestWebSocketFrameClientSSL extends WebSocketBaseTest {
+                 TesterProgrammaticEndpoint.class,
+                 clientEndpointConfig,
+                 new URI("wss://localhost:" + getPort() +
+-                        TesterFirehoseServer.Config.PATH));
++                        TesterFirehoseServer.PATH));
+         CountDownLatch latch =
+                 new CountDownLatch(TesterFirehoseServer.MESSAGE_COUNT);
+         BasicText handler = new BasicText(latch);
+@@ -92,7 +92,7 @@ public class TestWebSocketFrameClientSSL extends WebSocketBaseTest {
+         Tomcat tomcat = getTomcatInstance();
+         // No file system docBase required
+         Context ctx = tomcat.addContext("", null);
+-        ctx.addApplicationListener(TesterFirehoseServer.Config.class.getName());
++        ctx.addApplicationListener(TesterFirehoseServer.ConfigInline.class.getName());
+         Tomcat.addServlet(ctx, "default", new DefaultServlet());
+         ctx.addServletMappingDecoded("/", "default");
+ 
+@@ -111,7 +111,7 @@ public class TestWebSocketFrameClientSSL extends WebSocketBaseTest {
+                 TesterProgrammaticEndpoint.class,
+                 clientEndpointConfig,
+                 new URI("wss://localhost:" + getPort() +
+-                        TesterFirehoseServer.Config.PATH));
++                        TesterFirehoseServer.PATH));
+ 
+         // Process incoming messages very slowly
+         MessageHandler handler = new SleepingText(5000);
+
+==================================================
+TestSlowClient.java
+index e16b11b0be..f070323645 100644
+--- a/test/org/apache/tomcat/websocket/TesterFirehoseServer.java
++++ b/test/org/apache/tomcat/websocket/TesterFirehoseServer.java
+@@ -41,6 +41,8 @@ public class TesterFirehoseServer {
+     public static final int WAIT_TIME_MILLIS = 300000;
+     public static final int SEND_TIME_OUT_MILLIS = 5000;
+ 
++    public static final String PATH = "/firehose";
++
+     static {
+         StringBuilder sb = new StringBuilder(MESSAGE_SIZE);
+         for (int i = 0; i < MESSAGE_SIZE; i++) {
+@@ -50,22 +52,30 @@ public class TesterFirehoseServer {
+     }
+ 
+ 
+-    public static class Config extends TesterEndpointConfig {
++    public static class ConfigInline extends TesterEndpointConfig {
++
++        @Override
++        protected Class<?> getEndpointClass() {
++            return EndpointInline.class;
++        }
++    }
++
+ 
+-        public static final String PATH = "/firehose";
++    public static class ConfigThread extends TesterEndpointConfig {
+ 
+         @Override
+         protected Class<?> getEndpointClass() {
+-            return Endpoint.class;
++            return EndpointThread.class;
+         }
+     }
+ 
+ 
+-    @ServerEndpoint(Config.PATH)
+-    public static class Endpoint {
++    public abstract static class Endpoint {
++
++        private static final AtomicInteger openConnectionCount = new AtomicInteger(0);
++        private static final AtomicInteger errorCount = new AtomicInteger(0);
+ 
+-        private static AtomicInteger openConnectionCount = new AtomicInteger(0);
+-        private static AtomicInteger errorCount = new AtomicInteger(0);
++        private final boolean inline;
+ 
+         private volatile boolean started = false;
+ 
+@@ -77,6 +87,10 @@ public class TesterFirehoseServer {
+             return errorCount.intValue();
+         }
+ 
++        public Endpoint(boolean inline) {
++            this.inline = inline;
++        }
++
+         @OnOpen
+         public void onOpen() {
+             openConnectionCount.incrementAndGet();
+@@ -98,6 +112,46 @@ public class TesterFirehoseServer {
+ 
+             System.out.println("Received " + msg + ", now sending data");
+ 
++            Writer writer = new Writer(session);
++
++            if (inline) {
++                writer.doRun();
++            } else {
++                Thread t = new Thread(writer);
++                t.start();
++            }
++        }
++
++        @OnError
++        public void onError(@SuppressWarnings("unused") Throwable t) {
++            errorCount.incrementAndGet();
++        }
++
++        @OnClose
++        public void onClose() {
++            openConnectionCount.decrementAndGet();
++        }
++    }
++
++
++    private static class Writer implements Runnable {
++
++        private final Session session;
++
++        public Writer(Session session) {
++            this.session = session;
++        }
++
++        @Override
++        public void run() {
++            try {
++                doRun();
++            } catch (IOException ioe) {
++                ioe.printStackTrace();
++            }
++        }
++
++        public void doRun() throws IOException {
+             session.getUserProperties().put(
+                     org.apache.tomcat.websocket.Constants.BLOCKING_SEND_TIMEOUT_PROPERTY,
+                     Long.valueOf(SEND_TIME_OUT_MILLIS));
+@@ -116,15 +170,22 @@ public class TesterFirehoseServer {
+             // Flushing should happen automatically on session close
+             session.close();
+         }
++    }
+ 
+-        @OnError
+-        public void onError(@SuppressWarnings("unused") Throwable t) {
+-            errorCount.incrementAndGet();
++    @ServerEndpoint(PATH)
++    public static class EndpointInline extends Endpoint {
++
++        public EndpointInline() {
++            super(true);
+         }
++    }
+ 
+-        @OnClose
+-        public void onClose() {
+-            openConnectionCount.decrementAndGet();
++
++    @ServerEndpoint(PATH)
++    public static class EndpointThread extends Endpoint {
++
++        public EndpointThread() {
++            super(false);
+         }
+     }
+ }
+
+==================================================

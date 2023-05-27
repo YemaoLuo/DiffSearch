@@ -1,0 +1,1392 @@
+650b51480e0a44e897461ae39dcd7b4624b02e05
+==================================================
+Update DBCP fork to DBCP 2.1 + additional fixes to r1682314
+==================================================
+Mark Thomas
+==================================================
+Thu May 28 19:57:56 2015 +0000
+==================================================
+BasicDataSource.java
+Update DBCP fork to DBCP 2.1 + additional fixes to r1682314
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1682317 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+BasicDataSourceFactory.java
+index 50c6e0ade8..105b95a518 100644
+--- a/java/org/apache/tomcat/dbcp/dbcp2/BasicDataSource.java
++++ b/java/org/apache/tomcat/dbcp/dbcp2/BasicDataSource.java
+@@ -31,8 +31,10 @@ import java.sql.SQLFeatureNotSupportedException;
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.Collections;
++import java.util.HashSet;
+ import java.util.List;
+ import java.util.Properties;
++import java.util.Set;
+ import java.util.logging.Logger;
+ 
+ import javax.management.InstanceAlreadyExistsException;
+@@ -65,7 +67,7 @@ import org.apache.tomcat.dbcp.pool2.impl.GenericObjectPoolConfig;
+  * @author Dirk Verbeeck
+  * @since 2.0
+  */
+-public class BasicDataSource implements DataSource, BasicDataSourceMXBean, MBeanRegistration {
++public class BasicDataSource implements DataSource, BasicDataSourceMXBean, MBeanRegistration, AutoCloseable {
+ 
+     private static final Log log = LogFactory.getLog(BasicDataSource.class);
+ 
+@@ -973,9 +975,11 @@ public class BasicDataSource implements DataSource, BasicDataSourceMXBean, MBean
+      * @return the current number of active connections
+      */
+     @Override
+-    public synchronized int getNumActive() {
+-        if (connectionPool != null) {
+-            return connectionPool.getNumActive();
++    public int getNumActive() {
++        // Copy reference to avoid NPE if close happens after null check
++        GenericObjectPool<PoolableConnection> pool = connectionPool;
++        if (pool != null) {
++            return pool.getNumActive();
+         }
+         return 0;
+     }
+@@ -988,9 +992,11 @@ public class BasicDataSource implements DataSource, BasicDataSourceMXBean, MBean
+      * @return the current number of idle connections
+      */
+     @Override
+-    public synchronized int getNumIdle() {
+-        if (connectionPool != null) {
+-            return connectionPool.getNumIdle();
++    public int getNumIdle() {
++        // Copy reference to avoid NPE if close happens after null check
++        GenericObjectPool<PoolableConnection> pool = connectionPool;
++        if (pool != null) {
++            return pool.getNumIdle();
+         }
+         return 0;
+     }
+@@ -1267,6 +1273,20 @@ public class BasicDataSource implements DataSource, BasicDataSourceMXBean, MBean
+         return maxConnLifetimeMillis;
+     }
+ 
++    private boolean logExpiredConnections = true;
++
++    /**
++     * When {@link #getMaxConnLifetimeMillis()} is set to limit connection lifetime,
++     * this property determines whether or not log messages are generated when the
++     * pool closes connections due to maximum lifetime exceeded.
++     *
++     * @since 2.1
++     */
++    @Override
++    public boolean getLogExpiredConnections() {
++        return logExpiredConnections;
++    }
++
+     /**
+      * <p>Sets the maximum permitted lifetime of a connection in
+      * milliseconds. A value of zero or less indicates an infinite lifetime.</p>
+@@ -1280,6 +1300,16 @@ public class BasicDataSource implements DataSource, BasicDataSourceMXBean, MBean
+         this.maxConnLifetimeMillis = maxConnLifetimeMillis;
+     }
+ 
++    /**
++     * When {@link #getMaxConnLifetimeMillis()} is set to limit connection lifetime,
++     * this property determines whether or not log messages are generated when the
++     * pool closes connections due to maximum lifetime exceeded.  Set this property
++     * to false to suppress log messages when connections expire.
++     */
++    public void setLogExpiredConnections(boolean logExpiredConnections) {
++        this.logExpiredConnections = logExpiredConnections;
++    }
++
+     private String jmxName = null;
+ 
+     /**
+@@ -1326,7 +1356,6 @@ public class BasicDataSource implements DataSource, BasicDataSourceMXBean, MBean
+         this.enableAutoCommitOnReturn = enableAutoCommitOnReturn;
+     }
+ 
+-
+     private boolean rollbackOnReturn = true;
+ 
+     /**
+@@ -1347,6 +1376,97 @@ public class BasicDataSource implements DataSource, BasicDataSourceMXBean, MBean
+         this.rollbackOnReturn = rollbackOnReturn;
+     }
+ 
++    private volatile Set<String> disconnectionSqlCodes;
++
++    /**
++     * Returns the set of SQL_STATE codes considered to signal fatal conditions.
++     * @return fatal disconnection state codes
++     * @see #setDisconnectionSqlCodes(Collection)
++     * @since 2.1
++     */
++    public Set<String> getDisconnectionSqlCodes() {
++        Set<String> result = disconnectionSqlCodes;
++        if (result == null) {
++            return Collections.emptySet();
++        }
++        return result;
++    }
++
++    /**
++     * Provides the same data as {@link #getDisconnectionSqlCodes} but in an
++     * array so it is accessible via JMX.
++     * @since 2.1
++     */
++    @Override
++    public String[] getDisconnectionSqlCodesAsArray() {
++        Collection<String> result = getDisconnectionSqlCodes();
++        return result.toArray(new String[result.size()]);
++    }
++
++    /**
++     * Sets the SQL_STATE codes considered to signal fatal conditions.
++     * <p>
++     * Overrides the defaults in {@link Utils#DISCONNECTION_SQL_CODES}
++     * (plus anything starting with {@link Utils#DISCONNECTION_SQL_CODE_PREFIX}).
++     * If this property is non-null and {@link #getFastFailValidation()} is
++     * {@code true}, whenever connections created by this datasource generate exceptions
++     * with SQL_STATE codes in this list, they will be marked as "fatally disconnected"
++     * and subsequent validations will fail fast (no attempt at isValid or validation
++     * query).</p>
++     * <p>
++     * If {@link #getFastFailValidation()} is {@code false} setting this property has no
++     * effect.</p>
++     * <p>
++     * Note: this method currently has no effect once the pool has been
++     * initialized.  The pool is initialized the first time one of the
++     * following methods is invoked: {@code getConnection, setLogwriter,
++     * setLoginTimeout, getLoginTimeout, getLogWriter}.</p>
++     *
++     * @param disconnectionSqlCodes SQL_STATE codes considered to signal fatal conditions
++     * @since 2.1
++     */
++    public void setDisconnectionSqlCodes(Collection<String> disconnectionSqlCodes) {
++        if (disconnectionSqlCodes != null && disconnectionSqlCodes.size() > 0) {
++            HashSet<String> newVal = null;
++            for (String s : disconnectionSqlCodes) {
++            if (s != null && s.trim().length() > 0) {
++                    if (newVal == null) {
++                        newVal = new HashSet<>();
++                    }
++                    newVal.add(s);
++                }
++            }
++            this.disconnectionSqlCodes = newVal;
++        } else {
++            this.disconnectionSqlCodes = null;
++        }
++    }
++
++    private boolean fastFailValidation;
++
++    /**
++     * True means that validation will fail immediately for connections that
++     * have previously thrown SQLExceptions with SQL_STATE indicating fatal
++     * disconnection errors.
++     *
++     * @return true if connections created by this datasource will fast fail validation.
++     * @see #setDisconnectionSqlCodes(Collection)
++     * @since 2.1
++     */
++    @Override
++    public boolean getFastFailValidation() {
++        return fastFailValidation;
++    }
++
++    /**
++     * @see #getFastFailValidation()
++     * @param fastFailValidation true means connections created by this factory will
++     * fast fail validation
++     * @since 2.1
++     */
++    public void setFastFailValidation(boolean fastFailValidation) {
++        this.fastFailValidation = fastFailValidation;
++    }
+ 
+     // ----------------------------------------------------- Instance Variables
+ 
+@@ -1511,17 +1631,16 @@ public class BasicDataSource implements DataSource, BasicDataSourceMXBean, MBean
+      * <p>Flag to remove abandoned connections if they exceed the
+      * removeAbandonedTimeout when borrowObject is invoked.</p>
+      *
+-     * <p>The default value is false.<p>
++     * <p>The default value is false.</p>
+      *
+      * <p>If set to true a connection is considered abandoned and eligible
+      * for removal if it has not been used for more than
+      * {@link #getRemoveAbandonedTimeout() removeAbandonedTimeout} seconds.</p>
+      *
+      * <p>Abandoned connections are identified and removed when
+-     * {@link #getConnection()} is invoked and the following conditions hold:
++     * {@link #getConnection()} is invoked and all of the following conditions hold:
+      * </p>
+-     * <ul><li>{@link #getRemoveAbandonedOnBorrow()} or
+-     *         {@link #getRemoveAbandonedOnMaintenance()} = true</li>
++     * <ul><li>{@link #getRemoveAbandonedOnBorrow()} </li>
+      *     <li>{@link #getNumActive()} &gt; {@link #getMaxTotal()} - 3 </li>
+      *     <li>{@link #getNumIdle()} &lt; 2 </li></ul>
+      *
+@@ -1536,19 +1655,9 @@ public class BasicDataSource implements DataSource, BasicDataSourceMXBean, MBean
+     }
+ 
+     /**
+-     * <p>Flag to remove abandoned connections if they exceed the
+-     * removeAbandonedTimeout when borrowObject is invoked.</p>
+-     *
+-     * <p>If set to true a connection is considered abandoned and eligible
+-     * for removal if it has been idle longer than the
+-     * {@link #getRemoveAbandonedTimeout() removeAbandonedTimeout}.</p>
+-     *
+-     * <p>Setting this to true can recover db connections from poorly written
+-     * applications which fail to close a connection.</p>
+-     *
+-     * @param removeAbandonedOnMaintenance true means abandoned connections will
+-     *                                     be removed when borrowObject is
+-     *                                     invoked
++     * @param removeAbandonedOnMaintenance true means abandoned connections may
++     *                                     be removed on pool maintenance.
++     * @see #getRemoveAbandonedOnMaintenance()
+      */
+     public void setRemoveAbandonedOnMaintenance(
+             boolean removeAbandonedOnMaintenance) {
+@@ -1563,20 +1672,12 @@ public class BasicDataSource implements DataSource, BasicDataSourceMXBean, MBean
+      * <p>Flag to remove abandoned connections if they exceed the
+      * removeAbandonedTimeout during pool maintenance.</p>
+      *
+-     * <p>The default value is false.<p>
++     * <p>The default value is false.</p>
+      *
+      * <p>If set to true a connection is considered abandoned and eligible
+      * for removal if it has not been used for more than
+      * {@link #getRemoveAbandonedTimeout() removeAbandonedTimeout} seconds.</p>
+      *
+-     * <p>Abandoned connections are identified and removed when
+-     * {@link #getConnection()} is invoked and the following conditions hold:
+-     * </p>
+-     * <ul><li>{@link #getRemoveAbandonedOnBorrow()} or
+-     *         {@link #getRemoveAbandonedOnMaintenance()} = true</li>
+-     *     <li>{@link #getNumActive()} &gt; {@link #getMaxTotal()} - 3 </li>
+-     *     <li>{@link #getNumIdle()} &lt; 2 </li></ul>
+-     *
+      * @see #getRemoveAbandonedTimeout()
+      */
+     @Override
+@@ -1588,18 +1689,9 @@ public class BasicDataSource implements DataSource, BasicDataSourceMXBean, MBean
+     }
+ 
+     /**
+-     * <p>Flag to remove abandoned connections if they exceed the
+-     * removeAbandonedTimeout during pool maintenance.</p>
+-     *
+-     * <p>If set to true a connection is considered abandoned and eligible
+-     * for removal if it has been idle longer than the
+-     * {@link #getRemoveAbandonedTimeout() removeAbandonedTimeout}.</p>
+-     *
+-     * <p>Setting this to true can recover db connections from poorly written
+-     * applications which fail to close a connection.</p>
+-     *
+-     * @param removeAbandonedOnBorrow true means abandoned connections will be
+-     *                                removed during pool maintenance
++     * @param removeAbandonedOnBorrow true means abandoned connections may be
++     *                                removed when connections are borrowed from the pool.
++     * @see #getRemoveAbandonedOnBorrow()
+      */
+     public void setRemoveAbandonedOnBorrow(boolean removeAbandonedOnBorrow) {
+         if (abandonedConfig == null) {
+@@ -1809,13 +1901,14 @@ public class BasicDataSource implements DataSource, BasicDataSourceMXBean, MBean
+      * these connections to the pool, the underlying JDBC connections are closed.</p>
+      *
+      * <p>Attempts to acquire connections using {@link #getConnection()} after this method has been
+-     * invoked result in SQLExceptions.<p>
++     * invoked result in SQLExceptions.</p>
+      *
+      * <p>This method is idempotent - i.e., closing an already closed BasicDataSource has no effect
+      * and does not generate exceptions.</p>
+      *
+      * @throws SQLException if an error occurs closing idle connections
+      */
++    @Override
+     public synchronized void close() throws SQLException {
+         if (registeredJmxName != null) {
+             MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+@@ -1838,7 +1931,7 @@ public class BasicDataSource implements DataSource, BasicDataSourceMXBean, MBean
+         } catch(RuntimeException e) {
+             throw e;
+         } catch(Exception e) {
+-            throw new SQLException("Cannot close connection pool", e);
++            throw new SQLException(Utils.getMessage("pool.close.fail"), e);
+         }
+     }
+ 
+@@ -1963,10 +2056,11 @@ public class BasicDataSource implements DataSource, BasicDataSourceMXBean, MBean
+             }
+ 
+             // Create the pooling data source to manage connections
++            DataSource newDataSource;
+             success = false;
+             try {
+-                dataSource = createDataSourceInstance();
+-                dataSource.setLogWriter(logWriter);
++                newDataSource = createDataSourceInstance();
++                newDataSource.setLogWriter(logWriter);
+                 success = true;
+             } catch (SQLException se) {
+                 throw se;
+@@ -1993,6 +2087,7 @@ public class BasicDataSource implements DataSource, BasicDataSourceMXBean, MBean
+             // If timeBetweenEvictionRunsMillis > 0, start the pool's evictor task
+             startPoolMaintenance();
+ 
++            dataSource = newDataSource;
+             return dataSource;
+         }
+     }
+@@ -2100,6 +2195,7 @@ public class BasicDataSource implements DataSource, BasicDataSourceMXBean, MBean
+         // Create an object pool to contain our active connections
+         GenericObjectPoolConfig config = new GenericObjectPoolConfig();
+         updateJmxName(config);
++        config.setJmxEnabled(registeredJmxName != null);  // Disable JMX on the underlying pool if the DS is not registered.
+         GenericObjectPool<PoolableConnection> gop;
+         if (abandonedConfig != null &&
+                 (abandonedConfig.getRemoveAbandonedOnBorrow() ||
+@@ -2120,7 +2216,7 @@ public class BasicDataSource implements DataSource, BasicDataSourceMXBean, MBean
+         gop.setMinEvictableIdleTimeMillis(minEvictableIdleTimeMillis);
+         gop.setTestWhileIdle(testWhileIdle);
+         gop.setLifo(lifo);
+-        gop.setSwallowedExceptionListener(new SwallowedExceptionLogger(log));
++        gop.setSwallowedExceptionListener(new SwallowedExceptionLogger(log, logExpiredConnections));
+         gop.setEvictionPolicyClassName(evictionPolicyClassName);
+         factory.setPool(gop);
+         connectionPool = gop;
+@@ -2188,6 +2284,8 @@ public class BasicDataSource implements DataSource, BasicDataSourceMXBean, MBean
+             connectionFactory.setRollbackOnReturn(getRollbackOnReturn());
+             connectionFactory.setEnableAutoCommitOnReturn(getEnableAutoCommitOnReturn());
+             connectionFactory.setDefaultQueryTimeout(getDefaultQueryTimeout());
++            connectionFactory.setFastFailValidation(fastFailValidation);
++            connectionFactory.setDisconnectionSqlCodes(disconnectionSqlCodes);
+             validateConnectionFactory(connectionFactory);
+         } catch (RuntimeException e) {
+             throw e;
+
+==================================================
+BasicDataSourceMXBean.java
+index 0aa61c6159..0020d2467f 100644
+--- a/java/org/apache/tomcat/dbcp/dbcp2/BasicDataSourceFactory.java
++++ b/java/org/apache/tomcat/dbcp/dbcp2/BasicDataSourceFactory.java
+@@ -21,9 +21,13 @@ import java.io.ByteArrayInputStream;
+ import java.nio.charset.StandardCharsets;
+ import java.sql.Connection;
+ import java.util.ArrayList;
++import java.util.Arrays;
+ import java.util.Collection;
+ import java.util.Enumeration;
+ import java.util.Hashtable;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
+ import java.util.Properties;
+ import java.util.StringTokenizer;
+ 
+@@ -33,6 +37,11 @@ import javax.naming.RefAddr;
+ import javax.naming.Reference;
+ import javax.naming.spi.ObjectFactory;
+ 
++import org.apache.juli.logging.Log;
++import org.apache.juli.logging.LogFactory;
++import org.apache.tomcat.dbcp.pool2.impl.BaseObjectPoolConfig;
++import org.apache.tomcat.dbcp.pool2.impl.GenericObjectPoolConfig;
++
+ /**
+  * <p>JNDI object factory that creates an instance of
+  * <code>BasicDataSource</code> that has been configured based on the
+@@ -41,7 +50,7 @@ import javax.naming.spi.ObjectFactory;
+  * properties with the following exceptions:</p>
+  * <ul>
+  * <li><code>connectionInitSqls</code> must be passed to this factory as a
+- *     single String using semi-colon to delimt the statements whereas
++ *     single String using semi-colon to delimit the statements whereas
+  *     <code>BasicDataSource</code> requires a collection of Strings.</li>
+  * </ul>
+  *
+@@ -51,6 +60,8 @@ import javax.naming.spi.ObjectFactory;
+  */
+ public class BasicDataSourceFactory implements ObjectFactory {
+ 
++    private static final Log log = LogFactory.getLog(BasicDataSourceFactory.class);
++
+     private static final String PROP_DEFAULTAUTOCOMMIT = "defaultAutoCommit";
+     private static final String PROP_DEFAULTREADONLY = "defaultReadOnly";
+     private static final String PROP_DEFAULTTRANSACTIONISOLATION = "defaultTransactionIsolation";
+@@ -93,9 +104,34 @@ public class BasicDataSourceFactory implements ObjectFactory {
+     private static final String PROP_MAXOPENPREPAREDSTATEMENTS = "maxOpenPreparedStatements";
+     private static final String PROP_CONNECTIONPROPERTIES = "connectionProperties";
+     private static final String PROP_MAXCONNLIFETIMEMILLIS = "maxConnLifetimeMillis";
++    private static final String PROP_LOGEXPIREDCONNECTIONS = "logExpiredConnections";
+     private static final String PROP_ROLLBACK_ON_RETURN = "rollbackOnReturn";
+     private static final String PROP_ENABLE_AUTOCOMMIT_ON_RETURN = "enableAutoCommitOnReturn";
+     private static final String PROP_DEFAULT_QUERYTIMEOUT = "defaultQueryTimeout";
++    private static final String PROP_FASTFAIL_VALIDATION = "fastFailValidation";
++
++    /**
++     * Value string must be of the form [STATE_CODE,]*
++     */
++    private static final String PROP_DISCONNECTION_SQL_CODES = "disconnectionSqlCodes";
++
++    /*
++     * Block with obsolete properties from DBCP 1.x.
++     * Warn users that these are ignored and they should use the 2.x properties.
++     */
++    private static final String NUPROP_MAXACTIVE = "maxActive";
++    private static final String NUPROP_REMOVEABANDONED = "removeAbandoned";
++    private static final String NUPROP_MAXWAIT = "maxWait";
++
++    /*
++     * Block with properties expected in a DataSource
++     * This props will not be listed as ignored - we know that they may appear in Resource,
++     * and not listing them as ignored.
++     */
++    private static final String SILENTPROP_FACTORY = "factory";
++    private static final String SILENTPROP_SCOPE = "scope";
++    private static final String SILENTPROP_SINGLETON = "singleton";
++    private static final String SILENTPROP_AUTH = "auth";
+ 
+     private static final String[] ALL_PROPERTIES = {
+         PROP_DEFAULTAUTOCOMMIT,
+@@ -134,11 +170,54 @@ public class BasicDataSourceFactory implements ObjectFactory {
+         PROP_MAXOPENPREPAREDSTATEMENTS,
+         PROP_CONNECTIONPROPERTIES,
+         PROP_MAXCONNLIFETIMEMILLIS,
++        PROP_LOGEXPIREDCONNECTIONS,
+         PROP_ROLLBACK_ON_RETURN,
+         PROP_ENABLE_AUTOCOMMIT_ON_RETURN,
+-        PROP_DEFAULT_QUERYTIMEOUT
++        PROP_DEFAULT_QUERYTIMEOUT,
++        PROP_FASTFAIL_VALIDATION,
++        PROP_DISCONNECTION_SQL_CODES
+     };
+ 
++    /**
++     * Obsolete properties from DBCP 1.x. with warning strings suggesting
++     * new properties. LinkedHashMap will guarantee that properties will be listed
++     * to output in order of insertion into map.
++     */
++    private static final Map<String, String> NUPROP_WARNTEXT = new LinkedHashMap<>();
++
++    static {
++        NUPROP_WARNTEXT.put(
++                NUPROP_MAXACTIVE,
++                "Property " + NUPROP_MAXACTIVE + " is not used in DBCP2, use " + PROP_MAXTOTAL + " instead. "
++                        + PROP_MAXTOTAL + " default value is " + GenericObjectPoolConfig.DEFAULT_MAX_TOTAL+".");
++        NUPROP_WARNTEXT.put(
++                NUPROP_REMOVEABANDONED,
++                "Property " + NUPROP_REMOVEABANDONED + " is not used in DBCP2,"
++                        + " use one or both of "
++                        + PROP_REMOVEABANDONEDONBORROW + " or " + PROP_REMOVEABANDONEDONMAINTENANCE + " instead. "
++                        + "Both have default value set to false.");
++        NUPROP_WARNTEXT.put(
++                NUPROP_MAXWAIT,
++                "Property " + NUPROP_MAXWAIT + " is not used in DBCP2"
++                        + " , use " + PROP_MAXWAITMILLIS + " instead. "
++                        + PROP_MAXWAITMILLIS + " default value is " + BaseObjectPoolConfig.DEFAULT_MAX_WAIT_MILLIS+".");
++    }
++
++    /**
++     * Silent Properties.
++     * These properties will not be listed as ignored - we know that they may appear in JDBC Resource references,
++     * and we will not list them as ignored.
++     */
++    private static final List<String> SILENT_PROPERTIES = new ArrayList<>();
++
++    static {
++        SILENT_PROPERTIES.add(SILENTPROP_FACTORY);
++        SILENT_PROPERTIES.add(SILENTPROP_SCOPE);
++        SILENT_PROPERTIES.add(SILENTPROP_SINGLETON);
++        SILENT_PROPERTIES.add(SILENTPROP_AUTH);
++
++    }
++
+     // -------------------------------------------------- ObjectFactory Methods
+ 
+     /**
+@@ -170,6 +249,17 @@ public class BasicDataSourceFactory implements ObjectFactory {
+             return null;
+         }
+ 
++        // Check property names and log warnings about obsolete and / or unknown properties
++        final List<String> warnings = new ArrayList<>();
++        final List<String> infoMessages = new ArrayList<>();
++        validatePropertyNames(ref, name, warnings, infoMessages);
++        for (String warning : warnings) {
++            log.warn(warning);
++        }
++        for (String infoMessage : infoMessages) {
++            log.info(infoMessage);
++        }
++
+         Properties properties = new Properties();
+         for (String propertyName : ALL_PROPERTIES) {
+             RefAddr ra = ref.get(propertyName);
+@@ -182,6 +272,58 @@ public class BasicDataSourceFactory implements ObjectFactory {
+         return createDataSource(properties);
+     }
+ 
++    /**
++     * Collects warnings and info messages.  Warnings are generated when an obsolete
++     * property is set.  Unknown properties generate info messages.
++     *
++     * @param ref Reference to check properties of
++     * @param name Name provided to getObject
++     * @param warnings container for warning messages
++     * @param infoMessages container for info messages
++     */
++    private void validatePropertyNames(Reference ref, Name name, List<String> warnings,
++                                      List<String> infoMessages) {
++        final List<String> allPropsAsList = Arrays.asList(ALL_PROPERTIES);
++        final String nameString = name != null ? "Name = " + name.toString() + " " : "";
++        if (NUPROP_WARNTEXT!=null && !NUPROP_WARNTEXT.keySet().isEmpty()) {
++            for (String propertyName : NUPROP_WARNTEXT.keySet()) {
++                final RefAddr ra = ref.get(propertyName);
++                if (ra != null && !allPropsAsList.contains(ra.getType())) {
++                    final StringBuilder stringBuilder = new StringBuilder(nameString);
++                    final String propertyValue = ra.getContent().toString();
++                    stringBuilder.append(NUPROP_WARNTEXT.get(propertyName))
++                            .append(" You have set value of \"")
++                            .append(propertyValue)
++                            .append("\" for \"")
++                            .append(propertyName)
++                            .append("\" property, which is being ignored.");
++                    warnings.add(stringBuilder.toString());
++                }
++            }
++        }
++
++        final Enumeration<RefAddr> allRefAddrs = ref.getAll();
++        while (allRefAddrs.hasMoreElements()) {
++            final RefAddr ra = allRefAddrs.nextElement();
++            final String propertyName = ra.getType();
++            // If property name is not in the properties list, we haven't warned on it
++            // and it is not in the "silent" list, tell user we are ignoring it.
++            if (!(allPropsAsList.contains(propertyName)
++                    || NUPROP_WARNTEXT.keySet().contains(propertyName)
++                    || SILENT_PROPERTIES.contains(propertyName))) {
++                final String propertyValue = ra.getContent().toString();
++                final StringBuilder stringBuilder = new StringBuilder(nameString);
++                stringBuilder.append("Ignoring unknown property: ")
++                        .append("value of \"")
++                        .append(propertyValue)
++                        .append("\" for \"")
++                        .append(propertyName)
++                        .append("\" property");
++                infoMessages.add(stringBuilder.toString());
++            }
++        }
++    }
++
+     /**
+      * Creates and configures a {@link BasicDataSource} instance based on the
+      * given properties.
+@@ -386,15 +528,7 @@ public class BasicDataSourceFactory implements ObjectFactory {
+ 
+         value = properties.getProperty(PROP_CONNECTIONINITSQLS);
+         if (value != null) {
+-            StringTokenizer tokenizer = new StringTokenizer(value, ";");
+-            // Have to jump through these hoops as StringTokenizer implements
+-            // Enumeration<Object> rather than Enumeration<String>
+-            Collection<String> tokens =
+-                    new ArrayList<>(tokenizer.countTokens());
+-            while (tokenizer.hasMoreTokens()) {
+-                tokens.add(tokenizer.nextToken());
+-            }
+-            dataSource.setConnectionInitSqls(tokens);
++            dataSource.setConnectionInitSqls(parseList(value, ';'));
+         }
+ 
+         value = properties.getProperty(PROP_CONNECTIONPROPERTIES);
+@@ -412,6 +546,11 @@ public class BasicDataSourceFactory implements ObjectFactory {
+             dataSource.setMaxConnLifetimeMillis(Long.parseLong(value));
+         }
+ 
++        value = properties.getProperty(PROP_LOGEXPIREDCONNECTIONS);
++        if (value != null) {
++            dataSource.setLogExpiredConnections(Boolean.valueOf(value).booleanValue());
++        }
++
+         value = properties.getProperty(PROP_JMX_NAME);
+         if (value != null) {
+             dataSource.setJmxName(value);
+@@ -432,6 +571,15 @@ public class BasicDataSourceFactory implements ObjectFactory {
+             dataSource.setDefaultQueryTimeout(Integer.valueOf(value));
+         }
+ 
++        value = properties.getProperty(PROP_FASTFAIL_VALIDATION);
++        if (value != null) {
++            dataSource.setFastFailValidation(Boolean.valueOf(value).booleanValue());
++        }
++
++        value = properties.getProperty(PROP_DISCONNECTION_SQL_CODES);
++        if (value != null) {
++            dataSource.setDisconnectionSqlCodes(parseList(value, ','));
++        }
+ 
+         // DBCP-215
+         // Trick to make sure that initialSize connections are created
+@@ -457,4 +605,19 @@ public class BasicDataSourceFactory implements ObjectFactory {
+       }
+       return p;
+     }
++
++    /**
++     * Parse list of property values from a delimited string
++     * @param value delimited list of values
++     * @param delimiter character used to separate values in the list
++     * @return String Collection of values
++     */
++    private static Collection<String> parseList(String value, char delimiter) {
++        StringTokenizer tokenizer = new StringTokenizer(value, Character.toString(delimiter));
++        Collection<String> tokens = new ArrayList<>(tokenizer.countTokens());
++        while (tokenizer.hasMoreTokens()) {
++            tokens.add(tokenizer.nextToken());
++        }
++        return tokens;
++    }
+ }
+
+==================================================
+DelegatingConnection.java
+index 88a75f4654..ed797ad7cc 100644
+--- a/java/org/apache/tomcat/dbcp/dbcp2/BasicDataSourceMXBean.java
++++ b/java/org/apache/tomcat/dbcp/dbcp2/BasicDataSourceMXBean.java
+@@ -215,6 +215,13 @@ public interface BasicDataSourceMXBean {
+      */
+     long getMaxConnLifetimeMillis();
+ 
++    /**
++     * See {@link BasicDataSource#getLogExpiredConnections()}
++     * @return {@link BasicDataSource#getLogExpiredConnections()}
++     * @since 2.1
++     */
++    boolean getLogExpiredConnections();
++
+     /**
+      * See {@link BasicDataSource#getRemoveAbandonedOnBorrow()}
+      * @return {@link BasicDataSource#getRemoveAbandonedOnBorrow()}
+@@ -244,4 +251,18 @@ public interface BasicDataSourceMXBean {
+      * @return {@link BasicDataSource#isClosed()}
+      */
+     boolean isClosed();
++
++    /**
++     * See {@link BasicDataSource#getFastFailValidation()}
++     * @return {@link BasicDataSource#getFastFailValidation()}
++     * @since 2.1
++     */
++    boolean getFastFailValidation();
++
++    /**
++     * See {@link BasicDataSource#getDisconnectionSqlCodesAsArray()}
++     * @return {@link BasicDataSource#getDisconnectionSqlCodesAsArray()}
++     * @since 2.1
++     */
++    String[] getDisconnectionSqlCodesAsArray();
+ }
+
+==================================================
+DelegatingStatement.java
+index 81d9d8dce8..46ab2728c1 100644
+--- a/java/org/apache/tomcat/dbcp/dbcp2/DelegatingConnection.java
++++ b/java/org/apache/tomcat/dbcp/dbcp2/DelegatingConnection.java
+@@ -94,7 +94,7 @@ public class DelegatingConnection<C extends Connection> extends AbandonedTrace
+ 
+     /**
+      * Returns a string representation of the metadata associated with
+-     * the innnermost delegate connection.
++     * the innermost delegate connection.
+      */
+     @Override
+     public String toString() {
+
+==================================================
+LifetimeExceededException.java
+index 675855719c..97eb070680 100644
+--- a/java/org/apache/tomcat/dbcp/dbcp2/DelegatingStatement.java
++++ b/java/org/apache/tomcat/dbcp/dbcp2/DelegatingStatement.java
+@@ -138,7 +138,7 @@ public class DelegatingStatement extends AbandonedTrace implements Statement {
+                     _conn = null;
+                 }
+ 
+-                // The JDBC spec requires that a statment close any open
++                // The JDBC spec requires that a statement close any open
+                 // ResultSet's when it is closed.
+                 // FIXME The PreparedStatement we're wrapping should handle this for us.
+                 // See bug 17301 for what could happen when ResultSets are closed twice.
+
+==================================================
+PoolableCallableStatement.java
+index fd1674faa4..2e0ada2bb7 100644
+--- a/java/org/apache/tomcat/dbcp/dbcp2/LocalStrings.properties
++++ b/java/org/apache/tomcat/dbcp/dbcp2/LocalStrings.properties
+@@ -15,8 +15,12 @@
+ 
+ connectionFactory.lifetimeExceeded=The lifetime of the connection [{0}] milliseconds exceeds the maximum permitted value of [{1}] milliseconds
+ 
+-poolableConnectionFactory.validateObject.fail=Failed to validate a poolable connection
++poolableConnectionFactory.validateObject.fail=Failed to validate a poolable connection.
+ 
+-swallowedExceptionLogger.onSwallowedException=An internal object pool swallowed an Exception
++poolableConnection.validate.fastFail=Fatal SQLException was thrown previously on this connection.
+ 
+-poolingDataSource.factoryConfig="PoolableConnectionFactory not linked to pool. Calling setPool() to fix the configuration."
++swallowedExceptionLogger.onSwallowedException=An internal object pool swallowed an Exception.
++
++poolingDataSource.factoryConfig=PoolableConnectionFactory not linked to pool. Calling setPool() to fix the configuration.
++
++pool.close.fail=Cannot close connection pool.
+
+==================================================
+PoolableConnection.java
+index 240351b99d..8e5ede29b0 100644
+--- a/java/org/apache/tomcat/dbcp/dbcp2/PoolableCallableStatement.java
++++ b/java/org/apache/tomcat/dbcp/dbcp2/PoolableCallableStatement.java
+@@ -111,7 +111,7 @@ public class PoolableCallableStatement extends DelegatingCallableStatement {
+             getConnectionInternal().removeTrace(this);
+         }
+ 
+-        // The JDBC spec requires that a statment close any open
++        // The JDBC spec requires that a statement close any open
+         // ResultSet's when it is closed.
+         // FIXME The PreparedStatement we're wrapping should handle this for us.
+         // See DBCP-10 for what could happen when ResultSets are closed twice.
+
+==================================================
+PoolableConnectionFactory.java
+index cc60ceca28..6b31902964 100644
+--- a/java/org/apache/tomcat/dbcp/dbcp2/PoolableConnection.java
++++ b/java/org/apache/tomcat/dbcp/dbcp2/PoolableConnection.java
+@@ -21,6 +21,7 @@ import java.sql.Connection;
+ import java.sql.PreparedStatement;
+ import java.sql.ResultSet;
+ import java.sql.SQLException;
++import java.util.Collection;
+ 
+ import javax.management.InstanceAlreadyExistsException;
+ import javax.management.InstanceNotFoundException;
+@@ -55,7 +56,7 @@ public class PoolableConnection extends DelegatingConnection<Connection>
+     }
+ 
+     /** The pool to which I should return. */
+-    private ObjectPool<PoolableConnection> _pool = null;
++    private final ObjectPool<PoolableConnection> _pool;
+ 
+     private final ObjectName _jmxName;
+ 
+@@ -64,16 +65,39 @@ public class PoolableConnection extends DelegatingConnection<Connection>
+     private PreparedStatement validationPreparedStatement = null;
+     private String lastValidationSql = null;
+ 
++    /**
++     *  Indicate that unrecoverable SQLException was thrown when using this connection.
++     *  Such a connection should be considered broken and not pass validation in the future.
++     */
++    private boolean _fatalSqlExceptionThrown = false;
++
++    /**
++     * SQL_STATE codes considered to signal fatal conditions. Overrides the
++     * defaults in {@link Utils#DISCONNECTION_SQL_CODES} (plus anything starting
++     * with {@link Utils#DISCONNECTION_SQL_CODE_PREFIX}).
++     */
++    private final Collection<String> _disconnectionSqlCodes;
++
++    /** Whether or not to fast fail validation after fatal connection errors */
++    private final boolean _fastFailValidation;
++
+     /**
+      *
+      * @param conn my underlying connection
+      * @param pool the pool to which I should return when closed
++     * @param jmxName JMX name
++     * @param disconnectSqlCodes SQL_STATE codes considered fatal disconnection errors
++     * @param fastFailValidation true means fatal disconnection errors cause subsequent
++     *        validations to fail immediately (no attempt to run query or isValid)
+      */
+     public PoolableConnection(Connection conn,
+-            ObjectPool<PoolableConnection> pool, ObjectName jmxName) {
++            ObjectPool<PoolableConnection> pool, ObjectName jmxName, Collection<String> disconnectSqlCodes,
++            boolean fastFailValidation) {
+         super(conn);
+         _pool = pool;
+         _jmxName = jmxName;
++        _disconnectionSqlCodes = disconnectSqlCodes;
++        _fastFailValidation = fastFailValidation;
+ 
+         if (jmxName != null) {
+             try {
+@@ -85,6 +109,17 @@ public class PoolableConnection extends DelegatingConnection<Connection>
+         }
+     }
+ 
++    /**
++    *
++    * @param conn my underlying connection
++    * @param pool the pool to which I should return when closed
++    * @param jmxName JMX name
++    */
++   public PoolableConnection(Connection conn,
++           ObjectPool<PoolableConnection> pool, ObjectName jmxName) {
++       this(conn, pool, jmxName, null, false);
++   }
++
+ 
+     @Override
+     protected void passivate() throws SQLException {
+@@ -217,8 +252,29 @@ public class PoolableConnection extends DelegatingConnection<Connection>
+         return toString();
+     }
+ 
+-
++    /**
++     * Validates the connection, using the following algorithm:
++     * <ol>
++     *   <li>If {@code fastFailValidation} (constructor argument) is {@code true} and
++     *       this connection has previously thrown a fatal disconnection exception,
++     *       a {@code SQLException} is thrown. </li>
++     *   <li>If {@code sql} is null, the driver's
++     *       #{@link Connection#isValid(int) isValid(timeout)} is called.
++     *       If it returns {@code false}, {@code SQLException} is thrown;
++     *       otherwise, this method returns successfully.</li>
++     *   <li>If {@code sql} is not null, it is executed as a query and if the resulting
++     *       {@code ResultSet} contains at least one row, this method returns
++     *       successfully.  If not, {@code SQLException} is thrown.</li>
++     * </ol>
++     * @param sql validation query
++     * @param timeout validation timeout
++     * @throws SQLException if validation fails or an SQLException occurs during validation
++     */
+     public void validate(String sql, int timeout) throws SQLException {
++        if (_fastFailValidation && _fatalSqlExceptionThrown) {
++            throw new SQLException(Utils.getMessage("poolableConnection.validate.fastFail"));
++        }
++
+         if (sql == null || sql.length() == 0) {
+             if (timeout < 0) {
+                 timeout = 0;
+@@ -249,5 +305,38 @@ public class PoolableConnection extends DelegatingConnection<Connection>
+             throw sqle;
+         }
+     }
++
++    /**
++     * Checks the SQLState of the input exception and any nested SQLExceptions it wraps.
++     * <p>
++     * If {@link #getDisconnectSqlCodes() disconnectSQLCodes} has been set, sql states
++     * are compared to those in the configured list of fatal exception codes.  If this
++     * property is not set, codes are compared against the default codes in
++     * #{@link Utils.DISCONNECTION_SQL_CODES} and in this case anything starting with
++     * #{link Utils.DISCONNECTION_SQL_CODE_PREFIX} is considered a disconnection.</p>
++     *
++     * @param e SQLException to be examined
++     * @return true if the exception signals a disconnection
++     */
++    private boolean isDisconnectionSqlException(SQLException e) {
++        boolean fatalException = false;
++        String sqlState = e.getSQLState();
++        if (sqlState != null) {
++            fatalException = _disconnectionSqlCodes == null ? sqlState.startsWith(Utils.DISCONNECTION_SQL_CODE_PREFIX)
++                    || Utils.DISCONNECTION_SQL_CODES.contains(sqlState) : _disconnectionSqlCodes.contains(sqlState);
++            if (!fatalException) {
++                if (e.getNextException() != null) {
++                    fatalException = isDisconnectionSqlException(e.getNextException());
++                }
++            }
++        }
++        return fatalException;
++    }
++
++    @Override
++    protected void handleException(SQLException e) throws SQLException {
++        _fatalSqlExceptionThrown |= isDisconnectionSqlException(e);
++        super.handleException(e);
++    }
+ }
+ 
+
+==================================================
+PoolingConnection.java
+index b8d4eaffaf..363384d9ac 100644
+--- a/java/org/apache/tomcat/dbcp/dbcp2/PoolableConnectionFactory.java
++++ b/java/org/apache/tomcat/dbcp/dbcp2/PoolableConnectionFactory.java
+@@ -189,7 +189,6 @@ public class PoolableConnectionFactory
+         this.rollbackOnReturn = rollbackOnReturn;
+     }
+ 
+-
+     public Integer getDefaultQueryTimeout() {
+         return defaultQueryTimeout;
+     }
+@@ -198,6 +197,58 @@ public class PoolableConnectionFactory
+         this.defaultQueryTimeout = defaultQueryTimeout;
+     }
+ 
++    /**
++     * SQL_STATE codes considered to signal fatal conditions.
++     * <p>
++     * Overrides the defaults in {@link Utils#DISCONNECTION_SQL_CODES}
++     * (plus anything starting with {@link Utils#DISCONNECTION_SQL_CODE_PREFIX}).
++     * If this property is non-null and {@link #isFastFailValidation()} is
++     * {@code true}, whenever connections created by this factory generate exceptions
++     * with SQL_STATE codes in this list, they will be marked as "fatally disconnected"
++     * and subsequent validations will fail fast (no attempt at isValid or validation
++     * query).</p>
++     * <p>
++     * If {@link #isFastFailValidation()} is {@code false} setting this property has no
++     * effect.</p>
++     *
++     * @return SQL_STATE codes overriding defaults
++     * @since 2.1
++     */
++    public Collection<String> getDisconnectionSqlCodes() {
++        return _disconnectionSqlCodes;
++    }
++
++    /**
++     * @see #getDisconnectionSqlCodes()
++     * @param disconnectionSqlCodes
++     * @since 2.1
++     */
++    public void setDisconnectionSqlCodes(Collection<String> disconnectionSqlCodes) {
++        _disconnectionSqlCodes = disconnectionSqlCodes;
++    }
++
++    /**
++     * True means that validation will fail immediately for connections that
++     * have previously thrown SQLExceptions with SQL_STATE indicating fatal
++     * disconnection errors.
++     *
++     * @return true if connections created by this factory will fast fail validation.
++     * @see #setDisconnectionSqlCodes(Collection)
++     * @since 2.1
++     */
++    public boolean isFastFailValidation() {
++        return _fastFailValidation;
++    }
++
++    /**
++     * @see #isFastFailValidation()
++     * @param fastFailValidation true means connections created by this factory will
++     * fast fail validation
++     * @since 2.1
++     */
++    public void setFastFailValidation(boolean fastFailValidation) {
++        _fastFailValidation = fastFailValidation;
++    }
+ 
+     @Override
+     public PooledObject<PoolableConnection> makeObject() throws Exception {
+@@ -234,6 +285,8 @@ public class PoolableConnectionFactory
+                 base.append(Long.toString(connIndex));
+                 config.setJmxNameBase(base.toString());
+                 config.setJmxNamePrefix(Constants.JMX_STATEMENT_POOL_PREFIX);
++            } else {
++                config.setJmxEnabled(false);
+             }
+             KeyedObjectPool<PStmtKey,DelegatingPreparedStatement> stmtPool =
+                     new GenericKeyedObjectPool<>((PoolingConnection)conn, config);
+@@ -250,7 +303,8 @@ public class PoolableConnectionFactory
+                     Constants.JMX_CONNECTION_BASE_EXT + connIndex);
+         }
+ 
+-        PoolableConnection pc = new PoolableConnection(conn,_pool, connJmxName);
++        PoolableConnection pc = new PoolableConnection(conn,_pool, connJmxName,
++                                      _disconnectionSqlCodes, _fastFailValidation);
+ 
+         return new DefaultPooledObject<>(pc);
+     }
+@@ -366,7 +420,7 @@ public class PoolableConnectionFactory
+         if (maxConnLifetimeMillis > 0) {
+             long lifetime = System.currentTimeMillis() - p.getCreateTime();
+             if (lifetime > maxConnLifetimeMillis) {
+-                throw new Exception(Utils.getMessage(
++                throw new LifetimeExceededException(Utils.getMessage(
+                         "connectionFactory.lifetimeExceeded",
+                         Long.valueOf(lifetime),
+                         Long.valueOf(maxConnLifetimeMillis)));
+@@ -390,11 +444,21 @@ public class PoolableConnectionFactory
+         return _cacheState;
+     }
+ 
++    protected ObjectName getDataSourceJmxName() {
++        return dataSourceJmxName;
++    }
++
++    protected AtomicLong getConnectionIndex() {
++        return connectionIndex;
++    }
++
+     private final ConnectionFactory _connFactory;
+     private final ObjectName dataSourceJmxName;
+     private volatile String _validationQuery = null;
+     private volatile int _validationQueryTimeout = -1;
+     private Collection<String> _connectionInitSqls = null;
++    private Collection<String> _disconnectionSqlCodes = null;
++    private boolean _fastFailValidation = false;
+     private volatile ObjectPool<PoolableConnection> _pool = null;
+     private Boolean _defaultReadOnly = null;
+     private Boolean _defaultAutoCommit = null;
+
+==================================================
+PoolingDataSource.java
+index 5c9deebade..1f3dabffa1 100644
+--- a/java/org/apache/tomcat/dbcp/dbcp2/PoolingConnection.java
++++ b/java/org/apache/tomcat/dbcp/dbcp2/PoolingConnection.java
+@@ -295,7 +295,7 @@ public class PoolingConnection extends DelegatingConnection<Connection>
+ 
+     /**
+      * Normalize the given SQL statement, producing a
+-     * cannonical form that is semantically equivalent to the original.
++     * canonical form that is semantically equivalent to the original.
+      */
+     protected String normalizeSQL(String sql) {
+         return sql.trim();
+
+==================================================
+SwallowedExceptionLogger.java
+index f8e7d8d19c..79bf244acf 100644
+--- a/java/org/apache/tomcat/dbcp/dbcp2/PoolingDataSource.java
++++ b/java/org/apache/tomcat/dbcp/dbcp2/PoolingDataSource.java
+@@ -42,7 +42,7 @@ import org.apache.tomcat.dbcp.pool2.impl.GenericObjectPool;
+  * @author Dirk Verbeeck
+  * @since 2.0
+  */
+-public class PoolingDataSource<C extends Connection> implements DataSource {
++public class PoolingDataSource<C extends Connection> implements DataSource, AutoCloseable {
+ 
+     private static final Log log = LogFactory.getLog(PoolingDataSource.class);
+ 
+@@ -69,10 +69,25 @@ public class PoolingDataSource<C extends Connection> implements DataSource {
+         }
+     }
+ 
++    /**
++     * Close and free all {@link Connection}s from the pool.
++     * @since 2.1
++     */
++    @Override
++    public void close() throws Exception {
++        try {
++            _pool.close();
++        } catch(RuntimeException rte) {
++            throw new RuntimeException(Utils.getMessage("pool.close.fail"), rte);
++        } catch(Exception e) {
++            throw new SQLException(Utils.getMessage("pool.close.fail"), e);
++        }
++    }
++
+     /**
+      * Returns the value of the accessToUnderlyingConnectionAllowed property.
+      *
+-     * @return true if access to the underlying is allowed, false otherwise.
++     * @return true if access to the underlying {@link Connection} is allowed, false otherwise.
+      */
+     public boolean isAccessToUnderlyingConnectionAllowed() {
+         return this.accessToUnderlyingConnectionAllowed;
+
+==================================================
+Utils.java
+index d010ec0133..8928950758 100644
+--- a/java/org/apache/tomcat/dbcp/dbcp2/SwallowedExceptionLogger.java
++++ b/java/org/apache/tomcat/dbcp/dbcp2/SwallowedExceptionLogger.java
+@@ -20,20 +20,41 @@ import org.apache.juli.logging.Log;
+ import org.apache.tomcat.dbcp.pool2.SwallowedExceptionListener;
+ 
+ /**
+- * Class for logging swallowed exceptions
++ * Class for logging swallowed exceptions.
+  * @since 2.0
+  */
+ public class SwallowedExceptionLogger implements SwallowedExceptionListener{
+ 
+     private final Log log;
++    private final boolean logExpiredConnections;
+ 
++    /**
++     * Create a SwallowedExceptionLogger with the given logger.  By default,
++     * expired connection logging is turned on.
++     *
++     * @param log logger
++     */
+     public SwallowedExceptionLogger(Log log) {
++        this(log, true);
++    }
++
++    /**
++     * Create a SwallowedExceptionLogger with the given logger and expired
++     * connection logging property.
++     *
++     * @param log logger
++     * @param logExpiredConnections false suppresses logging of expired connection events
++     */
++    public SwallowedExceptionLogger(Log log, boolean logExpiredConnections) {
+         this.log = log;
++        this.logExpiredConnections = logExpiredConnections;
+     }
+ 
+     @Override
+     public void onSwallowException(Exception e) {
+-        log.warn(Utils.getMessage(
+-                "swallowedExceptionLogger.onSwallowedException"), e);
++        if (logExpiredConnections || !(e instanceof LifetimeExceededException)) {
++            log.warn(Utils.getMessage(
++                    "swallowedExceptionLogger.onSwallowedException"), e);
++        }
+     }
+ }
+
+==================================================
+InstanceKeyDataSource.java
+index 23517f16bd..0a3920eba2 100644
+--- a/java/org/apache/tomcat/dbcp/dbcp2/Utils.java
++++ b/java/org/apache/tomcat/dbcp/dbcp2/Utils.java
+@@ -22,10 +22,12 @@ import java.sql.Connection;
+ import java.sql.ResultSet;
+ import java.sql.Statement;
+ import java.text.MessageFormat;
++import java.util.HashSet;
+ import java.util.ResourceBundle;
++import java.util.Set;
+ 
+ /**
+- * Utility methods
++ * Utility methods.
+  * @since 2.0
+  */
+ public final class Utils {
+@@ -36,6 +38,31 @@ public final class Utils {
+     public static final boolean IS_SECURITY_ENABLED =
+             System.getSecurityManager() != null;
+ 
++    /** Any SQL_STATE starting with this value is considered a fatal disconnect */
++    public static final String DISCONNECTION_SQL_CODE_PREFIX = "08";
++
++    /**
++     * SQL codes of fatal connection errors.
++     * <ul>
++     *  <li>57P01 (ADMIN SHUTDOWN)</li>
++     *  <li>57P02 (CRASH SHUTDOWN)</li>
++     *  <li>57P03 (CANNOT CONNECT NOW)</li>
++     *  <li>01002 (SQL92 disconnect error)</li>
++     *  <li>JZ0C0 (Sybase disconnect error)</li>
++     *  <li>JZ0C1 (Sybase disconnect error)</li>
++     * </ul>
++     */
++    public static final Set<String> DISCONNECTION_SQL_CODES;
++
++    static {
++        DISCONNECTION_SQL_CODES = new HashSet<>();
++        DISCONNECTION_SQL_CODES.add("57P01"); // ADMIN SHUTDOWN
++        DISCONNECTION_SQL_CODES.add("57P02"); // CRASH SHUTDOWN
++        DISCONNECTION_SQL_CODES.add("57P03"); // CANNOT CONNECT NOW
++        DISCONNECTION_SQL_CODES.add("01002"); // SQL92 disconnect error
++        DISCONNECTION_SQL_CODES.add("JZ0C0"); // Sybase disconnect error
++        DISCONNECTION_SQL_CODES.add("JZ0C1"); // Sybase disconnect error
++    }
+ 
+     private Utils() {
+         // not instantiable
+
+==================================================
+KeyedCPDSConnectionFactory.java
+index d8a1d8dd98..da0e7b2c1d 100644
+--- a/java/org/apache/tomcat/dbcp/dbcp2/datasources/InstanceKeyDataSource.java
++++ b/java/org/apache/tomcat/dbcp/dbcp2/datasources/InstanceKeyDataSource.java
+@@ -84,7 +84,7 @@ import org.apache.tomcat.dbcp.pool2.impl.GenericKeyedObjectPoolConfig;
+  * @since 2.0
+  */
+ public abstract class InstanceKeyDataSource
+-        implements DataSource, Referenceable, Serializable {
++        implements DataSource, Referenceable, Serializable, AutoCloseable {
+ 
+     private static final long serialVersionUID = -6819270431752240878L;
+ 
+@@ -186,6 +186,7 @@ public abstract class InstanceKeyDataSource
+     /**
+      * Close the connection pool being maintained by this datasource.
+      */
++    @Override
+     public abstract void close() throws Exception;
+ 
+     protected abstract PooledConnectionManager getConnectionManager(UserPassKey upkey);
+@@ -230,7 +231,6 @@ public abstract class InstanceKeyDataSource
+         this.defaultBlockWhenExhausted = blockWhenExhausted;
+     }
+ 
+-
+     /**
+      * Gets the default value for
+      * {@link GenericKeyedObjectPoolConfig#getEvictionPolicyClassName()} for
+@@ -251,7 +251,6 @@ public abstract class InstanceKeyDataSource
+         this.defaultEvictionPolicyClassName = evictionPolicyClassName;
+     }
+ 
+-
+     /**
+      * Gets the default value for
+      * {@link GenericKeyedObjectPoolConfig#getLifo()} for each per user pool.
+@@ -269,7 +268,6 @@ public abstract class InstanceKeyDataSource
+         this.defaultLifo = lifo;
+     }
+ 
+-
+     /**
+      * Gets the default value for
+      * {@link GenericKeyedObjectPoolConfig#getMaxIdlePerKey()} for each per user
+@@ -289,7 +287,6 @@ public abstract class InstanceKeyDataSource
+         this.defaultMaxIdle = maxIdle;
+     }
+ 
+-
+     /**
+      * Gets the default value for
+      * {@link GenericKeyedObjectPoolConfig#getMaxTotalPerKey()} for each per
+@@ -309,7 +306,6 @@ public abstract class InstanceKeyDataSource
+         this.defaultMaxTotal = maxTotal;
+     }
+ 
+-
+     /**
+      * Gets the default value for
+      * {@link GenericKeyedObjectPoolConfig#getMaxWaitMillis()} for each per user
+@@ -329,7 +325,6 @@ public abstract class InstanceKeyDataSource
+         this.defaultMaxWaitMillis = maxWaitMillis;
+     }
+ 
+-
+     /**
+      * Gets the default value for
+      * {@link GenericKeyedObjectPoolConfig#getMinEvictableIdleTimeMillis()} for
+@@ -350,7 +345,6 @@ public abstract class InstanceKeyDataSource
+         this.defaultMinEvictableIdleTimeMillis = minEvictableIdleTimeMillis;
+     }
+ 
+-
+     /**
+      * Gets the default value for
+      * {@link GenericKeyedObjectPoolConfig#getMinIdlePerKey()} for each per user
+@@ -370,7 +364,6 @@ public abstract class InstanceKeyDataSource
+         this.defaultMinIdle = minIdle;
+     }
+ 
+-
+     /**
+      * Gets the default value for
+      * {@link GenericKeyedObjectPoolConfig#getNumTestsPerEvictionRun()} for each
+@@ -390,7 +383,6 @@ public abstract class InstanceKeyDataSource
+         this.defaultNumTestsPerEvictionRun = numTestsPerEvictionRun;
+     }
+ 
+-
+     /**
+      * Gets the default value for
+      * {@link org.apache.tomcat.dbcp.pool2.impl.GenericObjectPool GenericObjectPool#getSoftMinEvictableIdleTimeMillis()} for each
+@@ -410,7 +402,6 @@ public abstract class InstanceKeyDataSource
+         this.defaultSoftMinEvictableIdleTimeMillis = softMinEvictableIdleTimeMillis;
+     }
+ 
+-
+     /**
+      * Gets the default value for
+      * {@link org.apache.tomcat.dbcp.pool2.impl.GenericObjectPool GenericObjectPool#getTestOnCreate()} for each per user pool.
+@@ -428,7 +419,6 @@ public abstract class InstanceKeyDataSource
+         this.defaultTestOnCreate = testOnCreate;
+     }
+ 
+-
+     /**
+      * Gets the default value for
+      * {@link org.apache.tomcat.dbcp.pool2.impl.GenericObjectPool GenericObjectPool#getTestOnBorrow()} for each per user pool.
+@@ -446,7 +436,6 @@ public abstract class InstanceKeyDataSource
+         this.defaultTestOnBorrow = testOnBorrow;
+     }
+ 
+-
+     /**
+      * Gets the default value for
+      * {@link org.apache.tomcat.dbcp.pool2.impl.GenericObjectPool GenericObjectPool#getTestOnReturn()} for each per user pool.
+@@ -464,7 +453,6 @@ public abstract class InstanceKeyDataSource
+         this.defaultTestOnReturn = testOnReturn;
+     }
+ 
+-
+     /**
+      * Gets the default value for
+      * {@link org.apache.tomcat.dbcp.pool2.impl.GenericObjectPool GenericObjectPool#getTestWhileIdle()} for each per user pool.
+@@ -482,7 +470,6 @@ public abstract class InstanceKeyDataSource
+         this.defaultTestWhileIdle = testWhileIdle;
+     }
+ 
+-
+     /**
+      * Gets the default value for
+      * {@link org.apache.tomcat.dbcp.pool2.impl.GenericObjectPool GenericObjectPool#getTimeBetweenEvictionRunsMillis ()} for each
+@@ -503,22 +490,6 @@ public abstract class InstanceKeyDataSource
+         this.defaultTimeBetweenEvictionRunsMillis = timeBetweenEvictionRunsMillis ;
+     }
+ 
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+     /**
+      * Get the value of connectionPoolDataSource.  This method will return
+      * null, if the backing datasource is being accessed via jndi.
+@@ -940,7 +911,7 @@ public abstract class InstanceKeyDataSource
+             }
+             /*
+              * Password must have changed -> destroy connection and keep retrying until we get a new, good one,
+-             * destroying any idle connections with the old passowrd as we pull them from the pool.
++             * destroying any idle connections with the old password as we pull them from the pool.
+              */
+             final UserPassKey upkey = info.getUserPassKey();
+             final PooledConnectionManager manager = getConnectionManager(upkey);
+
+==================================================
+PooledConnectionManager.java
+index c8241d0e22..1bda76def3 100644
+--- a/java/org/apache/tomcat/dbcp/dbcp2/datasources/KeyedCPDSConnectionFactory.java
++++ b/java/org/apache/tomcat/dbcp/dbcp2/datasources/KeyedCPDSConnectionFactory.java
+@@ -39,7 +39,7 @@ import org.apache.tomcat.dbcp.pool2.impl.DefaultPooledObject;
+ 
+ /**
+  * A {@link KeyedPooledObjectFactory} that creates
+- * {@link PoolableConnection}s.
++ * {@link org.apache.tomcat.dbcp.dbcp2.PoolableConnection PoolableConnection}s.
+  *
+  * @author John D. McNally
+  * @since 2.0
+@@ -159,7 +159,7 @@ class KeyedCPDSConnectionFactory
+      * @param key ignored
+      * @param p wrapped {@link PooledConnectionAndInfo} containing the
+      *          connection to validate
+-     * @return true if validation suceeds
++     * @return true if validation succeeds
+      */
+     @Override
+     public boolean validateObject(UserPassKey key,
+
+==================================================

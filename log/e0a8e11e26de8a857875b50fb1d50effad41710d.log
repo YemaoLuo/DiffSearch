@@ -1,0 +1,213 @@
+e0a8e11e26de8a857875b50fb1d50effad41710d
+==================================================
+Fix https://bz.apache.org/bugzilla/show_bug.cgi?id=60013
+==================================================
+Mark Thomas
+==================================================
+Tue Sep 6 21:26:17 2016 +0000
+==================================================
+Resolver.java
+Fix https://bz.apache.org/bugzilla/show_bug.cgi?id=60013
+Implement B and NE. Update unit tests to use B and/or NE where required.
+Also make minor modifications to align unit tests with expected
+behaviour of httpd.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1759516 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+ResolverImpl.java
+index 97f471a11d..b02e6fcb31 100644
+--- a/java/org/apache/catalina/valves/rewrite/Resolver.java
++++ b/java/org/apache/catalina/valves/rewrite/Resolver.java
+@@ -33,4 +33,6 @@ public abstract class Resolver {
+     public abstract String resolveHttp(String key);
+ 
+     public abstract boolean resolveResource(int type, String name);
++
++    public abstract String getUriEncoding();
+ }
+
+==================================================
+RewriteRule.java
+index 5e5b82770d..b01e84ad2d 100644
+--- a/java/org/apache/catalina/valves/rewrite/ResolverImpl.java
++++ b/java/org/apache/catalina/valves/rewrite/ResolverImpl.java
+@@ -177,4 +177,9 @@ public class ResolverImpl extends Resolver {
+             return value;
+         }
+     }
++
++    @Override
++    public String getUriEncoding() {
++        return request.getConnector().getURIEncoding();
++    }
+ }
+
+==================================================
+RewriteValve.java
+index 21fee60566..c368386c6c 100644
+--- a/java/org/apache/catalina/valves/rewrite/RewriteRule.java
++++ b/java/org/apache/catalina/valves/rewrite/RewriteRule.java
+@@ -37,6 +37,8 @@ public class RewriteRule {
+             substitution = new Substitution();
+             substitution.setSub(substitutionString);
+             substitution.parse(maps);
++            substitution.setEscapeBackReferences(isEscapeBackReferences());
++            substitution.setNoEscape(isNoescape());
+         }
+         // Parse the pattern
+         int flags = 0;
+@@ -151,7 +153,7 @@ public class RewriteRule {
+     }
+ 
+ 
+-    private boolean escapeBackreferences = false;
++    private boolean escapeBackReferences = false;
+ 
+     /**
+      *  This flag chains the current rule with the next rule (which itself
+@@ -328,11 +330,11 @@ public class RewriteRule {
+     protected boolean type = false;
+     protected String typeValue = null;
+ 
+-    public boolean isEscapeBackreferences() {
+-        return escapeBackreferences;
++    public boolean isEscapeBackReferences() {
++        return escapeBackReferences;
+     }
+-    public void setEscapeBackreferences(boolean escapeBackreferences) {
+-        this.escapeBackreferences = escapeBackreferences;
++    public void setEscapeBackReferences(boolean escapeBackReferences) {
++        this.escapeBackReferences = escapeBackReferences;
+     }
+     public boolean isChain() {
+         return chain;
+
+==================================================
+Substitution.java
+index 3500108300..521f0e159c 100644
+--- a/java/org/apache/catalina/valves/rewrite/RewriteValve.java
++++ b/java/org/apache/catalina/valves/rewrite/RewriteValve.java
+@@ -44,10 +44,10 @@ import org.apache.catalina.Pipeline;
+ import org.apache.catalina.connector.Connector;
+ import org.apache.catalina.connector.Request;
+ import org.apache.catalina.connector.Response;
+-import org.apache.catalina.util.URLEncoder;
+ import org.apache.catalina.valves.ValveBase;
+ import org.apache.tomcat.util.buf.CharChunk;
+ import org.apache.tomcat.util.buf.MessageBytes;
++import org.apache.tomcat.util.buf.UDecoder;
+ import org.apache.tomcat.util.buf.UriUtil;
+ import org.apache.tomcat.util.http.RequestUtil;
+ 
+@@ -439,7 +439,7 @@ public class RewriteValve extends ValveBase {
+                     if (context) {
+                         chunk.append(contextPath);
+                     }
+-                    chunk.append(URLEncoder.DEFAULT.encode(urlString, "UTF-8"));
++                    chunk.append(urlString);
+                     request.getCoyoteRequest().requestURI().toChars();
+                     // Decoded and normalized URI
+                     request.getCoyoteRequest().decodedURI().setString(null);
+@@ -448,7 +448,8 @@ public class RewriteValve extends ValveBase {
+                     if (context) {
+                         chunk.append(contextPath);
+                     }
+-                    chunk.append(RequestUtil.normalize(urlString));
++                    chunk.append(RequestUtil.normalize(UDecoder.URLDecode(
++                            urlString, request.getConnector().getURIEncoding())));
+                     request.getCoyoteRequest().decodedURI().toChars();
+                     // Set the new Query if there is one
+                     if (queryString != null) {
+@@ -641,7 +642,7 @@ public class RewriteValve extends ValveBase {
+      */
+     protected static void parseRuleFlag(String line, RewriteRule rule, String flag) {
+         if (flag.equals("B")) {
+-            rule.setEscapeBackreferences(true);
++            rule.setEscapeBackReferences(true);
+         } else if (flag.equals("chain") || flag.equals("C")) {
+             rule.setChain(true);
+         } else if (flag.startsWith("cookie=") || flag.startsWith("CO=")) {
+
+==================================================
+TestRewriteValve.java
+index d78e76492e..30afa43911 100644
+--- a/java/org/apache/catalina/valves/rewrite/Substitution.java
++++ b/java/org/apache/catalina/valves/rewrite/Substitution.java
+@@ -20,8 +20,25 @@ import java.util.ArrayList;
+ import java.util.Map;
+ import java.util.regex.Matcher;
+ 
++import org.apache.catalina.util.URLEncoder;
++
+ public class Substitution {
+ 
++    private static URLEncoder STATIC_ENCODER = new URLEncoder();
++    static {
++        // Defaults
++        STATIC_ENCODER.addSafeCharacter('~');
++        STATIC_ENCODER.addSafeCharacter('-');
++        STATIC_ENCODER.addSafeCharacter('_');
++        STATIC_ENCODER.addSafeCharacter('.');
++        STATIC_ENCODER.addSafeCharacter('*');
++        STATIC_ENCODER.addSafeCharacter('/');
++        // httpd doesn't encode these either
++        STATIC_ENCODER.addSafeCharacter('?');
++        STATIC_ENCODER.addSafeCharacter('=');
++    }
++
++
+     public abstract class SubstitutionElement {
+         public abstract String evaluate(Matcher rule, Matcher cond, Resolver resolver);
+     }
+@@ -31,7 +48,11 @@ public class Substitution {
+ 
+         @Override
+         public String evaluate(Matcher rule, Matcher cond, Resolver resolver) {
+-            return value;
++            if (noEscape) {
++                return value;
++            } else {
++                return STATIC_ENCODER.encode(value, resolver.getUriEncoding());
++            }
+         }
+ 
+     }
+@@ -40,7 +61,15 @@ public class Substitution {
+         public int n;
+         @Override
+         public String evaluate(Matcher rule, Matcher cond, Resolver resolver) {
+-            return rule.group(n);
++            if (escapeBackReferences) {
++                // Note: This should be consistent with the way httpd behaves.
++                //       We might want to consider providing a dedicated decoder
++                //       with an option to add additional safe characters to
++                //       provide users with more flexibility
++                return URLEncoder.DEFAULT.encode(rule.group(n), resolver.getUriEncoding());
++            } else {
++                return rule.group(n);
++            }
+         }
+     }
+ 
+@@ -105,6 +134,16 @@ public class Substitution {
+     public String getSub() { return sub; }
+     public void setSub(String sub) { this.sub = sub; }
+ 
++    private boolean escapeBackReferences;
++    void setEscapeBackReferences(boolean escapeBackReferences) {
++        this.escapeBackReferences = escapeBackReferences;
++    }
++
++    private boolean noEscape;
++    void setNoEscape(boolean noEscape) {
++        this.noEscape = noEscape;
++    }
++
+     public void parse(Map<String, RewriteMap> maps) {
+ 
+         ArrayList<SubstitutionElement> elements = new ArrayList<>();
+
+==================================================

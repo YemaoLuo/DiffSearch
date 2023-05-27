@@ -1,0 +1,265 @@
+13baeea0fe9ffc1074686c7e06c99f34dbbbe6ae
+==================================================
+Better fix for https://issues.apache.org/bugzilla/show_bug.cgi?id=49922
+==================================================
+Mark Emlyn
+==================================================
+Wed Oct 13 11:10:30 2010 +0000
+==================================================
+ApplicationFilterChain.java
+Better fix for https://issues.apache.org/bugzilla/show_bug.cgi?id=49922
+Revert my approach and go with patch suggested by heyoulin.
+Extend test cases
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1022068 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+WebXml.java
+index 847c2b66a6..395c2a590a 100644
+--- a/java/org/apache/catalina/core/ApplicationFilterChain.java
++++ b/java/org/apache/catalina/core/ApplicationFilterChain.java
+@@ -525,6 +525,11 @@ final class ApplicationFilterChain implements FilterChain, CometFilterChain {
+      */
+     void addFilter(ApplicationFilterConfig filterConfig) {
+ 
++        // Prevent the same filter being added multiple times
++        for(ApplicationFilterConfig filter:filters)
++            if(filter==filterConfig)
++                return;
++
+         if (n == filters.length) {
+             ApplicationFilterConfig[] newFilters =
+                 new ApplicationFilterConfig[n + INCREMENT];
+
+==================================================
+ContextConfig.java
+index a0b79fa1c9..230e9fc80c 100644
+--- a/java/org/apache/catalina/deploy/WebXml.java
++++ b/java/org/apache/catalina/deploy/WebXml.java
+@@ -278,37 +278,13 @@ public class WebXml {
+     public Map<String,FilterDef> getFilters() { return filters; }
+     
+     // filter-mapping
+-    private Map<String,FilterMap> filterMaps =
+-        new LinkedHashMap<String,FilterMap>();
++    private Set<FilterMap> filterMaps = new LinkedHashSet<FilterMap>();
++    private Set<String> filterMappingNames = new HashSet<String>();
+     public void addFilterMapping(FilterMap filterMap) {
+-        FilterMap fm = filterMaps.get(filterMap.getFilterName());
+-        if (fm == null) {
+-            filterMaps.put(filterMap.getFilterName(), filterMap);
+-        } else {
+-            for (String dispatcher : filterMap.getDispatcherNames()) {
+-                fm.setDispatcher(dispatcher);
+-            }
+-            if (!fm.getMatchAllServletNames()) {
+-                if (filterMap.getMatchAllServletNames()) {
+-                    fm.addServletName("*");
+-                } else {
+-                    for (String servletName : filterMap.getServletNames()) {
+-                        fm.addServletName(servletName);
+-                    }
+-                }
+-            }
+-            if (!fm.getMatchAllUrlPatterns()) {
+-                if (filterMap.getMatchAllUrlPatterns()) {
+-                    fm.addURLPattern("*");
+-                } else {
+-                    for (String urlPattern : filterMap.getURLPatterns()) {
+-                        fm.addURLPattern(urlPattern);
+-                    }
+-                }
+-            }
+-        }
++        filterMaps.add(filterMap);
++        filterMappingNames.add(filterMap.getFilterName());
+     }
+-    public Map<String,FilterMap> getFilterMappings() { return filterMaps; }
++    public Set<FilterMap> getFilterMappings() { return filterMaps; }
+     
+     // listener
+     // TODO: description (multiple with language) is ignored
+@@ -651,7 +627,7 @@ public class WebXml {
+         }
+         sb.append('\n');
+ 
+-        for (FilterMap filterMap : filterMaps.values()) {
++        for (FilterMap filterMap : filterMaps) {
+             sb.append("  <filter-mapping>\n");
+             appendElement(sb, INDENT4, "filter-name",
+                     filterMap.getFilterName());
+@@ -1200,7 +1176,7 @@ public class WebXml {
+             }
+             context.addFilterDef(filter);
+         }
+-        for (FilterMap filterMap : filterMaps.values()) {
++        for (FilterMap filterMap : filterMaps) {
+             context.addFilterMap(filterMap);
+         }
+         for (JspPropertyGroup jspPropertyGroup : jspPropertyGroups) {
+@@ -1442,16 +1418,17 @@ public class WebXml {
+         // main web.xml override those in fragments and those in fragments
+         // override mappings in annotations
+         for (WebXml fragment : fragments) {
+-            Iterator<String> iterFilterMaps =
+-                fragment.getFilterMappings().keySet().iterator();
++            Iterator<FilterMap> iterFilterMaps =
++                fragment.getFilterMappings().iterator();
+             while (iterFilterMaps.hasNext()) {
+-                if (filterMaps.containsKey(iterFilterMaps.next())) {
++                FilterMap filterMap = iterFilterMaps.next();
++                if (filterMappingNames.contains(filterMap.getFilterName())) {
+                     iterFilterMaps.remove();
+                 }
+             }
+         }
+         for (WebXml fragment : fragments) {
+-            for (FilterMap filterMap : fragment.getFilterMappings().values()) {
++            for (FilterMap filterMap : fragment.getFilterMappings()) {
+                 // Additive
+                 addFilterMapping(filterMap);
+             }
+
+==================================================
+TestStandardContext.java
+index 1900fa338f..a04b97a168 100644
+--- a/java/org/apache/catalina/startup/ContextConfig.java
++++ b/java/org/apache/catalina/startup/ContextConfig.java
+@@ -33,7 +33,6 @@ import java.net.URISyntaxException;
+ import java.net.URL;
+ import java.net.URLConnection;
+ import java.util.ArrayList;
+-import java.util.Collection;
+ import java.util.Enumeration;
+ import java.util.HashMap;
+ import java.util.HashSet;
+@@ -2210,7 +2209,7 @@ public class ContextConfig
+             fragment.addFilterMapping(filterMap);
+         }
+         if (urlPatternsSet || dispatchTypesSet) {
+-            Collection<FilterMap> fmap = fragment.getFilterMappings().values();
++            Set<FilterMap> fmap = fragment.getFilterMappings();
+             FilterMap descMap = null;
+             for (FilterMap map : fmap) {
+                 if (filterName.equals(map.getFilterName())) {
+
+==================================================
+TestContextConfigAnnotation.java
+index 6ea70a1488..3c12da7211 100644
+--- a/test/org/apache/catalina/core/TestStandardContext.java
++++ b/test/org/apache/catalina/core/TestStandardContext.java
+@@ -126,23 +126,43 @@ public class TestStandardContext extends TomcatBaseTest {
+         tomcat.addWebapp("", root.getAbsolutePath());
+         
+         tomcat.start();
++        ByteChunk result;
+ 
+-        // Check path mapping works
+-        ByteChunk result = getUrl("http://localhost:" + getPort() +
+-        "/bug49922/foo");
+-        // Filter should only have been called once
+-        assertEquals("Filter", result.toString());
++        // Check filter and servlet aren't called
++        result = getUrl("http://localhost:" + getPort() +
++                "/bug49922/foo");
++        assertNull(result.toString());
+ 
+         // Check extension mapping works
++        result = getUrl("http://localhost:" + getPort() + "/foo.do");
++        assertEquals("FilterServlet", result.toString());
++
++        // Check path mapping works
++        result = getUrl("http://localhost:" + getPort() + "/bug49922/servlet");
++        assertEquals("FilterServlet", result.toString());
++
++        // Check servlet name mapping works
++        result = getUrl("http://localhost:" + getPort() + "/foo.od");
++        assertEquals("FilterServlet", result.toString());
++
++        // Check filter is only called once
++        result = getUrl("http://localhost:" + getPort() +
++                "/bug49922/servlet/foo.do");
++        assertEquals("FilterServlet", result.toString());
+         result = getUrl("http://localhost:" + getPort() +
+-        "/foo.do");
+-        // Filter should only have been called once
+-        assertEquals("Filter", result.toString());
++                "/bug49922/servlet/foo.od");
++        assertEquals("FilterServlet", result.toString());
+ 
++        // Check dispatcher mapping
++        result = getUrl("http://localhost:" + getPort() +
++                "/bug49922/target");
++        assertEquals("Target", result.toString());
+         result = getUrl("http://localhost:" + getPort() +
+-                "/bug49922/index.do");
+-        // Filter should only have been called once
+-        assertEquals("Filter", result.toString());
++                "/bug49922/forward");
++        assertEquals("FilterTarget", result.toString());
++        result = getUrl("http://localhost:" + getPort() +
++                "/bug49922/include");
++        assertEquals("IncludeFilterTarget", result.toString());
+     }
+ 
+     
+@@ -167,6 +187,45 @@ public class TestStandardContext extends TomcatBaseTest {
+         }
+     }
+     
++    public static final class Bug49922ForwardServlet extends HttpServlet {
++
++        private static final long serialVersionUID = 1L;
++
++        @Override
++        protected void doGet(HttpServletRequest req, HttpServletResponse resp)
++                throws ServletException, IOException {
++            req.getRequestDispatcher("/bug49922/target").forward(req, resp);
++        }
++        
++    }
++
++    public static final class Bug49922IncludeServlet extends HttpServlet {
++
++        private static final long serialVersionUID = 1L;
++
++        @Override
++        protected void doGet(HttpServletRequest req, HttpServletResponse resp)
++                throws ServletException, IOException {
++            resp.setContentType("text/plain");
++            resp.getWriter().print("Include");
++            req.getRequestDispatcher("/bug49922/target").include(req, resp);
++        }
++        
++    }
++
++    public static final class Bug49922TargetServlet extends HttpServlet {
++
++        private static final long serialVersionUID = 1L;
++
++        @Override
++        protected void doGet(HttpServletRequest req, HttpServletResponse resp)
++                throws ServletException, IOException {
++            resp.setContentType("text/plain");
++            resp.getWriter().print("Target");
++        }
++        
++    }
++
+     public static final class Bug49922Servlet extends HttpServlet {
+ 
+         private static final long serialVersionUID = 1L;
+@@ -174,7 +233,8 @@ public class TestStandardContext extends TomcatBaseTest {
+         @Override
+         protected void doGet(HttpServletRequest req, HttpServletResponse resp)
+                 throws ServletException, IOException {
+-            // NOOP
++            resp.setContentType("text/plain");
++            resp.getWriter().print("Servlet");
+         }
+         
+     }
+
+==================================================

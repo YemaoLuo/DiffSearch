@@ -1,0 +1,260 @@
+f170929cb80817eef0f2f32ca5b61199defab055
+==================================================
+Add in ability to purge the pool
+==================================================
+Filip Hanik
+==================================================
+Fri May 18 16:28:33 2012 +0000
+==================================================
+ConnectionPool.java
+Add in ability to purge the pool
+https://issues.apache.org/bugzilla/show_bug.cgi?id=53254
+
+
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1340160 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+DataSourceProxy.java
+index 02ba883060..e9524edbf8 100644
+--- a/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/ConnectionPool.java
++++ b/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/ConnectionPool.java
+@@ -39,6 +39,7 @@ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.TimeoutException;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicInteger;
++import java.util.concurrent.atomic.AtomicLong;
+ 
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+@@ -120,6 +121,8 @@ public class ConnectionPool {
+      */
+     private AtomicInteger waitcount = new AtomicInteger(0);
+ 
++    private AtomicLong poolVersion = new AtomicLong(Long.MIN_VALUE);
++
+     //===============================================================================
+     //         PUBLIC METHODS
+     //===============================================================================
+@@ -438,6 +441,8 @@ public class ConnectionPool {
+         if (properties.isFairQueue()) {
+             idle = new FairBlockingQueue<PooledConnection>();
+             //idle = new MultiLockFairBlockingQueue<PooledConnection>();
++            //idle = new LinkedTransferQueue<PooledConnection>();
++            //idle = new ArrayBlockingQueue<PooledConnection>(properties.getMaxActive(),false);
+         } else {
+             idle = new ArrayBlockingQueue<PooledConnection>(properties.getMaxActive(),properties.isFairQueue());
+         }
+@@ -836,6 +841,7 @@ public class ConnectionPool {
+      * @return true if the connection should be closed
+      */
+     protected boolean shouldClose(PooledConnection con, int action) {
++        if (con.getConnectionVersion() < getPoolVersion()) return true;
+         if (con.isDiscarded()) return true;
+         if (isClosed()) return true;
+         if (!con.validate(action)) return true;
+@@ -954,11 +960,16 @@ public class ConnectionPool {
+      * {@link PoolProperties#maxIdle}, {@link PoolProperties#minIdle}, {@link PoolProperties#minEvictableIdleTimeMillis}
+      */
+     public void checkIdle() {
++        checkIdle(false);
++    }
++
++    public void checkIdle(boolean ignoreMinSize) {
++
+         try {
+             if (idle.size()==0) return;
+             long now = System.currentTimeMillis();
+             Iterator<PooledConnection> unlocked = idle.iterator();
+-            while ( (idle.size()>=getPoolProperties().getMinIdle()) && unlocked.hasNext()) {
++            while ( (ignoreMinSize || (idle.size()>=getPoolProperties().getMinIdle())) && unlocked.hasNext()) {
+                 PooledConnection con = unlocked.next();
+                 boolean setToNull = false;
+                 try {
+@@ -967,7 +978,7 @@ public class ConnectionPool {
+                     if (busy.contains(con))
+                         continue;
+                     long time = con.getTimestamp();
+-                    if ((con.getReleaseTime()>0) && ((now - time) > con.getReleaseTime()) && (getSize()>getPoolProperties().getMinIdle())) {
++                    if (shouldReleaseIdle(now, con, time)) {
+                         release(con);
+                         idle.remove(con);
+                         setToNull = true;
+@@ -988,6 +999,12 @@ public class ConnectionPool {
+ 
+     }
+ 
++
++    protected boolean shouldReleaseIdle(long now, PooledConnection con, long time) {
++        if (con.getConnectionVersion() < getPoolVersion()) return true;
++        else return (con.getReleaseTime()>0) && ((now - time) > con.getReleaseTime()) && (getSize()>getPoolProperties().getMinIdle());
++    }
++
+     /**
+      * Forces a validation of all idle connections if {@link PoolProperties#testWhileIdle} is set.
+      */
+@@ -1057,6 +1074,27 @@ public class ConnectionPool {
+         return con;
+     }
+ 
++    /**
++     * Purges all connections in the pool.
++     * For connections currently in use, these connections will be
++     * purged when returned on the pool. This call also
++     * purges connections that are idle and in the pool
++     * To only purge used/active connections see {@link #purgeOnReturn()}
++     */
++    public void purge() {
++        purgeOnReturn();
++        checkIdle(true);
++    }
++
++    /**
++     * Purges connections when they are returned from the pool.
++     * This call does not purge idle connections until they are used.
++     * To purge idle connections see {@link #purge()}
++     */
++    public void purgeOnReturn() {
++        poolVersion.incrementAndGet();
++    }
++
+     /**
+      * Hook to perform final actions on a pooled connection object once it has been disconnected and will be discarded
+      * @param con
+@@ -1252,6 +1290,10 @@ public class ConnectionPool {
+         return Collections.<TimerTask>unmodifiableSet(cleaners);
+     }
+ 
++    public long getPoolVersion() {
++        return poolVersion.get();
++    }
++
+     public static Timer getPoolTimer() {
+         return poolCleanTimer;
+     }
+
+==================================================
+PooledConnection.java
+index 1892a5aca2..19331718a7 100644
+--- a/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/DataSourceProxy.java
++++ b/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/DataSourceProxy.java
+@@ -1288,4 +1288,26 @@ public class DataSourceProxy implements PoolConfiguration {
+         getPoolProperties().setPropagateInterruptState(propagateInterruptState);
+     }
+ 
++    /**
++     * {@inheritDoc}
++     */
++    public void purge()  {
++        try {
++            createPool().purge();
++        }catch (SQLException x) {
++            log.error("Unable to purge pool.",x);
++        }
++    }
++
++    /**
++     * {@inheritDoc}
++     */
++    public void purgeOnReturn() {
++        try {
++            createPool().purgeOnReturn();
++        }catch (SQLException x) {
++            log.error("Unable to purge pool.",x);
++        }
++    }
++
+ }
+
+==================================================
+ConnectionPool.java
+index d5797ca5f6..991d097f35 100644
+--- a/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/PooledConnection.java
++++ b/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/PooledConnection.java
+@@ -104,6 +104,8 @@ public class PooledConnection {
+ 
+     private HashMap<Object, Object> attributes = new HashMap<Object, Object>();
+ 
++    private volatile long connectionVersion=0;
++
+     /**
+      * Weak reference to cache the list of interceptors for this connection
+      * so that we don't create a new list of interceptors each time we borrow
+@@ -125,6 +127,11 @@ public class PooledConnection {
+     public PooledConnection(PoolConfiguration prop, ConnectionPool parent) {
+         poolProperties = prop;
+         this.parent = parent;
++        connectionVersion = parent.getPoolVersion();
++    }
++
++    public long getConnectionVersion() {
++        return connectionVersion;
+     }
+ 
+     public boolean checkUser(String username, String password) {
+
+==================================================
+ConnectionPoolMBean.java
+index ccf7b08e20..17f1c65a46 100644
+--- a/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/jmx/ConnectionPool.java
++++ b/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/jmx/ConnectionPool.java
+@@ -828,6 +828,26 @@ public class ConnectionPool extends NotificationBroadcasterSupport implements Co
+         getPoolProperties().setPropagateInterruptState(propagateInterruptState);
+     }
+ 
++    /**
++     * {@inheritDoc}
++     */
++    @Override
++    public void purge() {
++        pool.purge();
++
++    }
++
++    /**
++     * {@inheritDoc}
++     */
++    @Override
++    public void purgeOnReturn() {
++        pool.purgeOnReturn();
++
++    }
++
++
++
+ 
+ 
+ }
+
+==================================================
+PoolPurgeTest.java
+index 5a9ed6ab0f..aad592de72 100644
+--- a/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/jmx/ConnectionPoolMBean.java
++++ b/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/jmx/ConnectionPoolMBean.java
+@@ -44,6 +44,22 @@ public interface ConnectionPoolMBean extends PoolConfiguration  {
+ 
+     public void testIdle();
+ 
++    /**
++     * Purges all connections in the pool.
++     * For connections currently in use, these connections will be
++     * purged when returned on the pool. This call also
++     * purges connections that are idle and in the pool
++     * To only purge used/active connections see {@link #purgeOnReturn()}
++     */
++    public void purge();
++
++    /**
++     * Purges connections when they are returned from the pool.
++     * This call does not purge idle connections until they are used.
++     * To purge idle connections see {@link #purge()}
++     */
++    public void purgeOnReturn();
++
+     //=================================================================
+     //       POOL NOTIFICATIONS
+     //=================================================================
+
+==================================================

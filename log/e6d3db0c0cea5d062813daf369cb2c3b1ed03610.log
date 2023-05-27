@@ -1,0 +1,135 @@
+e6d3db0c0cea5d062813daf369cb2c3b1ed03610
+==================================================
+When performing an HTTP/1.1 upgrade to HTTP/2 (h2c) ensure that the hostname and port from the HTTP/1.1 Host header of the upgraded request are made available via the standard methods ServletRequest.getServerName() and ServletRequest.getServerPort()
+==================================================
+Mark Thomas
+==================================================
+Thu Feb 7 17:34:46 2019 +0000
+==================================================
+Stream.java
+When performing an HTTP/1.1 upgrade to HTTP/2 (h2c) ensure that the hostname and port from the HTTP/1.1 Host header of the upgraded request are made available via the standard methods ServletRequest.getServerName() and ServletRequest.getServerPort()
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1853152 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Http2TestBase.java
+index e876997181..95c2101345 100644
+--- a/java/org/apache/coyote/http2/Stream.java
++++ b/java/org/apache/coyote/http2/Stream.java
+@@ -103,8 +103,19 @@ class Stream extends AbstractStream implements HeaderEmitter {
+             // HTTP/1.1 upgrade
+             this.coyoteRequest = coyoteRequest;
+             this.inputBuffer = null;
+-            // Headers have been populated by this point
++            // Headers have been read by this point
+             state.receivedStartOfHeaders();
++            // Populate coyoteRequest from headers
++            try {
++                prepareRequest();
++            } catch (IllegalArgumentException iae) {
++                // Something in the headers is invalid
++                // Set correct return status
++                coyoteResponse.setStatus(400);
++                // Set error flag. This triggers error processing rather than
++                // the normal mapping
++                coyoteResponse.setError();
++            }
+             // TODO Assuming the body has been read at this point is not valid
+             state.receivedEndOfStream();
+         }
+@@ -118,6 +129,44 @@ class Stream extends AbstractStream implements HeaderEmitter {
+     }
+ 
+ 
++    private void prepareRequest() {
++        MessageBytes hostValueMB = coyoteRequest.getMimeHeaders().getUniqueValue("host");
++        if (hostValueMB == null) {
++            throw new IllegalArgumentException();
++        }
++        // This processing expects bytes. Server push will have used a String
++        // to trigger a conversion if required.
++        hostValueMB.toBytes();
++        ByteChunk valueBC = hostValueMB.getByteChunk();
++        byte[] valueB = valueBC.getBytes();
++        int valueL = valueBC.getLength();
++        int valueS = valueBC.getStart();
++
++        int colonPos = Host.parse(hostValueMB);
++        if (colonPos != -1) {
++            int port = 0;
++            for (int i = colonPos + 1; i < valueL; i++) {
++                char c = (char) valueB[i + valueS];
++                if (c < '0' || c > '9') {
++                    throw new IllegalArgumentException();
++                }
++                port = port * 10 + c - '0';
++            }
++            coyoteRequest.setServerPort(port);
++
++            // Only need to copy the host name up to the :
++            valueL = colonPos;
++        }
++
++        // Extract the host name
++        char[] hostNameC = new char[valueL];
++        for (int i = 0; i < valueL; i++) {
++            hostNameC[i] = (char) valueB[i + valueS];
++        }
++        coyoteRequest.serverName().setChars(hostNameC, 0, valueL);
++    }
++
++
+     final void rePrioritise(AbstractStream parent, boolean exclusive, int weight) {
+         if (log.isDebugEnabled()) {
+             log.debug(sm.getString("stream.reprioritisation.debug",
+
+==================================================
+TestHttp2InitialConnection.java
+index ccc19a9d16..3a0c8d92f1 100644
+--- a/test/org/apache/coyote/http2/Http2TestBase.java
++++ b/test/org/apache/coyote/http2/Http2TestBase.java
+@@ -476,25 +476,35 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+ 
+ 
+     protected String getCookieResponseTrace(int streamId, int cookieCount) {
+-        return getResponseBodyFrameTrace(streamId, "text/plain;charset=UTF-8",
++        return getResponseBodyFrameTrace(streamId, 200, "text/plain;charset=UTF-8", null,
+                 "Cookie count: " + cookieCount, null);
+     }
+ 
+ 
+-    private String getResponseBodyFrameTrace(int streamId, String body) {
+-        return getResponseBodyFrameTrace(streamId, "application/octet-stream", body, body);
++    protected String getResponseBodyFrameTrace(int streamId, String body) {
++        return getResponseBodyFrameTrace(streamId, 200, "application/octet-stream", null, body, body);
+     }
+ 
+-    private String getResponseBodyFrameTrace(int streamId, String contentType, String body, String cl) {
++
++    protected String getResponseBodyFrameTrace(int streamId, int status, String contentType,
++            String contentLanguage, String body, String cl) {
+         StringBuilder result = new StringBuilder();
+         result.append(streamId);
+         result.append("-HeadersStart\n");
+         result.append(streamId);
+-        result.append("-Header-[:status]-[200]\n");
++        result.append("-Header-[:status]-[");
++        result.append(status);
++        result.append("]\n");
+         result.append(streamId);
+         result.append("-Header-[content-type]-[");
+         result.append(contentType);
+         result.append("]\n");
++        if (contentLanguage != null) {
++            result.append(streamId);
++            result.append("-Header-[content-language]-[");
++            result.append(contentLanguage);
++            result.append("]\n");
++        }
+         if (cl != null) {
+             result.append(streamId);
+             result.append("-Header-[content-length]-[");
+
+==================================================

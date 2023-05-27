@@ -1,0 +1,972 @@
+d6f68b124d917154508706eb5ace8cdd16bf3fe5
+==================================================
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=46264
+==================================================
+Mark Emlyn
+==================================================
+Fri Oct 28 07:37:34 2011 +0000
+==================================================
+Container.java
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=46264
+Implement threaded start/stop for containers
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1190185 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Host.java
+index 138cb8b3ae..be227bc00f 100644
+--- a/java/org/apache/catalina/Container.java
++++ b/java/org/apache/catalina/Container.java
+@@ -461,4 +461,21 @@ public interface Container extends Lifecycle {
+      * that the request/response still appears in the correct access logs.
+      */
+     public AccessLog getAccessLog();
++
++
++    /**
++     * Returns the number of threads available for starting and stopping any
++     * children associated with this container. This allows start/stop calls to
++     * children to be processed in parallel.
++     */
++    public int getStartStopThreads();
++
++
++    /**
++     * Sets the number of threads available for starting and stopping any
++     * children associated with this container. This allows start/stop calls to
++     * children to be processed in parallel.
++     * @param   startStopThreads    The new number of threads to be used
++     */
++    public void setStartStopThreads(int startStopThreads);
+ }
+
+==================================================
+ContainerBase.java
+index 3d496af95c..b582aba05f 100644
+--- a/java/org/apache/catalina/Host.java
++++ b/java/org/apache/catalina/Host.java
+@@ -17,6 +17,7 @@
+ package org.apache.catalina;
+ 
+ import java.io.File;
++import java.util.concurrent.ExecutorService;
+ import java.util.regex.Pattern;
+ 
+ 
+@@ -180,9 +181,16 @@ public interface Host extends Container {
+     public void setDeployIgnore(String deployIgnore);
+ 
+ 
+-    // --------------------------------------------------------- Public Methods
++    /**
++     * Return the executor that is used for starting and stopping contexts. This
++     * is primarily for use by components deploying contexts that want to do
++     * this in a multi-threaded manner.
++     */
++    public ExecutorService getStartStopExecutor();
+ 
+ 
++    // --------------------------------------------------------- Public Methods
++
+     /**
+      * Add an alias name that should be mapped to this same Host.
+      *
+
+==================================================
+StandardContext.java
+index 3a4f3a03c4..7bb5642d54 100644
+--- a/java/org/apache/catalina/core/LocalStrings.properties
++++ b/java/org/apache/catalina/core/LocalStrings.properties
+@@ -53,6 +53,8 @@ aprListener.sslInit=Failed to initialize the SSLEngine.
+ aprListener.tcnValid=Loaded APR based Apache Tomcat Native library {0}.
+ aprListener.flags=APR capabilities: IPv6 [{0}], sendfile [{1}], accept filters [{2}], random [{3}].
+ asyncContextImpl.requestEnded=The request associated with the AsyncContext has already completed processing.
++containerBase.threadedStartFailed=A child container failed during start
++containerBase.threadedStopFailed=A child container failed during stop
+ containerBase.backgroundProcess.cluster=Exception processing cluster {0} background process
+ containerBase.backgroundProcess.loader=Exception processing loader {0} background process
+ containerBase.backgroundProcess.manager=Exception processing manager {0} background process
+
+==================================================
+StandardHost.java
+index 7419bab0a0..c9e55177f9 100644
+--- a/java/org/apache/catalina/core/StandardContext.java
++++ b/java/org/apache/catalina/core/StandardContext.java
+@@ -37,7 +37,6 @@ import java.util.Map;
+ import java.util.Set;
+ import java.util.Stack;
+ import java.util.TreeMap;
+-import java.util.concurrent.Callable;
+ import java.util.concurrent.atomic.AtomicLong;
+ 
+ import javax.management.ListenerNotFoundException;
+@@ -118,7 +117,6 @@ import org.apache.tomcat.JarScanner;
+ import org.apache.tomcat.util.ExceptionUtils;
+ import org.apache.tomcat.util.modeler.Registry;
+ import org.apache.tomcat.util.scan.StandardJarScanner;
+-import org.apache.tomcat.util.threads.DedicatedThreadExecutor;
+ 
+ /**
+  * Standard implementation of the <b>Context</b> interface.  Each
+@@ -5101,9 +5099,7 @@ public class StandardContext extends ContainerBase
+             }
+         }
+ 
+-        DedicatedThreadExecutor temporaryExecutor = new DedicatedThreadExecutor();
+         try {
+-
+             // Create context attributes that will be required
+             if (ok) {
+                 getServletContext().setAttribute(
+@@ -5128,22 +5124,7 @@ public class StandardContext extends ContainerBase
+ 
+             // Configure and call application event listeners
+             if (ok) {
+-                // we do it in a dedicated thread for memory leak protection, in
+-                // case the Listeners registers some ThreadLocals that they
+-                // forget to cleanup
+-                Boolean listenerStarted =
+-                    temporaryExecutor.execute(new Callable<Boolean>() {
+-                        @Override
+-                        public Boolean call() throws Exception {
+-                            ClassLoader old = bindThread();
+-                            try {
+-                                return Boolean.valueOf(listenerStart());
+-                            } finally {
+-                                unbindThread(old);
+-                            }
+-                        }
+-                    });
+-                if (!listenerStarted.booleanValue()) {
++                if (!listenerStart()) {
+                     log.error( "Error listenerStart");
+                     ok = false;
+                 }
+@@ -5164,22 +5145,7 @@ public class StandardContext extends ContainerBase
+ 
+             // Configure and call application filters
+             if (ok) {
+-                // we do it in a dedicated thread for memory leak protection, in
+-                // case the Filters register some ThreadLocals that they forget
+-                // to cleanup
+-                Boolean filterStarted =
+-                    temporaryExecutor.execute(new Callable<Boolean>() {
+-                        @Override
+-                        public Boolean call() throws Exception {
+-                            ClassLoader old = bindThread();
+-                            try {
+-                                return Boolean.valueOf(filterStart());
+-                            } finally {
+-                                unbindThread(old);
+-                            }
+-                        }
+-                    });
+-                if (!filterStarted.booleanValue()) {
++                if (!filterStart()) {
+                     log.error("Error filterStart");
+                     ok = false;
+                 }
+@@ -5187,27 +5153,12 @@ public class StandardContext extends ContainerBase
+ 
+             // Load and initialize all "load on startup" servlets
+             if (ok) {
+-                // we do it in a dedicated thread for memory leak protection, in
+-                // case the Servlets register some ThreadLocals that they forget
+-                // to cleanup
+-                temporaryExecutor.execute(new Callable<Void>() {
+-                    @Override
+-                    public Void call() throws Exception {
+-                        ClassLoader old = bindThread();
+-                        try {
+-                            loadOnStartup(findChildren());
+-                            return null;
+-                        } finally {
+-                            unbindThread(old);
+-                        }
+-                    }
+-                });
++                loadOnStartup(findChildren());
+             }
+ 
+         } finally {
+             // Unbinding thread
+             unbindThread(oldCCL);
+-            temporaryExecutor.shutdown();
+         }
+ 
+         // Set available status depending upon startup success
+@@ -5347,61 +5298,28 @@ public class StandardContext extends ContainerBase
+ 
+             // Stop our child containers, if any
+             final Container[] children = findChildren();
+-            // we do it in a dedicated thread for memory leak protection, in
+-            // case some webapp code registers some ThreadLocals that they
+-            // forget to cleanup
+-            // TODO Figure out why DedicatedThreadExecutor hangs randomly in the
+-            //      unit tests if used here
+-            RunnableWithLifecycleException stop =
+-                    new RunnableWithLifecycleException() {
+-                @Override
+-                public void run() {
+-                    ClassLoader old = bindThread();
+-                    try {
+-                        for (int i = 0; i < children.length; i++) {
+-                            try {
+-                                children[i].stop();
+-                            } catch (LifecycleException e) {
+-                                le = e;
+-                                return;
+-                            }
+-                        }
+ 
+-                        // Stop our filters
+-                        filterStop();
++            ClassLoader old = bindThread();
++            try {
++                for (int i = 0; i < children.length; i++) {
++                    children[i].stop();
++                }
+ 
+-                        // Stop ContainerBackgroundProcessor thread
+-                        threadStop();
++                // Stop our filters
++                filterStop();
+ 
+-                        if (manager != null && manager instanceof Lifecycle &&
+-                                ((Lifecycle) manager).getState().isAvailable()) {
+-                            try {
+-                                ((Lifecycle) manager).stop();
+-                            } catch (LifecycleException e) {
+-                                le = e;
+-                                return;
+-                            }
+-                        }
++                // Stop ContainerBackgroundProcessor thread
++                threadStop();
+ 
+-                        // Stop our application listeners
+-                        listenerStop();
+-                    }finally{
+-                        unbindThread(old);
+-                    }
++                if (manager != null && manager instanceof Lifecycle &&
++                        ((Lifecycle) manager).getState().isAvailable()) {
++                    ((Lifecycle) manager).stop();
+                 }
+-            };
+ 
+-            Thread t = new Thread(stop);
+-            t.setName("stop children - " + getObjectName().toString());
+-            t.start();
+-            try {
+-                t.join();
+-            } catch (InterruptedException e) {
+-                // Shouldn't happen
+-                throw new LifecycleException(e);
+-            }
+-            if (stop.getLifecycleException() != null) {
+-                throw stop.getLifecycleException();
++                // Stop our application listeners
++                listenerStop();
++            } finally{
++                unbindThread(old);
+             }
+ 
+             // Finalize our character set mapper
+@@ -6396,14 +6314,4 @@ public class StandardContext extends ContainerBase
+     public long getStartTime() {
+         return startTime;
+     }
+-
+-    private abstract static class RunnableWithLifecycleException
+-            implements Runnable {
+-
+-        protected LifecycleException le = null;
+-
+-        public LifecycleException getLifecycleException() {
+-            return le;
+-        }
+-    }
+ }
+
+==================================================
+ContextConfig.java
+index caa259cd3d..54b7980e31 100644
+--- a/java/org/apache/catalina/core/mbeans-descriptors.xml
++++ b/java/org/apache/catalina/core/mbeans-descriptors.xml
+@@ -1011,6 +1011,10 @@
+                description="Will children be started automatically when they are added."
+                type="boolean"/>
+ 
++    <attribute name="startStopThreads"
++               description="The number of threads to use when starting and stopping child Hosts"
++               type="int"/>
++
+     <attribute name="stateName"
+                description="The name of the LifecycleState that this component is currently in"
+                type="java.lang.String"
+@@ -1198,6 +1202,10 @@
+                description="Will children be started automatically when they are added?"
+                type="boolean"/>
+ 
++    <attribute name="startStopThreads"
++               description="The number of threads to use when starting, stopping and deploying child Contexts"
++               type="int"/>
++
+     <attribute name="stateName"
+                description="The name of the LifecycleState that this component is currently in"
+                type="java.lang.String"
+
+==================================================
+HostConfig.java
+index 09785783e2..b1f81a75a7 100644
+--- a/java/org/apache/catalina/startup/ContextConfig.java
++++ b/java/org/apache/catalina/startup/ContextConfig.java
+@@ -127,12 +127,6 @@ public class ContextConfig
+     protected static final LoginConfig DUMMY_LOGIN_CONFIG =
+         new LoginConfig("NONE", null, null, null);
+ 
+-    /**
+-     * The <code>Digester</code> we will use to process web application
+-     * context files.
+-     */
+-    protected static Digester contextDigester = null;
+-
+ 
+     /**
+      * The set of Authenticators that we know how to configure.  The key is
+@@ -142,32 +136,6 @@ public class ContextConfig
+     protected static Properties authenticators = null;
+ 
+ 
+-    /**
+-     * The <code>Digester</code>s available to process web deployment descriptor
+-     * files.
+-     */
+-    protected static Digester[] webDigesters = new Digester[4];
+-
+-
+-    /**
+-     * The <code>Digester</code>s available to process web fragment deployment
+-     * descriptor files.
+-     */
+-    protected static Digester[] webFragmentDigesters = new Digester[4];
+-
+-
+-    /**
+-     * The <code>Rule</code>s used to parse the web.xml
+-     */
+-    protected static WebRuleSet webRuleSet = new WebRuleSet(false);
+-
+-
+-    /**
+-     * The <code>Rule</code>s used to parse the web-fragment.xml
+-     */
+-    protected static WebRuleSet webFragmentRuleSet = new WebRuleSet(true);
+-
+-
+     /**
+      * Deployment count.
+      */
+@@ -236,12 +204,14 @@ public class ContextConfig
+      * deployment descriptor files.
+      */
+     protected Digester webDigester = null;
++    protected WebRuleSet webRuleSet = null;
+ 
+     /**
+      * The <code>Digester</code> we will use to process web fragment
+      * deployment descriptor files.
+      */
+     protected Digester webFragmentDigester = null;
++    protected WebRuleSet webFragmentRuleSet = null;
+ 
+ 
+     // ------------------------------------------------------------- Properties
+@@ -486,60 +456,21 @@ public class ContextConfig
+ 
+ 
+     /**
+-     * Create (if necessary) and return a Digester configured to process the
++     * Create and return a Digester configured to process the
+      * web application deployment descriptor (web.xml).
+      */
+     public void createWebXmlDigester(boolean namespaceAware,
+             boolean validation) {
+ 
+-        if (!namespaceAware && !validation) {
+-            if (webDigesters[0] == null) {
+-                webDigesters[0] = DigesterFactory.newDigester(validation,
+-                        namespaceAware, webRuleSet);
+-                webFragmentDigesters[0] = DigesterFactory.newDigester(validation,
+-                        namespaceAware, webFragmentRuleSet);
+-                webDigesters[0].getParser();
+-                webFragmentDigesters[0].getParser();
+-            }
+-            webDigester = webDigesters[0];
+-            webFragmentDigester = webFragmentDigesters[0];
+-
+-        } else if (!namespaceAware && validation) {
+-            if (webDigesters[1] == null) {
+-                webDigesters[1] = DigesterFactory.newDigester(validation,
+-                        namespaceAware, webRuleSet);
+-                webFragmentDigesters[1] = DigesterFactory.newDigester(validation,
+-                        namespaceAware, webFragmentRuleSet);
+-                webDigesters[1].getParser();
+-                webFragmentDigesters[1].getParser();
+-            }
+-            webDigester = webDigesters[1];
+-            webFragmentDigester = webFragmentDigesters[1];
+-
+-        } else if (namespaceAware && !validation) {
+-            if (webDigesters[2] == null) {
+-                webDigesters[2] = DigesterFactory.newDigester(validation,
+-                        namespaceAware, webRuleSet);
+-                webFragmentDigesters[2] = DigesterFactory.newDigester(validation,
+-                        namespaceAware, webFragmentRuleSet);
+-                webDigesters[2].getParser();
+-                webFragmentDigesters[2].getParser();
+-            }
+-            webDigester = webDigesters[2];
+-            webFragmentDigester = webFragmentDigesters[2];
++        webRuleSet = new WebRuleSet(false);
++        webDigester = DigesterFactory.newDigester(validation,
++                namespaceAware, webRuleSet);
++        webDigester.getParser();
+ 
+-        } else {
+-            if (webDigesters[3] == null) {
+-                webDigesters[3] = DigesterFactory.newDigester(validation,
+-                        namespaceAware, webRuleSet);
+-                webFragmentDigesters[3] = DigesterFactory.newDigester(validation,
+-                        namespaceAware, webFragmentRuleSet);
+-                webDigesters[3].getParser();
+-                webFragmentDigesters[3].getParser();
+-            }
+-            webDigester = webDigesters[3];
+-            webFragmentDigester = webFragmentDigesters[3];
+-        }
++        webFragmentRuleSet = new WebRuleSet(true);
++        webFragmentDigester = DigesterFactory.newDigester(validation,
++                namespaceAware, webFragmentRuleSet);
++        webFragmentDigester.getParser();
+     }
+ 
+ 
+@@ -577,7 +508,7 @@ public class ContextConfig
+     /**
+      * Process the default configuration file, if it exists.
+      */
+-    protected void contextConfig() {
++    protected void contextConfig(Digester digester) {
+ 
+         // Open the default context.xml file, if it exists
+         if( defaultContextXml==null && context instanceof StandardContext ) {
+@@ -596,7 +527,7 @@ public class ContextConfig
+             if (defaultContextFile.exists()) {
+                 try {
+                     URL defaultContextUrl = defaultContextFile.toURI().toURL();
+-                    processContextConfig(defaultContextUrl);
++                    processContextConfig(digester, defaultContextUrl);
+                 } catch (MalformedURLException e) {
+                     log.error(sm.getString(
+                             "contextConfig.badUrl", defaultContextFile), e);
+@@ -608,7 +539,7 @@ public class ContextConfig
+             if (hostContextFile.exists()) {
+                 try {
+                     URL hostContextUrl = hostContextFile.toURI().toURL();
+-                    processContextConfig(hostContextUrl);
++                    processContextConfig(digester, hostContextUrl);
+                 } catch (MalformedURLException e) {
+                     log.error(sm.getString(
+                             "contextConfig.badUrl", hostContextFile), e);
+@@ -616,7 +547,7 @@ public class ContextConfig
+             }
+         }
+         if (context.getConfigFile() != null) {
+-            processContextConfig(context.getConfigFile());
++            processContextConfig(digester, context.getConfigFile());
+         }
+ 
+     }
+@@ -625,7 +556,7 @@ public class ContextConfig
+     /**
+      * Process a context.xml.
+      */
+-    protected void processContextConfig(URL contextXml) {
++    protected void processContextConfig(Digester digester, URL contextXml) {
+ 
+         if (log.isDebugEnabled()) {
+             log.debug("Processing context [" + context.getName()
+@@ -653,45 +584,43 @@ public class ContextConfig
+         if (source == null) {
+             return;
+         }
+-        synchronized (contextDigester) {
+-            try {
+-                source.setByteStream(stream);
+-                contextDigester.setClassLoader(this.getClass().getClassLoader());
+-                contextDigester.setUseContextClassLoader(false);
+-                contextDigester.push(context.getParent());
+-                contextDigester.push(context);
+-                XmlErrorHandler errorHandler = new XmlErrorHandler();
+-                contextDigester.setErrorHandler(errorHandler);
+-                contextDigester.parse(source);
+-                if (errorHandler.getWarnings().size() > 0 ||
+-                        errorHandler.getErrors().size() > 0) {
+-                    errorHandler.logFindings(log, contextXml.toString());
+-                    ok = false;
+-                }
+-                if (log.isDebugEnabled()) {
+-                    log.debug("Successfully processed context [" + context.getName()
+-                            + "] configuration file [" + contextXml + "]");
+-                }
+-            } catch (SAXParseException e) {
+-                log.error(sm.getString("contextConfig.contextParse",
+-                        context.getName()), e);
+-                log.error(sm.getString("contextConfig.defaultPosition",
+-                                 "" + e.getLineNumber(),
+-                                 "" + e.getColumnNumber()));
+-                ok = false;
+-            } catch (Exception e) {
+-                log.error(sm.getString("contextConfig.contextParse",
+-                        context.getName()), e);
++
++        try {
++            source.setByteStream(stream);
++            digester.setClassLoader(this.getClass().getClassLoader());
++            digester.setUseContextClassLoader(false);
++            digester.push(context.getParent());
++            digester.push(context);
++            XmlErrorHandler errorHandler = new XmlErrorHandler();
++            digester.setErrorHandler(errorHandler);
++            digester.parse(source);
++            if (errorHandler.getWarnings().size() > 0 ||
++                    errorHandler.getErrors().size() > 0) {
++                errorHandler.logFindings(log, contextXml.toString());
+                 ok = false;
+-            } finally {
+-                contextDigester.reset();
+-                try {
+-                    if (stream != null) {
+-                        stream.close();
+-                    }
+-                } catch (IOException e) {
+-                    log.error(sm.getString("contextConfig.contextClose"), e);
++            }
++            if (log.isDebugEnabled()) {
++                log.debug("Successfully processed context [" + context.getName()
++                        + "] configuration file [" + contextXml + "]");
++            }
++        } catch (SAXParseException e) {
++            log.error(sm.getString("contextConfig.contextParse",
++                    context.getName()), e);
++            log.error(sm.getString("contextConfig.defaultPosition",
++                             "" + e.getLineNumber(),
++                             "" + e.getColumnNumber()));
++            ok = false;
++        } catch (Exception e) {
++            log.error(sm.getString("contextConfig.contextParse",
++                    context.getName()), e);
++            ok = false;
++        } finally {
++            try {
++                if (stream != null) {
++                    stream.close();
+                 }
++            } catch (IOException e) {
++                log.error(sm.getString("contextConfig.contextClose"), e);
+             }
+         }
+     }
+@@ -846,10 +775,8 @@ public class ContextConfig
+     protected void init() {
+         // Called from StandardContext.init()
+ 
+-        if (contextDigester == null){
+-            contextDigester = createContextDigester();
+-            contextDigester.getParser();
+-        }
++        Digester contextDigester = createContextDigester();
++        contextDigester.getParser();
+ 
+         if (log.isDebugEnabled()) {
+             log.debug(sm.getString("contextConfig.init"));
+@@ -857,7 +784,7 @@ public class ContextConfig
+         context.setConfigured(false);
+         ok = true;
+ 
+-        contextConfig();
++        contextConfig(contextDigester);
+ 
+         createWebXmlDigester(context.getXmlNamespaceAware(),
+                 context.getXmlValidation());
+@@ -1416,8 +1343,9 @@ public class ContextConfig
+         }
+ 
+         // Parsing global web.xml is relatively expensive. Use a sync block to
+-        // make sure it only happens once
+-        synchronized (host) {
++        // make sure it only happens once. Use the pipeline since a lock will
++        // already be held on the host by another thread
++        synchronized (host.getPipeline()) {
+             entry = hostWebXmlCache.get(host);
+             if (entry != null && entry.getGlobalTimeStamp() == globalTimeStamp &&
+                     entry.getHostTimeStamp() == hostTimeStamp) {
+@@ -1679,7 +1607,6 @@ public class ContextConfig
+         return getWebXmlSource(defaultWebXml, getBaseDir());
+     }
+ 
+-
+     /**
+      * Identify the host web.xml to be used and obtain an input source for
+      * it.
+@@ -1806,9 +1733,6 @@ public class ContextConfig
+ 
+         XmlErrorHandler handler = new XmlErrorHandler();
+ 
+-        // Web digesters and rulesets are shared between contexts but are not
+-        // thread safe. Whilst there should only be one thread at a time
+-        // processing a config, play safe and sync.
+         Digester digester;
+         WebRuleSet ruleSet;
+         if (fragment) {
+@@ -1819,41 +1743,36 @@ public class ContextConfig
+             ruleSet = webRuleSet;
+         }
+ 
+-        // Sync on the ruleSet since the same ruleSet is shared across all four
+-        // digesters
+-        synchronized(ruleSet) {
++        digester.push(dest);
++        digester.setErrorHandler(handler);
+ 
+-            digester.push(dest);
+-            digester.setErrorHandler(handler);
+-
+-            if(log.isDebugEnabled()) {
+-                log.debug(sm.getString("contextConfig.applicationStart",
+-                        source.getSystemId()));
+-            }
++        if(log.isDebugEnabled()) {
++            log.debug(sm.getString("contextConfig.applicationStart",
++                    source.getSystemId()));
++        }
+ 
+-            try {
+-                digester.parse(source);
++        try {
++            digester.parse(source);
+ 
+-                if (handler.getWarnings().size() > 0 ||
+-                        handler.getErrors().size() > 0) {
+-                    ok = false;
+-                    handler.logFindings(log, source.getSystemId());
+-                }
+-            } catch (SAXParseException e) {
+-                log.error(sm.getString("contextConfig.applicationParse",
+-                        source.getSystemId()), e);
+-                log.error(sm.getString("contextConfig.applicationPosition",
+-                                 "" + e.getLineNumber(),
+-                                 "" + e.getColumnNumber()));
++            if (handler.getWarnings().size() > 0 ||
++                    handler.getErrors().size() > 0) {
+                 ok = false;
+-            } catch (Exception e) {
+-                log.error(sm.getString("contextConfig.applicationParse",
+-                        source.getSystemId()), e);
+-                ok = false;
+-            } finally {
+-                digester.reset();
+-                ruleSet.recycle();
+-            }
++                handler.logFindings(log, source.getSystemId());
++            }
++        } catch (SAXParseException e) {
++            log.error(sm.getString("contextConfig.applicationParse",
++                    source.getSystemId()), e);
++            log.error(sm.getString("contextConfig.applicationPosition",
++                             "" + e.getLineNumber(),
++                             "" + e.getColumnNumber()));
++            ok = false;
++        } catch (Exception e) {
++            log.error(sm.getString("contextConfig.applicationParse",
++                    source.getSystemId()), e);
++            ok = false;
++        } finally {
++            digester.reset();
++            ruleSet.recycle();
+         }
+     }
+ 
+@@ -2244,7 +2163,8 @@ public class ContextConfig
+ 
+     /**
+      * process filter annotation and merge with existing one!
+-     * FIXME: refactoring method to long and has redundant subroutines with processAnnotationWebServlet!
++     * FIXME: refactoring method too long and has redundant subroutines with
++     *        processAnnotationWebServlet!
+      * @param className
+      * @param ae
+      * @param fragment
+
+==================================================
+AbstractProtocol.java
+index 4e082be29a..f77713c40b 100644
+--- a/java/org/apache/catalina/startup/LocalStrings.properties
++++ b/java/org/apache/catalina/startup/LocalStrings.properties
+@@ -80,11 +80,19 @@ hostConfig.context.restart=Error during context [{0}] restart
+ hostConfig.createDirs=Unable to create directory for deployment: {0}
+ hostConfig.deployDescriptor=Deploying configuration descriptor {0}
+ hostConfig.deployDescriptor.error=Error deploying configuration descriptor {0}
++hostConfig.deployDescriptor.threaded.error=Error waiting for multi-thread deployment of context descriptors to complete
+ hostConfig.deployDescriptor.localDocBaseSpecified=A docBase {0} inside the host appBase has been specified, and will be ignored
+ hostConfig.deployDir=Deploying web application directory {0}
+ hostConfig.deployDir.error=Error deploying web application directory {0}
++hostConfig.deployDir.threaded.error=Error waiting for multi-thread deployment of directories to completehostConfig.deployWar=Deploying web application archive {0}
+ hostConfig.deployWar=Deploying web application archive {0}
+ hostConfig.deployWar.error=Error deploying web application archive {0}
++hostConfig.deployWar.threaded.error=Error waiting for multi-thread deployment of WAR files to complete
++hostConfig.deploy.error=Exception while deploying web application directory {0}
++hostConfig.deploying=Deploying discovered web applications
++hostConfig.expand=Expanding web application archive {0}
++hostConfig.expand.error=Exception while expanding web application archive {0}
++hostConfig.expanding=Expanding discovered web application archives
+ hostConfig.ignorePath=Ignoring path [{0}] in appBase for automatic deployment
+ hostConfig.illegalWarName=The war name [{0}] is invalid. The archive will be ignored.
+ hostConfig.jmx.register=Register context [{0}] failed
+
+==================================================
+DedicatedThreadExecutor.java
+index 532cb08fae..8fed5c07d6 100644
+--- a/java/org/apache/coyote/AbstractProtocol.java
++++ b/java/org/apache/coyote/AbstractProtocol.java
+@@ -493,6 +493,12 @@ public abstract class AbstractProtocol implements ProtocolHandler,
+                 SocketStatus status) {
+             P processor = connections.remove(socket.getSocket());
+ 
++            if (getLog().isDebugEnabled()) {
++                getLog().debug("process() entry " +
++                        "Socket: [" + logHashcode(socket.getSocket()) + "], " +
++                        "Processor [" + logHashcode(processor) + "]");
++            }
++
+             socket.setAsync(false);
+ 
+             try {
+@@ -503,20 +509,51 @@ public abstract class AbstractProtocol implements ProtocolHandler,
+                     processor = createProcessor();
+                 }
+ 
++                if (getLog().isDebugEnabled()) {
++                    getLog().debug("process() gotProcessor " +
++                            "Socket: [" + logHashcode(socket.getSocket()) + "], " +
++                            "Processor [" + logHashcode(processor) + "]");
++                }
++
+                 initSsl(socket, processor);
+ 
+                 SocketState state = SocketState.CLOSED;
+                 do {
+                     if (processor.isAsync() || state == SocketState.ASYNC_END) {
+                         state = processor.asyncDispatch(status);
++                        if (getLog().isDebugEnabled()) {
++                            getLog().debug("process() asyncDispatch " +
++                                    "Socket: [" + logHashcode(socket.getSocket()) + "], " +
++                                    "Processor: [" + logHashcode(processor) + "], " +
++                                    "State: [" + state.toString() + "]");
++                        }
+                     } else if (processor.isComet()) {
+                         state = processor.event(status);
++                        if (getLog().isDebugEnabled()) {
++                            getLog().debug("process() event " +
++                                    "Socket: [" + logHashcode(socket.getSocket()) + "], " +
++                                    "Processor: [" + logHashcode(processor) + "], " +
++                                    "State: [" + state.toString() + "]");
++                        }
+                     } else {
+                         state = processor.process(socket);
++                        if (getLog().isDebugEnabled()) {
++                            getLog().debug("process() process " +
++                                    "Socket: [" + logHashcode(socket.getSocket()) + "], " +
++                                    "Processor: [" + logHashcode(processor) + "], " +
++                                    "State: [" + state.toString() + "]");
++                        }
+                     }
+ 
+                     if (state != SocketState.CLOSED && processor.isAsync()) {
+                         state = processor.asyncPostProcess();
++                        if (getLog().isDebugEnabled()) {
++                            getLog().debug("process() asyncPostProcess " +
++                                    "Socket: [" + logHashcode(socket.getSocket()) + "], " +
++                                    "Processor: [" + logHashcode(processor) + "], " +
++                                    "State: [" + state.toString() + "]");
++                        }
++
+                     }
+                 } while (state == SocketState.ASYNC_END);
+ 
+@@ -562,6 +599,14 @@ public abstract class AbstractProtocol implements ProtocolHandler,
+             return SocketState.CLOSED;
+         }
+ 
++        private String logHashcode (Object o) {
++            if (o == null) {
++                return "null";
++            } else {
++                return Integer.toString(o.hashCode());
++            }
++        }
++
+         protected abstract P createProcessor();
+         protected abstract void initSsl(SocketWrapper<S> socket, P processor);
+         protected abstract void longPoll(SocketWrapper<S> socket, P processor);
+
+==================================================
+DedicatedThreadExecutorTest.java
+deleted file mode 100644
+index 83ee8bab49..0000000000
+--- a/java/org/apache/tomcat/util/threads/DedicatedThreadExecutor.java
++++ /dev/null
+@@ -1,137 +0,0 @@
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package org.apache.tomcat.util.threads;
+-
+-import java.util.concurrent.Callable;
+-import java.util.concurrent.ExecutionException;
+-import java.util.concurrent.ExecutorService;
+-import java.util.concurrent.Executors;
+-import java.util.concurrent.Future;
+-import java.util.concurrent.ThreadFactory;
+-
+-/**
+- * A utility class to execute a {@link Callable} in a dedicated thread.
+- * It can be used either with an instance to reuse the same thread for each call
+- * to {@link #execute(Callable)} or with the static method
+- * {@link #executeInOwnThread(Callable)}. When using an instance,
+- * {@link #shutdown()} must be called when the instance is no longer needed to
+- * dispose of the dedicated thread.
+- */
+-public class DedicatedThreadExecutor {
+-    private final SingleThreadFactory singleThreadFactory =
+-        new SingleThreadFactory();
+-    private final ExecutorService executorService =
+-        Executors.newSingleThreadExecutor(singleThreadFactory);
+-
+-    /**
+-     * Executes the given {@link Callable} with the thread spawned for the
+-     * current {@link DedicatedThreadExecutor} instance, and returns its result.
+-     *
+-     * @param <V>
+-     *            the type of the returned value
+-     * @param callable
+-     * @return the completed result
+-     */
+-    public <V> V execute(final Callable<V> callable) {
+-        final Future<V> futureTask = executorService.submit(callable);
+-
+-        boolean interrupted = false;
+-        V result;
+-        while (true) {
+-            try {
+-                result = futureTask.get();
+-                break;
+-            } catch (InterruptedException e) {
+-                // keep waiting
+-                interrupted = true;
+-            } catch (ExecutionException e) {
+-                throw new RuntimeException(e);
+-            }
+-        }
+-        if (interrupted) {
+-            // set interruption status so that the caller may react to it
+-            Thread.currentThread().interrupt();
+-        }
+-        return result;
+-    }
+-
+-    /**
+-     * Stops the dedicated thread and waits for its death.
+-     */
+-    public void shutdown() {
+-        executorService.shutdown();
+-        if (singleThreadFactory.singleThread != null) {
+-            boolean interrupted = false;
+-            while (true) {
+-                try {
+-                    singleThreadFactory.singleThread.join();
+-                    singleThreadFactory.singleThread = null;
+-                    break;
+-                } catch (InterruptedException e) {
+-                    // keep waiting
+-                    interrupted = true;
+-                }
+-            }
+-            if (interrupted) {
+-                // set interruption status so that the caller may react to it
+-                Thread.currentThread().interrupt();
+-            }
+-        }
+-    }
+-
+-    /**
+-     * Executes the given {@link Callable} in a new thread and returns the
+-     * result after the thread is stopped.
+-     *
+-     * @param <V>
+-     * @param callable
+-     * @return the completed result
+-     */
+-    public static <V> V executeInOwnThread(
+-        final Callable<V> callable) {
+-        DedicatedThreadExecutor executor = new DedicatedThreadExecutor();
+-        try {
+-            return executor.execute(callable);
+-        } finally {
+-            executor.shutdown();
+-        }
+-
+-    }
+-
+-    // we use a ThreadFactory so that we can later call Thread.join().
+-    // Indeed, calling shutdown() on an ExecutorService will eventually stop the
+-    // thread but it might still be alive when execute() returns (race
+-    // condition).
+-    // This can lead to false alarms about potential memory leaks because the
+-    // thread may have a web application class loader for its context class
+-    // loader.
+-    private static class SingleThreadFactory implements ThreadFactory {
+-        private volatile Thread singleThread;
+-
+-        @Override
+-        public Thread newThread(Runnable r) {
+-            if (singleThread != null) {
+-                throw new IllegalStateException(
+-                    "should not have been called more than once");
+-            }
+-            singleThread = new Thread(r);
+-            singleThread.setDaemon(true);
+-            return singleThread;
+-        }
+-
+-    }
+-}
+
+==================================================

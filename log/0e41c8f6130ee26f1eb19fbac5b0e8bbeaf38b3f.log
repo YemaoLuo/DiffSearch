@@ -1,0 +1,191 @@
+0e41c8f6130ee26f1eb19fbac5b0e8bbeaf38b3f
+==================================================
+Fix BZ 65853 - refactor CsrfPreventionFilter to make extension easier
+==================================================
+Mark Thomas
+==================================================
+Mon May 9 18:34:52 2022 +0100
+==================================================
+CsrfPreventionFilter.java
+Fix BZ 65853 - refactor CsrfPreventionFilter to make extension easier
+
+
+==================================================
+CsrfPreventionFilterBase.java
+index 43af6eb8ae..1acf9dd329 100644
+--- a/java/org/apache/catalina/filters/CsrfPreventionFilter.java
++++ b/java/org/apache/catalina/filters/CsrfPreventionFilter.java
+@@ -118,25 +118,11 @@ public class CsrfPreventionFilter extends CsrfPreventionFilterBase {
+             HttpServletRequest req = (HttpServletRequest) request;
+             HttpServletResponse res = (HttpServletResponse) response;
+ 
+-            boolean skipNonceCheck = false;
+-
+-            if (Constants.METHOD_GET.equals(req.getMethod())
+-                    && entryPoints.contains(getRequestedPath(req))) {
+-                if(log.isTraceEnabled()) {
+-                    log.trace("Skipping CSRF nonce-check for GET request to entry point " + getRequestedPath(req));
+-                }
+-
+-                skipNonceCheck = true;
+-            }
+-
+             HttpSession session = req.getSession(false);
+ 
+-            @SuppressWarnings("unchecked")
+-            LruCache<String> nonceCache = (session == null) ? null
+-                    : (LruCache<String>) session.getAttribute(
+-                            Constants.CSRF_NONCE_SESSION_ATTR_NAME);
++            NonceCache<String> nonceCache = (session == null) ? null : getNonceCache(req, session);
+ 
+-            if (!skipNonceCheck) {
++            if (!skipNonceCheck(req)) {
+                 String previousNonce =
+                     req.getParameter(nonceRequestParameterName);
+ 
+@@ -182,7 +168,6 @@ public class CsrfPreventionFilter extends CsrfPreventionFilterBase {
+                     log.debug("Creating new CSRF nonce cache with size=" + nonceCacheSize + " for session " + (null == session ? "(will create)" : session.getId()));
+                 }
+ 
+-                nonceCache = new LruCache<>(nonceCacheSize);
+                 if (session == null) {
+                     if(log.isDebugEnabled()) {
+                          log.debug("Creating new session to store CSRF nonce cache");
+@@ -190,11 +175,11 @@ public class CsrfPreventionFilter extends CsrfPreventionFilterBase {
+ 
+                     session = req.getSession(true);
+                 }
+-                session.setAttribute(
+-                        Constants.CSRF_NONCE_SESSION_ATTR_NAME, nonceCache);
++
++                nonceCache = createNonceCache(req, session);
+             }
+ 
+-            String newNonce = generateNonce();
++            String newNonce = generateNonce(req);
+ 
+             nonceCache.add(newNonce);
+ 
+@@ -212,6 +197,64 @@ public class CsrfPreventionFilter extends CsrfPreventionFilterBase {
+     }
+ 
+ 
++    protected boolean skipNonceCheck(HttpServletRequest request) {
++        if (!Constants.METHOD_GET.equals(request.getMethod())) {
++            return false;
++        }
++
++        String requestedPath = getRequestedPath(request);
++
++        if (!entryPoints.contains(requestedPath)) {
++            return false;
++        }
++
++        if (log.isTraceEnabled()) {
++            log.trace("Skipping CSRF nonce-check for GET request to entry point " + requestedPath);
++        }
++
++        return true;
++    }
++
++
++    /**
++     * Create a new {@link NonceCache} and store in the {@link HttpSession}.
++     * This method is provided primarily for the benefit of sub-classes that
++     * wish to customise this behaviour.
++     *
++     * @param request   The request that triggered the need to create the nonce
++     *                      cache. Unused by the default implementation.
++     * @param session   The session associated with the request.
++     *
++     * @return A newly created {@link NonceCache}
++     */
++    protected NonceCache<String> createNonceCache(HttpServletRequest request, HttpSession session) {
++
++        NonceCache<String> nonceCache = new LruCache<>(nonceCacheSize);
++
++        session.setAttribute(Constants.CSRF_NONCE_SESSION_ATTR_NAME, nonceCache);
++
++        return nonceCache;
++    }
++
++
++    /**
++     * Obtain the {@link NonceCache} associated with the request and/or session.
++     * This method is provided primarily for the benefit of sub-classes that
++     * wish to customise this behaviour.
++     *
++     * @param request   The request that triggered the need to obtain the nonce
++     *                      cache. Unused by the default implementation.
++     * @param session   The session associated with the request.
++     *
++     * @return A newly created {@link NonceCache}
++     */
++    protected NonceCache<String> getNonceCache(HttpServletRequest request, HttpSession session) {
++        @SuppressWarnings("unchecked")
++        NonceCache<String> nonceCache =
++                (NonceCache<String>) session.getAttribute(Constants.CSRF_NONCE_SESSION_ATTR_NAME);
++        return nonceCache;
++    }
++
+     protected static class CsrfResponseWrapper
+             extends HttpServletResponseWrapper {
+ 
+@@ -273,7 +316,15 @@ public class CsrfPreventionFilter extends CsrfPreventionFilterBase {
+         }
+     }
+ 
+-    protected static class LruCache<T> implements Serializable {
++
++    protected static interface NonceCache<T> extends Serializable {
++        void add(T nonce);
++
++        boolean contains(T nonce);
++    }
++
++
++    protected static class LruCache<T> implements NonceCache<T> {
+ 
+         private static final long serialVersionUID = 1L;
+ 
+
+==================================================
+RestCsrfPreventionFilter.java
+index 169ed0ff88..959171c609 100644
+--- a/java/org/apache/catalina/filters/CsrfPreventionFilterBase.java
++++ b/java/org/apache/catalina/filters/CsrfPreventionFilterBase.java
+@@ -93,13 +93,32 @@ public abstract class CsrfPreventionFilterBase extends FilterBase {
+         return true;
+     }
+ 
++
++    /**
++     * Generate a once time token (nonce) for authenticating subsequent
++     * requests. The nonce generation is a simplified version of
++     * ManagerBase.generateSessionId().
++     *
++     * @param request   The request. Unused in this method but present for the
++     *                  the benefit of sub-classes.
++     *
++     * @return the generated nonce
++     */
++    protected String generateNonce(HttpServletRequest request) {
++        return generateNonce();
++    }
++
+     /**
+      * Generate a once time token (nonce) for authenticating subsequent
+      * requests. The nonce generation is a simplified version of
+      * ManagerBase.generateSessionId().
+      *
+      * @return the generated nonce
++     *
++     * @deprecated Use {@link #generateNonce(HttpServletRequest)} instead. This
++     *             method will be removed in Apache Tomcat 10.1.x onwards.
+      */
++    @Deprecated
+     protected String generateNonce() {
+         byte random[] = new byte[16];
+ 
+
+==================================================

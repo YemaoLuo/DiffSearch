@@ -1,0 +1,560 @@
+e31c413298faef4265598f29c9a5c79fb3761787
+==================================================
+Query collection stats
+==================================================
+Filip Hanik
+==================================================
+Fri Dec 5 17:36:09 2008 +0000
+==================================================
+ConnectionPool.java
+Query collection stats
+
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@723802 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+DataSourceProxy.java
+index b984daed31..57caa818d7 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/ConnectionPool.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/ConnectionPool.java
+@@ -28,6 +28,7 @@ import java.util.Queue;
+ import java.util.concurrent.ArrayBlockingQueue;
+ import java.util.concurrent.BlockingQueue;
+ import java.util.concurrent.Callable;
++import java.util.concurrent.ConcurrentLinkedQueue;
+ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.Future;
+@@ -57,6 +58,9 @@ import javax.management.ObjectName;
+  */
+ 
+ public class ConnectionPool {
++    public static interface CloseListener {
++        void poolClosed(ConnectionPool pool);
++    }
+ 
+     //logger
+     protected static Log log = LogFactory.getLog(ConnectionPool.class);
+@@ -64,7 +68,8 @@ public class ConnectionPool {
+     //===============================================================================
+     //         INSTANCE/QUICK ACCESS VARIABLE
+     //===============================================================================
+-
++    protected ConcurrentLinkedQueue<CloseListener> listeners = new ConcurrentLinkedQueue<CloseListener>();
++    
+     /**
+      * All the information about the connection pool
+      */
+@@ -226,11 +231,7 @@ public class ConnectionPool {
+         }
+ 
+         try {
+-            //cache the constructor
+-            if (proxyClassConstructor == null ) {
+-                Class proxyClass = Proxy.getProxyClass(ConnectionPool.class.getClassLoader(), new Class[] {java.sql.Connection.class});
+-                proxyClassConstructor = proxyClass.getConstructor(new Class[] { InvocationHandler.class });
+-            }
++            getProxyConstructor();
+             //create the proxy
+             //TODO possible optimization, keep track if this connection was returned properly, and don't generate a new facade
+             Connection connection = (Connection)proxyClassConstructor.newInstance(new Object[] { handler });
+@@ -243,13 +244,25 @@ public class ConnectionPool {
+         }
+ 
+     }
+-    
++
++    public Constructor getProxyConstructor() throws NoSuchMethodException {
++        //cache the constructor
++        if (proxyClassConstructor == null ) {
++            Class proxyClass = Proxy.getProxyClass(ConnectionPool.class.getClassLoader(), new Class[] {java.sql.Connection.class});
++            proxyClassConstructor = proxyClass.getConstructor(new Class[] { InvocationHandler.class });
++        }
++        return proxyClassConstructor;
++    }
+ 
+     @Override
+     protected void finalize() throws Throwable {
+         close(true);
+     }
+ 
++    public void addCloseListener(CloseListener listener) {
++        listeners.add(listener);
++    }
++    
+     /**
+      * Closes the pool and all disconnects all idle connections
+      * Active connections will be closed upon the {@link java.sql.Connection#close close} method is called
+@@ -288,6 +301,11 @@ public class ConnectionPool {
+         }
+         size.set(0);
+         if (this.getPoolProperties().isJmxEnabled()) stopJmx();
++        
++        while (listeners.size()>0) {
++            CloseListener listener = listeners.poll();
++            if (listener!=null) listener.poolClosed(this);
++        }
+     } //closePool
+ 
+ 
+
+==================================================
+AbstractCreateStatementInterceptor.java
+index f978f83197..823adeb800 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/DataSourceProxy.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/DataSourceProxy.java
+@@ -43,6 +43,10 @@ public class DataSourceProxy  {
+     protected static Log log = LogFactory.getLog(DataSourceProxy.class);
+     
+     protected volatile ConnectionPool pool = null;
++    public ConnectionPool getPool() {
++        return pool;
++    }
++
+     protected PoolProperties poolProperties = new PoolProperties();
+ 
+     public DataSourceProxy() {
+
+==================================================
+SlowQueryReport.java
+index 3609ac0f74..6ed063c009 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/interceptor/AbstractCreateStatementInterceptor.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/interceptor/AbstractCreateStatementInterceptor.java
+@@ -69,8 +69,9 @@ public abstract class  AbstractCreateStatementInterceptor extends JdbcIntercepto
+     public abstract void closeInvoked();
+ 
+     protected boolean process(String[] names, Method method, boolean process) {
++        final String name = method.getName();
+         for (int i=0; (!process) && i<names.length; i++) {
+-            process = compare(names[i],method);
++            process = compare(names[i],name);
+         }
+         return process;
+     }
+
+==================================================
+CreateTestTable.java
+index 91ba268769..0487a3425a 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/interceptor/SlowQueryReport.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/interceptor/SlowQueryReport.java
+@@ -16,97 +16,233 @@
+  */
+ package org.apache.tomcat.jdbc.pool.interceptor;
+ 
++import java.lang.reflect.Constructor;
+ import java.lang.reflect.InvocationHandler;
+ import java.lang.reflect.Method;
+ import java.lang.reflect.Proxy;
+ import java.sql.CallableStatement;
++import java.sql.PreparedStatement;
+ import java.sql.SQLException;
++import java.sql.Statement;
+ import java.util.HashMap;
+ import java.util.IdentityHashMap;
+ import java.util.LinkedHashMap;
+ import java.util.Map.Entry;
+ 
++import org.apache.juli.logging.Log;
++import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.jdbc.pool.ConnectionPool;
+ import org.apache.tomcat.jdbc.pool.JdbcInterceptor;
+ import org.apache.tomcat.jdbc.pool.PooledConnection;
+ 
+ /**
++ * Slow query report interceptor. Tracks timing of query executions.
+  * @author Filip Hanik
+  * @version 1.0
+  */
+-public class SlowQueryReport extends AbstractCreateStatementInterceptor {
+-    protected final String[] statements = {"createStatement","prepareStatement","prepareCall"};
+-    protected final String[] executes = {"execute","executeQuery","executeUpdate","executeBatch"};
+-
++public class SlowQueryReport extends AbstractCreateStatementInterceptor implements ConnectionPool.CloseListener {
++    //logger
++    protected static Log log = LogFactory.getLog(SlowQueryReport.class);
++    /**
++     * the constructors that are used to create statement proxies 
++     */
++    protected static final Constructor[] constructors = new Constructor[AbstractCreateStatementInterceptor.statements.length];
++    /**
++     * we will be keeping track of query stats on a per pool basis, do we want this, or global?
++     */
+     protected static IdentityHashMap<ConnectionPool,HashMap<String,QueryStats>> perPoolStats = 
+         new IdentityHashMap<ConnectionPool,HashMap<String,QueryStats>>();
+-    
++    /**
++     * the queries that are used for this interceptor.
++     */
+     protected HashMap<String,QueryStats> queries = null;
+-    
++    /**
++     * The threshold in milliseconds. If the query is faster than this, we don't measure it
++     */
+     protected long threshold = 100; //don't report queries less than this
++    /**
++     * Maximum number of queries we will be storing
++     */
+     protected int  maxQueries= 1000; //don't store more than this amount of queries
+-
+     
++    /**
++     * The pool that is associated with this interceptor so that we can clean up
++     */
++    private ConnectionPool pool = null;
++
++    /**
++     * Returns the query stats for a given pool
++     * @param pool - the pool we want to retrieve stats for
++     * @return a hash map containing statistics for 0 to maxQueries 
++     */
++    public static HashMap<String,QueryStats> getPoolStats(ConnectionPool pool) {
++        return perPoolStats.get(pool);
++    }
+     
++    /**
++     * Creates a slow query report interceptor
++     */
+     public SlowQueryReport() {
+         super();
+     }
+ 
++    /**
++     * returns the query measure threshold.
++     * This value is in milliseconds. If the query is faster than this threshold than it wont be accounted for
++     * @return
++     */
+     public long getThreshold() {
+         return threshold;
+     }
+ 
++    /**
++     * Sets the query measurement threshold. The value is in milliseconds.
++     * If the query goes faster than this threshold it will not be recorded.
++     * @param threshold set to -1 to record every query. Value is in milliseconds.
++     */
+     public void setThreshold(long threshold) {
+         this.threshold = threshold;
+     }
+ 
++    /**
++     * invoked when the connection receives the close request
++     * Not used for now.
++     */
+     @Override
+     public void closeInvoked() {
+         // TODO Auto-generated method stub
+         
+     }
++    
++    /**
++     * Creates a constructor for a proxy class, if one doesn't already exist
++     * @param idx - the index of the constructor
++     * @param clazz - the interface that the proxy will implement
++     * @return - returns a constructor used to create new instances
++     * @throws NoSuchMethodException
++     */
++    protected Constructor getConstructor(int idx, Class clazz) 
++        throws NoSuchMethodException {
++        if (constructors[idx]==null) {
++            Class proxyClass = Proxy.getProxyClass(SlowQueryReport.class.getClassLoader(), new Class[] {clazz});
++            constructors[idx] = proxyClass.getConstructor(new Class[] { InvocationHandler.class });
++        }
++        return constructors[idx];
++    }
+ 
++    /**
++     * Creates a statement interceptor to monitor query response times
++     */
+     @Override
+     public Object createStatement(Object proxy, Method method, Object[] args, Object statement) {
+-        // TODO Auto-generated method stub
+-        String sql = null;
+-        if (method.getName().startsWith("prepare")) {
+-            sql = (args.length>0 && (args[0] instanceof String))?(String)args[0]:null;
++        try {
++            Object result = null;
++            String name = method.getName();
++            String sql = null;
++            Constructor constructor = null;
++            if (compare(statements[0],name)) {
++                //createStatement
++                constructor = getConstructor(0,Statement.class);
++            }else if (compare(statements[1],name)) {
++                //prepareStatement
++                sql = (String)args[0];
++                constructor = getConstructor(1,PreparedStatement.class);
++            }else if (compare(statements[2],name)) {
++                //prepareCall
++                sql = (String)args[0];
++                constructor = getConstructor(2,CallableStatement.class);
++            }else {
++                //do nothing, might be a future unsupported method
++                //so we better bail out and let the system continue
++                return statement;
++            }
++            result = constructor.newInstance(new Object[] { new StatementProxy(statement,sql) });
++            return result;
++        }catch (Exception x) {
++            log.warn("Unable to create statement proxy for slow query report.",x);
+         }
+-        return new StatementProxy(statement,sql);
++        return statement;
+     }
+ 
+-    protected boolean process(final String[] names, Method method, boolean process) {
+-        for (int i=0; (!process) && i<names.length; i++) {
+-            process = compare(method.getName(),names[i]);
++    /**
++     * {@inheritDoc}
++     */
++    public void reset(ConnectionPool parent, PooledConnection con) {
++        //see if we already created a map for this pool
++        queries = SlowQueryReport.perPoolStats.get(parent);
++        if (queries==null) {
++            //create the map to hold our stats
++            //however TODO we need to improve the eviction
++            //selection
++            queries = new LinkedHashMap<String,QueryStats>() {
++                @Override
++                protected boolean removeEldestEntry(Entry<String, QueryStats> eldest) {
++                    return size()>maxQueries;
++                }
++
++            };
++            perPoolStats.put(parent, queries);
++            //add ourselves to the pool listener, so we can cleanup
++            parent.addCloseListener(this);
+         }
+-        return process;
++        this.pool = parent;
+     }
+ 
+-    protected class QueryStats {
++    
++    public void poolClosed(ConnectionPool pool) {
++        //clean up after ourselves.
++        perPoolStats.remove(pool);
++    }
++    
++
++    
++    /**
++     * 
++     * @author fhanik
++     *
++     */
++    public static class QueryStats {
+         private final String query;
+         private int nrOfInvocations;
+-        private long maxInvocationTime;
++        private long maxInvocationTime = Long.MIN_VALUE;
+         private long maxInvocationDate;
+-        private long minInvocationTime;
++        private long minInvocationTime = Long.MAX_VALUE;
+         private long minInvocationDate;
+         private long totalInvocationTime;
+         
++        public String toString() {
++            StringBuffer buf = new StringBuffer("QueryStats[query:");
++            buf.append(query);
++            buf.append(", nrOfInvocations:");
++            buf.append(nrOfInvocations);
++            buf.append(", maxInvocationTime:");
++            buf.append(maxInvocationTime);
++            buf.append(", maxInvocationDate:");
++            buf.append(new java.util.Date(maxInvocationDate).toGMTString());
++            buf.append(", minInvocationTime:");
++            buf.append(minInvocationTime);
++            buf.append(", minInvocationDate:");
++            buf.append(new java.util.Date(minInvocationDate).toGMTString());
++            buf.append(", totalInvocationTime:");
++            buf.append(totalInvocationTime);
++            buf.append(", averageInvocationTime:");
++            buf.append((float)totalInvocationTime / (float)nrOfInvocations);
++            buf.append("]");
++            return buf.toString();
++        }
++        
+         public QueryStats(String query) {
+             this.query = query;
+         }
+         
+-        public void add(long invocationTime) {
+-            long now = -1;
++        public void add(long invocationTime, long now) {
+             //not thread safe, but don't sacrifice performance for this kind of stuff
+             maxInvocationTime = Math.max(invocationTime, maxInvocationTime);
+             if (maxInvocationTime == invocationTime) {
+-                now = System.currentTimeMillis();
+                 maxInvocationDate = now;
+             }
+             minInvocationTime = Math.min(invocationTime, minInvocationTime);
+             if (minInvocationTime==invocationTime) {
+-                now = (now==-1)?System.currentTimeMillis():now;
+                 minInvocationDate = now;
+             }
+             nrOfInvocations++;
+@@ -148,12 +284,17 @@ public class SlowQueryReport extends AbstractCreateStatementInterceptor {
+         public boolean equals(Object other) {
+             if (other instanceof QueryStats) {
+                 QueryStats qs = (QueryStats)other;
+-                return SlowQueryReport.this.compare(qs.query,this.query);
++                return qs.query.equals(this.query);
+             } 
+             return false;
+         }
+     }
+     
++    /**
++     * Class to measure query execute time
++     * @author fhanik
++     *
++     */
+     protected class StatementProxy implements InvocationHandler {
+         protected boolean closed = false;
+         protected Object delegate;
+@@ -164,43 +305,50 @@ public class SlowQueryReport extends AbstractCreateStatementInterceptor {
+         }
+         
+         public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
++            //get the name of the method for comparison
+             final String name = method.getName();
++            //was close invoked?
+             boolean close = compare(JdbcInterceptor.CLOSE_VAL,name);
+-            if (close && closed) return null; //allow close to be called multiple times
++            //allow close to be called multiple times
++            if (close && closed) return null; 
++            //are we calling isClosed?
++            if (compare(JdbcInterceptor.ISCLOSED_VAL,name)) return closed;
++            //if we are calling anything else, bail out
+             if (closed) throw new SQLException("Statement closed.");
+             boolean process = false;
++            //check to see if we are about to execute a query
+             process = process(executes, method, process);
++            //if we are executing, get the current time
+             long start = (process)?System.currentTimeMillis():0;
+             //execute the query
+             Object result =  method.invoke(delegate,args);
+-            long delta = (process)?(System.currentTimeMillis()-start):0;
++            //measure the time
++            long delta = (process)?(System.currentTimeMillis()-start):Long.MIN_VALUE;
++            //see if we meet the requirements to measure
+             if (delta>threshold) {
+-                String sql = null;//TODO
+-                QueryStats qs = SlowQueryReport.this.queries.get(sql);
+-                if (qs == null) {
+-                    qs = new QueryStats(sql);
+-                    SlowQueryReport.this.queries.put((String)sql,qs);
++                //extract the query string
++                String sql = (query==null && args!=null &&  args.length>0)?(String)args[0]:query;
++                //if we do batch execution, then we name the query 'batch'
++                if (sql==null && compare(executes[3],name)) {
++                    sql = "batch";
++                }
++                //if we have a query, record the stats
++                if (sql!=null) {
++                    QueryStats qs = SlowQueryReport.this.queries.get(sql);
++                    if (qs == null) {
++                        qs = new QueryStats(sql);
++                        SlowQueryReport.this.queries.put((String)sql,qs);
++                    }
++                    qs.add(delta,start);
+                 }
+-                qs.add(delta);
+-                return qs;
+             }
++            //perform close cleanup
+             if (close) {
+                 closed=true;
+                 delegate = null;
++                queries = null;
+             }
+             return result;
+         }
+     }
+-
+-    public void reset(ConnectionPool parent, PooledConnection con) {
+-        if (queries==null && SlowQueryReport.perPoolStats.get(parent)==null) {
+-            queries = new LinkedHashMap<String,QueryStats>() {
+-                @Override
+-                protected boolean removeEldestEntry(Entry<String, QueryStats> eldest) {
+-                    return size()>maxQueries;
+-                }
+-
+-            };
+-        }
+-    }
+ }
+
+==================================================
+TestSlowQueryReport.java
+new file mode 100644
+index 0000000000..17eeef7bcb
+--- /dev/null
++++ b/modules/jdbc-pool/test/org/apache/tomcat/jdbc/test/CreateTestTable.java
+@@ -0,0 +1,61 @@
++package org.apache.tomcat.jdbc.test;
++
++import java.sql.Connection;
++import java.sql.PreparedStatement;
++import java.sql.Statement;
++import java.util.Random;
++
++
++
++public class CreateTestTable extends DefaultTestCase {
++
++    public CreateTestTable(String name) {
++        super(name);
++    }
++    
++    public void testPopulateData() throws Exception {
++        String insert = "insert into test values (?,?,?,?,?)";
++        this.init();
++        Connection con = datasource.getConnection();
++        Statement st = con.createStatement();
++        try {
++            st.execute("drop table test");
++        }catch (Exception ignore) {}
++        st.execute("create table test(id int not null, val1 varchar(255), val2 varchar(255), val3 varchar(255), val4 varchar(255))");
++        st.close();
++        PreparedStatement ps = con.prepareStatement(insert);
++        for (int i=0; i<10000000; i++) {
++            ps.setInt(1,i);
++            String s = getRandom();
++            ps.setString(2, s);
++            ps.setString(3, s);
++            ps.setString(4, s);
++            ps.setString(5, s);
++            ps.addBatch();
++            ps.clearParameters();
++            if ((i+1) % 1000 == 0) {
++                System.out.print(".");
++            }
++            if ((i+1) % 10000 == 0) {
++                System.out.print("\n"+(i+1));
++                ps.executeBatch();
++                ps.clearBatch();
++            }
++
++        }
++        ps.close();
++        con.close();
++    }
++    
++    public static Random random = new Random(System.currentTimeMillis());
++    public static String getRandom() {
++        StringBuffer s = new StringBuffer(256);
++        for (int i=0;i<254; i++) {
++            int b = Math.abs(random.nextInt() % 29);
++            char c = (char)(b+65);
++            s.append(c);
++        }
++        return s.toString();
++    }
++
++}
+
+==================================================

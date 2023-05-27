@@ -1,0 +1,239 @@
+5ec1dab0748c49674eebc8cd94398b762aa370aa
+==================================================
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=45451
+==================================================
+Mark Emlyn
+==================================================
+Tue Sep 16 21:12:38 2008 +0000
+==================================================
+Constants.java
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=45451
+Testing for this threw up all sorts of other failures around use of \${...} These should all now be fixed. The two pass parsing means we can do away with the previous 'replace with unused unicode character' trick.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@696061 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Compiler.java
+index 19e87cb0aa..4ce5bcdf81 100644
+--- a/java/org/apache/jasper/Constants.java
++++ b/java/org/apache/jasper/Constants.java
+@@ -180,13 +180,6 @@ public class Constants {
+     public static final String TEMP_VARIABLE_NAME_PREFIX =
+         System.getProperty("org.apache.jasper.Constants.TEMP_VARIABLE_NAME_PREFIX", "_jspx_temp");
+ 
+-    /**
+-     * A replacement char for "\$".
+-     * XXX This is a hack to avoid changing EL interpreter to recognize "\$"
+-     */
+-    public static final char ESC = '\u001b';
+-    public static final String ESCStr = "'\\u001b'";
+-
+     /**
+      * Has security been turned on?
+      */
+
+==================================================
+Generator.java
+index 5e7253038e..5c5c48aad4 100644
+--- a/java/org/apache/jasper/compiler/Compiler.java
++++ b/java/org/apache/jasper/compiler/Compiler.java
+@@ -145,8 +145,28 @@ public abstract class Compiler {
+ 
+         ServletWriter writer = null;
+         try {
++            /*
++             * The setting of isELIgnored changes the behaviour of the parser
++             * in subtle ways. To add to the 'fun', isELIgnored can be set in
++             * any file that forms part of the translation unit so setting it
++             * in a file included towards the end of the translation unit can
++             * change how the parser should have behaved when parsing content
++             * up to the point where isELIgnored was set. Arghh!
++             * Previous attempts to hack around this have only provided partial
++             * solutions. We now use two passes to parse the translation unit.
++             * The first just parses the directives and the second parses the
++             * whole translation unit once we know how isELIgnored has been set.
++             * TODO There are some possible optimisations of this process.  
++             */ 
+             // Parse the file
+             ParserController parserCtl = new ParserController(ctxt, this);
++            
++            // Pass 1 - the directives
++            Node.Nodes directives =
++                parserCtl.parseDirectives(ctxt.getJspFile());
++            Validator.validateDirectives(this, directives);
++            
++            // Pass 2 - the whole translation unit
+             pageNodes = parserCtl.parse(ctxt.getJspFile());
+ 
+             if (ctxt.isPrototypeMode()) {
+@@ -158,8 +178,9 @@ public abstract class Compiler {
+                 return null;
+             }
+ 
+-            // Validate and process attributes
+-            Validator.validate(this, pageNodes);
++            // Validate and process attributes - don't re-validate the
++            // directives we validated in pass 1
++            Validator.validateExDirectives(this, pageNodes);
+ 
+             if (log.isDebugEnabled()) {
+                 t2 = System.currentTimeMillis();
+
+==================================================
+JspDocumentParser.java
+index a4d57f1737..afbf2d8ae5 100644
+--- a/java/org/apache/jasper/compiler/Generator.java
++++ b/java/org/apache/jasper/compiler/Generator.java
+@@ -806,13 +806,8 @@ class Generator {
+                 }
+                 return v;
+             } else if (attr.isELInterpreterInput()) {
+-                boolean replaceESC = v.indexOf(Constants.ESC) > 0;
+                 v = JspUtil.interpreterCall(this.isTagFile, v, expectedType,
+                         attr.getEL().getMapName(), false);
+-                // XXX ESC replacement hack
+-                if (replaceESC) {
+-                    v = "(" + v + ").replace(" + Constants.ESCStr + ", '$')";
+-                }
+                 if (encode) {
+                     return "org.apache.jasper.runtime.JspRuntimeLibrary.URLEncode("
+                             + v + ", request.getCharacterEncoding())";
+@@ -2839,16 +2834,10 @@ class Generator {
+                     attrValue = sb.toString();
+                 } else {
+                     // run attrValue through the expression interpreter
+-                    boolean replaceESC = attrValue.indexOf(Constants.ESC) > 0;
+                     String mapName = (attr.getEL() != null) ? attr.getEL()
+                             .getMapName() : null;
+                     attrValue = JspUtil.interpreterCall(this.isTagFile,
+                             attrValue, c[0], mapName, false);
+-                    // XXX hack: Replace ESC with '$'
+-                    if (replaceESC) {
+-                        attrValue = "(" + attrValue + ").replace("
+-                                + Constants.ESCStr + ", '$')";
+-                    }
+                 }
+             } else {
+                 attrValue = convertString(c[0], attrValue, localName,
+
+==================================================
+JspUtil.java
+index d5a11bfa35..3acd9d5b91 100644
+--- a/java/org/apache/jasper/compiler/JspDocumentParser.java
++++ b/java/org/apache/jasper/compiler/JspDocumentParser.java
+@@ -580,6 +580,9 @@ class JspDocumentParser
+                         lastCh = ch;
+                     }
+                 } else if (lastCh == '\\' && (ch == '$' || ch == '#')) {
++                    if (pageInfo.isELIgnored()) {
++                        ttext.write('\\');
++                    }
+                     ttext.write(ch);
+                     ch = 0;  // Not start of EL anymore
+                 } else {
+
+==================================================
+Parser.java
+index ca7cc21ec4..bbadd294a4 100644
+--- a/java/org/apache/jasper/compiler/JspUtil.java
++++ b/java/org/apache/jasper/compiler/JspUtil.java
+@@ -177,7 +177,7 @@ public class JspUtil {
+             returnString = expression;
+         }
+ 
+-        return escapeXml(returnString.replace(Constants.ESC, '$'));
++        return escapeXml(returnString);
+     }
+ 
+     /**
+
+==================================================
+ParserController.java
+index a53a36a968..9e2780c2b8 100644
+--- a/java/org/apache/jasper/compiler/Parser.java
++++ b/java/org/apache/jasper/compiler/Parser.java
+@@ -266,6 +266,7 @@ class Parser implements TagConstants {
+     private String parseQuoted(Mark start, String tx, char quote)
+             throws JasperException {
+         StringBuffer buf = new StringBuffer();
++        boolean possibleEL = tx.contains("${");
+         int size = tx.length();
+         int i = 0;
+         while (i < size) {
+@@ -287,13 +288,22 @@ class Parser implements TagConstants {
+                 }
+             } else if (ch == '\\' && i + 1 < size) {
+                 ch = tx.charAt(i + 1);
+-                if (ch == '\\' || ch == '\"' || ch == '\'' || ch == '>') {
++                if (ch == '\\' || ch == '\"' || ch == '\'') {
++                    if (pageInfo.isELIgnored() || !possibleEL) {
++                        // EL is not enabled or no chance of EL
++                        // Unescape these now
++                        buf.append(ch);
++                        i += 2;
++                    } else {
++                        // EL is enabled and ${ appears in value
++                        // EL processing will escape these
++                        buf.append('\\');
++                        buf.append(ch);
++                        i += 2;
++                    }
++                } else if (ch == '>') {
+                     buf.append(ch);
+                     i += 2;
+-                } else if (ch == '$') {
+-                    // Replace "\$" with some special char. XXX hack!
+-                    buf.append(Constants.ESC);
+-                    i += 2;
+                 } else {
+                     buf.append('\\');
+                     ++i;
+@@ -1339,11 +1349,8 @@ class Parser implements TagConstants {
+                 }
+                 char next = (char) reader.peekChar();
+                 // Looking for \% or \$ or \#
+-                // TODO: only recognize \$ or \# if isELIgnored is false, but since
+-                // it can be set in a page directive, it cannot be determined
+-                // here. Argh! (which is the way it should be since we shouldn't
+-                // convolude multiple steps at once and create confusing parsers...)
+-                if (next == '%' || next == '$' || next == '#') {
++                if (next == '%' || ((next == '$' || next == '#') &&
++                        !pageInfo.isELIgnored())) {
+                     ch = reader.nextChar();
+                 }
+             }
+
+==================================================
+Validator.java
+index 22c79ebd9e..8c29fd6d79 100644
+--- a/java/org/apache/jasper/compiler/ParserController.java
++++ b/java/org/apache/jasper/compiler/ParserController.java
+@@ -103,6 +103,24 @@ class ParserController implements TagConstants {
+         return doParse(inFileName, null, ctxt.getTagFileJarUrl());
+     }
+ 
++    /**
++     * Parses the directives of a JSP page or tag file. This is invoked by the
++     * compiler.
++     *
++     * @param inFileName The path to the JSP page or tag file to be parsed.
++     */
++    public Node.Nodes parseDirectives(String inFileName)
++    throws FileNotFoundException, JasperException, IOException {
++        // If we're parsing a packaged tag file or a resource included by it
++        // (using an include directive), ctxt.getTagFileJar() returns the 
++        // JAR file from which to read the tag file or included resource,
++        // respectively.
++        isTagFile = ctxt.isTagFile();
++        directiveOnly = true;
++        return doParse(inFileName, null, ctxt.getTagFileJarUrl());
++    }
++
++
+     /**
+      * Processes an include directive with the given path.
+      *
+
+==================================================

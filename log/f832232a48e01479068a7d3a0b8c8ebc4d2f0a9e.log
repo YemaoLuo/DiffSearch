@@ -1,0 +1,166 @@
+f832232a48e01479068a7d3a0b8c8ebc4d2f0a9e
+==================================================
+Correct multiple certificate configuration plumbing.
+==================================================
+Mark Thomas
+==================================================
+Fri Jun 19 20:33:16 2015 +0000
+==================================================
+AbstractJsseEndpoint.java
+Correct multiple certificate configuration plumbing.
+APR/native can handle multiple certificates in a single 'SSLContext'
+JSSE needs one 'SSLContext' per certificate
+
+Get key/certificate selection completed to the point where a dummy implementation in a single method needs to be replaced with the real implementation.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1686499 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AprEndpoint.java
+index b1501e0257..4315d84498 100644
+--- a/java/org/apache/tomcat/util/net/AbstractJsseEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AbstractJsseEndpoint.java
+@@ -17,6 +17,7 @@
+ package org.apache.tomcat.util.net;
+ 
+ import java.util.List;
++import java.util.Set;
+ 
+ import javax.net.ssl.SSLEngine;
+ import javax.net.ssl.SSLParameters;
+@@ -85,7 +86,7 @@ public abstract class AbstractJsseEndpoint<S> extends AbstractEndpoint<S> {
+                         sslUtil.configureSessionContext(sessionContext);
+                     }
+                     SSLContextWrapper sslContextWrapper = new SSLContextWrapper(sslContext, sslUtil);
+-                    sslHostConfig.setSslContext(sslContextWrapper);
++                    certificate.setSslContextWrapper(sslContextWrapper);
+                 }
+             }
+         }
+@@ -94,7 +95,10 @@ public abstract class AbstractJsseEndpoint<S> extends AbstractEndpoint<S> {
+ 
+     protected SSLEngine createSSLEngine(String sniHostName, List<Cipher> clientRequestedCiphers) {
+         SSLHostConfig sslHostConfig = getSSLHostConfig(sniHostName);
+-        SSLContextWrapper sslContextWrapper = (SSLContextWrapper) sslHostConfig.getSslContext();
++
++        SSLHostConfigCertificate certificate = selectCertificate(sslHostConfig, clientRequestedCiphers);
++
++        SSLContextWrapper sslContextWrapper = certificate.getSslContextWrapper();
+         if (sslContextWrapper == null) {
+             throw new IllegalStateException(
+                     sm.getString("endpoint.jsse.noSslContext", sniHostName));
+@@ -127,15 +131,35 @@ public abstract class AbstractJsseEndpoint<S> extends AbstractEndpoint<S> {
+     }
+ 
+ 
++    private SSLHostConfigCertificate selectCertificate(
++            SSLHostConfig sslHostConfig, List<Cipher> clientRequestedCiphers) {
++
++        Set<SSLHostConfigCertificate> certificates = sslHostConfig.getCertificates(true);
++        if (certificates.size() == 1) {
++            return certificates.iterator().next();
++        }
++
++        // TODO:
++        // Need to select correct certificate based on the ciphers requested by
++        // the client, the ciphers configured for the server and which is
++        // configured to define the preference order
++
++        // For now, just return the first certificate
++        return certificates.iterator().next();
++    }
++
++
+     @Override
+     public void unbind() throws Exception {
+         for (SSLHostConfig sslHostConfig : sslHostConfigs.values()) {
+-            sslHostConfig.setSslContext(null);
++            for (SSLHostConfigCertificate certificate : sslHostConfig.getCertificates(true)) {
++                certificate.setSslContextWrapper(null);
++            }
+         }
+     }
+ 
+ 
+-    private static class SSLContextWrapper {
++    static class SSLContextWrapper {
+ 
+         private final SSLContext sslContext;
+         private final String[] enabledCiphers;
+
+==================================================
+SSLHostConfig.java
+index 0944bc7b06..cf60d906d8 100644
+--- a/java/org/apache/tomcat/util/net/AprEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AprEndpoint.java
+@@ -551,10 +551,10 @@ public class AprEndpoint extends AbstractEndpoint<Long> implements SNICallBack {
+                         log.warn(sm.getString("endpoint.alpn.fail", negotiableProtocols));
+                     }
+                 }
+-                sslHostConfig.setSslContext(Long.valueOf(ctx));
++                sslHostConfig.setOpenSslContext(Long.valueOf(ctx));
+             }
+             SSLHostConfig defaultSSLHostConfig = sslHostConfigs.get(getDefaultSSLHostConfigName());
+-            Long defaultSSLContext = (Long) defaultSSLHostConfig.getSslContext();
++            Long defaultSSLContext = (Long) defaultSSLHostConfig.getOpenSslContext();
+             sslContext = defaultSSLContext.longValue();
+             SSLContext.registerDefault(defaultSSLContext, this);
+         }
+@@ -564,7 +564,7 @@ public class AprEndpoint extends AbstractEndpoint<Long> implements SNICallBack {
+     @Override
+     public long getSslContext(String sniHostName) {
+         SSLHostConfig sslHostConfig = getSSLHostConfig(sniHostName);
+-        Long ctx = (Long) sslHostConfig.getSslContext();
++        Long ctx = (Long) sslHostConfig.getOpenSslContext();
+         if (ctx != null) {
+             return ctx.longValue();
+         }
+@@ -743,7 +743,7 @@ public class AprEndpoint extends AbstractEndpoint<Long> implements SNICallBack {
+             Long ctx = Long.valueOf(sslContext);
+             SSLContext.unregisterDefault(ctx);
+             for (SSLHostConfig sslHostConfig : sslHostConfigs.values()) {
+-                sslHostConfig.setSslContext(null);
++                sslHostConfig.setOpenSslContext(null);
+             }
+             sslContext = 0;
+         }
+
+==================================================
+SSLHostConfigCertificate.java
+index 99c783cb99..4448c5ba09 100644
+--- a/java/org/apache/tomcat/util/net/SSLHostConfig.java
++++ b/java/org/apache/tomcat/util/net/SSLHostConfig.java
+@@ -59,7 +59,10 @@ public class SSLHostConfig {
+ 
+     private String hostName = DEFAULT_SSL_HOST_NAME;
+ 
+-    private Object sslContext;
++    // OpenSSL can handle multiple certs in a single config so the reference to
++    // the context is here at the virtual host level. JSSE can't so the
++    // reference is held on the certificate.
++    private Long openSslContext;
+ 
+     // Configuration properties
+ 
+@@ -99,13 +102,13 @@ public class SSLHostConfig {
+     }
+ 
+ 
+-    public Object getSslContext() {
+-        return sslContext;
++    public Object getOpenSslContext() {
++        return openSslContext;
+     }
+ 
+ 
+-    public void setSslContext(Object sslContext) {
+-        this.sslContext = sslContext;
++    public void setOpenSslContext(Long openSslContext) {
++        this.openSslContext = openSslContext;
+     }
+ 
+ 
+
+==================================================

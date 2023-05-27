@@ -1,0 +1,254 @@
+884b997f5a9a7da9f696d00574d3b727afbfae8c
+==================================================
+Add support for Unix domain sockets for NIO
+==================================================
+remm remm@apache.org
+==================================================
+Wed Dec 23 11:45:58 2020 +0100
+==================================================
+Connector.java
+Add support for Unix domain sockets for NIO
+
+This requires Java 16 or later, and NIO (NIO2 did not get the feature).
+This does not remove the socket on shutdown, not sure what the best
+behavior is there. The socket is closed and Java doesn't do anything
+about that. This uses a bit of reflection, maybe the
+unixDomainSocketPath attribute can be added to avoid that, if the
+feature is actually popular.
+When using the feature, the JMX and thread names are slightly adjusted,
+and using the port attribute is optional.
+Based on a PR submitted by Graham Leggett
+https://github.com/apache/tomcat/pull/382
+
+
+==================================================
+AbstractProtocol.java
+index c2e7e2563f..4f4be1c38f 100644
+--- a/java/org/apache/catalina/connector/Connector.java
++++ b/java/org/apache/catalina/connector/Connector.java
+@@ -950,23 +950,30 @@ public class Connector extends LifecycleMBeanBase  {
+ 
+         StringBuilder sb = new StringBuilder("type=");
+         sb.append(type);
+-        sb.append(",port=");
+-        int port = getPortWithOffset();
+-        if (port > 0) {
+-            sb.append(port);
++        Object path = getProperty("unixDomainSocketPath");
++        if (path != null) {
++            // Maintain MBean name compatibility, even if not accurate
++            sb.append(",port=0,address=");
++            sb.append(ObjectName.quote(path.toString()));
+         } else {
+-            sb.append("auto-");
+-            sb.append(getProperty("nameIndex"));
+-        }
+-        String address = "";
+-        if (addressObj instanceof InetAddress) {
+-            address = ((InetAddress) addressObj).getHostAddress();
+-        } else if (addressObj != null) {
+-            address = addressObj.toString();
+-        }
+-        if (address.length() > 0) {
+-            sb.append(",address=");
+-            sb.append(ObjectName.quote(address));
++            sb.append(",port=");
++            int port = getPortWithOffset();
++            if (port > 0) {
++                sb.append(port);
++            } else {
++                sb.append("auto-");
++                sb.append(getProperty("nameIndex"));
++            }
++            String address = "";
++            if (addressObj instanceof InetAddress) {
++                address = ((InetAddress) addressObj).getHostAddress();
++            } else if (addressObj != null) {
++                address = addressObj.toString();
++            }
++            if (address.length() > 0) {
++                sb.append(",address=");
++                sb.append(ObjectName.quote(address));
++            }
+         }
+         return sb.toString();
+     }
+@@ -1059,7 +1066,7 @@ public class Connector extends LifecycleMBeanBase  {
+     protected void startInternal() throws LifecycleException {
+ 
+         // Validate settings before starting
+-        if (getPortWithOffset() < 0) {
++        if (getProperty("unixDomainSocketPath") == null && getPortWithOffset() < 0) {
+             throw new LifecycleException(sm.getString(
+                     "coyoteConnector.invalidPort", Integer.valueOf(getPortWithOffset())));
+         }
+@@ -1125,12 +1132,17 @@ public class Connector extends LifecycleMBeanBase  {
+         StringBuilder sb = new StringBuilder("Connector[");
+         sb.append(getProtocol());
+         sb.append('-');
+-        int port = getPortWithOffset();
+-        if (port > 0) {
+-            sb.append(port);
++        Object path = getProperty("unixDomainSocketPath");
++        if (path != null) {
++            sb.append(path.toString());
+         } else {
+-            sb.append("auto-");
+-            sb.append(getProperty("nameIndex"));
++            int port = getPortWithOffset();
++            if (port > 0) {
++                sb.append(port);
++            } else {
++                sb.append("auto-");
++                sb.append(getProperty("nameIndex"));
++            }
+         }
+         sb.append(']');
+         return sb.toString();
+
+==================================================
+Jre16Compat.java
+index d4d2d55dbb..bbe393ce72 100644
+--- a/java/org/apache/coyote/AbstractProtocol.java
++++ b/java/org/apache/coyote/AbstractProtocol.java
+@@ -347,22 +347,27 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+     private String getNameInternal() {
+         StringBuilder name = new StringBuilder(getNamePrefix());
+         name.append('-');
+-        if (getAddress() != null) {
+-            name.append(getAddress().getHostAddress());
+-            name.append('-');
+-        }
+-        int port = getPortWithOffset();
+-        if (port == 0) {
+-            // Auto binding is in use. Check if port is known
+-            name.append("auto-");
+-            name.append(getNameIndex());
+-            port = getLocalPort();
+-            if (port != -1) {
++        String path = getProperty("unixDomainSocketPath");
++        if (path != null) {
++            name.append(path);
++        } else {
++            if (getAddress() != null) {
++                name.append(getAddress().getHostAddress());
+                 name.append('-');
++            }
++            int port = getPortWithOffset();
++            if (port == 0) {
++                // Auto binding is in use. Check if port is known
++                name.append("auto-");
++                name.append(getNameIndex());
++                port = getLocalPort();
++                if (port != -1) {
++                    name.append('-');
++                    name.append(port);
++                }
++            } else {
+                 name.append(port);
+             }
+-        } else {
+-            name.append(port);
+         }
+         return name.toString();
+     }
+
+==================================================
+JreCompat.java
+index 406824f188..c142417171 100644
+--- a/java/org/apache/tomcat/util/compat/Jre16Compat.java
++++ b/java/org/apache/tomcat/util/compat/Jre16Compat.java
+@@ -22,6 +22,7 @@ import java.net.ProtocolFamily;
+ import java.net.SocketAddress;
+ import java.net.StandardProtocolFamily;
+ import java.nio.channels.ServerSocketChannel;
++import java.nio.channels.SocketChannel;
+ 
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+@@ -35,15 +36,18 @@ class Jre16Compat extends Jre9Compat {
+     private static final Class<?> unixDomainSocketAddressClazz;
+     private static final Method openServerSocketChannelFamilyMethod;
+     private static final Method unixDomainSocketAddressOfMethod;
++    private static final Method openSocketChannelFamilyMethod;
+ 
+     static {
+         Class<?> c1 = null;
+         Method m1 = null;
+         Method m2 = null;
++        Method m3 = null;
+         try {
+             c1 = Class.forName("java.net.UnixDomainSocketAddress");
+             m1 = ServerSocketChannel.class.getMethod("open", ProtocolFamily.class);
+             m2 = c1.getMethod("of", String.class);
++            m3 = SocketChannel.class.getMethod("open", ProtocolFamily.class);
+         } catch (ClassNotFoundException e) {
+             if (c1 == null) {
+                 // Must be pre-Java 16
+@@ -56,6 +60,7 @@ class Jre16Compat extends Jre9Compat {
+         unixDomainSocketAddressClazz = c1;
+         openServerSocketChannelFamilyMethod = m1;
+         unixDomainSocketAddressOfMethod = m2;
++        openSocketChannelFamilyMethod = m3;
+     }
+ 
+     static boolean isSupported() {
+@@ -82,4 +87,14 @@ class Jre16Compat extends Jre9Compat {
+         }
+     }
+ 
++    @Override
++    public SocketChannel openUnixDomainSocketChannel() {
++        try {
++            return (SocketChannel) openSocketChannelFamilyMethod.invoke
++                    (null, StandardProtocolFamily.valueOf("UNIX"));
++        } catch (IllegalAccessException | IllegalArgumentException | InvocationTargetException e) {
++            throw new UnsupportedOperationException(e);
++        }
++    }
++
+ }
+
+==================================================
+AbstractEndpoint.java
+index 543eb5266c..b12f80bf85 100644
+--- a/java/org/apache/tomcat/util/compat/JreCompat.java
++++ b/java/org/apache/tomcat/util/compat/JreCompat.java
+@@ -25,6 +25,7 @@ import java.net.SocketAddress;
+ import java.net.URL;
+ import java.net.URLConnection;
+ import java.nio.channels.ServerSocketChannel;
++import java.nio.channels.SocketChannel;
+ import java.util.Deque;
+ import java.util.jar.JarFile;
+ 
+@@ -311,4 +312,12 @@ public class JreCompat {
+         throw new UnsupportedOperationException(sm.getString("jreCompat.noUnixDomainSocket"));
+     }
+ 
++    /**
++     * Create socket channel using the specified socket domain socket address.
++     * @return the socket channel
++     */
++    public SocketChannel openUnixDomainSocketChannel() {
++        throw new UnsupportedOperationException(sm.getString("jreCompat.noUnixDomainSocket"));
++    }
++
+ }
+
+==================================================
+NioEndpoint.java
+index 1dcdb2a5bd..fe9957bffc 100644
+--- a/java/org/apache/tomcat/util/net/AbstractEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AbstractEndpoint.java
+@@ -942,7 +942,7 @@ public abstract class AbstractEndpoint<S,U> {
+     /**
+      * Unlock the server socket acceptor threads using bogus connections.
+      */
+-    private void unlockAccept() {
++    protected void unlockAccept() {
+         // Only try to unlock the acceptor if it is necessary
+         if (acceptor == null || acceptor.getState() != AcceptorState.RUNNING) {
+             return;
+
+==================================================

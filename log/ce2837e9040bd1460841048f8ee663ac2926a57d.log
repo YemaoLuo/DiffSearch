@@ -1,0 +1,276 @@
+ce2837e9040bd1460841048f8ee663ac2926a57d
+==================================================
+APR/native refactoring
+==================================================
+Mark Emlyn
+==================================================
+Wed Jan 16 22:40:40 2013 +0000
+==================================================
+Http11AprProtocol.java
+APR/native refactoring
+- Pull up comet flag to SocketWrappoer
+- Remove dedicated Comet Poller
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1434456 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AprEndpoint.java
+index 14f8654068..60a96e5ade 100644
+--- a/java/org/apache/coyote/http11/Http11AprProtocol.java
++++ b/java/org/apache/coyote/http11/Http11AprProtocol.java
+@@ -294,7 +294,8 @@ public class Http11AprProtocol extends AbstractHttp11Protocol<Long> {
+             } else if (processor.isComet()) {
+                 // Comet
+                 if (proto.endpoint.isRunning()) {
+-                    ((AprEndpoint) proto.endpoint).getCometPoller().add(
++                    socket.setComet(true);
++                    ((AprEndpoint) proto.endpoint).getPoller().add(
+                             socket.getSocket().longValue(),
+                             proto.endpoint.getSoTimeout(), true, false);
+                 } else {
+
+==================================================
+NioEndpoint.java
+index 3c456f3ae1..332baf0086 100644
+--- a/java/org/apache/tomcat/util/net/AprEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AprEndpoint.java
+@@ -194,15 +194,6 @@ public class AprEndpoint extends AbstractEndpoint {
+     }
+ 
+ 
+-    /**
+-     * The socket poller used for Comet support.
+-     */
+-    protected Poller cometPoller = null;
+-    public Poller getCometPoller() {
+-        return cometPoller;
+-    }
+-
+-
+     /**
+      * The static file sender.
+      */
+@@ -600,22 +591,13 @@ public class AprEndpoint extends AbstractEndpoint {
+             initializeConnectionLatch();
+ 
+             // Start poller thread
+-            poller = new Poller(false);
++            poller = new Poller();
+             poller.init();
+             Thread pollerThread = new Thread(poller, getName() + "-Poller");
+             pollerThread.setPriority(threadPriority);
+             pollerThread.setDaemon(true);
+             pollerThread.start();
+ 
+-            // Start comet poller thread
+-            cometPoller = new Poller(true);
+-            cometPoller.init();
+-            Thread cometPollerThread =
+-                    new Thread(cometPoller, getName() + "-CometPoller");
+-            cometPollerThread.setPriority(threadPriority);
+-            cometPollerThread.setDaemon(true);
+-            cometPollerThread.start();
+-
+             // Start sendfile thread
+             if (useSendfile) {
+                 sendfile = new Sendfile();
+@@ -681,12 +663,6 @@ public class AprEndpoint extends AbstractEndpoint {
+             }
+             poller = null;
+             connections.clear();
+-            try {
+-                cometPoller.destroy();
+-            } catch (Exception e) {
+-                // Ignore
+-            }
+-            cometPoller = null;
+             if (useSendfile) {
+                 try {
+                     sendfile.destroy();
+@@ -935,7 +911,6 @@ public class AprEndpoint extends AbstractEndpoint {
+         return log;
+     }
+ 
+-
+     // --------------------------------------------------- Acceptor Inner Class
+     /**
+      * The background thread that listens for incoming TCP/IP connections and
+@@ -1271,11 +1246,6 @@ public class AprEndpoint extends AbstractEndpoint {
+          */
+         protected SocketList localAddList = null;
+ 
+-        /**
+-         * Event mode flag.
+-         */
+-        protected boolean event = true;
+-
+         /**
+          * Structure used for storing timeouts.
+          */
+@@ -1294,9 +1264,6 @@ public class AprEndpoint extends AbstractEndpoint {
+         protected int connectionCount = 0;
+         public int getConnectionCount() { return connectionCount; }
+ 
+-        public Poller(boolean event) {
+-            this.event = event;
+-        }
+ 
+         /**
+          * Create the poller. With some versions of APR, the maximum poller size
+@@ -1371,7 +1338,9 @@ public class AprEndpoint extends AbstractEndpoint {
+             // Close all sockets in the add queue
+             SocketInfo info = addList.get();
+             while (info != null) {
+-                if (!event || (event && !processSocket(
++                boolean comet =
++                        connections.get(Long.valueOf(info.socket)).isComet();
++                if (!comet || (comet && !processSocket(
+                         info.socket, SocketStatus.STOP))) {
+                     destroySocket(info.socket);
+                 }
+@@ -1383,7 +1352,9 @@ public class AprEndpoint extends AbstractEndpoint {
+                 int rv = Poll.pollset(pollers[i], desc);
+                 if (rv > 0) {
+                     for (int n = 0; n < rv; n++) {
+-                        if (!event || (event && !processSocket(
++                        boolean comet = connections.get(
++                                Long.valueOf(desc[n*2+1])).isComet();
++                        if (!comet || (comet && !processSocket(
+                                 desc[n*2+1], SocketStatus.STOP))) {
+                             destroySocket(desc[n*2+1]);
+                         }
+@@ -1423,7 +1394,9 @@ public class AprEndpoint extends AbstractEndpoint {
+             }
+             if (!ok) {
+                 // Can't do anything: close the socket right away
+-                if (!event || (event && !processSocket(
++                boolean comet = connections.get(
++                        Long.valueOf(socket)).isComet();
++                if (!comet || (comet && !processSocket(
+                         socket, SocketStatus.ERROR))) {
+                     destroySocket(socket);
+                 }
+@@ -1465,7 +1438,9 @@ public class AprEndpoint extends AbstractEndpoint {
+             }
+             if (!ok) {
+                 // Can't do anything: close the socket right away
+-                if (!event || (event && !processSocket(
++                boolean comet = connections.get(
++                        Long.valueOf(socket)).isComet();
++                if (!comet || (comet && !processSocket(
+                         socket, SocketStatus.ERROR))) {
+                     destroySocket(socket);
+                 }
+@@ -1524,7 +1499,9 @@ public class AprEndpoint extends AbstractEndpoint {
+             long socket = timeouts.check(date);
+             while (socket != 0) {
+                 removeFromPoller(socket);
+-                if (!event || (event && !processSocket(
++                boolean comet = connections.get(
++                        Long.valueOf(socket)).isComet();
++                if (!comet || (comet && !processSocket(
+                         socket, SocketStatus.TIMEOUT))) {
+                     destroySocket(socket);
+                 }
+@@ -1539,7 +1516,7 @@ public class AprEndpoint extends AbstractEndpoint {
+         @Override
+         public String toString() {
+             StringBuffer buf = new StringBuffer();
+-            buf.append("Poller event=[").append(event).append("]");
++            buf.append("Poller");
+             long[] res = new long[actualPollerSize * 2];
+             for (int i = 0; i < pollers.length; i++) {
+                 int count = Poll.pollset(pollers[i], res);
+@@ -1602,8 +1579,10 @@ public class AprEndpoint extends AbstractEndpoint {
+                         SocketInfo info = localAddList.get();
+                         while (info != null) {
+                             if (info.read() || info.write()) {
++                                boolean comet = connections.get(
++                                        Long.valueOf(info.socket)).isComet();
+                                 // Store timeout
+-                                if (event) {
++                                if (comet) {
+                                     removeFromPoller(info.socket);
+                                 }
+                                 int events =
+@@ -1612,7 +1591,7 @@ public class AprEndpoint extends AbstractEndpoint {
+                                 if (!addToPoller(info.socket, events)) {
+                                     // Can't do anything: close the socket right
+                                     // away
+-                                    if (!event || (event && !processSocket(
++                                    if (!comet || (comet && !processSocket(
+                                             info.socket, SocketStatus.ERROR))) {
+                                         destroySocket(info.socket);
+                                     }
+@@ -1650,7 +1629,7 @@ public class AprEndpoint extends AbstractEndpoint {
+                             for (int n = 0; n < rv; n++) {
+                                 timeouts.remove(desc[n*2+1]);
+                                 // Check for failed sockets and hand this socket off to a worker
+-                                if (event) {
++                                if (connections.get(Long.valueOf(desc[n*2+1])).isComet()) {
+                                     // Event processes either a read or a write depending on what the poller returns
+                                     if (((desc[n*2] & Poll.APR_POLLHUP) == Poll.APR_POLLHUP)
+                                             || ((desc[n*2] & Poll.APR_POLLERR) == Poll.APR_POLLERR)
+
+==================================================
+SocketWrapper.java
+index 19e717e398..602da8d770 100644
+--- a/java/org/apache/tomcat/util/net/NioEndpoint.java
++++ b/java/org/apache/tomcat/util/net/NioEndpoint.java
+@@ -945,7 +945,7 @@ public class NioEndpoint extends AbstractEndpoint {
+             try {
+                 if ( key == null ) return;//nothing to do
+                 KeyAttachment ka = (KeyAttachment) key.attachment();
+-                if (ka != null && ka.getComet() && status != null) {
++                if (ka != null && ka.isComet() && status != null) {
+                     ka.setComet(false);//to avoid a loop
+                     if (status == SocketStatus.TIMEOUT ) {
+                         if (processSocket(ka.getChannel(), status, true)) {
+@@ -1122,7 +1122,7 @@ public class NioEndpoint extends AbstractEndpoint {
+                     if (sk.isReadable() || sk.isWritable() ) {
+                         if ( attachment.getSendfileData() != null ) {
+                             processSendfile(sk,attachment, false);
+-                        } else if ( attachment.getComet() ) {
++                        } else if ( attachment.isComet() ) {
+                             //check if thread is available
+                             if ( isWorkerAvailable() ) {
+                                 //set interest ops to 0 so we don't get multiple
+@@ -1334,7 +1334,7 @@ public class NioEndpoint extends AbstractEndpoint {
+                             ka.interestOps(0); //avoid duplicate timeout calls
+                             cancelledKey(key, SocketStatus.TIMEOUT);
+                         }
+-                    } else if (ka.isAsync() || ka.getComet()) {
++                    } else if (ka.isAsync() || ka.isComet()) {
+                         if (close) {
+                             key.interestOps(0);
+                             ka.interestOps(0); //avoid duplicate stop calls
+@@ -1379,7 +1379,7 @@ public class NioEndpoint extends AbstractEndpoint {
+             this.socket = channel;
+             this.poller = poller;
+             lastAccess = System.currentTimeMillis();
+-            comet = false;
++            setComet(false);
+             timeout = soTimeout;
+             error = false;
+             lastRegistered = 0;
+@@ -1414,8 +1414,6 @@ public class NioEndpoint extends AbstractEndpoint {
+ 
+         public Poller getPoller() { return poller;}
+         public void setPoller(Poller poller){this.poller = poller;}
+-        public void setComet(boolean comet) { this.comet = comet; }
+-        public boolean getComet() { return comet; }
+         public void setCometNotify(boolean notify) { this.cometNotify = notify; }
+         public boolean getCometNotify() { return cometNotify; }
+         public NioChannel getChannel() { return getSocket();}
+@@ -1452,7 +1450,6 @@ public class NioEndpoint extends AbstractEndpoint {
+ 
+         private Poller poller = null;
+         private int interestOps = 0;
+-        private boolean comet = false;
+         private boolean cometNotify = false;
+         private CountDownLatch readLatch = null;
+         private CountDownLatch writeLatch = null;
+
+==================================================

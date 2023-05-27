@@ -1,0 +1,157 @@
+cd688dbc66786c83df04cc7c557c01a98cb64ae7
+==================================================
+Obtain JarFile from ArchiveResourceSet when required so useage can be
+==================================================
+Mark Thomas
+==================================================
+Tue Jan 27 19:38:10 2015 +0000
+==================================================
+AbstractArchiveResource.java
+Obtain JarFile from ArchiveResourceSet when required so useage can be
+tracked and the JarFile closed when it is no longer needed.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1655129 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AbstractArchiveResourceSet.java
+index 52ecad2467..f84c54058c 100644
+--- a/java/org/apache/catalina/webresources/AbstractArchiveResource.java
++++ b/java/org/apache/catalina/webresources/AbstractArchiveResource.java
+@@ -22,7 +22,6 @@ import java.net.MalformedURLException;
+ import java.net.URL;
+ import java.security.cert.Certificate;
+ import java.util.jar.JarEntry;
+-import java.util.jar.JarFile;
+ import java.util.jar.Manifest;
+ 
+ public abstract class AbstractArchiveResource extends AbstractResource {
+@@ -61,6 +60,10 @@ public abstract class AbstractArchiveResource extends AbstractResource {
+         }
+     }
+ 
++    protected AbstractArchiveResourceSet getArchiveResourceSet() {
++        return archiveResourceSet;
++    }
++
+     protected final String getBase() {
+         return archiveResourceSet.getBase();
+     }
+@@ -213,13 +216,11 @@ public abstract class AbstractArchiveResource extends AbstractResource {
+ 
+     protected class JarInputStreamWrapper extends InputStream {
+ 
+-        private final JarFile jarFile;
+         private final JarEntry jarEntry;
+         private final InputStream is;
+ 
+ 
+-        public JarInputStreamWrapper(JarFile jarFile, JarEntry jarEntry, InputStream is) {
+-            this.jarFile = jarFile;
++        public JarInputStreamWrapper(JarEntry jarEntry, InputStream is) {
+             this.jarEntry = jarEntry;
+             this.is = is;
+         }
+@@ -259,7 +260,7 @@ public abstract class AbstractArchiveResource extends AbstractResource {
+         public void close() throws IOException {
+             // Closing the JarFile releases the file lock on the JAR and also
+             // closes all input streams created from the JarFile.
+-            jarFile.close();
++            archiveResourceSet.closeJarFile();
+         }
+ 
+ 
+
+==================================================
+JarResource.java
+index 8a5bca1180..f16c582603 100644
+--- a/java/org/apache/catalina/webresources/AbstractArchiveResourceSet.java
++++ b/java/org/apache/catalina/webresources/AbstractArchiveResourceSet.java
+@@ -17,6 +17,7 @@
+ package org.apache.catalina.webresources;
+ 
+ import java.io.File;
++import java.io.IOException;
+ import java.io.InputStream;
+ import java.net.URL;
+ import java.util.ArrayList;
+@@ -24,6 +25,7 @@ import java.util.HashMap;
+ import java.util.Iterator;
+ import java.util.Set;
+ import java.util.jar.JarEntry;
++import java.util.jar.JarFile;
+ import java.util.jar.Manifest;
+ 
+ import org.apache.catalina.WebResource;
+@@ -37,6 +39,11 @@ public abstract class AbstractArchiveResourceSet extends AbstractResourceSet {
+     private String baseUrlString;
+     private Manifest manifest;
+ 
++    private JarFile archive = null;
++    private final Object archiveLock = new Object();
++    private long archiveUseCount = 0;
++    private long archiveLastUsed = 0;
++
+ 
+     protected final void setManifest(Manifest manifest) {
+         this.manifest = manifest;
+@@ -270,4 +277,36 @@ public abstract class AbstractArchiveResourceSet extends AbstractResourceSet {
+         throw new IllegalArgumentException(
+                 sm.getString("abstractArchiveResourceSet.setReadOnlyFalse"));
+     }
++
++    protected JarFile openJarFile() throws IOException {
++        synchronized (archiveLock) {
++            if (archive == null) {
++                archive = new JarFile(getBase());
++            }
++            archiveUseCount++;
++            archiveLastUsed = System.currentTimeMillis();
++            return archive;
++        }
++    }
++
++    protected void closeJarFile() {
++        synchronized (archiveLock) {
++            archiveUseCount--;
++        }
++    }
++
++    @Override
++    public void backgroundProcess() {
++        synchronized (archiveLock) {
++            if (archive != null && archiveUseCount == 0 &&
++                    (System.currentTimeMillis() - archiveLastUsed) > 1000) {
++                try {
++                    archive.close();
++                } catch (IOException e) {
++                    // Log at least WARN
++                }
++                archive = null;
++            }
++        }
++    }
+ }
+
+==================================================
+JarWarResource.java
+index 4f08102036..480f2fbfa8 100644
+--- a/java/org/apache/catalina/webresources/JarResource.java
++++ b/java/org/apache/catalina/webresources/JarResource.java
+@@ -40,11 +40,11 @@ public class JarResource extends AbstractArchiveResource {
+     @Override
+     protected JarInputStreamWrapper getJarInputStreamWrapper() {
+         try {
+-            JarFile jarFile = new JarFile(getBase());
++            JarFile jarFile = getArchiveResourceSet().openJarFile();
+             // Need to create a new JarEntry so the certificates can be read
+             JarEntry jarEntry = jarFile.getJarEntry(getResource().getName());
+             InputStream is = jarFile.getInputStream(jarEntry);
+-            return new JarInputStreamWrapper(jarFile, jarEntry, is);
++            return new JarInputStreamWrapper(jarEntry, is);
+         } catch (IOException e) {
+             if (log.isDebugEnabled()) {
+                 log.debug(sm.getString("jarResource.getInputStreamFail",
+
+==================================================

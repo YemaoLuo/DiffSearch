@@ -1,0 +1,180 @@
+74fb729a36cbab86afa1b409e009a03db73ebe62
+==================================================
+refactor latch usage, since its shared by all connectors
+==================================================
+Filip Hanik
+==================================================
+Tue Dec 21 17:40:57 2010 +0000
+==================================================
+AbstractEndpoint.java
+refactor latch usage, since its shared by all connectors
+
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1051578 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AprEndpoint.java
+index c3dcda0617..8e80c3b05b 100644
+--- a/java/org/apache/tomcat/util/net/AbstractEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AbstractEndpoint.java
+@@ -126,7 +126,7 @@ public abstract class AbstractEndpoint {
+     /**
+      * counter for nr of connections handled by an endpoint
+      */
+-    protected volatile CounterLatch connectionCounterLatch = null;
++    private volatile CounterLatch connectionCounterLatch = null;
+ 
+     /**
+      * Socket properties
+@@ -576,6 +576,43 @@ public abstract class AbstractEndpoint {
+ 
+     protected abstract Log getLog();
+     public abstract boolean getUseSendfile();
++    
++    protected CounterLatch initializeConnectionLatch() {
++        if (connectionCounterLatch==null) {
++            connectionCounterLatch = new CounterLatch(0,getMaxConnections());
++        }
++        return connectionCounterLatch;
++    }
++    
++    protected void releaseConnectionLatch() {
++        CounterLatch latch = connectionCounterLatch;
++        if (latch!=null) latch.releaseAll();
++        connectionCounterLatch = null;
++    }
++    
++    protected void awaitConnection() throws InterruptedException {
++        CounterLatch latch = connectionCounterLatch;
++        if (latch!=null) latch.await();
++    }
++    
++    protected long countUpConnection() {
++        CounterLatch latch = connectionCounterLatch;
++        if (latch!=null) return latch.countUp();
++        else return -1;
++    }
++    
++    protected long countDownConnection() {
++        CounterLatch latch = connectionCounterLatch;
++        if (latch!=null) {
++            long result = latch.countDown();
++            if (result<0) {
++                getLog().warn("Incorrect connection count, multiple socket.close called on the same socket." );
++            }
++            return result;
++        } else return -1;
++    }
++    
++    
+ 
+     // --------------------  SSL related properties --------------------
+ 
+
+==================================================
+JIoEndpoint.java
+index 393b44eb2c..c4025f3ebd 100644
+--- a/java/org/apache/tomcat/util/net/AprEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AprEndpoint.java
+@@ -40,6 +40,7 @@ import org.apache.tomcat.jni.SSLSocket;
+ import org.apache.tomcat.jni.Socket;
+ import org.apache.tomcat.jni.Status;
+ import org.apache.tomcat.util.ExceptionUtils;
++import org.apache.tomcat.util.threads.CounterLatch;
+ 
+ 
+ /**
+@@ -531,6 +532,8 @@ public class AprEndpoint extends AbstractEndpoint {
+             if (getExecutor() == null) {
+                 createExecutor();
+             }
++            
++            initializeConnectionLatch();
+ 
+             // Start poller threads
+             pollers = new Poller[pollerThreadCount];
+@@ -592,6 +595,7 @@ public class AprEndpoint extends AbstractEndpoint {
+      */
+     @Override
+     public void stopInternal() {
++        releaseConnectionLatch();
+         if (!paused) {
+             pause();
+         }
+@@ -885,6 +889,7 @@ public class AprEndpoint extends AbstractEndpoint {
+             // parent pool or acceptor socket.
+             // In any case disable double free which would cause JVM core.
+             Socket.destroy(socket);
++            countDownConnection();
+         }
+     }
+ 
+@@ -926,8 +931,12 @@ public class AprEndpoint extends AbstractEndpoint {
+                     break;
+                 }
+                 try {
++                    //if we have reached max connections, wait
++                    awaitConnection();
+                     // Accept the next incoming connection from the server socket
+                     long socket = Socket.accept(serverSock);
++                    //increment socket count
++                    countUpConnection();
+                     /*
+                      * In the case of a deferred accept unlockAccept needs to
+                      * send data. This data will be rubbish, so destroy the
+
+==================================================
+NioEndpoint.java
+index 1cacd90fc4..f7e2e9bde1 100644
+--- a/java/org/apache/tomcat/util/net/JIoEndpoint.java
++++ b/java/org/apache/tomcat/util/net/JIoEndpoint.java
+@@ -201,7 +201,7 @@ public class JIoEndpoint extends AbstractEndpoint {
+                 }
+                 try {
+                     //if we have reached max connections, wait
+-                    connectionCounterLatch.await();
++                    awaitConnection();                    
+                     // Accept the next incoming connection from the server socket
+                     Socket socket = serverSocketFactory.acceptSocket(serverSocket);
+                     
+@@ -216,7 +216,7 @@ public class JIoEndpoint extends AbstractEndpoint {
+                                 // Ignore
+                             }
+                         } else {
+-                            connectionCounterLatch.countUp();
++                            countUpConnection();
+                         }
+                     } else {
+                         // Close socket right away
+@@ -293,7 +293,7 @@ public class JIoEndpoint extends AbstractEndpoint {
+                         if (log.isTraceEnabled()) {
+                             log.trace("Closing socket:"+socket);
+                         }
+-                        connectionCounterLatch.countDown();
++                        countDownConnection();
+                         try {
+                             socket.getSocket().close();
+                         } catch (IOException e) {
+@@ -382,7 +382,7 @@ public class JIoEndpoint extends AbstractEndpoint {
+                 createExecutor();
+             }
+             
+-            connectionCounterLatch = new CounterLatch(0,getMaxConnections());
++            initializeConnectionLatch();
+ 
+             // Start acceptor threads
+             for (int i = 0; i < acceptorThreadCount; i++) {
+@@ -404,8 +404,7 @@ public class JIoEndpoint extends AbstractEndpoint {
+ 
+     @Override
+     public void stopInternal() {
+-        connectionCounterLatch.releaseAll();
+-        connectionCounterLatch = null;
++        releaseConnectionLatch();
+         if (!paused) {
+             pause();
+         }
+
+==================================================

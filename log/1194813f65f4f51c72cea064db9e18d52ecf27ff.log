@@ -1,0 +1,429 @@
+1194813f65f4f51c72cea064db9e18d52ecf27ff
+==================================================
+Update the implementation of the the proposed Servlet 4.0 API to provide mapping type information for the current request to reflect discussions within the EG.
+==================================================
+Mark Thomas
+==================================================
+Mon Apr 11 10:08:37 2016 +0000
+==================================================
+RequestDispatcher.java
+Update the implementation of the the proposed Servlet 4.0 API to provide mapping type information for the current request to reflect discussions within the EG.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1738562 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+HttpServletRequest.java
+index 99ceeef80d..5f4849f65d 100644
+--- a/java/javax/servlet/RequestDispatcher.java
++++ b/java/javax/servlet/RequestDispatcher.java
+@@ -91,6 +91,17 @@ public interface RequestDispatcher {
+      */
+     static final String FORWARD_QUERY_STRING = "javax.servlet.forward.query_string";
+ 
++    /**
++     * The name of the request attribute that should be set by the container
++     * when the {@link #forward(ServletRequest, ServletResponse)} method is
++     * called. It provides the original value of a path-related property of the
++     * request. See the chapter "Forwarded Request Parameters" in the Servlet
++     * Specification for details.
++     *
++     * @since Servlet 4.0
++     */
++    static final String FORWARD_MAPPING = "javax.servlet.forward.mapping";
++
+     /**
+      * The name of the request attribute that should be set by the container
+      * when the {@link #include(ServletRequest, ServletResponse)} method is
+@@ -151,6 +162,18 @@ public interface RequestDispatcher {
+      */
+     static final String INCLUDE_QUERY_STRING = "javax.servlet.include.query_string";
+ 
++    /**
++     * The name of the request attribute that should be set by the container
++     * when the {@link #include(ServletRequest, ServletResponse)} method is
++     * called on the {@code RequestDispatcher} obtained by a path and not by a
++     * name. It provides information on the path that was used to obtain the
++     * {@code RequestDispatcher} instance for this include call. See the chapter
++     * "Included Request Parameters" in the Servlet Specification for details.
++     *
++     * @since Servlet 4.0
++     */
++    static final String INCLUDE_MAPPING = "javax.servlet.include.mapping";
++
+     /**
+      * The name of the request attribute that should be set by the container
+      * when custom error-handling servlet or JSP page is invoked. The value of
+
+==================================================
+Mapping.java
+index f775d516cf..0f042af352 100644
+--- a/java/javax/servlet/http/HttpServletRequest.java
++++ b/java/javax/servlet/http/HttpServletRequest.java
+@@ -184,9 +184,14 @@ public interface HttpServletRequest extends ServletRequest {
+             }
+ 
+             @Override
+-            public MappingMatch getMatchType() {
++            public MappingMatch getMappingMatch() {
+                 return MappingMatch.UNKNOWN;
+             }
++
++            @Override
++            public String getServletName() {
++                return "";
++            }
+         };
+     }
+ 
+
+==================================================
+MappingMatch.java
+index 88a89202ad..695e012fdf 100644
+--- a/java/javax/servlet/http/Mapping.java
++++ b/java/javax/servlet/http/Mapping.java
+@@ -16,6 +16,8 @@
+ */
+ package javax.servlet.http;
+ 
++import javax.servlet.annotation.WebServlet;
++
+ /**
+  * Represents how the request from which this object was obtained was mapped to
+  * the associated servlet.
+@@ -38,5 +40,14 @@ public interface Mapping {
+     /**
+      * @return The type of match ({@link MappingMatch#UNKNOWN} if not known)
+      */
+-    MappingMatch getMatchType();
++    MappingMatch getMappingMatch();
++
++    /**
++     * @return The name of the servlet (as specified in web.xml,
++     *         {@link WebServlet#name()},
++     *         {@link javax.servlet.ServletContext#addServlet(String, Class)} or
++     *         one of the other <code>addServlet()</code> methods) that the
++     *         request was mapped to.
++     */
++    String getServletName();
+ }
+
+==================================================
+ApplicationContext.java
+index ecda17706c..6e126c06d8 100644
+--- a/java/javax/servlet/http/MappingMatch.java
++++ b/java/javax/servlet/http/MappingMatch.java
+@@ -27,7 +27,6 @@ public enum MappingMatch {
+     DEFAULT,
+     EXACT,
+     EXTENSION,
+-    IMPLICIT,
+     PATH,
+     UNKNOWN
+ }
+
+==================================================
+ApplicationDispatcher.java
+index 8cb70fee06..f8692fad85 100644
+--- a/java/org/apache/catalina/core/ApplicationContext.java
++++ b/java/org/apache/catalina/core/ApplicationContext.java
+@@ -52,6 +52,7 @@ import javax.servlet.descriptor.JspConfigDescriptor;
+ import javax.servlet.http.HttpSessionAttributeListener;
+ import javax.servlet.http.HttpSessionIdListener;
+ import javax.servlet.http.HttpSessionListener;
++import javax.servlet.http.Mapping;
+ 
+ import org.apache.catalina.Container;
+ import org.apache.catalina.Context;
+@@ -375,7 +376,7 @@ public class ApplicationContext
+         if (wrapper == null)
+             return (null);
+ 
+-        return new ApplicationDispatcher(wrapper, null, null, null, null, name);
++        return new ApplicationDispatcher(wrapper, null, null, null, null, null, name);
+ 
+     }
+ 
+@@ -460,13 +461,14 @@ public class ApplicationContext
+         Wrapper wrapper = mappingData.wrapper;
+         String wrapperPath = mappingData.wrapperPath.toString();
+         String pathInfo = mappingData.pathInfo.toString();
++        Mapping mapping = (new ApplicationMapping(mappingData)).getMapping();
+ 
+         mappingData.recycle();
+ 
+         // Construct a RequestDispatcher to process this request
+         return new ApplicationDispatcher
+             (wrapper, uriCC.toString(), wrapperPath, pathInfo,
+-             queryString, null);
++             queryString, mapping, null);
+ 
+     }
+ 
+
+==================================================
+ApplicationHttpRequest.java
+index 79ecf613a8..9089d009d7 100644
+--- a/java/org/apache/catalina/core/ApplicationDispatcher.java
++++ b/java/org/apache/catalina/core/ApplicationDispatcher.java
+@@ -34,6 +34,7 @@ import javax.servlet.ServletResponseWrapper;
+ import javax.servlet.UnavailableException;
+ import javax.servlet.http.HttpServletRequest;
+ import javax.servlet.http.HttpServletResponse;
++import javax.servlet.http.Mapping;
+ 
+ import org.apache.catalina.AsyncDispatcher;
+ import org.apache.catalina.Context;
+@@ -199,12 +200,13 @@ final class ApplicationDispatcher implements AsyncDispatcher, RequestDispatcher
+      *  (if any)
+      * @param queryString Query string parameters included with this request
+      *  (if any)
++     * @param mapping The mapping for this resource (if any)
+      * @param name Servlet name (if a named dispatcher was created)
+      *  else <code>null</code>
+      */
+     public ApplicationDispatcher
+         (Wrapper wrapper, String requestURI, String servletPath,
+-         String pathInfo, String queryString, String name) {
++         String pathInfo, String queryString, Mapping mapping, String name) {
+ 
+         super();
+ 
+@@ -215,6 +217,7 @@ final class ApplicationDispatcher implements AsyncDispatcher, RequestDispatcher
+         this.servletPath = servletPath;
+         this.pathInfo = pathInfo;
+         this.queryString = queryString;
++        this.mapping = mapping;
+         this.name = name;
+     }
+ 
+@@ -257,6 +260,12 @@ final class ApplicationDispatcher implements AsyncDispatcher, RequestDispatcher
+     private final String servletPath;
+ 
+ 
++    /**
++     * The mapping for this RequestDispatcher.
++     */
++    private final Mapping mapping;
++
++
+     /**
+      * The StringManager for this package.
+      */
+@@ -349,8 +358,7 @@ final class ApplicationDispatcher implements AsyncDispatcher, RequestDispatcher
+                 (ApplicationHttpRequest) wrapRequest(state);
+             String contextPath = context.getPath();
+             HttpServletRequest hrequest = state.hrequest;
+-            if (hrequest.getAttribute(
+-                    RequestDispatcher.FORWARD_REQUEST_URI) == null) {
++            if (hrequest.getAttribute(RequestDispatcher.FORWARD_REQUEST_URI) == null) {
+                 wrequest.setAttribute(RequestDispatcher.FORWARD_REQUEST_URI,
+                                       hrequest.getRequestURI());
+                 wrequest.setAttribute(RequestDispatcher.FORWARD_CONTEXT_PATH,
+@@ -361,6 +369,7 @@ final class ApplicationDispatcher implements AsyncDispatcher, RequestDispatcher
+                                       hrequest.getPathInfo());
+                 wrequest.setAttribute(RequestDispatcher.FORWARD_QUERY_STRING,
+                                       hrequest.getQueryString());
++                wrequest.setAttribute(RequestDispatcher.FORWARD_MAPPING, hrequest.getMapping());
+             }
+ 
+             wrequest.setContextPath(contextPath);
+@@ -371,6 +380,7 @@ final class ApplicationDispatcher implements AsyncDispatcher, RequestDispatcher
+                 wrequest.setQueryString(queryString);
+                 wrequest.setQueryParams(queryString);
+             }
++            wrequest.setMapping(mapping);
+ 
+             processRequest(request,response,state);
+         }
+@@ -560,6 +570,9 @@ final class ApplicationDispatcher implements AsyncDispatcher, RequestDispatcher
+                                       queryString);
+                 wrequest.setQueryParams(queryString);
+             }
++            if (mapping != null) {
++                wrequest.setAttribute(RequestDispatcher.INCLUDE_MAPPING, mapping);
++            }
+ 
+             wrequest.setAttribute(Globals.DISPATCHER_TYPE_ATTR,
+                     DispatcherType.INCLUDE);
+
+==================================================
+ApplicationMapping.java
+index 285a7c65fb..71a8f63748 100644
+--- a/java/org/apache/catalina/core/ApplicationHttpRequest.java
++++ b/java/org/apache/catalina/core/ApplicationHttpRequest.java
+@@ -33,6 +33,7 @@ import javax.servlet.ServletContext;
+ import javax.servlet.http.HttpServletRequest;
+ import javax.servlet.http.HttpServletRequestWrapper;
+ import javax.servlet.http.HttpSession;
++import javax.servlet.http.Mapping;
+ import javax.servlet.http.PushBuilder;
+ 
+ import org.apache.catalina.Context;
+@@ -75,11 +76,13 @@ class ApplicationHttpRequest extends HttpServletRequestWrapper {
+       RequestDispatcher.INCLUDE_SERVLET_PATH,
+       RequestDispatcher.INCLUDE_PATH_INFO,
+       RequestDispatcher.INCLUDE_QUERY_STRING,
++      RequestDispatcher.INCLUDE_MAPPING,
+       RequestDispatcher.FORWARD_REQUEST_URI,
+       RequestDispatcher.FORWARD_CONTEXT_PATH,
+       RequestDispatcher.FORWARD_SERVLET_PATH,
+       RequestDispatcher.FORWARD_PATH_INFO,
+-      RequestDispatcher.FORWARD_QUERY_STRING };
++      RequestDispatcher.FORWARD_QUERY_STRING,
++      RequestDispatcher.FORWARD_MAPPING};
+ 
+ 
+     // ----------------------------------------------------------- Constructors
+@@ -181,6 +184,12 @@ class ApplicationHttpRequest extends HttpServletRequestWrapper {
+     protected String servletPath = null;
+ 
+ 
++    /**
++     * The mapping for this request.
++     */
++    private Mapping mapping = null;
++
++
+     /**
+      * The currently active session for this request.
+      */
+@@ -510,6 +519,12 @@ class ApplicationHttpRequest extends HttpServletRequestWrapper {
+     }
+ 
+ 
++    @Override
++    public Mapping getMapping() {
++        return mapping;
++    }
++
++
+     /**
+      * Return the session associated with this Request, creating one
+      * if necessary.
+@@ -689,7 +704,7 @@ class ApplicationHttpRequest extends HttpServletRequestWrapper {
+         queryString = request.getQueryString();
+         requestURI = request.getRequestURI();
+         servletPath = request.getServletPath();
+-
++        mapping = request.getMapping();
+     }
+ 
+ 
+@@ -747,6 +762,12 @@ class ApplicationHttpRequest extends HttpServletRequestWrapper {
+         this.queryParamString = queryString;
+     }
+ 
++
++    void setMapping(Mapping mapping) {
++        this.mapping = mapping;
++    }
++
++
+     // ------------------------------------------------------ Protected Methods
+ 
+     /**
+
+==================================================
+ApplicationRequest.java
+index c12bcbb758..24b0fd7dcf 100644
+--- a/java/org/apache/catalina/core/ApplicationMapping.java
++++ b/java/org/apache/catalina/core/ApplicationMapping.java
+@@ -35,31 +35,33 @@ public class ApplicationMapping {
+         if (mapping == null) {
+             switch (mappingData.matchType) {
+                 case CONTEXT_ROOT:
+-                    mapping = new MappingImpl("", "", mappingData.matchType);
++                    mapping = new MappingImpl("", "", mappingData.matchType,
++                            mappingData.wrapper.getName());
+                     break;
+                 case DEFAULT:
+-                    mapping = new MappingImpl("/", "/", mappingData.matchType);
++                    mapping = new MappingImpl("/", "/", mappingData.matchType,
++                            mappingData.wrapper.getName());
+                     break;
+                 case EXACT:
+                     mapping = new MappingImpl(mappingData.wrapperPath.toString(),
+-                            mappingData.wrapperPath.toString(), mappingData.matchType);
++                            mappingData.wrapperPath.toString(), mappingData.matchType,
++                            mappingData.wrapper.getName());
+                     break;
+                 case EXTENSION:
+                     String path = mappingData.wrapperPath.toString();
+                     int extIndex = path.lastIndexOf('.');
+                     mapping = new MappingImpl(path.substring(0, extIndex),
+-                            "*" + path.substring(extIndex), mappingData.matchType);
++                            "*" + path.substring(extIndex), mappingData.matchType,
++                            mappingData.wrapper.getName());
+                     break;
+                 case PATH:
+                     mapping = new MappingImpl(mappingData.pathInfo.toString(),
+                             mappingData.wrapperPath.toString() + "/*",
+-                            mappingData.matchType);
++                            mappingData.matchType, mappingData.wrapper.getName());
+                     break;
+-                case IMPLICIT:
+-                    // Treat IMPLICIT as UNKNOWN since Tomcat doesn't use
+-                    // implicit mappings
+                 case UNKNOWN:
+-                    mapping = new MappingImpl("", "", mappingData.matchType);
++                    mapping = new MappingImpl("", "", mappingData.matchType,
++                            mappingData.wrapper.getName());
+                     break;
+             }
+         }
+@@ -76,11 +78,14 @@ public class ApplicationMapping {
+         private final String matchValue;
+         private final String pattern;
+         private final MappingMatch mappingType;
++        private final String servletName;
+ 
+-        public MappingImpl(String matchValue, String pattern, MappingMatch mappingType) {
++        public MappingImpl(String matchValue, String pattern, MappingMatch mappingType,
++                String servletName) {
+             this.matchValue = matchValue;
+             this.pattern = pattern;
+             this.mappingType = mappingType;
++            this.servletName = servletName;
+         }
+ 
+         @Override
+@@ -94,8 +99,13 @@ public class ApplicationMapping {
+         }
+ 
+         @Override
+-        public MappingMatch getMatchType() {
++        public MappingMatch getMappingMatch() {
+             return mappingType;
+         }
++
++        @Override
++        public String getServletName() {
++            return servletName;
++        }
+     }
+ }
+
+==================================================
+TestApplicationMapping.java
+index d60e94665e..0c0125a31d 100644
+--- a/java/org/apache/catalina/core/ApplicationRequest.java
++++ b/java/org/apache/catalina/core/ApplicationRequest.java
+@@ -57,11 +57,13 @@ class ApplicationRequest extends ServletRequestWrapper {
+       RequestDispatcher.INCLUDE_SERVLET_PATH,
+       RequestDispatcher.INCLUDE_PATH_INFO,
+       RequestDispatcher.INCLUDE_QUERY_STRING,
++      RequestDispatcher.INCLUDE_MAPPING,
+       RequestDispatcher.FORWARD_REQUEST_URI,
+       RequestDispatcher.FORWARD_CONTEXT_PATH,
+       RequestDispatcher.FORWARD_SERVLET_PATH,
+       RequestDispatcher.FORWARD_PATH_INFO,
+-      RequestDispatcher.FORWARD_QUERY_STRING };
++      RequestDispatcher.FORWARD_QUERY_STRING,
++      RequestDispatcher.FORWARD_MAPPING};
+ 
+ 
+     // ----------------------------------------------------------- Constructors
+
+==================================================

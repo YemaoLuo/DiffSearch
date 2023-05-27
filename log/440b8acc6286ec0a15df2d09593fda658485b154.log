@@ -1,0 +1,231 @@
+440b8acc6286ec0a15df2d09593fda658485b154
+==================================================
+Add bind()/unbind() to Context
+==================================================
+Mark Emlyn
+==================================================
+Thu Jan 23 12:15:19 2014 +0000
+==================================================
+Context.java
+Add bind()/unbind() to Context
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1560653 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+StandardContext.java
+index 8699dbde51..de6999f62d 100644
+--- a/java/org/apache/catalina/Context.java
++++ b/java/org/apache/catalina/Context.java
+@@ -1594,4 +1594,43 @@ public interface Context extends Container {
+      *         method names.
+      */
+     public Map<String, String> findPreDestroyMethods();
++
++    /**
++     * Change the current thread context class loader to the web application
++     * class loader. If no web application class loader is defined, or if the
++     * current thread is already using the web application class loader then no
++     * change will be made. If the class loader is changed and a
++     * {@link ThreadBindingListener} is configured then
++     * {@link ThreadBindingListener#bind()} will be called after the change has
++     * been made.
++     *
++     * @param usePrivilegedAction
++     *          Should a {@link java.security.PrivilegedAction} be used when
++     *          obtaining the current thread context class loader and setting
++     *          the new one?
++     * @param originalClassLoader
++     *          The current class loader if known to save this method having to
++     *          look it up
++     *
++     * @return If the class loader has been changed by the method it will return
++     *         the thread context class loader in use when the method was
++     *         called. If no change was made then this method returns null.
++     */
++    public ClassLoader bind(boolean usePrivilegedAction, ClassLoader originalClassLoader);
++
++    /**
++     * Restore the current thread context class loader to the original class
++     * loader in used before {@link #bind(boolean, ClassLoader)} was called. If
++     * no original class loader is passed to this method then no change will be
++     * made. If the class loader is changed and a {@link ThreadBindingListener}
++     * is configured then {@link ThreadBindingListener#unbind()} will be called
++     * before the change is made.
++     *
++     * @param usePrivilegedAction
++     *          Should a {@link java.security.PrivilegedAction} be used when
++     *          setting the current thread context class loader?
++     * @param originalClassLoader
++     *          The class loader to restore as the thread context class loader
++     */
++    public void unbind(boolean usePrivilegedAction, ClassLoader originalClassLoader);
+ }
+
+==================================================
+FailedContext.java
+index 309a32da3b..38322384e3 100644
+--- a/java/org/apache/catalina/core/StandardContext.java
++++ b/java/org/apache/catalina/core/StandardContext.java
+@@ -23,6 +23,8 @@ import java.io.InputStream;
+ import java.io.InputStreamReader;
+ import java.net.MalformedURLException;
+ import java.net.URL;
++import java.security.AccessController;
++import java.security.PrivilegedAction;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collection;
+@@ -5707,16 +5709,7 @@ public class StandardContext extends ContainerBase
+      */
+     protected ClassLoader bindThread() {
+ 
+-        ClassLoader oldContextClassLoader =
+-            Thread.currentThread().getContextClassLoader();
+-
+-        if (getLoader() != null && getLoader().getClassLoader() != null) {
+-            Thread.currentThread().setContextClassLoader
+-                (getLoader().getClassLoader());
+-        }
+-        if (getThreadBindingListener() != null) {
+-            getThreadBindingListener().bind();
+-        }
++        ClassLoader oldContextClassLoader = bind(false, null);
+ 
+         if (isUseNaming()) {
+             try {
+@@ -5740,10 +5733,102 @@ public class StandardContext extends ContainerBase
+             ContextBindings.unbindThread(this, this);
+         }
+ 
+-        if (getThreadBindingListener() != null) {
+-            getThreadBindingListener().unbind();
++        unbind(false, oldContextClassLoader);
++    }
++
++
++    @Override
++    public ClassLoader bind(boolean usePrivilegedAction, ClassLoader originalClassLoader) {
++        Loader loader = getLoader();
++        ClassLoader webApplicationClassLoader = null;
++        if (loader != null) {
++            webApplicationClassLoader = loader.getClassLoader();
++        }
++
++        if (originalClassLoader == null) {
++            if (usePrivilegedAction) {
++                PrivilegedAction<ClassLoader> pa = new PrivilegedGetTccl();
++                originalClassLoader = AccessController.doPrivileged(pa);
++            } else {
++                originalClassLoader = Thread.currentThread().getContextClassLoader();
++            }
++        }
++
++        if (webApplicationClassLoader == null ||
++                webApplicationClassLoader == originalClassLoader) {
++            // Not possible or not necessary to switch class loaders. Return
++            // null to indicate this.
++            return null;
++        }
++
++        ThreadBindingListener threadBindingListener = getThreadBindingListener();
++
++        if (usePrivilegedAction) {
++            PrivilegedAction<Void> pa = new PrivilegedSetTccl(webApplicationClassLoader);
++            AccessController.doPrivileged(pa);
++        } else {
++            Thread.currentThread().setContextClassLoader(webApplicationClassLoader);
++        }
++        if (threadBindingListener != null) {
++            try {
++                threadBindingListener.bind();
++            } catch (Throwable t) {
++                ExceptionUtils.handleThrowable(t);
++                log.error(sm.getString(
++                        "standardContext.threadBindingListenerError", getName()), t);
++            }
++        }
++
++        return originalClassLoader;
++    }
++
++
++    @Override
++    public void unbind(boolean usePrivilegedAction, ClassLoader originalClassLoader) {
++        if (originalClassLoader == null) {
++            return;
++        }
++
++        if (threadBindingListener != null) {
++            try {
++                threadBindingListener.unbind();
++            } catch (Throwable t) {
++                ExceptionUtils.handleThrowable(t);
++                log.error(sm.getString(
++                        "standardContext.threadBindingListenerError", getName()), t);
++            }
++        }
++
++        if (usePrivilegedAction) {
++            PrivilegedAction<Void> pa = new PrivilegedSetTccl(originalClassLoader);
++            AccessController.doPrivileged(pa);
++        } else {
++            Thread.currentThread().setContextClassLoader(originalClassLoader);
++        }
++    }
++
++
++    private static class PrivilegedSetTccl implements PrivilegedAction<Void> {
++
++        private ClassLoader cl;
++
++        PrivilegedSetTccl(ClassLoader cl) {
++            this.cl = cl;
++        }
++
++        @Override
++        public Void run() {
++            Thread.currentThread().setContextClassLoader(cl);
++            return null;
++        }
++    }
++
++
++    private static class PrivilegedGetTccl implements PrivilegedAction<ClassLoader> {
++        @Override
++        public ClassLoader run() {
++            return Thread.currentThread().getContextClassLoader();
+         }
+-        Thread.currentThread().setContextClassLoader(oldContextClassLoader);
+     }
+ 
+ 
+
+==================================================
+TesterContext.java
+index 0681e639bb..c5d12b1363 100644
+--- a/java/org/apache/catalina/startup/FailedContext.java
++++ b/java/org/apache/catalina/startup/FailedContext.java
+@@ -736,6 +736,17 @@ public class FailedContext extends LifecycleMBeanBase implements Context {
+     public ThreadBindingListener getThreadBindingListener() { return null; }
+ 
+     @Override
+-    public void setThreadBindingListener(ThreadBindingListener threadBindingListener) { /* NO-OP */ }
++    public void setThreadBindingListener(ThreadBindingListener threadBindingListener) {
++        // NO-OP
++    }
++
++    @Override
++    public ClassLoader bind(boolean usePrivilegedAction, ClassLoader originalClassLoader) {
++        return null;
++    }
+ 
++    @Override
++    public void unbind(boolean usePrivilegedAction, ClassLoader originalClassLoader) {
++        // NO-OP
++    }
+ }
+\ No newline at end of file
+
+==================================================

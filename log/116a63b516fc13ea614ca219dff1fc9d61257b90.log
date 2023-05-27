@@ -1,0 +1,345 @@
+116a63b516fc13ea614ca219dff1fc9d61257b90
+==================================================
+Improved maxAge handling.
+==================================================
+KeiichiFujino kfujino@apache.org
+==================================================
+Tue Mar 19 14:54:23 2019 +0900
+==================================================
+ConnectionPool.java
+index 7138771279..890fe4081e 100644
+--- a/modules/jdbc-pool/doc/jdbc-pool.xml
++++ b/modules/jdbc-pool/doc/jdbc-pool.xml
+@@ -335,7 +335,7 @@
+     <attribute name="timeBetweenEvictionRunsMillis" required="false">
+       <p>(int) The number of milliseconds to sleep between runs of the idle connection validation/cleaner thread.
+          This value should not be set under 1 second. It dictates how often we check for idle, abandoned connections, and how often
+-         we validate idle connections.
++         we validate idle connections. This value will be overridden by <code>maxAge</code> if the latter is non-zero and lower.
+          The default value is <code>5000</code> (5 seconds). <br/>
+       </p>
+     </attribute>
+@@ -463,17 +463,22 @@
+     </attribute>
+ 
+     <attribute name="maxAge" required="false">
+-      <p>(long) Time in milliseconds to keep this connection. This attribute
+-         works both when returning connection and when borrowing connection.
++      <p>(long) Time in milliseconds to keep a connection before recreating it.
+          When a connection is borrowed from the pool, the pool will check to see
+          if the <code>now - time-when-connected > maxAge</code> has been reached
+          , and if so, it reconnects before borrow it. When a connection is
+          returned to the pool, the pool will check to see if the
+          <code>now - time-when-connected > maxAge</code> has been reached, and
+-         if so, it closes the connection rather than returning it to the pool.
++         if so, it tries to reconnect.
++         When a connection is idle and <code>timeBetweenEvictionRunsMillis</code> is
++         greater than zero, the pool will periodically check to see if the
++         <code>now - time-when-connected > maxAge</code> has been reached, and
++         if so, it tries to reconnect.
++         Setting <code>maxAge</code> to a value lower than <code>timeBetweenEvictionRunsMillis</code>
++         will override it (so idle connection validation/cleaning will run more frequently).
+          The default value is <code>0</code>, which implies that connections
+          will be left open and no age check will be done upon borrowing from the
+-         pool and returning the connection to the pool.</p>
++         pool, returning the connection to the pool or when checking idle connections.</p>
+     </attribute>
+ 
+     <attribute name="useEquals" required="false">
+
+==================================================
+PoolConfiguration.java
+index b2ede14456..f5b1862693 100644
+--- a/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/ConnectionPool.java
++++ b/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/ConnectionPool.java
+@@ -524,6 +524,11 @@ public class ConnectionPool {
+             log.warn("maxIdle is smaller than minIdle, setting maxIdle to: "+properties.getMinIdle());
+             properties.setMaxIdle(properties.getMinIdle());
+         }
++        if (properties.getMaxAge()>0 && properties.isPoolSweeperEnabled() &&
++                properties.getTimeBetweenEvictionRunsMillis()>properties.getMaxAge()) {
++            log.warn("timeBetweenEvictionRunsMillis is larger than maxAge, setting timeBetweenEvictionRunsMillis to: " + properties.getMaxAge());
++            properties.setTimeBetweenEvictionRunsMillis((int)properties.getMaxAge());
++        }
+     }
+ 
+     public void initializePoolCleaner(PoolConfiguration properties) {
+@@ -824,10 +829,9 @@ public class ConnectionPool {
+             try {
+                 con.reconnect();
+                 reconnectedCount.incrementAndGet();
+-                int validationMode = getPoolProperties().isTestOnConnect() || getPoolProperties().getInitSQL()!=null ?
+-                    PooledConnection.VALIDATE_INIT :
+-                    PooledConnection.VALIDATE_BORROW;
+-
++                int validationMode = isInitNewConnections() ?
++                        PooledConnection.VALIDATE_INIT:
++                        PooledConnection.VALIDATE_BORROW;
+                 if (con.validate(validationMode)) {
+                     //set the timestamp
+                     con.setTimestamp(now);
+@@ -861,6 +865,18 @@ public class ConnectionPool {
+             }
+         }
+     }
++
++    /**
++     * Returns whether new connections should be initialized by invoking
++     * {@link PooledConnection#validate(int)} with {@link PooledConnection#VALIDATE_INIT}.
++     *
++     * @return true if pool is either configured to test connections on connect or a non-NULL init
++     * SQL has been configured
++     */
++    private boolean isInitNewConnections() {
++        return getPoolProperties().isTestOnConnect() || getPoolProperties().getInitSQL()!=null;
++    }
++
+     /**
+      * Terminate the current transaction for the given connection.
+      * @param con The connection
+@@ -898,8 +914,32 @@ public class ConnectionPool {
+         if (isClosed()) return true;
+         if (!con.validate(action)) return true;
+         if (!terminateTransaction(con)) return true;
+-        if (con.isMaxAgeExpired()) return true;
+-        else return false;
++        return false;
++    }
++
++    /**
++     * Checks whether this connection has {@link PooledConnection#isMaxAgeExpired() expired} and tries to reconnect if it has.
++     *
++     * @return true if the connection was either not expired or expired but reconnecting succeeded,
++     * false if reconnecting failed (either because a new connection could not be established or
++     * validating the newly created connection failed)
++     * @see PooledConnection#isMaxAgeExpired()
++     */
++    protected boolean reconnectIfExpired(PooledConnection con) {
++        if (con.isMaxAgeExpired()) {
++            try {
++                if (log.isDebugEnabled()) log.debug( "Connection ["+this+"] expired because of maxAge, trying to reconnect" );
++                con.reconnect();
++                reconnectedCount.incrementAndGet();
++                if ( isInitNewConnections() && !con.validate( PooledConnection.VALIDATE_INIT)) {
++                    return false;
++                }
++            } catch(Exception e) {
++                log.error("Failed to re-connect connection ["+this+"] that expired because of maxAge",e);
++                return false;
++            }
++        }
++        return true;
+     }
+ 
+     /**
+@@ -933,7 +973,7 @@ public class ConnectionPool {
+                 }
+                 if (busy.remove(con)) {
+ 
+-                    if (!shouldClose(con,PooledConnection.VALIDATE_RETURN)) {
++                    if (!shouldClose(con,PooledConnection.VALIDATE_RETURN) && reconnectIfExpired(con)) {
+                         con.clearWarnings();
+                         con.setStackTrace(null);
+                         con.setTimestamp(System.currentTimeMillis());
+@@ -1071,6 +1111,15 @@ public class ConnectionPool {
+      * Forces a validation of all idle connections if {@link PoolProperties#testWhileIdle} is set.
+      */
+     public void testAllIdle() {
++        testAllIdle(false);
++    }
++
++    /**
++     * Forces a validation of all idle connections if {@link PoolProperties#testWhileIdle} is set.
++     * @param checkMaxAgeOnly whether to only check {@link PooledConnection#isMaxAgeExpired()} but
++     *                        not invoke {@link PooledConnection#validate(int)}
++     */
++    public void testAllIdle(boolean checkMaxAgeOnly) {
+         try {
+             if (idle.isEmpty()) return;
+             Iterator<PooledConnection> unlocked = idle.iterator();
+@@ -1081,7 +1130,14 @@ public class ConnectionPool {
+                     //the con been taken out, we can't clean it up
+                     if (busy.contains(con))
+                         continue;
+-                    if (!con.validate(PooledConnection.VALIDATE_IDLE)) {
++
++                    boolean release;
++                    if (checkMaxAgeOnly) {
++                        release = !reconnectIfExpired(con);
++                    } else {
++                        release = !reconnectIfExpired(con) || !con.validate(PooledConnection.VALIDATE_IDLE);
++                    }
++                    if (release) {
+                         idle.remove(con);
+                         release(con);
+                     }
+@@ -1469,8 +1525,11 @@ public class ConnectionPool {
+                     if (pool.getPoolProperties().getMinIdle() < pool.idle
+                             .size())
+                         pool.checkIdle();
+-                    if (pool.getPoolProperties().isTestWhileIdle())
+-                        pool.testAllIdle();
++                    if (pool.getPoolProperties().isTestWhileIdle()) {
++                        pool.testAllIdle(false);
++                    } else if (pool.getPoolProperties().getMaxAge() > 0) {
++                        pool.testAllIdle(true);
++                    }
+                 } catch (Exception x) {
+                     log.error("", x);
+                 }
+
+==================================================
+PoolProperties.java
+index 82e329016f..f5962e972d 100644
+--- a/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/PoolConfiguration.java
++++ b/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/PoolConfiguration.java
+@@ -699,12 +699,13 @@ public interface PoolConfiguration {
+     public void setUseEquals(boolean useEquals);
+ 
+     /**
+-     * Time in milliseconds to keep this connection alive even when used.
+-     * When a connection is returned to the pool, the pool will check to see if the
+-     * ((now - time-when-connected) &gt; maxAge) has been reached, and if so,
+-     * it closes the connection rather than returning it to the pool.
++     * Time in milliseconds to keep this connection before reconnecting.
++     * When a connection is idle, returned to the pool or borrowed from the pool, the pool will
++     * check to see if the ((now - time-when-connected) &gt; maxAge) has been reached, and if so,
++     * it reconnects. Note that the age of idle connections will only be checked if
++     * {@link #getTimeBetweenEvictionRunsMillis()} returns a value greater than 0.
+      * The default value is 0, which implies that connections will be left open and no
+-     * age check will be done upon returning the connection to the pool.
++     * age checks will be done.
+      * This is a useful setting for database sessions that leak memory as it ensures that the session
+      * will have a finite life span.
+      * @return the time in milliseconds a connection will be open for when used
+@@ -712,12 +713,13 @@ public interface PoolConfiguration {
+     public long getMaxAge();
+ 
+     /**
+-     * Time in milliseconds to keep this connection alive even when used.
+-     * When a connection is returned to the pool, the pool will check to see if the
+-     * ((now - time-when-connected) &gt; maxAge) has been reached, and if so,
+-     * it closes the connection rather than returning it to the pool.
++     * Time in milliseconds to keep this connection before reconnecting.
++     * When a connection is idle, returned to the pool or borrowed from the pool, the pool will
++     * check to see if the ((now - time-when-connected) &gt; maxAge) has been reached, and if so,
++     * it reconnects. Note that the age of idle connections will only be checked if
++     * {@link #getTimeBetweenEvictionRunsMillis()} returns a value greater than 0.
+      * The default value is 0, which implies that connections will be left open and no
+-     * age check will be done upon returning the connection to the pool.
++     * age checks will be done.
+      * This is a useful setting for database sessions that leak memory as it ensures that the session
+      * will have a finite life span.
+      * @param maxAge the time in milliseconds a connection will be open for when used
+
+==================================================
+ConnectionPool.java
+index 2d995d9510..13dee2b6fc 100644
+--- a/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/PoolProperties.java
++++ b/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/PoolProperties.java
+@@ -921,6 +921,7 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
+         result = result || (timer && getSuspectTimeout()>0);
+         result = result || (timer && isTestWhileIdle());
+         result = result || (timer && getMinEvictableIdleTimeMillis()>0);
++        result = result || (timer && getMaxAge()>0);
+         return result;
+     }
+ 
+
+==================================================
+PoolCleanerTest.java
+index e60638247c..5ca7a38ced 100644
+--- a/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/jmx/ConnectionPool.java
++++ b/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/jmx/ConnectionPool.java
+@@ -521,7 +521,11 @@ public class ConnectionPool extends NotificationBroadcasterSupport
+ 
+     @Override
+     public void setMaxAge(long maxAge) {
++        boolean wasEnabled = getPoolProperties().isPoolSweeperEnabled();
+         getPoolProperties().setMaxAge(maxAge);
++        //make sure the pool is properly configured
++        pool.checkPoolConfiguration(getPoolProperties());
++        poolCleanerAttributeUpdated(wasEnabled);
+     }
+ 
+     @Override
+@@ -631,10 +635,7 @@ public class ConnectionPool extends NotificationBroadcasterSupport
+     public void setMinEvictableIdleTimeMillis(int minEvictableIdleTimeMillis) {
+         boolean wasEnabled = getPoolProperties().isPoolSweeperEnabled();
+         getPoolProperties().setMinEvictableIdleTimeMillis(minEvictableIdleTimeMillis);
+-        boolean shouldBeEnabled = getPoolProperties().isPoolSweeperEnabled();
+-        //make sure pool cleaner starts/stops when it should
+-        if (!wasEnabled && shouldBeEnabled) pool.initializePoolCleaner(getPoolProperties());
+-        else if (wasEnabled && !shouldBeEnabled) pool.terminatePoolCleaner();
++        poolCleanerAttributeUpdated(wasEnabled);
+     }
+ 
+ 
+@@ -662,10 +663,7 @@ public class ConnectionPool extends NotificationBroadcasterSupport
+     public void setRemoveAbandoned(boolean removeAbandoned) {
+         boolean wasEnabled = getPoolProperties().isPoolSweeperEnabled();
+         getPoolProperties().setRemoveAbandoned(removeAbandoned);
+-        boolean shouldBeEnabled = getPoolProperties().isPoolSweeperEnabled();
+-        //make sure pool cleaner starts/stops when it should
+-        if (!wasEnabled && shouldBeEnabled) pool.initializePoolCleaner(getPoolProperties());
+-        else if (wasEnabled && !shouldBeEnabled) pool.terminatePoolCleaner();
++        poolCleanerAttributeUpdated(wasEnabled);
+     }
+ 
+ 
+@@ -673,10 +671,7 @@ public class ConnectionPool extends NotificationBroadcasterSupport
+     public void setRemoveAbandonedTimeout(int removeAbandonedTimeout) {
+         boolean wasEnabled = getPoolProperties().isPoolSweeperEnabled();
+         getPoolProperties().setRemoveAbandonedTimeout(removeAbandonedTimeout);
+-        boolean shouldBeEnabled = getPoolProperties().isPoolSweeperEnabled();
+-        //make sure pool cleaner starts/stops when it should
+-        if (!wasEnabled && shouldBeEnabled) pool.initializePoolCleaner(getPoolProperties());
+-        else if (wasEnabled && !shouldBeEnabled) pool.terminatePoolCleaner();
++        poolCleanerAttributeUpdated(wasEnabled);
+     }
+ 
+ 
+@@ -702,10 +697,7 @@ public class ConnectionPool extends NotificationBroadcasterSupport
+     public void setTestWhileIdle(boolean testWhileIdle) {
+         boolean wasEnabled = getPoolProperties().isPoolSweeperEnabled();
+         getPoolProperties().setTestWhileIdle(testWhileIdle);
+-        boolean shouldBeEnabled = getPoolProperties().isPoolSweeperEnabled();
+-        //make sure pool cleaner starts/stops when it should
+-        if (!wasEnabled && shouldBeEnabled) pool.initializePoolCleaner(getPoolProperties());
+-        else if (wasEnabled && !shouldBeEnabled) pool.terminatePoolCleaner();
++        poolCleanerAttributeUpdated(wasEnabled);
+     }
+ 
+ 
+@@ -713,6 +705,21 @@ public class ConnectionPool extends NotificationBroadcasterSupport
+     public void setTimeBetweenEvictionRunsMillis(int timeBetweenEvictionRunsMillis) {
+         boolean wasEnabled = getPoolProperties().isPoolSweeperEnabled();
+         getPoolProperties().setTimeBetweenEvictionRunsMillis(timeBetweenEvictionRunsMillis);
++        //make sure the pool is properly configured
++        pool.checkPoolConfiguration(getPoolProperties());
++        poolCleanerAttributeUpdated(wasEnabled);
++    }
++
++    /**
++     * Starts/stops pool cleaner thread as necessary after its configuration properties
++     * were updated.
++     *
++     * This method must be called <b>after</b> configuration properties affecting the pool cleaner
++     * have been updated.
++     *
++     * @param wasEnabled whether the pool cleaner was enabled <b>before</b> the configuration change occurred.
++     */
++    private void poolCleanerAttributeUpdated(boolean wasEnabled) {
+         boolean shouldBeEnabled = getPoolProperties().isPoolSweeperEnabled();
+         //make sure pool cleaner starts/stops when it should
+         if (!wasEnabled && shouldBeEnabled) {
+@@ -725,7 +732,6 @@ public class ConnectionPool extends NotificationBroadcasterSupport
+         }
+     }
+ 
+-
+     @Override
+     public void setUrl(String url) {
+         getPoolProperties().setUrl(url);
+
+==================================================

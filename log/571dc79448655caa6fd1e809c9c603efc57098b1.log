@@ -1,0 +1,181 @@
+571dc79448655caa6fd1e809c9c603efc57098b1
+==================================================
+Add an instance manager field to the token, it's safer than going through the bindings, and it can be used to determine if it needs the CL environment.
+==================================================
+Remy Maucherat
+==================================================
+Fri Nov 6 12:14:21 2015 +0000
+==================================================
+Request.java
+Add an instance manager field to the token, it's safer than going through the bindings, and it can be used to determine if it needs the CL environment.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1712952 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AbstractProtocol.java
+index dda1d598ef..91e73b4bba 100644
+--- a/java/org/apache/catalina/connector/Request.java
++++ b/java/org/apache/catalina/connector/Request.java
+@@ -84,6 +84,7 @@ import org.apache.coyote.UpgradeToken;
+ import org.apache.coyote.http11.upgrade.InternalHttpUpgradeHandler;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
++import org.apache.tomcat.InstanceManager;
+ import org.apache.tomcat.util.ExceptionUtils;
+ import org.apache.tomcat.util.buf.B2CConverter;
+ import org.apache.tomcat.util.buf.ByteChunk;
+@@ -1844,17 +1845,20 @@ public class Request implements HttpServletRequest {
+     public <T extends HttpUpgradeHandler> T upgrade(
+             Class<T> httpUpgradeHandlerClass) throws java.io.IOException, ServletException {
+         T handler;
++        InstanceManager instanceManager = null;
+         try {
+             // Do not go through the instance manager for internal Tomcat classes since they don't need injection
+             if (InternalHttpUpgradeHandler.class.isAssignableFrom(httpUpgradeHandlerClass)) {
+                 handler = (T) httpUpgradeHandlerClass.newInstance();
+             } else {
+-                handler = (T) getContext().getInstanceManager().newInstance(httpUpgradeHandlerClass);
++                instanceManager = getContext().getInstanceManager();
++                handler = (T) instanceManager.newInstance(httpUpgradeHandlerClass);
+             }
+         } catch (InstantiationException | IllegalAccessException | InvocationTargetException | NamingException e) {
+             throw new ServletException(e);
+         }
+-        UpgradeToken upgradeToken = new UpgradeToken(handler, getContext().getLoader().getClassLoader());
++        UpgradeToken upgradeToken = new UpgradeToken(handler,
++                getContext().getLoader().getClassLoader(), instanceManager);
+ 
+         coyoteRequest.action(ActionCode.UPGRADE, upgradeToken);
+ 
+
+==================================================
+UpgradeToken.java
+index ad77ae07c7..9b2891ebb5 100644
+--- a/java/org/apache/coyote/AbstractProtocol.java
++++ b/java/org/apache/coyote/AbstractProtocol.java
+@@ -35,9 +35,8 @@ import javax.management.ObjectName;
+ import javax.servlet.http.HttpUpgradeHandler;
+ import javax.servlet.http.WebConnection;
+ 
+-import org.apache.coyote.http11.upgrade.InternalHttpUpgradeHandler;
+ import org.apache.juli.logging.Log;
+-import org.apache.tomcat.InstanceManagerBindings;
++import org.apache.tomcat.InstanceManager;
+ import org.apache.tomcat.util.ExceptionUtils;
+ import org.apache.tomcat.util.collections.SynchronizedStack;
+ import org.apache.tomcat.util.modeler.Registry;
+@@ -759,7 +758,7 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+                         // This cast should be safe. If it fails the error
+                         // handling for the surrounding try/catch will deal with
+                         // it.
+-                        if (httpUpgradeHandler instanceof InternalHttpUpgradeHandler) {
++                        if (upgradeToken.getInstanceManager() == null) {
+                             httpUpgradeHandler.init((WebConnection) processor);
+                         } else {
+                             Thread thread = Thread.currentThread();
+@@ -811,7 +810,8 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+                     if (processor.isUpgrade()) {
+                         UpgradeToken upgradeToken = processor.getUpgradeToken();
+                         HttpUpgradeHandler httpUpgradeHandler = upgradeToken.getHttpUpgradeHandler();
+-                        if (httpUpgradeHandler instanceof InternalHttpUpgradeHandler) {
++                        InstanceManager instanceManager = upgradeToken.getInstanceManager();
++                        if (instanceManager == null) {
+                             httpUpgradeHandler.destroy();
+                         } else {
+                             Thread thread = Thread.currentThread();
+@@ -820,8 +820,7 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+                             try {
+                                 thread.setContextClassLoader(upgradeToken.getApplicationClassLoader());
+                                 httpUpgradeHandler.destroy();
+-                                InstanceManagerBindings.get(upgradeToken.getApplicationClassLoader())
+-                                    .destroyInstance(httpUpgradeHandler);
++                                instanceManager.destroyInstance(httpUpgradeHandler);
+                             } finally {
+                                 thread.setContextClassLoader(originalClassLoader);
+                             }
+
+==================================================
+Http11Processor.java
+index 02e8b8866a..3e6857759a 100644
+--- a/java/org/apache/coyote/UpgradeToken.java
++++ b/java/org/apache/coyote/UpgradeToken.java
+@@ -19,6 +19,8 @@ package org.apache.coyote;
+ 
+ import javax.servlet.http.HttpUpgradeHandler;
+ 
++import org.apache.tomcat.InstanceManager;
++
+ /**
+  * Token used during the upgrade process.
+  */
+@@ -26,11 +28,13 @@ public final class UpgradeToken {
+ 
+     private final ClassLoader applicationClassLoader;
+     private final HttpUpgradeHandler httpUpgradeHandler;
++    private final InstanceManager instanceManager;
+ 
+     public UpgradeToken(HttpUpgradeHandler httpUpgradeHandler,
+-            ClassLoader applicationClassLoader) {
++            ClassLoader applicationClassLoader, InstanceManager instanceManager) {
+         this.applicationClassLoader = applicationClassLoader;
+         this.httpUpgradeHandler = httpUpgradeHandler;
++        this.instanceManager = instanceManager;
+     }
+ 
+     public final ClassLoader getApplicationClassLoader() {
+@@ -41,4 +45,8 @@ public final class UpgradeToken {
+         return httpUpgradeHandler;
+     }
+ 
++    public final InstanceManager getInstanceManager() {
++        return instanceManager;
++    }
++
+ }
+
+==================================================
+UpgradeProcessorInternal.java
+index 3d1903649f..e1c96d13bb 100644
+--- a/java/org/apache/coyote/http11/Http11Processor.java
++++ b/java/org/apache/coyote/http11/Http11Processor.java
+@@ -1021,7 +1021,7 @@ public class Http11Processor extends AbstractProcessor {
+                                 upgradeProtocol.getInternalUpgradeHandler(
+                                         getAdapter(), cloneRequest(request));
+                         UpgradeToken upgradeToken = new UpgradeToken(
+-                                upgradeHandler, Http11Processor.class.getClassLoader());
++                                upgradeHandler, Http11Processor.class.getClassLoader(), null);
+                         action(ActionCode.UPGRADE, upgradeToken);
+                         return SocketState.UPGRADING;
+                     }
+
+==================================================
+Http2Protocol.java
+index 126e144148..0708aae44a 100644
+--- a/java/org/apache/coyote/http11/upgrade/UpgradeProcessorInternal.java
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeProcessorInternal.java
+@@ -25,7 +25,6 @@ import javax.servlet.ServletOutputStream;
+ import org.apache.coyote.UpgradeToken;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+-import org.apache.tomcat.InstanceManagerBindings;
+ import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
+ import org.apache.tomcat.util.net.SSLSupport;
+ import org.apache.tomcat.util.net.SocketStatus;
+@@ -79,12 +78,7 @@ public class UpgradeProcessorInternal extends UpgradeProcessorBase {
+ 
+     @Override
+     public void close() throws Exception {
+-        try {
+-            internalHttpUpgradeHandler.destroy();
+-        } finally {
+-            InstanceManagerBindings.get(getUpgradeToken().getApplicationClassLoader())
+-                .destroyInstance(internalHttpUpgradeHandler);
+-        }
++        internalHttpUpgradeHandler.destroy();
+     }
+ 
+ 
+
+==================================================

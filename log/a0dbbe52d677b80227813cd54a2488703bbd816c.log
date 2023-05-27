@@ -1,0 +1,226 @@
+a0dbbe52d677b80227813cd54a2488703bbd816c
+==================================================
+- Handle incomplete writes as it is very easy to do, just in case (it never happens for me though).
+==================================================
+Remy Maucherat
+==================================================
+Wed Apr 2 09:59:14 2014 +0000
+==================================================
+InternalNio2OutputBuffer.java
+- Handle incomplete writes as it is very easy to do, just in case (it never happens for me though).
+- Try again that SSL test.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1583950 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Nio2ServletOutputStream.java
+index b98ebf3e99..580e9c8df4 100644
+--- a/java/org/apache/coyote/http11/InternalNio2OutputBuffer.java
++++ b/java/org/apache/coyote/http11/InternalNio2OutputBuffer.java
+@@ -76,7 +76,7 @@ public class InternalNio2OutputBuffer extends AbstractOutputBuffer<Nio2Channel>
+     /**
+      * The completion handler used for asynchronous write operations
+      */
+-    protected CompletionHandler<Integer, SocketWrapper<Nio2Channel>> completionHandler;
++    protected CompletionHandler<Integer, ByteBuffer> completionHandler;
+ 
+     /**
+      * The completion handler used for asynchronous write operations
+@@ -111,18 +111,20 @@ public class InternalNio2OutputBuffer extends AbstractOutputBuffer<Nio2Channel>
+         this.socket = socketWrapper;
+         this.endpoint = associatedEndpoint;
+ 
+-        this.completionHandler = new CompletionHandler<Integer, SocketWrapper<Nio2Channel>>() {
++        this.completionHandler = new CompletionHandler<Integer, ByteBuffer>() {
+             @Override
+-            public void completed(Integer nBytes, SocketWrapper<Nio2Channel> attachment) {
++            public void completed(Integer nBytes, ByteBuffer attachment) {
+                 boolean notify = false;
+                 synchronized (completionHandler) {
+                     if (nBytes.intValue() < 0) {
+                         failed(new EOFException(sm.getString("iob.failedwrite")), attachment);
+                         return;
+-                    }
+-                    if (bufferedWrites.size() > 0) {
+-                        // Continue writing data
++                    } else if (bufferedWrites.size() > 0) {
++                        // Continue writing data using a gathering write
+                         ArrayList<ByteBuffer> arrayList = new ArrayList<>();
++                        if (attachment.hasRemaining()) {
++                            arrayList.add(attachment);
++                        }
+                         for (ByteBuffer buffer : bufferedWrites) {
+                             buffer.flip();
+                             arrayList.add(buffer);
+@@ -130,9 +132,14 @@ public class InternalNio2OutputBuffer extends AbstractOutputBuffer<Nio2Channel>
+                         bufferedWrites.clear();
+                         ByteBuffer[] array = arrayList.toArray(EMPTY_BUF_ARRAY);
+                         socket.getSocket().write(array, 0, array.length,
+-                                attachment.getTimeout(), TimeUnit.MILLISECONDS,
++                                socket.getTimeout(), TimeUnit.MILLISECONDS,
+                                 array, gatherCompletionHandler);
++                    } else if (attachment.hasRemaining()) {
++                        // Regular write
++                        socket.getSocket().write(attachment, socket.getTimeout(),
++                                TimeUnit.MILLISECONDS, attachment, completionHandler);
+                     } else {
++                        // All data has been written
+                         if (interest && !Nio2Endpoint.isInline()) {
+                             interest = false;
+                             notify = true;
+@@ -141,13 +148,13 @@ public class InternalNio2OutputBuffer extends AbstractOutputBuffer<Nio2Channel>
+                     }
+                 }
+                 if (notify) {
+-                    endpoint.processSocket(attachment, SocketStatus.OPEN_WRITE, true);
++                    endpoint.processSocket(socket, SocketStatus.OPEN_WRITE, true);
+                 }
+             }
+ 
+             @Override
+-            public void failed(Throwable exc, SocketWrapper<Nio2Channel> attachment) {
+-                attachment.setError(true);
++            public void failed(Throwable exc, ByteBuffer attachment) {
++                socket.setError(true);
+                 if (exc instanceof IOException) {
+                     e = (IOException) exc;
+                 } else {
+@@ -155,7 +162,7 @@ public class InternalNio2OutputBuffer extends AbstractOutputBuffer<Nio2Channel>
+                 }
+                 response.getRequest().setAttribute(RequestDispatcher.ERROR_EXCEPTION, e);
+                 writePending.release();
+-                endpoint.processSocket(attachment, SocketStatus.OPEN_WRITE, true);
++                endpoint.processSocket(socket, SocketStatus.OPEN_WRITE, true);
+             }
+         };
+         this.gatherCompletionHandler = new CompletionHandler<Long, ByteBuffer[]>() {
+@@ -166,8 +173,7 @@ public class InternalNio2OutputBuffer extends AbstractOutputBuffer<Nio2Channel>
+                     if (nBytes.longValue() < 0) {
+                         failed(new EOFException(sm.getString("iob.failedwrite")), attachment);
+                         return;
+-                    }
+-                    if (bufferedWrites.size() > 0 || arrayHasData(attachment)) {
++                    } else if (bufferedWrites.size() > 0 || arrayHasData(attachment)) {
+                         // Continue writing data
+                         ArrayList<ByteBuffer> arrayList = new ArrayList<>();
+                         for (ByteBuffer buffer : attachment) {
+@@ -185,6 +191,7 @@ public class InternalNio2OutputBuffer extends AbstractOutputBuffer<Nio2Channel>
+                                 socket.getTimeout(), TimeUnit.MILLISECONDS,
+                                 array, gatherCompletionHandler);
+                     } else {
++                        // All data has been written
+                         if (interest && !Nio2Endpoint.isInline()) {
+                             interest = false;
+                             notify = true;
+@@ -384,13 +391,15 @@ public class InternalNio2OutputBuffer extends AbstractOutputBuffer<Nio2Channel>
+                     if (bufferedWrites.size() > 0) {
+                         for (ByteBuffer buffer : bufferedWrites) {
+                             buffer.flip();
+-                            if (socket.getSocket().write(buffer).get(socket.getTimeout(), TimeUnit.MILLISECONDS).intValue() < 0) {
+-                                throw new EOFException(sm.getString("iob.failedwrite"));
++                            while (buffer.hasRemaining()) {
++                                if (socket.getSocket().write(buffer).get(socket.getTimeout(), TimeUnit.MILLISECONDS).intValue() < 0) {
++                                    throw new EOFException(sm.getString("iob.failedwrite"));
++                                }
+                             }
+                         }
+                         bufferedWrites.clear();
+                     }
+-                    if (byteBuffer.hasRemaining()) {
++                    while (byteBuffer.hasRemaining()) {
+                         if (socket.getSocket().write(byteBuffer).get(socket.getTimeout(), TimeUnit.MILLISECONDS).intValue() < 0) {
+                             throw new EOFException(sm.getString("iob.failedwrite"));
+                         }
+@@ -437,7 +446,7 @@ public class InternalNio2OutputBuffer extends AbstractOutputBuffer<Nio2Channel>
+                     } else if (byteBuffer.hasRemaining()) {
+                         // Regular write
+                         socket.getSocket().write(byteBuffer, socket.getTimeout(),
+-                                TimeUnit.MILLISECONDS, socket, completionHandler);
++                                TimeUnit.MILLISECONDS, byteBuffer, completionHandler);
+                     } else {
+                         // Nothing was written
+                         writePending.release();
+
+==================================================
+TestWebSocketFrameClientSSL.java
+index 5223dedc7d..c7e5b672c6 100644
+--- a/java/org/apache/coyote/http11/upgrade/Nio2ServletOutputStream.java
++++ b/java/org/apache/coyote/http11/upgrade/Nio2ServletOutputStream.java
+@@ -38,42 +38,46 @@ public class Nio2ServletOutputStream extends AbstractServletOutputStream<Nio2Cha
+     private final AbstractEndpoint<Nio2Channel> endpoint;
+     private final Nio2Channel channel;
+     private final int maxWrite;
+-    private final CompletionHandler<Integer, SocketWrapper<Nio2Channel>> completionHandler;
++    private final CompletionHandler<Integer, ByteBuffer> completionHandler;
+     private final Semaphore writePending = new Semaphore(1);
+ 
+-    public Nio2ServletOutputStream(AbstractEndpoint<Nio2Channel> endpoint0, SocketWrapper<Nio2Channel> socketWrapper) {
+-        super(socketWrapper);
++    public Nio2ServletOutputStream(AbstractEndpoint<Nio2Channel> endpoint0, SocketWrapper<Nio2Channel> socketWrapper0) {
++        super(socketWrapper0);
+         this.endpoint = endpoint0;
+-        channel = socketWrapper.getSocket();
++        channel = socketWrapper0.getSocket();
+         maxWrite = channel.getBufHandler().getWriteBuffer().capacity();
+-        this.completionHandler = new CompletionHandler<Integer, SocketWrapper<Nio2Channel>>() {
++        this.completionHandler = new CompletionHandler<Integer, ByteBuffer>() {
+             @Override
+-            public void completed(Integer nBytes, SocketWrapper<Nio2Channel> attachment) {
++            public void completed(Integer nBytes, ByteBuffer attachment) {
+                 if (nBytes.intValue() < 0) {
+                     failed(new EOFException(), attachment);
+                     return;
+-                }
+-                writePending.release();
+-                if (!Nio2Endpoint.isInline()) {
+-                    try {
+-                        onWritePossible();
+-                    } catch (IOException e) {
+-                        attachment.setError(true);
+-                        onError(e);
+-                        endpoint.processSocket(attachment, SocketStatus.ERROR, true);
++                } else if (attachment.hasRemaining()) {
++                    channel.write(attachment, socketWrapper.getTimeout(),
++                            TimeUnit.MILLISECONDS, attachment, completionHandler);
++                } else {
++                    writePending.release();
++                    if (!Nio2Endpoint.isInline()) {
++                        try {
++                            onWritePossible();
++                        } catch (IOException e) {
++                            socketWrapper.setError(true);
++                            onError(e);
++                            endpoint.processSocket(socketWrapper, SocketStatus.ERROR, true);
++                        }
+                     }
+                 }
+             }
+             @Override
+-            public void failed(Throwable exc, SocketWrapper<Nio2Channel> attachment) {
+-                attachment.setError(true);
++            public void failed(Throwable exc, ByteBuffer attachment) {
++                socketWrapper.setError(true);
+                 writePending.release();
+                 if (exc instanceof AsynchronousCloseException) {
+                     // If already closed, don't call onError and close again
+                     return;
+                 }
+                 onError(exc);
+-                endpoint.processSocket(attachment, SocketStatus.ERROR, true);
++                endpoint.processSocket(socketWrapper, SocketStatus.ERROR, true);
+             }
+         };
+     }
+@@ -140,7 +144,7 @@ public class Nio2ServletOutputStream extends AbstractServletOutputStream<Nio2Cha
+                 buffer.put(b, off, len);
+                 buffer.flip();
+                 Nio2Endpoint.startInline();
+-                channel.write(buffer, socketWrapper.getTimeout(), TimeUnit.MILLISECONDS, socketWrapper, completionHandler);
++                channel.write(buffer, socketWrapper.getTimeout(), TimeUnit.MILLISECONDS, buffer, completionHandler);
+                 Nio2Endpoint.endInline();
+                 written = len;
+             }
+
+==================================================

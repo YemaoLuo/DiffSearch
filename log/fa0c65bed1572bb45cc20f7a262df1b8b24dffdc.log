@@ -1,0 +1,693 @@
+fa0c65bed1572bb45cc20f7a262df1b8b24dffdc
+==================================================
+Added RateLimitFilter
+==================================================
+Igal Sapir
+==================================================
+0700
+==================================================
+RateLimitFilter.java
+index 31f7bd0acd..cd5a52366e 100644
+--- a/java/org/apache/catalina/filters/LocalStrings.properties
++++ b/java/org/apache/catalina/filters/LocalStrings.properties
+@@ -52,6 +52,9 @@ http.403=Access to the specified resource [{0}] has been forbidden.
+ httpHeaderSecurityFilter.clickjack.invalid=An invalid value [{0}] was specified for the anti click-jacking header
+ httpHeaderSecurityFilter.committed=Unable to add HTTP headers since response is already committed on entry to the HTTP header security Filter
+ 
++rateLimitFilter.initialized=RateLimitFilter [{0}] initialized with [{1}] requests per [{2}] seconds. Actual is [{3}] per [{4}] milliseconds. {5}.
++rateLimitFilter.maxRequestsExceeded=[{0}] [{1}] Requests from [{2}] have exceeded the maximum allowed of [{3}] in a [{4}] second window.
++
+ remoteCidrFilter.invalid=Invalid configuration provided for [{0}]. See previous messages for details.
+ remoteCidrFilter.noRemoteIp=Client does not have an IP address. Request denied.
+ 
+
+==================================================
+TimeBucketCounter.java
+new file mode 100644
+index 0000000000..97d7c63670
+--- /dev/null
++++ b/java/org/apache/catalina/filters/RateLimitFilter.java
+@@ -0,0 +1,230 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.catalina.filters;
++
++import jakarta.servlet.FilterChain;
++import jakarta.servlet.FilterConfig;
++import jakarta.servlet.GenericFilter;
++import jakarta.servlet.ServletException;
++import jakarta.servlet.ServletRequest;
++import jakarta.servlet.ServletResponse;
++import jakarta.servlet.http.HttpServletResponse;
++import org.apache.catalina.util.TimeBucketCounter;
++import org.apache.juli.logging.Log;
++import org.apache.juli.logging.LogFactory;
++import org.apache.tomcat.util.res.StringManager;
++
++import java.io.IOException;
++
++public class RateLimitFilter extends GenericFilter {
++
++    /**
++     * default duration in seconds
++     */
++    public static final int DEFAULT_BUCKET_DURATION = 60;
++
++    /**
++     * default number of requests per duration
++     */
++    public static final int DEFAULT_BUCKET_REQUESTS = 300;
++
++    /**
++     * default value for enforce
++     */
++    public static final boolean DEFAULT_ENFORCE = true;
++
++    /**
++     * default status code to return if requests per duration exceeded
++     */
++    public static final int DEFAULT_STATUS_CODE = 429;
++
++    /**
++     * default status message to return if requests per duration exceeded
++     */
++    public static final String DEFAULT_STATUS_MESSAGE = "Too many requests";
++
++    /**
++     * request attribute that will contain the number of requests per duration
++     */
++    public static final String RATE_LIMIT_ATTRIBUTE_COUNT = "org.apache.catalina.filters.RateLimitFilter.Count";
++
++    /**
++     * filter init-param to set the bucket duration in seconds
++     */
++    public static final String PARAM_BUCKET_DURATION = "ratelimit.bucket.duration";
++
++    /**
++     * filter init-param to set the bucket number of requests
++     */
++    public static final String PARAM_BUCKET_REQUESTS = "ratelimit.bucket.requests";
++
++    /**
++     * filter init-param to set the enforce flag
++     */
++    public static final String PARAM_ENFORCE = "ratelimit.enforce";
++
++    /**
++     * filter init-param to set a custom status code if requests per duration exceeded
++     */
++    public static final String PARAM_STATUS_CODE = "ratelimit.status.code";
++
++    /**
++     * filter init-param to set a custom status message if requests per duration exceeded
++     */
++    public static final String PARAM_STATUS_MESSAGE = "ratelimit.status.message";
++
++    TimeBucketCounter bucketCounter;
++
++    private int actualRequests;
++
++    private int bucketRequests = DEFAULT_BUCKET_REQUESTS;
++
++    private int bucketDuration = DEFAULT_BUCKET_DURATION;
++
++    private boolean enforce = DEFAULT_ENFORCE;
++    private int statusCode = DEFAULT_STATUS_CODE;
++
++    private String statusMessage = DEFAULT_STATUS_MESSAGE;
++
++    private transient Log log = LogFactory.getLog(RateLimitFilter.class);
++
++    private static final StringManager sm = StringManager.getManager(RateLimitFilter.class);
++
++    /**
++     * @return the actual maximum allowed requests per time bucket
++     */
++    public int getActualRequests() {
++        return actualRequests;
++    }
++
++    /**
++     * @return the actual duration of a time bucket in milliseconds
++     */
++    public int getActualDurationInSeconds() {
++        return bucketCounter.getActualDuration() / 1000;
++    }
++
++    @Override
++    public void init() throws ServletException {
++
++        FilterConfig config = getFilterConfig();
++
++        String param;
++        param = config.getInitParameter(PARAM_BUCKET_DURATION);
++        if (param != null)
++            bucketDuration = Integer.parseInt(param);
++
++        param = config.getInitParameter(PARAM_BUCKET_REQUESTS);
++        if (param != null)
++            bucketRequests = Integer.parseInt(param);
++
++        param = config.getInitParameter(PARAM_ENFORCE);
++        if (param != null)
++            enforce = Boolean.parseBoolean(param);
++
++        param = config.getInitParameter(PARAM_STATUS_CODE);
++        if (param != null)
++            statusCode = Integer.parseInt(param);
++
++        param = config.getInitParameter(PARAM_STATUS_MESSAGE);
++        if (param != null)
++            statusMessage = param;
++
++        bucketCounter = new TimeBucketCounter(bucketDuration);
++
++        actualRequests = (int) Math.round(bucketCounter.getRatio() * bucketRequests);
++
++        log.info(sm.getString("rateLimitFilter.initialized",
++            super.getFilterName(), bucketRequests, bucketDuration, getActualRequests(),
++            getActualDurationInSeconds(), (!enforce ? "Not " : "") + "enforcing")
++        );
++    }
++
++    /**
++     * The <code>doFilter</code> method of the Filter is called by the container
++     * each time a request/response pair is passed through the chain due to a
++     * client request for a resource at the end of the chain. The FilterChain
++     * passed in to this method allows the Filter to pass on the request and
++     * response to the next entity in the chain.
++     * <p>
++     * A typical implementation of this method would follow the following
++     * pattern:- <br>
++     * 1. Examine the request<br>
++     * 2. Optionally wrap the request object with a custom implementation to
++     * filter content or headers for input filtering <br>
++     * 3. Optionally wrap the response object with a custom implementation to
++     * filter content or headers for output filtering <br>
++     * 4. a) <strong>Either</strong> invoke the next entity in the chain using
++     * the FilterChain object (<code>chain.doFilter()</code>), <br>
++     * 4. b) <strong>or</strong> not pass on the request/response pair to the
++     * next entity in the filter chain to block the request processing<br>
++     * 5. Directly set headers on the response after invocation of the next
++     * entity in the filter chain.
++     *
++     * @param request  The request to process
++     * @param response The response associated with the request
++     * @param chain    Provides access to the next filter in the chain for this
++     *                 filter to pass the request and response to for further
++     *                 processing
++     * @throws IOException      if an I/O error occurs during this filter's
++     *                          processing of the request
++     * @throws ServletException if the processing fails for any other reason
++     */
++    @Override
++    public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain)
++                            throws IOException, ServletException {
++
++        String ipAddr = request.getRemoteAddr();
++        int reqCount = bucketCounter.increment(ipAddr);
++
++        request.setAttribute(RATE_LIMIT_ATTRIBUTE_COUNT, reqCount);
++
++        if (enforce && (reqCount > actualRequests)) {
++
++            ((HttpServletResponse) response).sendError(statusCode, statusMessage);
++            log.warn(sm.getString("rateLimitFilter.maxRequestsExceeded",
++                super.getFilterName(), reqCount, ipAddr, getActualRequests(), getActualDurationInSeconds())
++            );
++
++            return;
++        }
++
++        chain.doFilter(request, response);
++    }
++
++    /**
++     * Called by the web container to indicate to a filter that it is being
++     * taken out of service. This method is only called once all threads within
++     * the filter's doFilter method have exited or after a timeout period has
++     * passed. After the web container calls this method, it will not call the
++     * doFilter method again on this instance of the filter. <br>
++     * <br>
++     * <p>
++     * This method gives the filter an opportunity to clean up any resources
++     * that are being held (for example, memory, file handles, threads) and make
++     * sure that any persistent state is synchronized with the filter's current
++     * state in memory.
++     * <p>
++     * The default implementation is a NO-OP.
++     */
++    @Override
++    public void destroy() {
++        this.bucketCounter.destroy();
++        super.destroy();
++    }
++}
+
+==================================================
+TestRateLimitFilter.java
+new file mode 100644
+index 0000000000..0cacc49d31
+--- /dev/null
++++ b/java/org/apache/catalina/util/TimeBucketCounter.java
+@@ -0,0 +1,217 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.catalina.util;
++
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.atomic.AtomicInteger;
++
++/**
++ * this class maintains a thread safe hash map that has timestamp-based buckets
++ * followed by a string for a key, and a counter for a value. each time the
++ * increment() method is called it adds the key if it does not exist, increments
++ * its value and returns it.
++ *
++ * a maintenance thread cleans up keys that are prefixed by previous timestamp
++ * buckets.
++ */
++public class TimeBucketCounter {
++
++    /**
++     * Map to hold the buckets
++     */
++    private final ConcurrentHashMap<String, AtomicInteger> map = new ConcurrentHashMap<>();
++
++    /**
++     * Milliseconds bucket size as a Power of 2 for bit shift math, e.g.
++     * 16 for 65_536ms which is about 1:05 minute
++     */
++    private final int numBits;
++
++    /**
++     * ratio of actual duration to config duration
++     */
++    private final double ratio;
++
++    /**
++     * flag for the maintenance thread
++     */
++    volatile boolean isRunning = false;
++
++    /**
++     *
++     * @param bucketDuration duration in seconds, e.g. for 1 minute pass 60
++     */
++    public TimeBucketCounter(int bucketDuration) {
++
++        int durationMillis = bucketDuration * 1000;
++
++        int bits = 0;
++        int pof2 = nextPowerOf2(durationMillis);
++        int bitCheck = pof2;
++        while (bitCheck > 1) {
++            bitCheck = pof2 >> ++bits;
++        }
++
++        this.numBits = bits;
++
++        this.ratio = ratioToPowerOf2(durationMillis);
++
++        int cleanupsPerBucketDuration = (durationMillis >= 60_000) ? 6 : 3;
++        Thread mt = new MaintenanceThread(durationMillis / cleanupsPerBucketDuration);
++        mt.start();
++    }
++
++    /**
++     * increments the counter for the passed identifier in the current time
++     * bucket and returns the new value
++     *
++     * @param identifier an identifier for which we want to maintain count, e.g. IP Address
++     * @return the count within the current time bucket
++     */
++    public final int increment(String identifier) {
++        String key = getCurrentBucketPrefix() + "-" + identifier;
++        AtomicInteger ai = map.computeIfAbsent(key, v -> new AtomicInteger());
++        return ai.incrementAndGet();
++    }
++
++    /**
++     * calculates the current time bucket prefix by shifting bits for fast
++     * division, e.g. shift 16 bits is the same as dividing by 65,536 which is
++     * about 1:05m
++     */
++    public final int getCurrentBucketPrefix() {
++        return (int) (System.currentTimeMillis() >> this.numBits);
++    }
++
++    /**
++     *
++     * @return
++     */
++    public int getNumBits() {
++        return numBits;
++    }
++
++    /**
++     * the actual duration may differ from the configured duration because
++     * it is set to the next power of 2 value in order to perform very fast
++     * bit shift arithmetic
++     *
++     * @return the actual bucket duration in milliseconds
++     */
++    public int getActualDuration() {
++        return (int) Math.pow(2, getNumBits());
++    }
++
++    /**
++     * returns the ratio between the configured duration param and the
++     * actual duration which will be set to the next power of 2.  we then
++     * multiply the configured requests param by the same ratio in order
++     * to compensate for the added time, if any
++     *
++     * @return the ratio, e.g. 1.092 if the actual duration is 65_536 for
++     *         the configured duration of 60_000
++     */
++    public double getRatio() {
++        return ratio;
++    }
++
++    /**
++     * returns the ratio to the next power of 2 so that we can adjust the value
++     *
++     * @param value
++     * @return
++     */
++    static double ratioToPowerOf2(int value) {
++        double nextPO2 = nextPowerOf2(value);
++        return Math.round((1000 * nextPO2 / value)) / 1000d;
++    }
++
++    /**
++     * returns the next power of 2 given a value, e.g. 256 for 250,
++     * or 1024, for 1000
++     *
++     * @param value
++     * @return
++     */
++    static int nextPowerOf2(int value) {
++        int valueOfHighestBit = Integer.highestOneBit(value);
++        if (valueOfHighestBit == value)
++            return value;
++
++        return valueOfHighestBit << 1;
++    }
++
++    /**
++     * when we want to test a full bucket duration we need to sleep until the
++     * next bucket starts
++     *
++     * @return the number of milliseconds until the next bucket
++     */
++    public long getMillisUntilNextBucket() {
++        long millis = System.currentTimeMillis();
++        long nextTimeBucketMillis = ((millis + (long) Math.pow(2, numBits)) >> numBits) << numBits;
++        long delta = nextTimeBucketMillis - millis;
++        return delta;
++    }
++
++    /**
++     * sets isRunning to false to terminate the maintenance thread
++     */
++    public void destroy() {
++        this.isRunning = false;
++    }
++
++    /**
++     * this class runs a background thread to clean up old keys from the map
++     */
++    class MaintenanceThread extends Thread {
++
++        final long sleeptime;
++
++        public MaintenanceThread(long sleeptime) {
++            super.setDaemon(true);
++            this.sleeptime = sleeptime;
++        }
++
++        @Override
++        public void start() {
++            isRunning = true;
++            super.start();
++        }
++
++        @Override
++        public void run() {
++
++            while (isRunning) {
++                String currentBucketPrefix = String.valueOf(getCurrentBucketPrefix());
++                ConcurrentHashMap.KeySetView<String, AtomicInteger> keys = map.keySet();
++
++                for (String k : keys) {
++                    if (!k.startsWith(currentBucketPrefix)) {
++                        // the key is obsolete, remove it
++                        keys.remove((k));
++                    }
++                }
++
++                try {
++                    Thread.sleep(sleeptime);
++                } catch (InterruptedException e) {}
++            }
++        }
++    }
++}
+
+==================================================
+TestTimeBucketCounter.java
+new file mode 100644
+index 0000000000..2aeb2020d0
+--- /dev/null
++++ b/test/org/apache/catalina/filters/TestRateLimitFilter.java
+@@ -0,0 +1,198 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.catalina.filters;
++
++import jakarta.servlet.FilterChain;
++import jakarta.servlet.FilterConfig;
++import jakarta.servlet.ServletContext;
++import jakarta.servlet.ServletException;
++import org.apache.catalina.Context;
++import org.apache.catalina.LifecycleException;
++import org.apache.catalina.startup.Tomcat;
++import org.apache.catalina.startup.TomcatBaseTest;
++import org.apache.catalina.filters.TestRemoteIpFilter.MockFilterChain;
++import org.apache.catalina.filters.TestRemoteIpFilter.MockHttpServletRequest;
++import org.apache.tomcat.unittest.TesterResponse;
++import org.apache.tomcat.unittest.TesterServletContext;
++import org.apache.tomcat.util.descriptor.web.FilterDef;
++import org.apache.tomcat.util.descriptor.web.FilterMap;
++import org.junit.Assert;
++import org.junit.Test;
++
++import java.io.IOException;
++import java.time.Instant;
++import java.util.Enumeration;
++import java.util.Map;
++
++public class TestRateLimitFilter extends TomcatBaseTest {
++
++    @Test
++    public void TestRateLimitWith4Clients() throws Exception {
++
++        int bucketRequests = 40;
++        int bucketDuration = 4;
++
++        FilterDef filterDef = new FilterDef();
++        filterDef.addInitParameter(RateLimitFilter.PARAM_BUCKET_REQUESTS, String.valueOf(bucketRequests));
++        filterDef.addInitParameter(RateLimitFilter.PARAM_BUCKET_DURATION, String.valueOf(bucketDuration));
++
++        Tomcat tomcat = getTomcatInstance();
++        Context root = tomcat.addContext("", TEMP_DIR);
++        tomcat.start();
++
++        MockFilterChain filterChain = new MockFilterChain();
++        RateLimitFilter rateLimitFilter = testRateLimitFilter(filterDef, root);
++
++        int allowedRequests = (int) Math.round(rateLimitFilter.bucketCounter.getRatio() * bucketRequests);
++
++        long sleepTime = rateLimitFilter.bucketCounter.getMillisUntilNextBucket();
++        System.out.printf("Sleeping %d millis for the next time bucket to start\n", sleepTime);
++        Thread.sleep(sleepTime);
++
++        TestClient tc1 = new TestClient(rateLimitFilter, filterChain, "10.20.20.5", 200, 5);
++        TestClient tc2 = new TestClient(rateLimitFilter, filterChain, "10.20.20.10", 200, 10);
++
++        TestClient tc3 = new TestClient(rateLimitFilter, filterChain, "10.20.20.20", 200, 20);
++        TestClient tc4 = new TestClient(rateLimitFilter, filterChain, "10.20.20.40", 200, 40);
++
++        Thread.sleep(5000);
++
++        Assert.assertEquals(200, tc1.results[24]);    // only 25 requests made, all allowed
++
++        Assert.assertEquals(200, tc2.results[49]);    // only 25 requests made, all allowed
++
++        Assert.assertEquals(200, tc3.results[allowedRequests - 1]); // first allowedRequests allowed
++        Assert.assertEquals(429, tc3.results[allowedRequests]);     // subsequent requests dropped
++
++        Assert.assertEquals(200, tc4.results[allowedRequests - 1]); // first allowedRequests allowed
++        Assert.assertEquals(429, tc4.results[allowedRequests]);     // subsequent requests dropped
++    }
++
++    private RateLimitFilter testRateLimitFilter(FilterDef filterDef, Context root)
++            throws LifecycleException, IOException, ServletException {
++
++        RateLimitFilter rateLimitFilter = new RateLimitFilter();
++        filterDef.setFilterClass(RateLimitFilter.class.getName());
++        filterDef.setFilter(rateLimitFilter);
++        filterDef.setFilterName(RateLimitFilter.class.getName());
++        root.addFilterDef(filterDef);
++
++        FilterMap filterMap = new FilterMap();
++        filterMap.setFilterName(RateLimitFilter.class.getName());
++        filterMap.addURLPatternDecoded("*");
++        root.addFilterMap(filterMap);
++
++        FilterConfig filterConfig = generateFilterConfig(filterDef);
++
++        rateLimitFilter.init(filterConfig);
++
++        return rateLimitFilter;
++        //*/
++    }
++
++    static class TestClient extends Thread {
++        RateLimitFilter filter;
++        FilterChain filterChain;
++        String ip;
++
++        int requests;
++        int sleep;
++
++        int[] results;
++
++        TestClient(RateLimitFilter filter, FilterChain filterChain, String ip, int requests, int rps) {
++            this.filter = filter;
++            this.filterChain = filterChain;
++            this.ip = ip;
++            this.requests = requests;
++            this.sleep = 1000 / rps;
++            this.results = new int[requests];
++            super.setDaemon(true);
++            super.start();
++        }
++
++        @Override
++        public void run() {
++            try {
++                for (int i = 0; i < requests; i++) {
++                    MockHttpServletRequest request = new MockHttpServletRequest();
++                    request.setRemoteAddr(ip);
++                    TesterResponse response = new TesterResponseWithStatus();
++                    response.setRequest(request);
++                    filter.doFilter(request, response, filterChain);
++                    results[i] = response.getStatus();
++                    System.out.printf("%s %s: %s %d\n", ip, Instant.now(), i + 1, response.getStatus());
++                    Thread.sleep(sleep);
++                }
++            }
++            catch (Exception ex) {
++                ex.printStackTrace();
++            }
++        }
++    }
++
++    static class TesterResponseWithStatus extends TesterResponse {
++
++        int status = 200;
++        String message = "OK";
++
++        @Override
++        public void sendError(int status, String message) throws IOException {
++            this.status = status;
++            this.message = message;
++        }
++
++        @Override
++        public int getStatus() {
++            return status;
++        }
++    }
++
++    private static FilterConfig generateFilterConfig(FilterDef filterDef) {
++
++        TesterServletContext mockServletContext = new TesterServletContext();
++        Map<String, String> parameters = filterDef.getParameterMap();
++
++        FilterConfig filterConfig = new FilterConfig() {
++
++            @Override
++            public String getFilterName() {
++                return "rate-limit-filter";
++            }
++
++            @Override
++            public ServletContext getServletContext() {
++                return mockServletContext;
++            }
++
++            @Override
++            public String getInitParameter(String name) {
++
++                return parameters.get(name);
++            }
++
++            @Override
++            public Enumeration<String> getInitParameterNames() {
++                return null;
++            }
++        };
++
++        return filterConfig;
++    }
++
++}
+
+==================================================

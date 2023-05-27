@@ -1,0 +1,87 @@
+ebb47b6b1fbec3ae28fec73be084a0e1cafcfa3d
+==================================================
+Implement non blocking read on HTTP requests.
+==================================================
+Filip Hanik
+==================================================
+Wed Oct 18 23:24:52 2006 +0000
+==================================================
+Http11NioProcessor.java
+Implement non blocking read on HTTP requests.
+
+A common scalability problem when it comes to HTTP is the fact that there are slow clients, that will block a server resources while sending a HTTP request. Especially when you have larger request headers.
+
+On FreeBSD the kernel has a built in http filter to not wake up the application socket handle until the entire request has been received, however on other platforms this is not available.
+
+With the Tomcat connectors, there is an obvious problem when it comes to slow clients, if the client sends up a partial request, Tomcat will block the thread until the client has finished sending the request. For example, if the client has 10 headers it sends up the first 5 headers, then the next 5 in a sequential batch, the tomcat thread is locked in a blocking read
+I've tried to fix that problem by making the NIO connector be non blocking. The only time the NIO connector will block now is when the servlet asks for data, usually the request body, as we don't have a way to suspend a thread, like continuations.
+Once we have continuations(that can truly remember thread stack data), we can have a truly non blocking server, but we are not there yet.
+
+I believe this code could be easily ported to APR connector with very little effort.
+When you review this code, please note that I have not attemtped to rewrite the header parse logic, I might do that in a later stage as this got a little messy, but I wanted the proof of concept done first and reuse as much code as possible.
+
+Please feel free to review and even flame me if needed, at least that means this got some attention :)
+
+
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/tc6.0.x/trunk@465417 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+InternalNioInputBuffer.java
+index 122b8e7e3d..d781149c15 100644
+--- a/java/org/apache/coyote/http11/Http11NioProcessor.java
++++ b/java/org/apache/coyote/http11/Http11NioProcessor.java
+@@ -820,7 +820,7 @@ public class Http11NioProcessor implements ActionHook {
+ 
+         boolean keptAlive = false;
+         boolean openSocket = false;
+-
++        boolean recycle = true;
+         while (!error && keepAlive && !comet) {
+ 
+             // Parsing the request header
+@@ -829,8 +829,7 @@ public class Http11NioProcessor implements ActionHook {
+                     socket.getIOChannel().socket().setSoTimeout((int)soTimeout);
+                     inputBuffer.readTimeout = soTimeout;
+                 }
+-                if (!inputBuffer.parseRequestLine
+-                        (keptAlive && (endpoint.getCurrentThreadsBusy() > limit))) {
++                if (!inputBuffer.parseRequestLine(keptAlive && (endpoint.getCurrentThreadsBusy() > limit))) {
+                     // This means that no data is available right now
+                     // (long keepalive), so that the processor should be recycled
+                     // and the method should return true
+@@ -839,13 +838,18 @@ public class Http11NioProcessor implements ActionHook {
+                     socket.getPoller().add(socket);
+                     break;
+                 }
+-                request.setStartTime(System.currentTimeMillis());
+                 keptAlive = true;
+-                if (!disableUploadTimeout) {
++                if ( !inputBuffer.parseHeaders() ) {
++                    openSocket = true;
++                    socket.getPoller().add(socket);
++                    recycle = false;
++                    break;
++                }
++                request.setStartTime(System.currentTimeMillis());
++                if (!disableUploadTimeout) { //only for body, not for request headers
+                     socket.getIOChannel().socket().setSoTimeout((int)timeout);
+                     inputBuffer.readTimeout = soTimeout;
+                 }
+-                inputBuffer.parseHeaders();
+             } catch (IOException e) {
+                 error = true;
+                 break;
+@@ -934,7 +938,7 @@ public class Http11NioProcessor implements ActionHook {
+                 return SocketState.LONG;
+             }
+         } else {
+-            recycle();
++            if ( recycle ) recycle();
+             return (openSocket) ? SocketState.OPEN : SocketState.CLOSED;
+         }
+ 
+
+==================================================

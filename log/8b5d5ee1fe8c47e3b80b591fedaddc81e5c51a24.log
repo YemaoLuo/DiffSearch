@@ -1,0 +1,420 @@
+8b5d5ee1fe8c47e3b80b591fedaddc81e5c51a24
+==================================================
+Implement new approahc to doHead(). Expand testing to cover HTTP/2.
+==================================================
+Mark Thomas
+==================================================
+Mon Oct 11 14:39:44 2021 +0100
+==================================================
+HttpServlet.java
+Implement new approahc to doHead(). Expand testing to cover HTTP/2.
+
+
+
+==================================================
+OutputBuffer.java
+index ea9976cbfb..f5373213cc 100644
+--- a/java/jakarta/servlet/http/HttpServlet.java
++++ b/java/jakarta/servlet/http/HttpServlet.java
+@@ -31,6 +31,7 @@ import jakarta.servlet.AsyncEvent;
+ import jakarta.servlet.AsyncListener;
+ import jakarta.servlet.DispatcherType;
+ import jakarta.servlet.GenericServlet;
++import jakarta.servlet.ServletConfig;
+ import jakarta.servlet.ServletException;
+ import jakarta.servlet.ServletOutputStream;
+ import jakarta.servlet.ServletRequest;
+@@ -94,12 +95,21 @@ public abstract class HttpServlet extends GenericServlet {
+     private static final String LSTRING_FILE = "jakarta.servlet.http.LocalStrings";
+     private static final ResourceBundle lStrings = ResourceBundle.getBundle(LSTRING_FILE);
+ 
++    /**
++     * @deprecated May be removed in a future release
++     *
++     * @since 6.0
++     */
++    @Deprecated
++    public static final String LEGACY_DO_HEAD = "jakarta.servlet.http.legacyDoHead";
++
+     private final transient Object cachedAllowHeaderValueLock = new Object();
+     /**
+      * Cached value of the HTTP {@code Allow} header for this servlet.
+      */
+     private volatile String cachedAllowHeaderValue = null;
+ 
++    private volatile boolean cachedUseLegacyDoHead;
+ 
+     /**
+      * Does nothing, because this is an abstract class.
+@@ -109,6 +119,13 @@ public abstract class HttpServlet extends GenericServlet {
+     }
+ 
+ 
++    @Override
++    public void init(ServletConfig config) throws ServletException {
++        super.init(config);
++        cachedUseLegacyDoHead = Boolean.parseBoolean(config.getInitParameter(LEGACY_DO_HEAD));
++    }
++
++
+     /**
+      * Called by the server (via the <code>service</code> method) to
+      * allow a servlet to handle a GET request.
+@@ -241,7 +258,7 @@ public abstract class HttpServlet extends GenericServlet {
+     protected void doHead(HttpServletRequest req, HttpServletResponse resp)
+         throws ServletException, IOException {
+ 
+-        if (DispatcherType.INCLUDE.equals(req.getDispatcherType())) {
++        if (DispatcherType.INCLUDE.equals(req.getDispatcherType()) || !cachedUseLegacyDoHead) {
+             doGet(req, resp);
+         } else {
+             NoBodyResponse response = new NoBodyResponse(resp);
+
+==================================================
+Stream.java
+index d7a6783ea3..af2c9afd85 100644
+--- a/java/org/apache/catalina/connector/OutputBuffer.java
++++ b/java/org/apache/catalina/connector/OutputBuffer.java
+@@ -234,13 +234,9 @@ public class OutputBuffer extends Writer {
+             flushCharBuffer();
+         }
+ 
+-        if ((!coyoteResponse.isCommitted()) && (coyoteResponse.getContentLengthLong() == -1)
+-                && !coyoteResponse.getRequest().method().equals("HEAD")) {
++        if ((!coyoteResponse.isCommitted()) && (coyoteResponse.getContentLengthLong() == -1)) {
+             // If this didn't cause a commit of the response, the final content
+-            // length can be calculated. Only do this if this is not a HEAD
+-            // request since in that case no body should have been written and
+-            // setting a value of zero here will result in an explicit content
+-            // length of zero being set on the response.
++            // length can be calculated.
+             if (!coyoteResponse.isCommitted()) {
+                 coyoteResponse.setContentLength(bb.remaining());
+             }
+
+==================================================
+TestHttpServletDoHead.java
+index cad1079a61..5ad9396f08 100644
+--- a/java/org/apache/coyote/http2/Stream.java
++++ b/java/org/apache/coyote/http2/Stream.java
+@@ -34,6 +34,7 @@ import org.apache.coyote.Request;
+ import org.apache.coyote.Response;
+ import org.apache.coyote.http11.HttpOutputBuffer;
+ import org.apache.coyote.http11.OutputFilter;
++import org.apache.coyote.http11.filters.VoidOutputFilter;
+ import org.apache.coyote.http2.HpackDecoder.HeaderEmitter;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+@@ -325,6 +326,10 @@ class Stream extends AbstractNonZeroStream implements HeaderEmitter {
+         case ":method": {
+             if (coyoteRequest.method().isNull()) {
+                 coyoteRequest.method().setString(value);
++                if ("HEAD".equals(value)) {
++                    addOutputFilter(new VoidOutputFilter());
++                    streamOutputBuffer.closed = true;
++                }
+             } else {
+                 throw new HpackException(sm.getString("stream.header.duplicate",
+                         getConnectionId(), getIdAsString(), ":method" ));
+
+==================================================
+TestHttp11Processor.java
+index 31f4b913e8..e7a5426cbb 100644
+--- a/test/jakarta/servlet/http/TestHttpServletDoHead.java
++++ b/test/jakarta/servlet/http/TestHttpServletDoHead.java
+@@ -19,6 +19,7 @@ package jakarta.servlet.http;
+ import java.io.IOException;
+ import java.io.OutputStream;
+ import java.io.PrintWriter;
++import java.nio.ByteBuffer;
+ import java.nio.charset.StandardCharsets;
+ import java.util.ArrayList;
+ import java.util.Collection;
+@@ -34,14 +35,16 @@ import org.junit.runner.RunWith;
+ import org.junit.runners.Parameterized;
+ import org.junit.runners.Parameterized.Parameter;
+ 
++import org.apache.catalina.LifecycleException;
++import org.apache.catalina.Wrapper;
+ import org.apache.catalina.core.StandardContext;
+ import org.apache.catalina.startup.Tomcat;
+-import org.apache.catalina.startup.TomcatBaseTest;
++import org.apache.coyote.http2.Http2TestBase;
+ import org.apache.tomcat.util.buf.ByteChunk;
+ import org.apache.tomcat.util.collections.CaseInsensitiveKeyMap;
+ 
+ @RunWith(Parameterized.class)
+-public class TestHttpServletDoHead extends TomcatBaseTest {
++public class TestHttpServletDoHead extends Http2TestBase {
+ 
+     // Tomcat has a minimum output buffer size of 8 * 1024.
+     // (8 * 1024) /16 = 512
+@@ -55,17 +58,19 @@ public class TestHttpServletDoHead extends TomcatBaseTest {
+             Integer.valueOf(511), Integer.valueOf(512), Integer.valueOf(513),
+             Integer.valueOf(1023), Integer.valueOf(1024), Integer.valueOf(1025) };
+ 
+-    @Parameterized.Parameters(name = "{index}: {0} {1} {2} {3} {4} {5}")
++    @Parameterized.Parameters(name = "{index}: {0} {1} {2} {3} {4} {5} {6}")
+     public static Collection<Object[]> parameters() {
+ 
+         List<Object[]> parameterSets = new ArrayList<>();
+-        for (Integer buf : BUFFERS) {
+-            for (Boolean w : booleans) {
+-                for (Integer c1 : COUNTS) {
+-                    for (ResetType rt : ResetType.values()) {
+-                        for (Integer c2 : COUNTS) {
+-                            for (Boolean f : booleans) {
+-                                parameterSets.add(new Object[] { buf, w, c1, rt, c2, f });
++        for (Boolean l : booleans) {
++            for (Integer buf : BUFFERS) {
++                for (Boolean w : booleans) {
++                    for (Integer c1 : COUNTS) {
++                        for (ResetType rt : ResetType.values()) {
++                            for (Integer c2 : COUNTS) {
++                                for (Boolean f : booleans) {
++                                    parameterSets.add(new Object[] { l, buf, w, c1, rt, c2, f });
++                                }
+                             }
+                         }
+                     }
+@@ -76,30 +81,25 @@ public class TestHttpServletDoHead extends TomcatBaseTest {
+     }
+ 
+     @Parameter(0)
+-    public int bufferSize;
++    public boolean useLegacy;
+     @Parameter(1)
+-    public boolean useWriter;
++    public int bufferSize;
+     @Parameter(2)
+-    public int invalidWriteCount;
++    public boolean useWriter;
+     @Parameter(3)
+-    public ResetType resetType;
++    public int invalidWriteCount;
+     @Parameter(4)
+-    public int validWriteCount;
++    public ResetType resetType;
+     @Parameter(5)
++    public int validWriteCount;
++    @Parameter(6)
+     public boolean explicitFlush;
+ 
+     @Test
+     public void testDoHead() throws Exception {
+         Tomcat tomcat = getTomcatInstance();
+ 
+-        // No file system docBase required
+-        StandardContext ctx = (StandardContext) tomcat.addContext("", null);
+-
+-        HeadTestServlet s = new HeadTestServlet(bufferSize, useWriter, invalidWriteCount, resetType, validWriteCount, explicitFlush);
+-        Tomcat.addServlet(ctx, "HeadTestServlet", s);
+-        ctx.addServletMappingDecoded("/test", "HeadTestServlet");
+-
+-        tomcat.start();
++        configureAndStartWebApplication();
+ 
+         Map<String,List<String>> getHeaders = new CaseInsensitiveKeyMap<>();
+         String path = "http://localhost:" + getPort() + "/test";
+@@ -133,6 +133,73 @@ public class TestHttpServletDoHead extends TomcatBaseTest {
+     }
+ 
+ 
++    @Test
++    public void testDoHeadHttp2() throws Exception {
++        http2Connect();
++
++        // Get request
++        byte[] frameHeaderGet = new byte[9];
++        ByteBuffer headersPayloadGet = ByteBuffer.allocate(128);
++        buildGetRequest(frameHeaderGet, headersPayloadGet, null, 3, "/test");
++        writeFrame(frameHeaderGet, headersPayloadGet);
++
++        parser.readFrame(true);
++        String traceGet = output.getTrace();
++        while (!output.getTrace().endsWith("3-EndOfStream\n")) {
++            parser.readFrame(true);
++        }
++        output.clearTrace();
++
++        // Head request
++        byte[] frameHeaderHead = new byte[9];
++        ByteBuffer headersPayloadHead = ByteBuffer.allocate(128);
++        buildHeadRequest(frameHeaderHead, headersPayloadHead, 5, "/test");
++        writeFrame(frameHeaderHead, headersPayloadHead);
++
++        while (!output.getTrace().endsWith("5-EndOfStream\n")) {
++            parser.readFrame(true);
++        }
++        String traceHead = output.getTrace();
++
++        String[] getHeaders = traceGet.split("\n");
++        String[] headHeaders = traceHead.split("\n");
++
++        int i = 0;
++        for (; i < getHeaders.length; i++) {
++            // Headers should be the same, ignoring the first character which is the steam ID
++            Assert.assertEquals(getHeaders[i].charAt(0), '3');
++            Assert.assertEquals(headHeaders[i].charAt(0), '5');
++            Assert.assertEquals(getHeaders[i].substring(1), headHeaders[i].substring(1));
++        }
++
++        // Stream 5 should have one more trace entry
++        Assert.assertEquals("5-EndOfStream", headHeaders[i]);
++    }
++
++
++    @Override
++    @SuppressWarnings("deprecation")
++    protected void configureAndStartWebApplication() throws LifecycleException {
++        Tomcat tomcat = getTomcatInstance();
++
++        // No file system docBase required
++        StandardContext ctxt = (StandardContext) tomcat.addContext("", null);
++
++
++        Tomcat.addServlet(ctxt, "simple", new SimpleServlet());
++        ctxt.addServletMappingDecoded("/simple", "simple");
++
++        HeadTestServlet s = new HeadTestServlet(bufferSize, useWriter, invalidWriteCount, resetType, validWriteCount, explicitFlush);
++        Wrapper w = Tomcat.addServlet(ctxt, "HeadTestServlet", s);
++        if (useLegacy) {
++            w.addInitParameter(HttpServlet.LEGACY_DO_HEAD, "true");
++        }
++        ctxt.addServletMappingDecoded("/test", "HeadTestServlet");
++
++        tomcat.start();
++    }
++
++
+     private static class HeadTestServlet extends HttpServlet {
+ 
+         private static final long serialVersionUID = 1L;
+
+==================================================
+Http2TestBase.java
+index cad207b7ab..dbc3ba8d00 100644
+--- a/test/org/apache/coyote/http11/TestHttp11Processor.java
++++ b/test/org/apache/coyote/http11/TestHttp11Processor.java
+@@ -876,15 +876,27 @@ public class TestHttp11Processor extends TomcatBaseTest {
+ 
+         tomcat.start();
+ 
+-        ByteChunk responseBody = new ByteChunk();
+-        Map<String,List<String>> responseHeaders = new HashMap<>();
++        ByteChunk getBody = new ByteChunk();
++        Map<String,List<String>> getHeaders = new HashMap<>();
++        int getStatus = getUrl("http://localhost:" + getPort() + "/test", getBody,
++                getHeaders);
+ 
+-        int rc = headUrl("http://localhost:" + getPort() + "/test", responseBody,
+-                responseHeaders);
++        ByteChunk headBody = new ByteChunk();
++        Map<String,List<String>> headHeaders = new HashMap<>();
++        int headStatus = getUrl("http://localhost:" + getPort() + "/test", headBody,
++                headHeaders);
+ 
+-        Assert.assertEquals(HttpServletResponse.SC_OK, rc);
+-        Assert.assertEquals(0, responseBody.getLength());
+-        Assert.assertFalse(responseHeaders.containsKey("Content-Length"));
++        Assert.assertEquals(HttpServletResponse.SC_OK, getStatus);
++        Assert.assertEquals(HttpServletResponse.SC_OK, headStatus);
++
++        Assert.assertEquals(0, getBody.getLength());
++        Assert.assertEquals(0, headBody.getLength());
++
++        if (getHeaders.containsKey("Content-Length")) {
++            Assert.assertEquals(getHeaders.get("Content-Length"), headHeaders.get("Content-Length"));
++        } else {
++            Assert.assertFalse(headHeaders.containsKey("Content-Length"));
++        }
+     }
+ 
+ 
+@@ -895,7 +907,6 @@ public class TestHttp11Processor extends TomcatBaseTest {
+         @Override
+         protected void doGet(HttpServletRequest req, HttpServletResponse resp)
+                 throws ServletException, IOException {
+-            super.doGet(req, resp);
+         }
+ 
+         @Override
+
+==================================================
+TesterHttp2Parser.java
+index 7cee15acba..f677719cbd 100644
+--- a/test/org/apache/coyote/http2/Http2TestBase.java
++++ b/test/org/apache/coyote/http2/Http2TestBase.java
+@@ -95,7 +95,7 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+     protected HpackEncoder hpackEncoder;
+     protected Input input;
+     protected TestOutput output;
+-    protected Http2Parser parser;
++    protected TesterHttp2Parser parser;
+     protected OutputStream os;
+ 
+     // Server
+@@ -432,6 +432,34 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+     }
+ 
+ 
++    protected void buildHeadRequest(byte[] headersFrameHeader, ByteBuffer headersPayload, int streamId, String path) {
++        MimeHeaders headers = new MimeHeaders();
++        headers.addValue(":method").setString("HEAD");
++        headers.addValue(":scheme").setString("http");
++        headers.addValue(":path").setString(path);
++        headers.addValue(":authority").setString("localhost:" + getPort());
++        hpackEncoder.encode(headers, headersPayload);
++
++        headersPayload.flip();
++
++        ByteUtil.setThreeBytes(headersFrameHeader, 0, headersPayload.limit());
++        headersFrameHeader[3] = FrameType.HEADERS.getIdByte();
++        // Flags. end of headers (0x04)
++        headersFrameHeader[4] = 0x04;
++        // Stream id
++        ByteUtil.set31Bits(headersFrameHeader, 5, streamId);
++    }
++
++
++    protected void sendHeadRequest(int streamId, String path) throws IOException {
++        byte[] frameHeader = new byte[9];
++        ByteBuffer headersPayload = ByteBuffer.allocate(128);
++
++        buildHeadRequest(frameHeader, headersPayload, streamId, path);
++        writeFrame(frameHeader, headersPayload);
++    }
++
++
+     protected void writeFrame(byte[] header, ByteBuffer payload)
+             throws IOException {
+         writeFrame(header, payload, 0, payload.limit());
+@@ -635,7 +663,7 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+ 
+         input = new TestInput(is);
+         output = new TestOutput();
+-        parser = new Http2Parser("-1", input, output);
++        parser = new TesterHttp2Parser("-1", input, output);
+         hpackEncoder = new HpackEncoder();
+     }
+ 
+@@ -996,7 +1024,7 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+     }
+ 
+ 
+-    class TestOutput implements Output, HeaderEmitter {
++    public class TestOutput implements Output, HeaderEmitter {
+ 
+         private StringBuffer trace = new StringBuffer();
+         private String lastStreamId = "0";
+@@ -1229,7 +1257,7 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+     }
+ 
+ 
+-    protected static class SimpleServlet extends HttpServlet {
++    public static class SimpleServlet extends HttpServlet {
+ 
+         private static final long serialVersionUID = 1L;
+ 
+
+==================================================

@@ -1,0 +1,164 @@
+401c7038fb0c6bba3d6a05d1665469b38bc2db26
+==================================================
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=52500
+==================================================
+Christopher Schultz
+==================================================
+Thu Mar 8 17:22:29 2012 +0000
+==================================================
+RealmBase.java
+index c5546e8ec5..a66aa67dd6 100644
+--- a/java/org/apache/catalina/realm/LocalStrings.properties
++++ b/java/org/apache/catalina/realm/LocalStrings.properties
+@@ -60,6 +60,11 @@ realmBase.hasRoleSuccess=Username {0} has role {1}
+ realmBase.authenticateFailure=Username {0} NOT successfully authenticated
+ realmBase.authenticateSuccess=Username {0} successfully authenticated
+ realmBase.gssNameFail=Failed to extract name from established GSSContext
++realmBase.gotX509Username=Got user name from X509 certificate: {0}
++realmBase.createUsernameRetriever.ClassCastException=Class {0} is not an X509UsernameRetriever.
++realmBase.createUsernameRetriever.ClassNotFoundException=Cannot find class {0}.
++realmBase.createUsernameRetriever.InstantiationException=Cannot create object of type {0}.
++realmBase.createUsernameRetriever.IllegalAccessException=Cannot create object of type {0}.
+ userDatabaseRealm.lookup=Exception looking up UserDatabase under key {0}
+ userDatabaseRealm.noDatabase=No UserDatabase component found under key {0}
+ dataSourceRealm.authenticateFailure=Username {0} NOT successfully authenticated
+
+==================================================
+X509SubjectDnRetriever.java
+index 170c937735..4ce1594665 100644
+--- a/java/org/apache/catalina/realm/RealmBase.java
++++ b/java/org/apache/catalina/realm/RealmBase.java
+@@ -136,6 +136,16 @@ public abstract class RealmBase extends LifecycleMBeanBase implements Realm {
+      */
+     protected boolean validate = true;
+ 
++    /**
++     * The name of the class to use for retrieving user names from X509
++     * certificates.
++     */
++    protected String x509UsernameRetrieverClassName;
++
++    /**
++     * The object that will extract user names from X509 client certificates.
++     */
++    protected X509UsernameRetriever x509UsernameRetriever;
+ 
+     /**
+      * The all role mode.
+@@ -266,6 +276,29 @@ public abstract class RealmBase extends LifecycleMBeanBase implements Realm {
+ 
+     }
+ 
++    /**
++     * Gets the name of the class that will be used to extract user names
++     * from X509 client certificates.
++     * @return The name of the class that will be used to extract user names
++     *         from X509 client certificates.
++     */
++    public String getX509UsernameRetrieverClassName()
++    {
++        return x509UsernameRetrieverClassName;
++    }
++
++    /**
++     * Sets the name of the class that will be used to extract user names
++     * from X509 client certificates. The class must implement
++     * {@see X509UsernameRetriever}.
++     *
++     * @param className The name of the class that will be used to extract user names
++     *                  from X509 client certificates.
++     */
++    public void setX509UsernameRetrieverClassName(String className)
++    {
++        this.x509UsernameRetrieverClassName = className;
++    }
+ 
+     public boolean isStripRealmForGss() {
+         return stripRealmForGss;
+@@ -1034,6 +1067,8 @@ public abstract class RealmBase extends LifecycleMBeanBase implements Realm {
+         if (container != null) {
+             this.containerLog = container.getLogger();
+         }
++        
++        x509UsernameRetriever = createUsernameRetriever(x509UsernameRetrieverClassName);
+     }
+ 
+     /**
+@@ -1191,7 +1226,12 @@ public abstract class RealmBase extends LifecycleMBeanBase implements Realm {
+      * Return the Principal associated with the given certificate.
+      */
+     protected Principal getPrincipal(X509Certificate usercert) {
+-        return(getPrincipal(usercert.getSubjectDN().getName()));
++        String username = x509UsernameRetriever.getUsername(usercert);
++
++        if(log.isDebugEnabled())
++            log.debug(sm.getString("realmBase.gotX509Username", username));
++
++        return(getPrincipal(username));
+     }
+ 
+ 
+@@ -1391,4 +1431,23 @@ public abstract class RealmBase extends LifecycleMBeanBase implements Realm {
+         }
+     }
+ 
++    private static X509UsernameRetriever createUsernameRetriever(String className)
++        throws LifecycleException {
++        if(null == className || "".equals(className.trim()))
++            return new X509SubjectDnRetriever();
++
++        try {
++            @SuppressWarnings("unchecked")
++            Class<? extends X509UsernameRetriever> clazz = (Class<? extends X509UsernameRetriever>)Class.forName(className);
++            return (X509UsernameRetriever)clazz.newInstance();
++        } catch (ClassNotFoundException e) {
++            throw new LifecycleException(sm.getString("realmBase.createUsernameRetriever.ClassNotFoundException", className), e);
++        } catch (InstantiationException e) {
++            throw new LifecycleException(sm.getString("realmBase.createUsernameRetriever.InstantiationException", className), e);
++        } catch (IllegalAccessException e) {
++            throw new LifecycleException(sm.getString("realmBase.createUsernameRetriever.IllegalAccessException", className), e);
++        } catch (ClassCastException e) {
++            throw new LifecycleException(sm.getString("realmBase.createUsernameRetriever.ClassCastException", className), e);
++        }
++    }
+ }
+
+==================================================
+X509UsernameRetriever.java
+new file mode 100644
+index 0000000000..ed333430db
+--- /dev/null
++++ b/java/org/apache/catalina/realm/X509SubjectDnRetriever.java
+@@ -0,0 +1,30 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.catalina.realm;
++
++import java.security.cert.X509Certificate;
++
++/**
++ * An X509UsernameRetriever that returns a certificate's entire
++ * SubjectDN as the username.
++ */
++public class X509SubjectDnRetriever
++    implements X509UsernameRetriever {
++    public String getUsername(X509Certificate clientCert) {
++        return clientCert.getSubjectDN().getName();
++    }
++}
+
+==================================================

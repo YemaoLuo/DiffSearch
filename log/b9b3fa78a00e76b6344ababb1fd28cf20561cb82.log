@@ -1,0 +1,102 @@
+b9b3fa78a00e76b6344ababb1fd28cf20561cb82
+==================================================
+Fix bz 65137 Don't corrupt response on early termination
+==================================================
+Mark Thomas
+==================================================
+Fri Feb 19 15:33:56 2021 +0000
+==================================================
+AprEndpoint.java
+Fix bz 65137 Don't corrupt response on early termination
+
+Ensure that a response is not corrupted as well as incomplete if the
+connection is closed before the response is fully written due to a write
+timeout.
+
+https://bz.apache.org/bugzilla/show_bug.cgi?id=65137
+
+
+==================================================
+NioEndpoint.java
+index cf62eabe1f..b388d04330 100644
+--- a/java/org/apache/tomcat/util/net/AprEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AprEndpoint.java
+@@ -2364,6 +2364,25 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
+ 
+ 
+         private void doWriteInternal(ByteBuffer from) throws IOException {
++
++            if (previousIOException != null) {
++                /*
++                 * Socket has previously seen an IOException on write.
++                 *
++                 * Blocking writes assume that buffer is always fully written so
++                 * there is no code checking for incomplete writes, retaining
++                 * the unwritten data and attempting to write it as part of a
++                 * subsequent write call.
++                 *
++                 * Because of the above, when an IOException is triggered we
++                 * need so skip subsequent attempts to write as otherwise it
++                 * will appear to the client as if some data was dropped just
++                 * before the connection is lost. It is better if the client
++                 * just sees the dropped connection.
++                 */
++                throw new IOException(previousIOException);
++            }
++
+             int thisTime;
+ 
+             do {
+@@ -2400,8 +2419,9 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
+                     // 10053 on Windows is connection aborted
+                     throw new EOFException(sm.getString("socket.apr.clientAbort"));
+                 } else if (thisTime < 0) {
+-                    throw new IOException(sm.getString("socket.apr.write.error",
++                    previousIOException = new IOException(sm.getString("socket.apr.write.error",
+                             Integer.valueOf(-thisTime), getSocket(), this));
++                    throw previousIOException;
+                 }
+             } while ((thisTime > 0 || getBlockingStatus()) && from.hasRemaining());
+ 
+
+==================================================
+SocketWrapperBase.java
+index 9cbf422ddc..5d8db7572a 100644
+--- a/java/org/apache/tomcat/util/net/NioEndpoint.java
++++ b/java/org/apache/tomcat/util/net/NioEndpoint.java
+@@ -1305,6 +1305,23 @@ public class NioEndpoint extends AbstractJsseEndpoint<NioChannel,SocketChannel>
+                 throw new ClosedChannelException();
+             }
+             if (block) {
++                if (previousIOException != null) {
++                    /*
++                     * Socket has previously timed out.
++                     *
++                     * Blocking writes assume that buffer is always fully
++                     * written so there is no code checking for incomplete
++                     * writes, retaining the unwritten data and attempting to
++                     * write it as part of a subsequent write call.
++                     *
++                     * Because of the above, when a timeout is triggered we need
++                     * so skip subsequent attempts to write as otherwise it will
++                     * appear to the client as if some data was dropped just
++                     * before the connection is lost. It is better if the client
++                     * just sees the dropped connection.
++                     */
++                    throw new IOException(previousIOException);
++                }
+                 long timeout = getWriteTimeout();
+                 long startNanos = 0;
+                 do {
+@@ -1315,7 +1332,8 @@ public class NioEndpoint extends AbstractJsseEndpoint<NioChannel,SocketChannel>
+                         }
+                         timeout -= elapsedMillis;
+                         if (timeout <= 0) {
+-                            throw new SocketTimeoutException();
++                            previousIOException = new SocketTimeoutException();
++                            throw previousIOException;
+                         }
+                     }
+                     n = getSocket().write(buffer);
+
+==================================================

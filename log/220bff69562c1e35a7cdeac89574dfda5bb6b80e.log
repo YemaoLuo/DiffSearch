@@ -1,0 +1,724 @@
+220bff69562c1e35a7cdeac89574dfda5bb6b80e
+==================================================
+Add a socket properties class so that we can configure every single socket option, currently only on NIO.
+==================================================
+Filip Hanik
+==================================================
+Tue Oct 24 14:46:13 2006 +0000
+==================================================
+Http11NioProcessor.java
+Add a socket properties class so that we can configure every single socket option, currently only on NIO.
+Remove redundant byte[] buffer in the NIO OutputBuffer, this avoids double copy from byte[] to byte[] to ByteBuffer
+Add in the ability to configure the selector pool, as this be dependent on JVM and OS settings
+
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/tc6.0.x/trunk@467349 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Http11NioProtocol.java
+index b130b3b502..11e7057cfe 100644
+--- a/java/org/apache/coyote/http11/Http11NioProcessor.java
++++ b/java/org/apache/coyote/http11/Http11NioProcessor.java
+@@ -83,7 +83,7 @@ public class Http11NioProcessor implements ActionHook {
+     // ----------------------------------------------------------- Constructors
+ 
+ 
+-    public Http11NioProcessor(int headerBufferSize, NioEndpoint endpoint) {
++    public Http11NioProcessor(int rxBufSize, int txBufSize, NioEndpoint endpoint) {
+ 
+         this.endpoint = endpoint;
+ 
+@@ -95,12 +95,12 @@ public class Http11NioProcessor implements ActionHook {
+             readTimeout = timeout;
+             //readTimeout = -1;
+         }
+-        inputBuffer = new InternalNioInputBuffer(request, headerBufferSize,readTimeout);
++        inputBuffer = new InternalNioInputBuffer(request, rxBufSize,readTimeout);
+         request.setInputBuffer(inputBuffer);
+ 
+         response = new Response();
+         response.setHook(this);
+-        outputBuffer = new InternalNioOutputBuffer(response, headerBufferSize,readTimeout);
++        outputBuffer = new InternalNioOutputBuffer(response, txBufSize,readTimeout);
+         response.setOutputBuffer(outputBuffer);
+         request.setResponse(response);
+ 
+@@ -1004,8 +1004,9 @@ public class Http11NioProcessor implements ActionHook {
+                 return;
+ 
+             // Validate and write response headers
+-            prepareResponse();
++            
+             try {
++                prepareResponse();
+                 outputBuffer.commit();
+             } catch (IOException e) {
+                 // Set error flag
+@@ -1552,7 +1553,7 @@ public class Http11NioProcessor implements ActionHook {
+      * When committing the response, we have to validate the set of headers, as
+      * well as setup the response filters.
+      */
+-    protected void prepareResponse() {
++    protected void prepareResponse() throws IOException {
+ 
+         boolean entityBody = true;
+         contentDelimitation = false;
+
+==================================================
+InternalNioOutputBuffer.java
+index b8d610356a..2689ab6b9d 100644
+--- a/java/org/apache/coyote/http11/Http11NioProtocol.java
++++ b/java/org/apache/coyote/http11/Http11NioProtocol.java
+@@ -93,6 +93,9 @@ public class Http11NioProtocol implements ProtocolHandler, MBeanRegistration
+      * Set a property.
+      */
+     public void setProperty(String name, String value) {
++        if ( name!=null && (name.startsWith("socket.") ||name.startsWith("selectorPool.")) ){
++            ep.setProperty(name, value);
++        }
+         setAttribute(name, value);
+     }
+ 
+@@ -119,13 +122,14 @@ public class Http11NioProtocol implements ProtocolHandler, MBeanRegistration
+     public void init() throws Exception {
+         ep.setName(getName());
+         ep.setHandler(cHandler);
+-        ep.setReadBufSize(getMaxHttpHeaderSize());
+-        ep.setWriteBufSize(getMaxHttpHeaderSize());
++        
++        //todo, determine if we even need these
++        ep.getSocketProperties().setRxBufSize(Math.max(ep.getSocketProperties().getRxBufSize(),getMaxHttpHeaderSize()));
++        ep.getSocketProperties().setTxBufSize(Math.max(ep.getSocketProperties().getTxBufSize(),getMaxHttpHeaderSize()));
++        
+         try {
+             ep.init();
+-            
+             sslImplementation = SSLImplementation.getInstance("org.apache.tomcat.util.net.jsse.JSSEImplementation");
+-            
+         } catch (Exception ex) {
+             log.error(sm.getString("http11protocol.endpoint.initerror"), ex);
+             throw ex;
+@@ -209,6 +213,7 @@ public class Http11NioProtocol implements ProtocolHandler, MBeanRegistration
+     private int socketCloseDelay=-1;
+     private boolean disableUploadTimeout = true;
+     private int socketBuffer = 9000;
++    
+     private Adapter adapter;
+     private Http11ConnectionHandler cHandler;
+ 
+@@ -297,24 +302,6 @@ public class Http11NioProtocol implements ProtocolHandler, MBeanRegistration
+         setAttribute("firstReadTimeout", "" + i);
+     }
+ 
+-    public int getPollTime() {
+-        return ep.getPollTime();
+-    }
+-
+-    public void setPollTime( int i ) {
+-        ep.setPollTime(i);
+-        setAttribute("pollTime", "" + i);
+-    }
+-
+-    public void setPollerSize(int i) {
+-        ep.setPollerSize(i); 
+-        setAttribute("pollerSize", "" + i);
+-    }
+-
+-    public int getPollerSize() {
+-        return ep.getPollerSize();
+-    }
+-
+     public InetAddress getAddress() {
+         return ep.getAddress();
+     }
+@@ -667,7 +654,10 @@ public class Http11NioProtocol implements ProtocolHandler, MBeanRegistration
+         }
+ 
+         public Http11NioProcessor createProcessor() {
+-            Http11NioProcessor processor = new Http11NioProcessor(proto.maxHttpHeaderSize, proto.ep);
++            Http11NioProcessor processor = new Http11NioProcessor(
++              Math.max(proto.maxHttpHeaderSize,proto.ep.getSocketProperties().getRxBufSize()),
++              Math.max(proto.maxHttpHeaderSize,proto.ep.getSocketProperties().getRxBufSize()), 
++              proto.ep);
+             processor.setAdapter(proto.adapter);
+             processor.setMaxKeepAliveRequests(proto.maxKeepAliveRequests);
+             processor.setTimeout(proto.timeout);
+
+==================================================
+NioEndpoint.java
+index 37459c1e92..83a1846220 100644
+--- a/java/org/apache/coyote/http11/InternalNioOutputBuffer.java
++++ b/java/org/apache/coyote/http11/InternalNioOutputBuffer.java
+@@ -69,15 +69,8 @@ public class InternalNioOutputBuffer
+         this.response = response;
+         headers = response.getMimeHeaders();
+ 
+-        buf = new byte[headerBufferSize];
++        //buf = new byte[headerBufferSize];
+         
+-        if (headerBufferSize < (8 * 1024)) {
+-            bbufLimit = 6 * 1500;    
+-        } else {
+-            bbufLimit = (headerBufferSize / 1500 + 1) * 1500;
+-        }
+-        //bbuf = ByteBuffer.allocateDirect(bbufLimit);
+-
+         outputStreamOutputBuffer = new SocketOutputBuffer();
+ 
+         filterLibrary = new OutputFilter[0];
+@@ -135,7 +128,7 @@ public class InternalNioOutputBuffer
+     /**
+      * Pointer to the current write buffer.
+      */
+-    protected byte[] buf;
++    //protected byte[] buf;
+ 
+ 
+     /**
+@@ -447,11 +440,12 @@ public class InternalNioOutputBuffer
+     /**
+      * Send the response status line.
+      */
+-    public void sendStatus() {
++    public void sendStatus() throws IOException  {
+ 
+         // Write protocol name
+         write(Constants.HTTP_11_BYTES);
+-        buf[pos++] = Constants.SP;
++        addToBB(Constants.SP);
++        pos++;
+ 
+         // Write status code
+         int status = response.getStatus();
+@@ -469,7 +463,8 @@ public class InternalNioOutputBuffer
+             write(status);
+         }
+ 
+-        buf[pos++] = Constants.SP;
++        addToBB(Constants.SP);
++        pos++;
+ 
+         // Write message
+         String message = response.getMessage();
+@@ -480,8 +475,10 @@ public class InternalNioOutputBuffer
+         }
+ 
+         // End the response status line
+-        buf[pos++] = Constants.CR;
+-        buf[pos++] = Constants.LF;
++        addToBB(Constants.CR);
++        pos++;
++        addToBB(Constants.LF);
++        pos++;
+ 
+     }
+ 
+@@ -492,14 +489,18 @@ public class InternalNioOutputBuffer
+      * @param name Header name
+      * @param value Header value
+      */
+-    public void sendHeader(MessageBytes name, MessageBytes value) {
++    public void sendHeader(MessageBytes name, MessageBytes value) throws IOException {
+ 
+         write(name);
+-        buf[pos++] = Constants.COLON;
+-        buf[pos++] = Constants.SP;
++        addToBB(Constants.COLON);
++        pos++;
++        addToBB(Constants.SP);
++        pos++;
+         write(value);
+-        buf[pos++] = Constants.CR;
+-        buf[pos++] = Constants.LF;
++        addToBB(Constants.CR);
++        pos++;
++        addToBB(Constants.LF);
++        pos++;
+ 
+     }
+ 
+@@ -510,15 +511,18 @@ public class InternalNioOutputBuffer
+      * @param name Header name
+      * @param value Header value
+      */
+-    public void sendHeader(ByteChunk name, ByteChunk value) {
++    public void sendHeader(ByteChunk name, ByteChunk value) throws IOException {
+ 
+         write(name);
+-        buf[pos++] = Constants.COLON;
+-        buf[pos++] = Constants.SP;
++        addToBB(Constants.COLON);
++        pos++;
++        addToBB(Constants.SP);
++        pos++;
+         write(value);
+-        buf[pos++] = Constants.CR;
+-        buf[pos++] = Constants.LF;
+-
++        addToBB(Constants.CR);
++        pos++;
++        addToBB(Constants.LF);
++        pos++;
+     }
+ 
+ 
+@@ -531,11 +535,16 @@ public class InternalNioOutputBuffer
+     public void sendHeader(String name, String value) {
+ 
+         write(name);
+-        buf[pos++] = Constants.COLON;
+-        buf[pos++] = Constants.SP;
++        addToBB(Constants.COLON);
++        pos++;
++        addToBB(Constants.SP);
++        pos++;
+         write(value);
+-        buf[pos++] = Constants.CR;
+-        buf[pos++] = Constants.LF;
++        addToBB(Constants.CR);
++        pos++;
++        addToBB(Constants.LF);
++        pos++;
++
+ 
+     }
+ 
+@@ -545,8 +554,10 @@ public class InternalNioOutputBuffer
+      */
+     public void endHeaders() {
+ 
+-        buf[pos++] = Constants.CR;
+-        buf[pos++] = Constants.LF;
++        addToBB(Constants.CR);
++        pos++;
++        addToBB(Constants.LF);
++        pos++;
+ 
+     }
+ 
+@@ -598,17 +609,28 @@ public class InternalNioOutputBuffer
+ 
+         if (pos > 0) {
+             // Sending the response header buffer
+-            addToBB(buf, 0, pos);
++            //flushBuffer();//do we need this?
+         }
+ 
+     }
+ 
+     int total = 0;
++    private void addToBB(byte b)  {
++        ByteBuffer bytebuffer = socket.getBufHandler().getWriteBuffer();
++        final int length = 1;
++        if (bytebuffer.remaining() <= length) {
++            try { flushBuffer();} catch (IOException x) {throw new RuntimeException(x);}
++        }
++        bytebuffer.put(b);
++        total += length;
++    }
++
+     private void addToBB(byte[] buf, int offset, int length) throws IOException {
+-        if (socket.getBufHandler().getWriteBuffer().capacity() <= (offset + length)) {
++        ByteBuffer bytebuffer = socket.getBufHandler().getWriteBuffer();
++        if (bytebuffer.remaining() <= length) {
+             flushBuffer();
+         }
+-        socket.getBufHandler().getWriteBuffer().put(buf, offset, length);
++        bytebuffer.put(buf, offset, length);
+         total += length;
+     }
+ 
+@@ -620,7 +642,7 @@ public class InternalNioOutputBuffer
+      * 
+      * @param mb data to be written
+      */
+-    protected void write(MessageBytes mb) {
++    protected void write(MessageBytes mb) throws IOException {
+ 
+         if (mb.getType() == MessageBytes.T_BYTES) {
+             ByteChunk bc = mb.getByteChunk();
+@@ -642,11 +664,10 @@ public class InternalNioOutputBuffer
+      * 
+      * @param bc data to be written
+      */
+-    protected void write(ByteChunk bc) {
++    protected void write(ByteChunk bc) throws IOException{
+ 
+         // Writing the byte chunk to the output buffer
+-        System.arraycopy(bc.getBytes(), bc.getStart(), buf, pos,
+-                         bc.getLength());
++        addToBB(bc.getBytes(), bc.getStart(),bc.getLength());
+         pos = pos + bc.getLength();
+ 
+     }
+@@ -675,7 +696,8 @@ public class InternalNioOutputBuffer
+             } else if (c == 127) {
+                 c = ' ';
+             }
+-            buf[pos++] = (byte) c;
++            addToBB((byte) c);
++            pos++;
+         }
+ 
+     }
+@@ -688,10 +710,10 @@ public class InternalNioOutputBuffer
+      * 
+      * @param b data to be written
+      */
+-    public void write(byte[] b) {
++    public void write(byte[] b) throws IOException  {
+ 
+         // Writing the byte chunk to the output buffer
+-        System.arraycopy(b, 0, buf, pos, b.length);
++        addToBB(b,0,b.length);
+         pos = pos + b.length;
+ 
+     }
+@@ -722,7 +744,8 @@ public class InternalNioOutputBuffer
+             } else if (c == 127) {
+                 c = ' ';
+             }
+-            buf[pos++] = (byte) c;
++            addToBB((byte) c);
++            pos++;
+         }
+ 
+     }
+
+==================================================
+NioSelectorPool.java
+index 268bbe371e..e9da70fe84 100644
+--- a/java/org/apache/tomcat/util/net/NioEndpoint.java
++++ b/java/org/apache/tomcat/util/net/NioEndpoint.java
+@@ -29,6 +29,7 @@ import java.nio.channels.Selector;
+ import java.nio.channels.ServerSocketChannel;
+ import java.nio.channels.SocketChannel;
+ import java.security.KeyStore;
++import java.util.HashMap;
+ import java.util.Iterator;
+ import java.util.Set;
+ import java.util.StringTokenizer;
+@@ -42,6 +43,7 @@ import javax.net.ssl.TrustManagerFactory;
+ 
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
++import org.apache.tomcat.util.IntrospectionUtils;
+ import org.apache.tomcat.util.net.SecureNioChannel.ApplicationBufferHandler;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+@@ -137,12 +139,8 @@ public class NioEndpoint {
+      * Sequence number used to generate thread names.
+      */
+     protected int sequence = 0;
+-
+-
+-    protected int readBufSize = 8192;
+-    protected int writeBufSize = 8192;
+     
+-    protected NioSelectorPool selectorPool = new NioSelectorPool();;
++    protected NioSelectorPool selectorPool = new NioSelectorPool();
+     
+     /**
+      * Server socket "pointer".
+@@ -187,15 +185,6 @@ public class NioEndpoint {
+     public int getThreadPriority() { return threadPriority; }
+ 
+ 
+-    /**
+-     * Size of the socket poller.
+-     */
+-    protected int pollerSize = 8 * 1024;
+-    public void setPollerSize(int pollerSize) { this.pollerSize = pollerSize; }
+-    public int getPollerSize() { return pollerSize; }
+-
+-
+-
+     /**
+      * Server socket port.
+      */
+@@ -229,29 +218,30 @@ public class NioEndpoint {
+     public void setBacklog(int backlog) { if (backlog > 0) this.backlog = backlog; }
+     public int getBacklog() { return backlog; }
+ 
++    protected SocketProperties socketProperties = new SocketProperties();
+ 
+     /**
+      * Socket TCP no delay.
+      */
+-    protected boolean tcpNoDelay = false;
+-    public boolean getTcpNoDelay() { return tcpNoDelay; }
+-    public void setTcpNoDelay(boolean tcpNoDelay) { this.tcpNoDelay = tcpNoDelay; }
++    public boolean getTcpNoDelay() { return socketProperties.getTcpNoDelay();}
++    public void setTcpNoDelay(boolean tcpNoDelay) { socketProperties.setTcpNoDelay(tcpNoDelay); }
+ 
+ 
+     /**
+      * Socket linger.
+      */
+-    protected int soLinger = 100;
+-    public int getSoLinger() { return soLinger; }
+-    public void setSoLinger(int soLinger) { this.soLinger = soLinger; }
++    public int getSoLinger() { return socketProperties.getSoLingerTime(); }
++    public void setSoLinger(int soLinger) { 
++        socketProperties.setSoLingerTime(soLinger);
++        socketProperties.setSoLingerOn(soLinger>=0);
++    }
+ 
+ 
+     /**
+      * Socket timeout.
+      */
+-    protected int soTimeout = -1;
+-    public int getSoTimeout() { return soTimeout; }
+-    public void setSoTimeout(int soTimeout) { this.soTimeout = soTimeout; }
++    public int getSoTimeout() { return socketProperties.getSoTimeout(); }
++    public void setSoTimeout(int soTimeout) { socketProperties.setSoTimeout(soTimeout); }
+ 
+ 
+     /**
+@@ -262,15 +252,6 @@ public class NioEndpoint {
+     public void setFirstReadTimeout(int firstReadTimeout) { this.firstReadTimeout = firstReadTimeout; }
+ 
+ 
+-    /**
+-     * Poll interval, in microseconds. The smaller the value, the more CPU the poller
+-     * will use, but the more responsive to activity it will be.
+-     */
+-    protected int pollTime = 2000;
+-    public int getPollTime() { return pollTime; }
+-    public void setPollTime(int pollTime) { if (pollTime > 0) { this.pollTime = pollTime; } }
+-
+-
+     /**
+      * The default is true - the created threads will be
+      *  in daemon mode. If set to false, the control thread
+@@ -348,6 +329,24 @@ public class NioEndpoint {
+      * Dummy minSpareThreads property.
+      */
+     public int getMinSpareThreads() { return Math.min(getMaxThreads(),5); }
++    
++    /**
++     * Generic properties, introspected
++     */
++    public void setProperty(String name, String value) {
++        final String selectorPoolName = "selectorPool.";
++        final String socketName = "socket.";
++        try {
++            if (name.startsWith(selectorPoolName)) {
++                IntrospectionUtils.setProperty(selectorPool, name.substring(selectorPoolName.length()), value);
++            } else if (name.startsWith(socketName)) {
++                IntrospectionUtils.setProperty(socketProperties, name.substring(socketName.length()), value);
++            }
++        }catch ( Exception x ) {
++            log.error("Unable to set attribute \""+name+"\" to \""+value+"\"",x);
++        }
++    }
++
+ 
+     // --------------------  SSL related properties --------------------
+     protected String keystoreFile = System.getProperty("user.home")+"/.keystore";
+@@ -411,18 +410,14 @@ public class NioEndpoint {
+     public boolean getSecure() { return secure;}
+     public void setSecure(boolean b) { secure = b;}
+ 
+-    public void setWriteBufSize(int writeBufSize) {
+-        this.writeBufSize = writeBufSize;
+-    }
+-
+-    public void setReadBufSize(int readBufSize) {
+-        this.readBufSize = readBufSize;
+-    }
+-
+     public void setSelectorPool(NioSelectorPool selectorPool) {
+         this.selectorPool = selectorPool;
+     }
+ 
++    public void setSocketProperties(SocketProperties socketProperties) {
++        this.socketProperties = socketProperties;
++    }
++
+     protected SSLContext sslContext = null;
+     public SSLContext getSSLContext() { return sslContext;}
+     public void setSSLContext(SSLContext c) { sslContext = c;}
+@@ -553,10 +548,6 @@ public class NioEndpoint {
+             running = true;
+             paused = false;
+             
+-            selectorPool.setMaxSelectors(maxThreads);
+-            selectorPool.setMaxSpareSelectors(-1);
+-            selectorPool.open();
+-            
+             // Create worker collection
+             if (executor == null) {
+                 workers = new WorkerStack(maxThreads);
+@@ -619,7 +610,6 @@ public class NioEndpoint {
+             }
+             pollers = null;
+         }
+-        try {selectorPool.close();}catch (IOException x){}
+         nioChannels.clear();
+     }
+ 
+@@ -652,17 +642,21 @@ public class NioEndpoint {
+     }
+ 
+     public int getWriteBufSize() {
+-        return writeBufSize;
++        return socketProperties.getTxBufSize();
+     }
+ 
+     public int getReadBufSize() {
+-        return readBufSize;
++        return socketProperties.getRxBufSize();
+     }
+ 
+     public NioSelectorPool getSelectorPool() {
+         return selectorPool;
+     }
+ 
++    public SocketProperties getSocketProperties() {
++        return socketProperties;
++    }
++
+     /**
+      * Unlock the server socket accept using a bogus connection.
+      */
+@@ -704,13 +698,7 @@ public class NioEndpoint {
+             //disable blocking, APR style, we are gonna be polling it
+             socket.configureBlocking(false);
+             Socket sock = socket.socket();
+-            // 1: Set socket options: timeout, linger, etc
+-            if (soLinger >= 0)
+-                sock.setSoLinger(true,soLinger);
+-            if (tcpNoDelay)
+-                sock.setTcpNoDelay(true);
+-            if (soTimeout > 0)
+-                sock.setSoTimeout(soTimeout);
++            socketProperties.setProperties(sock);
+ 
+             NioChannel channel = nioChannels.poll();
+             if ( channel == null ) {
+@@ -720,11 +708,15 @@ public class NioEndpoint {
+                 if (sslContext != null) {
+                     SSLEngine engine = createSSLEngine();
+                     int appbufsize = engine.getSession().getApplicationBufferSize();
+-                    int bufsize = Math.max(Math.max(getReadBufSize(), getWriteBufSize()), appbufsize);
+-                    NioBufferHandler bufhandler = new NioBufferHandler(bufsize, bufsize);
++                    NioBufferHandler bufhandler = new NioBufferHandler(Math.max(appbufsize,getReadBufSize()),
++                                                                       Math.max(appbufsize,getWriteBufSize()),
++                                                                       socketProperties.getDirectBuffer());
+                     channel = new SecureNioChannel(socket, engine, bufhandler, selectorPool);
+                 } else {
+-                    NioBufferHandler bufhandler = new NioBufferHandler(getReadBufSize(), getWriteBufSize());
++                    NioBufferHandler bufhandler = new NioBufferHandler(getReadBufSize(),
++                                                                       getWriteBufSize(),
++                                                                       socketProperties.getDirectBuffer());
++
+                     channel = new NioChannel(socket, bufhandler);
+                 }
+             } else {
+@@ -1172,7 +1164,7 @@ public class NioEndpoint {
+             //don't process timeouts too frequently, but if the selector simply timed out
+             //then we can check timeouts to avoid gaps
+             if ( (now < nextExpiration) && (keyCount>0 || hasEvents) ) return;
+-            nextExpiration = now + (long)soTimeout;
++            nextExpiration = now + (long)socketProperties.getSoTimeout();
+             //timeout
+             Set<SelectionKey> keys = selector.keys();
+             for (Iterator<SelectionKey> iter = keys.iterator(); iter.hasNext(); ) {
+@@ -1186,7 +1178,7 @@ public class NioEndpoint {
+                     }else if ((ka.interestOps()&SelectionKey.OP_READ) == SelectionKey.OP_READ) {
+                         //only timeout sockets that we are waiting for a read from
+                         long delta = now - ka.getLastAccess();
+-                        long timeout = (ka.getTimeout()==-1)?((long) soTimeout):(ka.getTimeout());
++                        long timeout = (ka.getTimeout()==-1)?((long) socketProperties.getSoTimeout()):(ka.getTimeout());
+                         boolean isTimedout = delta > timeout;
+                         if (isTimedout) {
+                             cancelledKey(key, SocketStatus.TIMEOUT);
+@@ -1449,11 +1441,14 @@ public class NioEndpoint {
+         protected ByteBuffer readbuf = null;
+         protected ByteBuffer writebuf = null;
+         
+-        public NioBufferHandler(int readsize, int writesize) {
+-            readbuf = ByteBuffer.allocateDirect(readsize);
+-            writebuf = ByteBuffer.allocateDirect(writesize);
+-//            readbuf = ByteBuffer.allocate(readsize);
+-//            writebuf = ByteBuffer.allocate(writesize);
++        public NioBufferHandler(int readsize, int writesize, boolean direct) {
++            if ( direct ) {
++                readbuf = ByteBuffer.allocateDirect(readsize);
++                writebuf = ByteBuffer.allocateDirect(writesize);
++            }else {
++                readbuf = ByteBuffer.allocate(readsize);
++                writebuf = ByteBuffer.allocate(writesize);
++            }
+         }
+         
+         public ByteBuffer expand(ByteBuffer buffer, int remaining) {return buffer;}
+
+==================================================
+SocketProperties.java
+index 2cc8568a58..f3b3eb0bd9 100644
+--- a/java/org/apache/tomcat/util/net/NioSelectorPool.java
++++ b/java/org/apache/tomcat/util/net/NioSelectorPool.java
+@@ -46,7 +46,7 @@ public class NioSelectorPool {
+     
+     public Selector get() throws IOException{
+         if ( (!enabled) || active.incrementAndGet() >= maxSelectors ) {
+-            active.decrementAndGet();
++            if ( enabled ) active.decrementAndGet();
+             return null;
+         }
+         Selector s = null;
+@@ -66,7 +66,7 @@ public class NioSelectorPool {
+     
+     
+     public void put(Selector s) throws IOException {
+-        active.decrementAndGet();
++        if ( enabled ) active.decrementAndGet();
+         if ( enabled && (maxSpareSelectors==-1 || spare.get() < Math.min(maxSpareSelectors,maxSelectors)) ) {
+             spare.incrementAndGet();
+             selectors.offer(s);
+@@ -79,6 +79,7 @@ public class NioSelectorPool {
+         Selector s;
+         while ( (s = selectors.poll()) != null ) s.close();
+         spare.set(0);
++        active.set(0);
+     }
+     
+     public void open(){
+@@ -125,12 +126,14 @@ public class NioSelectorPool {
+             }//while
+             if ( timedout ) throw new SocketTimeoutException();
+         } finally {
+-            if (key != null) key.cancel();
+-            if (selector != null) selector.selectNow();
++            if (key != null) {
++                key.cancel();
++                if (selector != null) selector.selectNow();//removes the key from this selector
++            }
+         }
+         return written;
+     }
+-    
++     
+     /**
+      * Performs a blocking read using the bytebuffer for data to be read and a selector to block.
+      * If the <code>selector</code> parameter is null, then it will perform a busy read that could
+@@ -168,8 +171,10 @@ public class NioSelectorPool {
+             }//while
+             if ( timedout ) throw new SocketTimeoutException();
+         } finally {
+-            if (key != null) key.cancel();
+-            if (selector != null) selector.selectNow();
++            if (key != null) {
++                key.cancel();
++                if (selector != null) selector.selectNow();//removes the key from this selector
++            }
+         }
+         return read;
+     }
+
+==================================================

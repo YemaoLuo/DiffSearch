@@ -1,0 +1,201 @@
+f6e656e4b1076a8b7d77d7eded2290a6fe926fb8
+==================================================
+Reduce memory footprint of closed http/2 streams
+==================================================
+Mark Thomas
+==================================================
+Thu Sep 24 17:32:49 2020 +0100
+==================================================
+AbstractNonZeroStream.java
+Reduce memory footprint of closed http/2 streams
+
+This refactoring replaces closed streams with a new RecycledStream
+object and changes the mechanism used to look up known streams.
+Pull up re-prioritisation
+
+
+
+==================================================
+AbstractStream.java
+index 63fb5e718a..ce08cc5d57 100644
+--- a/java/org/apache/coyote/http2/AbstractNonZeroStream.java
++++ b/java/org/apache/coyote/http2/AbstractNonZeroStream.java
+@@ -16,6 +16,11 @@
+  */
+ package org.apache.coyote.http2;
+ 
++import java.util.Iterator;
++
++import org.apache.juli.logging.Log;
++import org.apache.juli.logging.LogFactory;
++import org.apache.tomcat.util.res.StringManager;
+ 
+ /**
+  * Base class for all streams other than stream 0, the connection. Primarily
+@@ -23,7 +28,73 @@ package org.apache.coyote.http2;
+  */
+ abstract class AbstractNonZeroStream extends AbstractStream {
+ 
++    private static final Log log = LogFactory.getLog(AbstractNonZeroStream.class);
++    private static final StringManager sm = StringManager.getManager(AbstractNonZeroStream.class);
++
++    private volatile int weight;
++
++
+     AbstractNonZeroStream(Integer identifier) {
++        this(identifier, Constants.DEFAULT_WEIGHT);
++    }
++
++
++    AbstractNonZeroStream(Integer identifier, int weight) {
+         super(identifier);
++        this.weight = weight;
++    }
++
++
++    @Override
++    final int getWeight() {
++        return weight;
+     }
++
++
++    final void rePrioritise(AbstractStream parent, boolean exclusive, int weight) {
++        if (log.isDebugEnabled()) {
++            log.debug(sm.getString("stream.reprioritisation.debug",
++                    getConnectionId(), getIdAsString(), Boolean.toString(exclusive),
++                    parent.getIdAsString(), Integer.toString(weight)));
++        }
++
++        // Check if new parent is a descendant of this stream
++        if (isDescendant(parent)) {
++            parent.detachFromParent();
++            // Cast is always safe since any descendant of this stream must be
++            // an instance of Stream
++            getParentStream().addChild((Stream) parent);
++        }
++
++        if (exclusive) {
++            // Need to move children of the new parent to be children of this
++            // stream. Slightly convoluted to avoid concurrent modification.
++            Iterator<AbstractNonZeroStream> parentsChildren = parent.getChildStreams().iterator();
++            while (parentsChildren.hasNext()) {
++                AbstractNonZeroStream parentsChild = parentsChildren.next();
++                parentsChildren.remove();
++                this.addChild(parentsChild);
++            }
++        }
++        detachFromParent();
++        parent.addChild(this);
++        this.weight = weight;
++    }
++
++
++    /*
++     * Used when removing closed streams from the tree and we know there is no
++     * need to check for circular references.
++     */
++    final void rePrioritise(AbstractStream parent, int weight) {
++        if (log.isDebugEnabled()) {
++            log.debug(sm.getString("stream.reprioritisation.debug",
++                    getConnectionId(), getIdAsString(), Boolean.FALSE,
++                    parent.getIdAsString(), Integer.toString(weight)));
++        }
++
++        parent.addChild(this);
++        this.weight = weight;
++    }
++
+ }
+
+==================================================
+Http2UpgradeHandler.java
+index 21963eedc0..c7374b6fa9 100644
+--- a/java/org/apache/coyote/http2/AbstractStream.java
++++ b/java/org/apache/coyote/http2/AbstractStream.java
+@@ -37,7 +37,7 @@ abstract class AbstractStream {
+     private final String idAsString;
+ 
+     private volatile AbstractStream parentStream = null;
+-    private final Set<Stream> childStreams = Collections.newSetFromMap(new ConcurrentHashMap<>());
++    private final Set<AbstractNonZeroStream> childStreams = Collections.newSetFromMap(new ConcurrentHashMap<>());
+     private long windowSize = ConnectionSettingsBase.DEFAULT_INITIAL_WINDOW_SIZE;
+ 
+ 
+@@ -70,7 +70,7 @@ abstract class AbstractStream {
+     }
+ 
+ 
+-    final void addChild(Stream child) {
++    final void addChild(AbstractNonZeroStream child) {
+         child.setParentStream(this);
+         childStreams.add(child);
+     }
+@@ -97,7 +97,7 @@ abstract class AbstractStream {
+     }
+ 
+ 
+-    final Set<Stream> getChildStreams() {
++    final Set<AbstractNonZeroStream> getChildStreams() {
+         return childStreams;
+     }
+ 
+
+==================================================
+RecycledStream.java
+index 152b2f36d8..cc07372235 100644
+--- a/java/org/apache/coyote/http2/Http2UpgradeHandler.java
++++ b/java/org/apache/coyote/http2/Http2UpgradeHandler.java
+@@ -1269,17 +1269,17 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
+         Stream streamToRemove = streams.remove(streamIdToRemove);
+         // Move the removed Stream's children to the removed Stream's
+         // parent.
+-        Set<Stream> children = streamToRemove.getChildStreams();
++        Set<AbstractNonZeroStream> children = streamToRemove.getChildStreams();
+         if (children.size() == 1) {
+             // Shortcut
+             children.iterator().next().rePrioritise(
+                     streamToRemove.getParentStream(), streamToRemove.getWeight());
+         } else {
+             int totalWeight = 0;
+-            for (Stream child : children) {
++            for (AbstractNonZeroStream child : children) {
+                 totalWeight += child.getWeight();
+             }
+-            for (Stream child : children) {
++            for (AbstractNonZeroStream child : children) {
+                 children.iterator().next().rePrioritise(
+                         streamToRemove.getParentStream(),
+                         streamToRemove.getWeight() * child.getWeight() / totalWeight);
+
+==================================================
+Stream.java
+index f5006465c3..1e630df215 100644
+--- a/java/org/apache/coyote/http2/RecycledStream.java
++++ b/java/org/apache/coyote/http2/RecycledStream.java
+@@ -23,12 +23,10 @@ package org.apache.coyote.http2;
+ class RecycledStream extends AbstractNonZeroStream {
+ 
+     private final String connectionId;
+-    private int weight;
+ 
+     RecycledStream(Stream stream) {
+-        super(stream.getIdentifier());
++        super(stream.getIdentifier(), stream.getWeight());
+         connectionId = stream.getConnectionId();
+-        weight = stream.getWeight();
+     }
+ 
+ 
+@@ -36,10 +34,4 @@ class RecycledStream extends AbstractNonZeroStream {
+     String getConnectionId() {
+         return connectionId;
+     }
+-
+-
+-    @Override
+-    int getWeight() {
+-        return weight;
+-    }
+ }
+
+==================================================

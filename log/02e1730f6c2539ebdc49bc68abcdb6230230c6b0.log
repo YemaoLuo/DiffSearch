@@ -1,0 +1,142 @@
+02e1730f6c2539ebdc49bc68abcdb6230230c6b0
+==================================================
+Add initial support for trailer headers
+==================================================
+Mark Thomas
+==================================================
+Wed Oct 19 13:31:26 2016 +0000
+==================================================
+Http2UpgradeHandler.java
+Add initial support for trailer headers
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1765589 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Stream.java
+index 8df2273d3c..b7ba166d37 100644
+--- a/java/org/apache/coyote/http2/Http2UpgradeHandler.java
++++ b/java/org/apache/coyote/http2/Http2UpgradeHandler.java
+@@ -1247,8 +1247,9 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
+         setMaxProcessedStream(streamId);
+         Stream stream = getStream(streamId, connectionState.get().isNewStreamAllowed());
+         if (stream != null && stream.isActive()) {
+-            stream.receivedEndOfHeaders();
+-            processStreamOnContainerThread(stream);
++            if (stream.receivedEndOfHeaders()) {
++                processStreamOnContainerThread(stream);
++            }
+         }
+     }
+ 
+
+==================================================
+Http2TestBase.java
+index b5fcc5d666..c25c184e91 100644
+--- a/java/org/apache/coyote/http2/Stream.java
++++ b/java/org/apache/coyote/http2/Stream.java
+@@ -293,13 +293,14 @@ class Stream extends AbstractStream implements HeaderEmitter {
+     }
+ 
+ 
+-    final void receivedEndOfHeaders() {
++    final boolean receivedEndOfHeaders() {
+         // Cookie headers need to be concatenated into a single header
+         // See RFC 7540 8.1.2.5
+         // Can only do this once the headers are fully received
+         if (cookieHeader != null) {
+             coyoteRequest.getMimeHeaders().addValue("cookie").setString(cookieHeader.toString());
+         }
++        return headerState == HEADER_STATE_REGULAR || headerState == HEADER_STATE_PSEUDO;
+     }
+ 
+ 
+@@ -362,6 +363,9 @@ class Stream extends AbstractStream implements HeaderEmitter {
+ 
+ 
+     final void receivedEndOfStream() {
++        synchronized (inputBuffer) {
++            inputBuffer.notifyAll();
++        }
+         state.recievedEndOfStream();
+     }
+ 
+
+==================================================
+TestHttp2Section_8_1.java
+index 8a0dc18e31..49b385043d 100644
+--- a/test/org/apache/coyote/http2/Http2TestBase.java
++++ b/test/org/apache/coyote/http2/Http2TestBase.java
+@@ -69,6 +69,8 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+         EMPTY_HTTP2_SETTINGS_HEADER = "HTTP2-Settings: " + Base64.encodeBase64String(empty) + "\r\n";
+     }
+ 
++    private static final String TRAILER_HEADER_NAME = "X-TrailerTest";
++
+     private Socket s;
+     protected HpackEncoder hpackEncoder;
+     protected Input input;
+@@ -294,6 +296,13 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+     protected void buildPostRequest(byte[] headersFrameHeader, ByteBuffer headersPayload,
+             boolean useExpectation, byte[] dataFrameHeader, ByteBuffer dataPayload, byte[] padding,
+             int streamId) {
++        buildPostRequest(headersFrameHeader, headersPayload, useExpectation, dataFrameHeader,
++                dataPayload, padding, null, null, streamId);
++    }
++
++    protected void buildPostRequest(byte[] headersFrameHeader, ByteBuffer headersPayload,
++            boolean useExpectation, byte[] dataFrameHeader, ByteBuffer dataPayload, byte[] padding,
++            byte[] trailersFrameHeader, ByteBuffer trailersPayload, int streamId) {
+         MimeHeaders headers = new MimeHeaders();
+         headers.addValue(":method").setString("POST");
+         headers.addValue(":path").setString("/simple");
+@@ -332,12 +341,31 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+         ByteUtil.setThreeBytes(dataFrameHeader, 0, dataPayload.limit());
+         // Data is type 0
+         // Flags: End of stream 1, Padding 8
+-        if (padding == null) {
++        if (trailersPayload == null) {
+             dataFrameHeader[4] = 0x01;
+         } else {
+-            dataFrameHeader[4] = 0x09;
++            dataFrameHeader[4] = 0x00;
++        }
++        if (padding != null) {
++            dataFrameHeader[4] += 0x08;
+         }
+         ByteUtil.set31Bits(dataFrameHeader, 5, streamId);
++
++        // Trailers
++        if (trailersPayload != null) {
++            MimeHeaders trailerHeaders = new MimeHeaders();
++            trailerHeaders.addValue(TRAILER_HEADER_NAME).setString("xxxx");
++            hpackEncoder.encode(trailerHeaders, trailersPayload);
++
++            trailersPayload.flip();
++
++            ByteUtil.setThreeBytes(trailersFrameHeader, 0, trailersPayload.limit());
++            trailersFrameHeader[3] = FrameType.HEADERS.getIdByte();
++            // Flags. end of headers (0x04) and end of stream (0x01)
++            trailersFrameHeader[4] = 0x05;
++            // Stream id
++            ByteUtil.set31Bits(trailersFrameHeader, 5, streamId);
++        }
+     }
+ 
+ 
+@@ -1049,6 +1077,12 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+ 
+             ByteArrayInputStream bais = new ByteArrayInputStream(baos.toByteArray());
+             IOTools.flow(bais, resp.getOutputStream());
++
++            // Check for trailer headers
++            String trailerValue = req.getHeader(TRAILER_HEADER_NAME);
++            if (trailerValue != null) {
++                resp.getOutputStream().write(trailerValue.getBytes(StandardCharsets.UTF_8));
++            }
+         }
+     }
+ 
+
+==================================================

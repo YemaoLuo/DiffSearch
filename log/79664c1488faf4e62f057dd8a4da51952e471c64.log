@@ -1,0 +1,1439 @@
+79664c1488faf4e62f057dd8a4da51952e471c64
+==================================================
+Use a lighter weight processor for upgrades.
+==================================================
+Mark Emlyn
+==================================================
+Tue Feb 7 10:18:10 2012 +0000
+==================================================
+Request.java
+Use a lighter weight processor for upgrades.
+Note that extending the Http11 processors is a hack that I think can be removed with some further refactoring of the connectors.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1241410 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+RequestFacade.java
+index ffefa0cc03..6e742b3153 100644
+--- a/java/org/apache/catalina/connector/Request.java
++++ b/java/org/apache/catalina/connector/Request.java
+@@ -74,7 +74,7 @@ import org.apache.catalina.core.AsyncContextImpl;
+ import org.apache.catalina.util.ParameterMap;
+ import org.apache.catalina.util.StringParser;
+ import org.apache.coyote.ActionCode;
+-import org.apache.coyote.http11.UpgradeInbound;
++import org.apache.coyote.http11.upgrade.UpgradeInbound;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.ExceptionUtils;
+
+==================================================
+StreamInbound.java
+index 1178ccee6f..b9b89c749a 100644
+--- a/java/org/apache/catalina/connector/RequestFacade.java
++++ b/java/org/apache/catalina/connector/RequestFacade.java
+@@ -41,7 +41,7 @@ import javax.servlet.http.Part;
+ 
+ import org.apache.catalina.Globals;
+ import org.apache.catalina.security.SecurityUtil;
+-import org.apache.coyote.http11.UpgradeInbound;
++import org.apache.coyote.http11.upgrade.UpgradeInbound;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+ /**
+
+==================================================
+WsInputStream.java
+index 50d52bf3aa..6bc8591998 100644
+--- a/java/org/apache/catalina/websocket/StreamInbound.java
++++ b/java/org/apache/catalina/websocket/StreamInbound.java
+@@ -22,8 +22,9 @@ import java.io.InputStreamReader;
+ import java.io.Reader;
+ 
+ import org.apache.catalina.util.Conversions;
+-import org.apache.coyote.http11.UpgradeInbound;
+-import org.apache.coyote.http11.UpgradeOutbound;
++import org.apache.coyote.http11.upgrade.UpgradeInbound;
++import org.apache.coyote.http11.upgrade.UpgradeOutbound;
++import org.apache.coyote.http11.upgrade.UpgradeProcessor;
+ import org.apache.tomcat.util.buf.B2CConverter;
+ import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
+ 
+@@ -41,7 +42,7 @@ public abstract class StreamInbound implements UpgradeInbound {
+     // frames
+     // TODO
+ 
+-    private InputStream is = null;
++    private UpgradeProcessor processor = null;
+     private WsOutbound outbound;
+ 
+     @Override
+@@ -51,8 +52,8 @@ public abstract class StreamInbound implements UpgradeInbound {
+ 
+ 
+     @Override
+-    public void setInputStream(InputStream is) {
+-        this.is = is;
++    public void setUpgradeProcessor(UpgradeProcessor processor) {
++        this.processor = processor;
+     }
+ 
+     public WsOutbound getStreamOutbound() {
+@@ -64,7 +65,7 @@ public abstract class StreamInbound implements UpgradeInbound {
+         // Must be start the start of a frame
+ 
+         // Read the first byte
+-        int i = is.read();
++        int i = processor.read();
+ 
+         fin = (i & 0x80) > 0;
+ 
+@@ -80,7 +81,7 @@ public abstract class StreamInbound implements UpgradeInbound {
+         validateOpCode(opCode);
+ 
+         // Read the next byte
+-        i = is.read();
++        i = processor.read();
+ 
+         // Client data must be masked and this isn't
+         if ((i & 0x80) == 0) {
+@@ -91,19 +92,20 @@ public abstract class StreamInbound implements UpgradeInbound {
+         payloadLength = i & 0x7F;
+         if (payloadLength == 126) {
+             byte[] extended = new byte[2];
+-            is.read(extended);
++            processor.read(extended);
+             payloadLength = Conversions.byteArrayToLong(extended);
+         } else if (payloadLength == 127) {
+             byte[] extended = new byte[8];
+-            is.read(extended);
++            processor.read(extended);
+             payloadLength = Conversions.byteArrayToLong(extended);
+         }
+ 
+         byte[] mask = new byte[4];
+-        is.read(mask);
++        processor.read(mask);
+ 
+         if (opCode == 1 || opCode == 2) {
+-            WsInputStream wsIs = new WsInputStream(is, mask, payloadLength);
++            WsInputStream wsIs = new WsInputStream(processor, mask,
++                    payloadLength);
+             if (opCode == 2) {
+                 onBinaryData(wsIs);
+             } else {
+@@ -123,7 +125,7 @@ public abstract class StreamInbound implements UpgradeInbound {
+         // TODO: Handle control frames appearing in the middle of a multi-frame
+         //       message
+ 
+-        return SocketState.UPGRADE;
++        return SocketState.UPGRADED;
+     }
+ 
+     protected abstract void onBinaryData(InputStream is) throws IOException;
+
+==================================================
+WsOutbound.java
+index 0dc0292df6..dfd746114f 100644
+--- a/java/org/apache/catalina/websocket/WsInputStream.java
++++ b/java/org/apache/catalina/websocket/WsInputStream.java
+@@ -17,17 +17,19 @@
+ package org.apache.catalina.websocket;
+ 
+ import java.io.IOException;
+-import java.io.InputStream;
++
++import org.apache.coyote.http11.upgrade.UpgradeProcessor;
+ 
+ public class WsInputStream extends java.io.InputStream {
+ 
+-    private InputStream wrapped;
++    private UpgradeProcessor processor;
+     private byte[] mask;
+     private long remaining;
+     private long read;
+ 
+-    public WsInputStream(InputStream wrapped, byte[] mask, long remaining) {
+-        this.wrapped = wrapped;
++    public WsInputStream(UpgradeProcessor processor, byte[] mask,
++            long remaining) {
++        this.processor = processor;
+         this.mask = mask;
+         this.remaining = remaining;
+         this.read = 0;
+@@ -42,7 +44,7 @@ public class WsInputStream extends java.io.InputStream {
+         remaining--;
+         read++;
+ 
+-        int masked = wrapped.read();
++        int masked = processor.read();
+         return masked ^ mask[(int) ((read - 1) % 4)];
+     }
+ 
+
+==================================================
+AbstractProcessor.java
+index 0f68ae6a2b..2aacbe52d5 100644
+--- a/java/org/apache/catalina/websocket/WsOutbound.java
++++ b/java/org/apache/catalina/websocket/WsOutbound.java
+@@ -20,7 +20,7 @@ import java.io.IOException;
+ import java.nio.ByteBuffer;
+ import java.nio.CharBuffer;
+ 
+-import org.apache.coyote.http11.UpgradeOutbound;
++import org.apache.coyote.http11.upgrade.UpgradeOutbound;
+ import org.apache.tomcat.util.buf.B2CConverter;
+ 
+ public class WsOutbound {
+
+==================================================
+AbstractProtocol.java
+index 18a69eabf0..9b1a598248 100644
+--- a/java/org/apache/coyote/AbstractProcessor.java
++++ b/java/org/apache/coyote/AbstractProcessor.java
+@@ -19,6 +19,7 @@ package org.apache.coyote;
+ import java.io.IOException;
+ import java.util.concurrent.Executor;
+ 
++import org.apache.coyote.http11.upgrade.UpgradeInbound;
+ import org.apache.tomcat.util.net.AbstractEndpoint;
+ import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
+ import org.apache.tomcat.util.net.SocketStatus;
+@@ -31,12 +32,20 @@ import org.apache.tomcat.util.net.SocketWrapper;
+ public abstract class AbstractProcessor<S> implements ActionHook, Processor {
+ 
+     protected Adapter adapter;
+-    protected final AsyncStateMachine asyncStateMachine;
+-    protected final AbstractEndpoint endpoint;
+-    protected final Request request;
+-    protected final Response response;
++    protected AsyncStateMachine asyncStateMachine;
++    protected AbstractEndpoint endpoint;
++    protected Request request;
++    protected Response response;
+ 
+ 
++    /**
++     * Intended for use by the Upgrade sub-classes that have no need to
++     * initialise the request, response, etc.
++     */
++    protected AbstractProcessor() {
++        // NOOP
++    }
++
+     public AbstractProcessor(AbstractEndpoint endpoint) {
+         this.endpoint = endpoint;
+         asyncStateMachine = new AsyncStateMachine(this);
+@@ -96,7 +105,7 @@ public abstract class AbstractProcessor<S> implements ActionHook, Processor {
+ 
+ 
+     public boolean isAsync() {
+-        return asyncStateMachine.isAsync();
++        return (asyncStateMachine != null && asyncStateMachine.isAsync());
+     }
+ 
+ 
+@@ -131,4 +140,6 @@ public abstract class AbstractProcessor<S> implements ActionHook, Processor {
+      * upgrade.
+      */
+     public abstract SocketState upgradeDispatch() throws IOException;
++
++    public abstract UpgradeInbound getUpgradeInbound();
+ }
+
+==================================================
+AbstractAjpProcessor.java
+index 529a83e018..7dbfc79def 100644
+--- a/java/org/apache/coyote/AbstractProtocol.java
++++ b/java/org/apache/coyote/AbstractProtocol.java
+@@ -16,6 +16,7 @@
+  */
+ package org.apache.coyote;
+ 
++import java.io.IOException;
+ import java.net.InetAddress;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.ConcurrentLinkedQueue;
+@@ -28,6 +29,7 @@ import javax.management.MBeanServer;
+ import javax.management.MalformedObjectNameException;
+ import javax.management.ObjectName;
+ 
++import org.apache.coyote.http11.upgrade.UpgradeInbound;
+ import org.apache.juli.logging.Log;
+ import org.apache.tomcat.util.ExceptionUtils;
+ import org.apache.tomcat.util.modeler.Registry;
+@@ -576,9 +578,18 @@ public abstract class AbstractProtocol implements ProtocolHandler,
+                     // closed. If it works, the socket will be re-added to the
+                     // poller
+                     release(socket, processor, false, false);
+-                } else if (state == SocketState.UPGRADE) {
++                } else if (state == SocketState.UPGRADED) {
+                     // Need to keep the connection associated with the processor
+-                    longPoll(socket, processor);
++                    upgradePoll(socket, processor);
++                } else if (state == SocketState.UPGRADING) {
++                    // Get the UpgradeInbound handler
++                    UpgradeInbound inbound = processor.getUpgradeInbound();
++                    // Release the Http11 processor to be re-used
++                    release(socket, processor, false, false);
++                    // Create the light-weight upgrade processor
++                    processor = createUpgradeProcessor(socket, inbound);
++                    // Need to keep the connection associated with the processor
++                    upgradePoll(socket, processor);
+                 } else {
+                     // Connection closed. OK to recycle the processor.
+                     release(socket, processor, true, false);
+@@ -610,9 +621,12 @@ public abstract class AbstractProtocol implements ProtocolHandler,
+         protected abstract P createProcessor();
+         protected abstract void initSsl(SocketWrapper<S> socket, P processor);
+         protected abstract void longPoll(SocketWrapper<S> socket, P processor);
++        protected abstract void upgradePoll(SocketWrapper<S> socket,
++                P processor);
+         protected abstract void release(SocketWrapper<S> socket, P processor,
+                 boolean socketClosing, boolean addToPoller);
+-
++        protected abstract P createUpgradeProcessor(SocketWrapper<S> socket,
++                UpgradeInbound inbound) throws IOException;
+ 
+         protected void register(AbstractProcessor<S> processor) {
+             if (getProtocol().getDomain() != null) {
+@@ -645,8 +659,12 @@ public abstract class AbstractProtocol implements ProtocolHandler,
+             if (getProtocol().getDomain() != null) {
+                 synchronized (this) {
+                     try {
+-                        RequestInfo rp =
+-                            processor.getRequest().getRequestProcessor();
++                        Request r = processor.getRequest();
++                        if (r == null) {
++                            // Probably an UpgradeProcessor
++                            return;
++                        }
++                        RequestInfo rp = r.getRequestProcessor();
+                         rp.setGlobalProcessor(null);
+                         ObjectName rpName = rp.getRpName();
+                         if (getLog().isDebugEnabled()) {
+
+==================================================
+AbstractAjpProtocol.java
+index e341a6ab73..3a0078266b 100644
+--- a/java/org/apache/coyote/ajp/AbstractAjpProcessor.java
++++ b/java/org/apache/coyote/ajp/AbstractAjpProcessor.java
+@@ -33,6 +33,7 @@ import org.apache.coyote.OutputBuffer;
+ import org.apache.coyote.Request;
+ import org.apache.coyote.RequestInfo;
+ import org.apache.coyote.Response;
++import org.apache.coyote.http11.upgrade.UpgradeInbound;
+ import org.apache.juli.logging.Log;
+ import org.apache.tomcat.util.ExceptionUtils;
+ import org.apache.tomcat.util.buf.ByteChunk;
+@@ -521,6 +522,14 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+     }
+ 
+ 
++    @Override
++    public UpgradeInbound getUpgradeInbound() {
++        // Should never reach this code but in case we do...
++        throw new IllegalStateException(
++                sm.getString("ajpprocessor.httpupgrade.notsupported"));
++    }
++
++
+     /**
+      * Recycle the processor, ready for the next request which may be on the
+      * same connection or a different connection.
+
+==================================================
+AbstractHttp11Processor.java
+index d1515f64e0..8076509f92 100644
+--- a/java/org/apache/coyote/ajp/AbstractAjpProtocol.java
++++ b/java/org/apache/coyote/ajp/AbstractAjpProtocol.java
+@@ -17,6 +17,7 @@
+ package org.apache.coyote.ajp;
+ 
+ import org.apache.coyote.AbstractProtocol;
++import org.apache.coyote.http11.upgrade.UpgradeInbound;
+ import org.apache.tomcat.util.net.SocketWrapper;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+@@ -86,5 +87,17 @@ public abstract class AbstractAjpProtocol extends AbstractProtocol {
+             connections.put(socket.getSocket(), processor);
+             socket.setAsync(true);
+         }
++
++        @Override
++        protected void upgradePoll(SocketWrapper<S> socket, P processor) {
++            // TODO Should never happen. ISE?
++        }
++
++        @Override
++        protected P createUpgradeProcessor(SocketWrapper<S> socket,
++                UpgradeInbound inbound) {
++            // TODO should fail - throw IOE
++            return null;
++        }
+     }
+ }
+
+==================================================
+Http11AprProcessor.java
+index 4022a624f5..8d3c7e2030 100644
+--- a/java/org/apache/coyote/http11/AbstractHttp11Processor.java
++++ b/java/org/apache/coyote/http11/AbstractHttp11Processor.java
+@@ -36,6 +36,7 @@ import org.apache.coyote.http11.filters.IdentityOutputFilter;
+ import org.apache.coyote.http11.filters.SavedRequestInputFilter;
+ import org.apache.coyote.http11.filters.VoidInputFilter;
+ import org.apache.coyote.http11.filters.VoidOutputFilter;
++import org.apache.coyote.http11.upgrade.UpgradeInbound;
+ import org.apache.juli.logging.Log;
+ import org.apache.tomcat.util.ExceptionUtils;
+ import org.apache.tomcat.util.buf.Ascii;
+@@ -60,6 +61,14 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+     protected static final StringManager sm =
+         StringManager.getManager(Constants.Package);
+ 
++    /**
++     * Intended for use by the Upgrade sub-classes that have no need to
++     * initialise the request, response, etc.
++     */
++    protected AbstractHttp11Processor() {
++        // NOOP
++    }
++
+     /*
+      * Tracks how many internal filters are in the filter library so they
+      * are skipped when looking for pluggable filters.
+@@ -835,11 +844,6 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+             ((AtomicBoolean) param).set(asyncStateMachine.isAsyncTimingOut());
+         } else if (actionCode == ActionCode.UPGRADE) {
+             upgradeInbound = (UpgradeInbound) param;
+-            upgradeInbound.setInputStream(
+-                    new UpgradeInputStream(getInputBuffer()));
+-            upgradeInbound.setUpgradeOutbound(
+-                    new UpgradeOutbound(
+-                            new UpgradeOutputStream(getOutputBuffer())));
+             // Stop further HTTP output
+             getOutputBuffer().finished = true;
+         } else {
+@@ -1066,8 +1070,7 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+         } else if (isAsync() || comet) {
+             return SocketState.LONG;
+         } else if (isUpgrade()) {
+-            // May be data on the connection to process
+-            return upgradeDispatch();
++            return SocketState.UPGRADING;
+         } else {
+             if (sendfileInProgress) {
+                 return SocketState.SENDFILE;
+@@ -1579,22 +1582,15 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+ 
+     @Override
+     public SocketState upgradeDispatch() throws IOException {
+-        SocketState result = upgradeInbound.onData();
+-        AbstractInputBuffer<S> ib = getInputBuffer();
+-        while (result == SocketState.UPGRADE) {
+-            // Check to see if there is more data to process
+-            if (ib.available() == 0) {
+-                // Read any data that might be available
+-                // Note: This will block for BIO regardless
+-                ib.fill(false);
+-            }
+-            if (ib.available() == 0) {
+-                // Still no data available, exit this loop
+-                break;
+-            }
+-            result = upgradeInbound.onData();
+-        }
+-        return result;
++        // Should never reach this code but in case we do...
++        // TODO
++        throw new IOException(
++                sm.getString("TODO"));
++    }
++
++
++    public UpgradeInbound getUpgradeInbound() {
++        return upgradeInbound;
+     }
+ 
+ 
+@@ -1652,9 +1648,15 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+ 
+ 
+     public final void recycle() {
+-        getInputBuffer().recycle();
+-        getOutputBuffer().recycle();
+-        asyncStateMachine.recycle();
++        if (getInputBuffer() != null) {
++            getInputBuffer().recycle();
++        }
++        if (getOutputBuffer() != null) {
++            getOutputBuffer().recycle();
++        }
++        if (asyncStateMachine != null) {
++            asyncStateMachine.recycle();
++        }
+         upgradeInbound = null;
+         remoteAddr = null;
+         remoteHost = null;
+
+==================================================
+Http11AprProtocol.java
+index 499ec2649d..bdf7aeb251 100644
+--- a/java/org/apache/coyote/http11/Http11AprProcessor.java
++++ b/java/org/apache/coyote/http11/Http11AprProcessor.java
+@@ -57,6 +57,15 @@ public class Http11AprProcessor extends AbstractHttp11Processor<Long> {
+     // ----------------------------------------------------------- Constructors
+ 
+ 
++    /**
++     * Intended for use by the Upgrade sub-classes that have no need to
++     * initialise the request, response, etc.
++     */
++    protected Http11AprProcessor() {
++        // NOOP
++    }
++
++
+     public Http11AprProcessor(int headerBufferSize, AprEndpoint endpoint,
+             int maxTrailerSize) {
+ 
+
+==================================================
+Http11NioProcessor.java
+index 5f708ca02e..cfcf3b2485 100644
+--- a/java/org/apache/coyote/http11/Http11AprProtocol.java
++++ b/java/org/apache/coyote/http11/Http11AprProtocol.java
+@@ -16,7 +16,11 @@
+  */
+ package org.apache.coyote.http11;
+ 
++import java.io.IOException;
++
+ import org.apache.coyote.AbstractProtocol;
++import org.apache.coyote.http11.upgrade.UpgradeAprProcessor;
++import org.apache.coyote.http11.upgrade.UpgradeInbound;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.net.AbstractEndpoint;
+@@ -240,6 +244,14 @@ public class Http11AprProtocol extends AbstractHttp11Protocol {
+             }
+         }
+ 
++        @Override
++        protected void upgradePoll(SocketWrapper<Long> socket,
++                Http11AprProcessor processor) {
++            connections.put(socket.getSocket(), processor);
++            ((AprEndpoint) proto.endpoint).getPoller().add(
++                    socket.getSocket().longValue(), false);
++        }
++
+         @Override
+         protected Http11AprProcessor createProcessor() {
+             Http11AprProcessor processor = new Http11AprProcessor(
+@@ -263,5 +275,12 @@ public class Http11AprProtocol extends AbstractHttp11Protocol {
+             register(processor);
+             return processor;
+         }
++
++        @Override
++        protected Http11AprProcessor createUpgradeProcessor(
++                SocketWrapper<Long> socket, UpgradeInbound inbound)
++                throws IOException {
++            return new UpgradeAprProcessor(socket, inbound);
++        }
+     }
+ }
+
+==================================================
+Http11NioProtocol.java
+index 7810ca80df..9927116507 100644
+--- a/java/org/apache/coyote/http11/Http11NioProcessor.java
++++ b/java/org/apache/coyote/http11/Http11NioProcessor.java
+@@ -62,6 +62,15 @@ public class Http11NioProcessor extends AbstractHttp11Processor<NioChannel> {
+     // ----------------------------------------------------------- Constructors
+ 
+ 
++    /**
++     * Intended for use by the Upgrade sub-classes that have no need to
++     * initialise the request, response, etc.
++     */
++    protected Http11NioProcessor() {
++        // NOOP
++    }
++
++
+     public Http11NioProcessor(int maxHttpHeaderSize, NioEndpoint endpoint,
+             int maxTrailerSize) {
+ 
+
+==================================================
+Http11Processor.java
+index 5ea84757d0..f980a8f19b 100644
+--- a/java/org/apache/coyote/http11/Http11NioProtocol.java
++++ b/java/org/apache/coyote/http11/Http11NioProtocol.java
+@@ -16,11 +16,14 @@
+  */
+ package org.apache.coyote.http11;
+ 
++import java.io.IOException;
+ import java.nio.channels.SelectionKey;
+ import java.nio.channels.SocketChannel;
+ import java.util.Iterator;
+ 
+ import org.apache.coyote.AbstractProtocol;
++import org.apache.coyote.http11.upgrade.UpgradeInbound;
++import org.apache.coyote.http11.upgrade.UpgradeNioProcessor;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.net.AbstractEndpoint;
+@@ -279,5 +282,25 @@ public class Http11NioProtocol extends AbstractHttp11JsseProtocol {
+             register(processor);
+             return processor;
+         }
++
++        @Override
++        protected Http11NioProcessor createUpgradeProcessor(
++                SocketWrapper<NioChannel> socket, UpgradeInbound inbound)
++                throws IOException {
++            return new UpgradeNioProcessor(socket, inbound,
++                    ((Http11NioProtocol) getProtocol()).getEndpoint().getSelectorPool());
++        }
++
++        @Override
++        protected void upgradePoll(SocketWrapper<NioChannel> socket,
++                Http11NioProcessor processor) {
++            connections.put(socket.getSocket(), processor);
++
++            SelectionKey key = socket.getSocket().getIOChannel().keyFor(
++                    socket.getSocket().getPoller().getSelector());
++            key.interestOps(SelectionKey.OP_READ);
++            ((KeyAttachment) socket).interestOps(
++                    SelectionKey.OP_READ);
++        }
+     }
+ }
+
+==================================================
+Http11Protocol.java
+index 7aaedcdb98..36e160f560 100644
+--- a/java/org/apache/coyote/http11/Http11Processor.java
++++ b/java/org/apache/coyote/http11/Http11Processor.java
+@@ -49,6 +49,15 @@ public class Http11Processor extends AbstractHttp11Processor<Socket> {
+    // ------------------------------------------------------------ Constructor
+ 
+ 
++    /**
++     * Intended for use by the Upgrade sub-classes that have no need to
++     * initialise the request, response, etc.
++     */
++    protected Http11Processor() {
++        // NOOP
++    }
++
++
+     public Http11Processor(int headerBufferSize, JIoEndpoint endpoint,
+             int maxTrailerSize) {
+ 
+
+==================================================
+UpgradeInputStream.java
+index 6c83102bc2..5907e84774 100644
+--- a/java/org/apache/coyote/http11/Http11Protocol.java
++++ b/java/org/apache/coyote/http11/Http11Protocol.java
+@@ -16,9 +16,12 @@
+  */
+ package org.apache.coyote.http11;
+ 
++import java.io.IOException;
+ import java.net.Socket;
+ 
+ import org.apache.coyote.AbstractProtocol;
++import org.apache.coyote.http11.upgrade.UpgradeBioProcessor;
++import org.apache.coyote.http11.upgrade.UpgradeInbound;
+ import org.apache.juli.logging.Log;
+ import org.apache.tomcat.util.net.AbstractEndpoint;
+ import org.apache.tomcat.util.net.JIoEndpoint;
+@@ -180,5 +183,18 @@ public class Http11Protocol extends AbstractHttp11JsseProtocol {
+             register(processor);
+             return processor;
+         }
++
++        @Override
++        protected Http11Processor createUpgradeProcessor(
++                SocketWrapper<Socket> socket, UpgradeInbound inbound)
++                throws IOException {
++            return new UpgradeBioProcessor(socket, inbound);
++        }
++
++        @Override
++        protected void upgradePoll(SocketWrapper<Socket> socket,
++                Http11Processor processor) {
++            connections.put(socket.getSocket(), processor);
++        }
+     }
+ }
+
+==================================================
+UpgradeOutputStream.java
+deleted file mode 100644
+index fbeb32f823..0000000000
+--- a/java/org/apache/coyote/http11/UpgradeInputStream.java
++++ /dev/null
+@@ -1,55 +0,0 @@
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package org.apache.coyote.http11;
+-
+-import java.io.IOException;
+-import java.io.InputStream;
+-
+-import org.apache.coyote.InputBuffer;
+-import org.apache.tomcat.util.buf.ByteChunk;
+-import org.apache.tomcat.util.buf.ByteChunk.ByteInputChannel;
+-
+-/**
+- * Provides a buffered {@link InputStream} to read data from the upgraded
+- * connection.
+- *
+- * TODO: Override a few more {@link InputStream} methods for efficiency.
+- *
+- * Based on a combination of {@link org.apache.catalina.connector.InputBuffer}
+- * and (@link CoyoteInputStream}.
+- */
+-public class UpgradeInputStream extends InputStream
+-        implements ByteInputChannel {
+-
+-    private InputBuffer ib = null;
+-    private ByteChunk bb = new ByteChunk(8192);
+-
+-    public UpgradeInputStream(InputBuffer ib) {
+-        this.ib = ib;
+-        bb.setByteInputChannel(this);
+-    }
+-
+-    @Override
+-    public int read() throws IOException {
+-        return bb.substract();
+-    }
+-
+-    @Override
+-    public int realReadBytes(byte[] cbuf, int off, int len) throws IOException {
+-        return ib.doRead(bb, null);
+-    }
+-}
+
+==================================================
+UpgradeAprProcessor.java
+deleted file mode 100644
+index 569fdf9793..0000000000
+--- a/java/org/apache/coyote/http11/UpgradeOutputStream.java
++++ /dev/null
+@@ -1,55 +0,0 @@
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package org.apache.coyote.http11;
+-
+-import java.io.IOException;
+-import java.io.OutputStream;
+-
+-
+-import org.apache.tomcat.util.buf.ByteChunk;
+-import org.apache.tomcat.util.buf.ByteChunk.ByteOutputChannel;
+-
+-public class UpgradeOutputStream extends OutputStream
+-        implements ByteOutputChannel{
+-
+-    private AbstractOutputBuffer<?> ob = null;
+-    private ByteChunk bb = new ByteChunk(8192);
+-
+-    public UpgradeOutputStream(AbstractOutputBuffer<?> ob) {
+-        this.ob = ob;
+-        bb.setByteOutputChannel(this);
+-    }
+-
+-
+-    @Override
+-    public void realWriteBytes(byte[] cbuf, int off, int len)
+-            throws IOException {
+-        ob.committed = true;
+-        ob.doWrite(bb, null);
+-    }
+-
+-    @Override
+-    public void write(int b) throws IOException {
+-        bb.append((byte) b);
+-    }
+-
+-    @Override
+-    public void flush() throws IOException {
+-        bb.flushBuffer();
+-        ob.flush();
+-    }
+-}
+
+==================================================
+UpgradeBioProcessor.java
+new file mode 100644
+index 0000000000..4d41706618
+--- /dev/null
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeAprProcessor.java
+@@ -0,0 +1,123 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.coyote.http11.upgrade;
++
++import java.io.IOException;
++
++import org.apache.coyote.http11.Http11AprProcessor;
++import org.apache.tomcat.jni.Socket;
++import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
++import org.apache.tomcat.util.net.SocketStatus;
++import org.apache.tomcat.util.net.SocketWrapper;
++
++/**
++ * Implementation note: The need to extend Http11Processor could probably be
++ * removed if the Processor interface was expanded to cover all of the methods
++ * required by the AbstractProtocol. That would simplify the code and further
++ * reduce the size of instances of this class.
++ */
++public class UpgradeAprProcessor extends Http11AprProcessor
++        implements UpgradeProcessor {
++
++    long socket;
++
++    public UpgradeAprProcessor(SocketWrapper<Long> wrapper,
++            UpgradeInbound inbound) {
++        this.socket = wrapper.getSocket().longValue();
++
++        this.upgradeInbound = inbound;
++        upgradeInbound.setUpgradeProcessor(this);
++        upgradeInbound.setUpgradeOutbound(new UpgradeOutbound(this));
++        // Remove the default - no need for it here
++        this.compressableMimeTypes = null;
++    }
++
++
++    @Override
++    public SocketState upgradeDispatch() throws IOException {
++        return upgradeInbound.onData();
++    }
++
++
++    /*
++     * Output methods
++     */
++    @Override
++    public void flush() throws IOException {
++        // NOOP
++    }
++
++
++    @Override
++    public void write(int b) throws IOException {
++        Socket.send(socket, new byte[] {(byte) b}, 0, 1);
++    }
++
++
++    /*
++     * Input methods
++     */
++    @Override
++    public int read() throws IOException {
++        byte[] bytes = new byte[1];
++        Socket.recv(socket, bytes, 0, 1);
++        return bytes[0];
++    }
++
++
++    @Override
++    public int read(byte[] bytes) throws IOException {
++        return Socket.recv(socket, bytes, 0, bytes.length);
++    }
++
++
++    /*
++     * None of the following NO-OP methods are strictly necessary - assuming the
++     * there are no bugs in the connector code that cause upgraded connections
++     * to be treated as Http11, Comet or Async. These NO-OP methods are here for
++     * safety and to aid debugging during development.
++     */
++
++    @Override
++    public SocketState event(SocketStatus status) throws IOException {
++        // TODO Log an error
++        return SocketState.CLOSED;
++    }
++
++
++    @Override
++    public SocketState process(SocketWrapper<Long> socketWrapper)
++            throws IOException {
++        // TODO Log an error
++        return SocketState.CLOSED;
++    }
++
++
++    @Override
++    public SocketState asyncDispatch(SocketStatus status) {
++        // TODO Log an error
++        return SocketState.CLOSED;
++    }
++
++
++    @Override
++    public SocketState asyncPostProcess() {
++        // TODO Log an error
++        return SocketState.CLOSED;
++    }
++
++}
+
+==================================================
+UpgradeInbound.java
+new file mode 100644
+index 0000000000..a4cbe3bfa1
+--- /dev/null
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeBioProcessor.java
+@@ -0,0 +1,123 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.coyote.http11.upgrade;
++
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.net.Socket;
++
++import org.apache.coyote.http11.Http11Processor;
++import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
++import org.apache.tomcat.util.net.SocketStatus;
++import org.apache.tomcat.util.net.SocketWrapper;
++
++/**
++ * Implementation note: The need to extend Http11Processor could probably be
++ * removed if the Processor interface was expanded to cover all of the methods
++ * required by the AbstractProtocol. That would simplify the code and further
++ * reduce the size of instances of this class.
++ */
++public class UpgradeBioProcessor extends Http11Processor
++        implements UpgradeProcessor{
++
++    private InputStream inputStream;
++    private OutputStream outputStream;
++
++    public UpgradeBioProcessor(SocketWrapper<Socket> wrapper,
++            UpgradeInbound inbound) throws IOException {
++        this.inputStream = wrapper.getSocket().getInputStream();
++        this.outputStream = wrapper.getSocket().getOutputStream();
++        this.upgradeInbound = inbound;
++        upgradeInbound.setUpgradeProcessor(this);
++        upgradeInbound.setUpgradeOutbound(new UpgradeOutbound(this));
++        // Remove the default - no need for it here
++        this.compressableMimeTypes = null;
++    }
++
++
++    @Override
++    public SocketState upgradeDispatch() throws IOException {
++        return upgradeInbound.onData();
++    }
++
++
++    /*
++     * Output methods
++     */
++    @Override
++    public void flush() throws IOException {
++        outputStream.flush();
++    }
++
++
++    @Override
++    public void write(int b) throws IOException {
++        outputStream.write(b);
++    }
++
++
++    /*
++     * Input methods
++     */
++    @Override
++    public int read() throws IOException {
++        return inputStream.read();
++    }
++
++
++    @Override
++    public int read(byte[] bytes) throws IOException {
++        return inputStream.read(bytes);
++    }
++
++
++    /*
++     * None of the following NO-OP methods are strictly necessary - assuming the
++     * there are no bugs in the connector code that cause upgraded connections
++     * to be treated as Http11, Comet or Async. These NO-OP methods are here for
++     * safety and to aid debugging during development.
++     */
++
++    @Override
++    public SocketState event(SocketStatus status) throws IOException {
++        // TODO Log an error
++        return SocketState.CLOSED;
++    }
++
++
++    @Override
++    public SocketState process(SocketWrapper<Socket> socketWrapper)
++            throws IOException {
++        // TODO Log an error
++        return SocketState.CLOSED;
++    }
++
++
++    @Override
++    public SocketState asyncDispatch(SocketStatus status) {
++        // TODO Log an error
++        return SocketState.CLOSED;
++    }
++
++
++    @Override
++    public SocketState asyncPostProcess() {
++        // TODO Log an error
++        return SocketState.CLOSED;
++    }
++}
+
+==================================================
+UpgradeNioProcessor.java
+similarity index 87%
+rename from java/org/apache/coyote/http11/UpgradeInbound.java
+rename to java/org/apache/coyote/http11/upgrade/UpgradeInbound.java
+index c2ff58addc..f7ea4df3a2 100644
+--- a/java/org/apache/coyote/http11/UpgradeInbound.java
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeInbound.java
+@@ -14,22 +14,19 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+-package org.apache.coyote.http11;
++package org.apache.coyote.http11.upgrade;
+ 
+ import java.io.IOException;
+-import java.io.InputStream;
+ 
+ import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
+ 
+ /**
+  * Receives notification that there is data to be read on the upgraded
+  * connection and processes it.
+- *
+- * TODO: Move this to a more appropriate package (TBD).
+  */
+ public interface UpgradeInbound {
+ 
+-    void setInputStream(InputStream is);
++    void setUpgradeProcessor(UpgradeProcessor processor);
+ 
+     SocketState onData() throws IOException;
+ 
+
+==================================================
+UpgradeOutbound.java
+new file mode 100644
+index 0000000000..3f334411f9
+--- /dev/null
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeNioProcessor.java
+@@ -0,0 +1,228 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.coyote.http11.upgrade;
++
++import java.io.EOFException;
++import java.io.IOException;
++import java.nio.channels.Selector;
++
++import org.apache.coyote.http11.Http11NioProcessor;
++import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
++import org.apache.tomcat.util.net.NioChannel;
++import org.apache.tomcat.util.net.NioEndpoint;
++import org.apache.tomcat.util.net.NioSelectorPool;
++import org.apache.tomcat.util.net.SocketStatus;
++import org.apache.tomcat.util.net.SocketWrapper;
++
++/**
++ * Implementation note: The need to extend Http11Processor could probably be
++ * removed if the Processor interface was expanded to cover all of the methods
++ * required by the AbstractProtocol. That would simplify the code and further
++ * reduce the size of instances of this class.
++ */
++public class UpgradeNioProcessor extends Http11NioProcessor
++        implements UpgradeProcessor {
++
++    private NioChannel nioChannel;
++    private NioSelectorPool pool;
++
++    public UpgradeNioProcessor(SocketWrapper<NioChannel> wrapper,
++            UpgradeInbound inbound, NioSelectorPool pool) {
++        this.nioChannel = wrapper.getSocket();
++        this.pool = pool;
++
++        this.upgradeInbound = inbound;
++        upgradeInbound.setUpgradeProcessor(this);
++        upgradeInbound.setUpgradeOutbound(new UpgradeOutbound(this));
++        // Remove the default - no need for it here
++        this.compressableMimeTypes = null;
++    }
++
++
++    @Override
++    public SocketState upgradeDispatch() throws IOException {
++        return upgradeInbound.onData();
++    }
++
++
++    /*
++     * Output methods
++     */
++    @Override
++    public void flush() throws IOException {
++        NioEndpoint.KeyAttachment att =
++                (NioEndpoint.KeyAttachment) nioChannel.getAttachment(false);
++        if (att == null) {
++            throw new IOException("Key must be cancelled");
++        }
++        long writeTimeout = att.getTimeout();
++        Selector selector = null;
++        try {
++            selector = pool.get();
++        } catch ( IOException x ) {
++            //ignore
++        }
++        try {
++            do {
++                if (nioChannel.flush(true, selector, writeTimeout)) {
++                    break;
++                }
++            } while (true);
++        } finally {
++            if (selector != null) {
++                pool.put(selector);
++            }
++        }
++    }
++
++    @Override
++    public void write(int b) throws IOException {
++        writeToSocket(new byte[] {(byte) b});
++    }
++
++    /*
++     * Input methods
++     */
++    @Override
++    public int read() throws IOException {
++        byte[] bytes = new byte[1];
++        readSocket(true, bytes, 0, 1);
++        return bytes[0];
++    }
++
++    @Override
++    public int read(byte[] bytes) throws IOException {
++        return readSocket(true, bytes, 0, bytes.length);
++    }
++
++
++    /*
++     * Adapted from the NioInputBuffer.
++     */
++    private int readSocket(boolean block, byte[] bytes, int offset, int len)
++            throws IOException {
++
++        int nRead = 0;
++        nioChannel.getBufHandler().getReadBuffer().clear();
++        nioChannel.getBufHandler().getReadBuffer().limit(len);
++        if (block) {
++            Selector selector = null;
++            try {
++                selector = pool.get();
++            } catch ( IOException x ) {
++                // Ignore
++            }
++            try {
++                NioEndpoint.KeyAttachment att =
++                        (NioEndpoint.KeyAttachment) nioChannel.getAttachment(false);
++                if (att == null) {
++                    throw new IOException("Key must be cancelled.");
++                }
++                nRead = pool.read(nioChannel.getBufHandler().getReadBuffer(),
++                        nioChannel, selector, att.getTimeout());
++            } catch (EOFException eof) {
++                nRead = -1;
++            } finally {
++                if (selector != null) {
++                    pool.put(selector);
++                }
++            }
++        } else {
++            nRead = nioChannel.read(nioChannel.getBufHandler().getReadBuffer());
++        }
++        if (nRead > 0) {
++            nioChannel.getBufHandler().getReadBuffer().flip();
++            nioChannel.getBufHandler().getReadBuffer().limit(nRead);
++            nioChannel.getBufHandler().getReadBuffer().get(bytes, offset, nRead);
++            return nRead;
++        } else if (nRead == -1) {
++            //return false;
++            throw new EOFException(sm.getString("iib.eof.error"));
++        } else {
++            return 0;
++        }
++    }
++
++
++    /*
++     * Adapted from the NioOutputBuffer
++     */
++    private synchronized int writeToSocket(byte[] bytes) throws IOException {
++
++        nioChannel.getBufHandler().getWriteBuffer().clear();
++        nioChannel.getBufHandler().getWriteBuffer().put(bytes);
++        nioChannel.getBufHandler().getWriteBuffer().flip();
++
++        int written = 0;
++        NioEndpoint.KeyAttachment att =
++                (NioEndpoint.KeyAttachment) nioChannel.getAttachment(false);
++        if (att == null) {
++            throw new IOException("Key must be cancelled");
++        }
++        long writeTimeout = att.getTimeout();
++        Selector selector = null;
++        try {
++            selector = pool.get();
++        } catch ( IOException x ) {
++            //ignore
++        }
++        try {
++            written = pool.write(nioChannel.getBufHandler().getWriteBuffer(),
++                    nioChannel, selector, writeTimeout, true);
++        } finally {
++            if (selector != null) {
++                pool.put(selector);
++            }
++        }
++        return written;
++    }
++
++    /*
++     * None of the following NO-OP methods are strictly necessary - assuming the
++     * there are no bugs in the connector code that cause upgraded connections
++     * to be treated as Http11, Comet or Async. These NO-OP methods are here for
++     * safety and to aid debugging during development.
++     */
++
++    @Override
++    public SocketState event(SocketStatus status) throws IOException {
++        // TODO Log an error
++        return SocketState.CLOSED;
++    }
++
++
++    @Override
++    public SocketState process(SocketWrapper<NioChannel> socketWrapper)
++            throws IOException {
++        // TODO Log an error
++        return SocketState.CLOSED;
++    }
++
++
++    @Override
++    public SocketState asyncDispatch(SocketStatus status) {
++        // TODO Log an error
++        return SocketState.CLOSED;
++    }
++
++
++    @Override
++    public SocketState asyncPostProcess() {
++        // TODO Log an error
++        return SocketState.CLOSED;
++    }
++}
+
+==================================================
+UpgradeProcessor.java
+similarity index 83%
+rename from java/org/apache/coyote/http11/UpgradeOutbound.java
+rename to java/org/apache/coyote/http11/upgrade/UpgradeOutbound.java
+index e4853d66f1..fa48b7495a 100644
+--- a/java/org/apache/coyote/http11/UpgradeOutbound.java
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeOutbound.java
+@@ -14,33 +14,32 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+-package org.apache.coyote.http11;
++package org.apache.coyote.http11.upgrade;
+ 
+ import java.io.IOException;
+ import java.io.OutputStream;
+ 
++
+ /**
+  * Allows data to be written to the upgraded connection.
+  *
+- * TODO: Move this to a more appropriate package (TBD).
+- *
+  * TODO: Override more methods for efficiency.
+  */
+ public class UpgradeOutbound extends OutputStream {
+ 
+     @Override
+     public void flush() throws IOException {
+-        os.flush();
++        processor.flush();
+     }
+ 
+-    private OutputStream os;
++    private UpgradeProcessor processor;
+ 
+-    public UpgradeOutbound(OutputStream os) {
+-        this.os = os;
++    public UpgradeOutbound(UpgradeProcessor processor) {
++        this.processor = processor;
+     }
+ 
+     @Override
+     public void write(int b) throws IOException {
+-        os.write(b);
++        processor.write(b);
+     }
+ }
+
+==================================================
+AbstractEndpoint.java
+new file mode 100644
+index 0000000000..75be65cf64
+--- /dev/null
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeProcessor.java
+@@ -0,0 +1,30 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.coyote.http11.upgrade;
++
++import java.io.IOException;
++
++public interface UpgradeProcessor {
++
++    // Output methods
++    public void flush() throws IOException;
++    public void write(int b) throws IOException;
++
++    // Input methods
++    public int read() throws IOException;
++    public int read(byte[] bytes) throws IOException;
++}
+
+==================================================
+JIoEndpoint.java
+index 688d2b1d9e..ac3adfb83c 100644
+--- a/java/org/apache/tomcat/util/net/AbstractEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AbstractEndpoint.java
+@@ -55,7 +55,7 @@ public abstract class AbstractEndpoint {
+         public enum SocketState {
+             // TODO Add a new state to the AsyncStateMachine and remove
+             //      ASYNC_END (if possible)
+-            OPEN, CLOSED, LONG, ASYNC_END, SENDFILE, UPGRADE
++            OPEN, CLOSED, LONG, ASYNC_END, SENDFILE, UPGRADING, UPGRADED
+         }
+ 
+ 
+
+==================================================

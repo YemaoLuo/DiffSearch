@@ -1,0 +1,224 @@
+308f0ec385e8456c4f824a5d6200f8e1b99b31ce
+==================================================
+Fix regression in connector re-factoring that was too aggressive cleaning up AJP/BIO between requests triggering 400 entries in the access log
+==================================================
+Mark Emlyn
+==================================================
+Fri Jul 8 10:45:19 2011 +0000
+==================================================
+AbstractAjpProcessor.java
+Fix regression in connector re-factoring that was too aggressive cleaning up AJP/BIO between requests triggering 400 entries in the access log
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1144246 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AjpAprProcessor.java
+index 66c059e5e7..3107331787 100644
+--- a/java/org/apache/coyote/ajp/AbstractAjpProcessor.java
++++ b/java/org/apache/coyote/ajp/AbstractAjpProcessor.java
+@@ -494,7 +494,15 @@ public abstract class AbstractAjpProcessor extends AbstractProcessor {
+     }
+ 
+ 
+-    public void recycle() {
++    /**
++     * Recycle the processor, ready for the next request which may be on the
++     * same connection or a different connection.
++     * 
++     * @param socketClosing Indicates if the socket is about to be closed
++     *                      allowing the processor to perform any additional
++     *                      clean-up that may be required
++     */
++    public void recycle(boolean socketClosing) {
+         asyncStateMachine.recycle();
+ 
+         // Recycle Request object
+
+==================================================
+AjpAprProtocol.java
+index c4b4a07965..94880bca14 100644
+--- a/java/org/apache/coyote/ajp/AjpAprProcessor.java
++++ b/java/org/apache/coyote/ajp/AjpAprProcessor.java
+@@ -219,7 +219,7 @@ public class AjpAprProcessor extends AbstractAjpProcessor {
+             request.updateCounters();
+ 
+             rp.setStage(org.apache.coyote.Constants.STAGE_KEEPALIVE);
+-            recycle();
++            recycle(false);
+         }
+ 
+         rp.setStage(org.apache.coyote.Constants.STAGE_ENDED);
+@@ -487,8 +487,8 @@ public class AjpAprProcessor extends AbstractAjpProcessor {
+      * Recycle the processor.
+      */
+     @Override
+-    public void recycle() {
+-        super.recycle();
++    public void recycle(boolean socketClosing) {
++        super.recycle(socketClosing);
+ 
+         inputBuffer.clear();
+         inputBuffer.limit(0);
+
+==================================================
+AjpNioProcessor.java
+index 83a6b25c38..f1152bfeef 100644
+--- a/java/org/apache/coyote/ajp/AjpAprProtocol.java
++++ b/java/org/apache/coyote/ajp/AjpAprProtocol.java
+@@ -165,12 +165,12 @@ public class AjpAprProtocol extends AbstractAjpProtocol {
+                 } else if (state == SocketState.OPEN){
+                     // In keep-alive but between requests. OK to recycle
+                     // processor. Continue to poll for the next request.
+-                    processor.recycle();
++                    processor.recycle(false);
+                     recycledProcessors.offer(processor);
+                     ((AprEndpoint)proto.endpoint).getPoller().add(
+                             socket.getSocket().longValue());
+                 } else {
+-                    processor.recycle();
++                    processor.recycle(true);
+                     recycledProcessors.offer(processor);
+                 }
+                 return state;
+@@ -194,7 +194,7 @@ public class AjpAprProtocol extends AbstractAjpProtocol {
+                 // less-than-verbose logs.
+                 log.error(sm.getString("ajpprotocol.proto.error"), e);
+             }
+-            processor.recycle();
++            processor.recycle(true);
+             recycledProcessors.offer(processor);
+             return SocketState.CLOSED;
+         }
+
+==================================================
+AjpNioProtocol.java
+index ca8cb3f4cf..e68057e560 100644
+--- a/java/org/apache/coyote/ajp/AjpNioProcessor.java
++++ b/java/org/apache/coyote/ajp/AjpNioProcessor.java
+@@ -127,14 +127,14 @@ public class AjpNioProcessor extends AbstractAjpProcessor {
+                     } catch (IOException e) {
+                         error = true;
+                     }
+-                    recycle();
++                    recycle(true);
+                     continue;
+                 } else if(type != Constants.JK_AJP13_FORWARD_REQUEST) {
+                     // Usually the servlet didn't read the previous request body
+                     if(log.isDebugEnabled()) {
+                         log.debug("Unexpected message: "+type);
+                     }
+-                    recycle();
++                    recycle(false);
+                     continue;
+                 }
+                 request.setStartTime(System.currentTimeMillis());
+@@ -216,7 +216,7 @@ public class AjpNioProcessor extends AbstractAjpProcessor {
+                 socket.setTimeout(keepAliveTimeout);
+             }
+ 
+-            recycle();
++            recycle(true);
+         }
+         
+         rp.setStage(org.apache.coyote.Constants.STAGE_ENDED);
+
+==================================================
+AjpProcessor.java
+index d678a956ef..412c2ae3d1 100644
+--- a/java/org/apache/coyote/ajp/AjpNioProtocol.java
++++ b/java/org/apache/coyote/ajp/AjpNioProtocol.java
+@@ -136,7 +136,7 @@ public class AjpNioProtocol extends AbstractAjpProtocol {
+                 if (entry.getKey().getSocket().getIOChannel()==socket) {
+                     it.remove();
+                     AjpNioProcessor result = entry.getValue();
+-                    result.recycle();
++                    result.recycle(true);
+                     unregister(result);
+                     released = true;
+                     break;
+@@ -148,22 +148,22 @@ public class AjpNioProtocol extends AbstractAjpProtocol {
+         
+         /**
+          * Use this only if the processor is not available, otherwise use
+-         * {@link #release(SocketWrapper, AjpNioProcessor)}.
++         * {@link #release(SocketWrapper, AjpNioProcessor, boolean)}.
+          */
+         @Override
+         public void release(SocketWrapper<NioChannel> socket) {
+             AjpNioProcessor processor = connections.remove(socket);
+             if (processor != null) {
+-                processor.recycle();
++                processor.recycle(true);
+                 recycledProcessors.offer(processor);
+             }
+         }
+ 
+ 
+         public void release(SocketWrapper<NioChannel> socket,
+-                AjpNioProcessor processor) {
++                AjpNioProcessor processor, boolean isSocketClosing) {
+             connections.remove(socket);
+-            processor.recycle();
++            processor.recycle(isSocketClosing);
+             recycledProcessors.offer(processor);
+         }
+ 
+@@ -204,11 +204,11 @@ public class AjpNioProtocol extends AbstractAjpProtocol {
+                 } else if (state == SocketState.OPEN){
+                     // In keep-alive but between requests. OK to recycle
+                     // processor. Continue to poll for the next request.
+-                    release(socket, processor);
++                    release(socket, processor, false);
+                     socket.getSocket().getPoller().add(socket.getSocket());
+                 } else {
+                     // Connection closed. OK to recycle the processor.
+-                    release(socket, processor);
++                    release(socket, processor, true);
+                 }
+                 return state;
+ 
+@@ -231,7 +231,7 @@ public class AjpNioProtocol extends AbstractAjpProtocol {
+                 // less-than-verbose logs.
+                 log.error(sm.getString("ajpprotocol.proto.error"), e);
+             }
+-            release(socket, processor);
++            release(socket, processor, true);
+             return SocketState.CLOSED;
+         }
+ 
+
+==================================================
+AjpProtocol.java
+index 3bb4deedba..e62085d6ee 100644
+--- a/java/org/apache/coyote/ajp/AjpProcessor.java
++++ b/java/org/apache/coyote/ajp/AjpProcessor.java
+@@ -227,7 +227,7 @@ public class AjpProcessor extends AbstractAjpProcessor {
+             request.updateCounters();
+ 
+             rp.setStage(org.apache.coyote.Constants.STAGE_KEEPALIVE);
+-            recycle();
++            recycle(false);
+         }
+         
+         rp.setStage(org.apache.coyote.Constants.STAGE_ENDED);
+@@ -243,10 +243,12 @@ public class AjpProcessor extends AbstractAjpProcessor {
+     }
+ 
+     @Override
+-    public void recycle() {
+-        super.recycle();
+-        input = null;
+-        output = null;
++    public void recycle(boolean socketClosing) {
++        super.recycle(socketClosing);
++        if (socketClosing) {
++            input = null;
++            output = null;
++        }
+     }
+ 
+     // ----------------------------------------------------- ActionHook Methods
+
+==================================================

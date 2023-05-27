@@ -1,0 +1,162 @@
+0ff5997d3287b4b705c74d3bba72eb768c3dfba9
+==================================================
+Introduce a new method SocketWrapperBase.doWrite(boolean, ByteBuffer)
+==================================================
+Violeta Georgieva
+==================================================
+Fri Aug 26 10:23:15 2016 +0000
+==================================================
+AprEndpoint.java
+Introduce a new method SocketWrapperBase.doWrite(boolean, ByteBuffer)
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1757813 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Nio2Endpoint.java
+index 8227d867cc..6ea407ceee 100644
+--- a/java/org/apache/tomcat/util/net/AprEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AprEndpoint.java
+@@ -2441,7 +2441,7 @@ public class AprEndpoint extends AbstractEndpoint<Long> implements SNICallBack {
+ 
+ 
+         @Override
+-        protected void doWrite(boolean block) throws IOException {
++        protected void doWrite(boolean block, ByteBuffer from) throws IOException {
+             if (closed) {
+                 throw new IOException(sm.getString("socket.apr.closed", getSocket()));
+             }
+@@ -2455,7 +2455,7 @@ public class AprEndpoint extends AbstractEndpoint<Long> implements SNICallBack {
+                     if (block) {
+                         Socket.timeoutSet(getSocket().longValue(), getWriteTimeout() * 1000);
+                     }
+-                    doWriteInternal();
++                    doWriteInternal(from);
+                     return;
+                 }
+             } finally {
+@@ -2476,7 +2476,7 @@ public class AprEndpoint extends AbstractEndpoint<Long> implements SNICallBack {
+                 readLock.lock();
+                 try {
+                     writeLock.unlock();
+-                    doWriteInternal();
++                    doWriteInternal(from);
+                 } finally {
+                     readLock.unlock();
+                 }
+@@ -2490,18 +2490,16 @@ public class AprEndpoint extends AbstractEndpoint<Long> implements SNICallBack {
+         }
+ 
+ 
+-        private void doWriteInternal() throws IOException {
++        private void doWriteInternal(ByteBuffer from) throws IOException {
+             int thisTime;
+ 
+-            ByteBuffer socketWriteBuffer = socketBufferHandler.getWriteBuffer();
+             do {
+                 thisTime = 0;
+                 if (getEndpoint().isSSLEnabled()) {
+                     if (sslOutputBuffer.remaining() == 0) {
+                         // Buffer was fully written last time around
+                         sslOutputBuffer.clear();
+-                        socketBufferHandler.configureWriteBufferForRead();
+-                        transfer(socketWriteBuffer, sslOutputBuffer);
++                        transfer(from, sslOutputBuffer);
+                         sslOutputBuffer.flip();
+                     } else {
+                         // Buffer still has data from previous attempt to write
+@@ -2514,11 +2512,10 @@ public class AprEndpoint extends AbstractEndpoint<Long> implements SNICallBack {
+                         sslOutputBuffer.position(sslOutputBuffer.position() + thisTime);
+                     }
+                 } else {
+-                    socketBufferHandler.configureWriteBufferForRead();
+-                    thisTime = Socket.sendb(getSocket().longValue(), socketWriteBuffer,
+-                            socketWriteBuffer.position(), socketWriteBuffer.remaining());
++                    thisTime = Socket.sendb(getSocket().longValue(), from, from.position(),
++                            from.remaining());
+                     if (thisTime > 0) {
+-                        socketWriteBuffer.position(socketWriteBuffer.position() + thisTime);
++                        from.position(from.position() + thisTime);
+                     }
+                 }
+                 if (Status.APR_STATUS_IS_EAGAIN(-thisTime)) {
+@@ -2533,7 +2530,7 @@ public class AprEndpoint extends AbstractEndpoint<Long> implements SNICallBack {
+                     throw new IOException(sm.getString("socket.apr.write.error",
+                             Integer.valueOf(-thisTime), getSocket(), this));
+                 }
+-            } while ((thisTime > 0 || getBlockingStatus()) && socketWriteBuffer.hasRemaining());
++            } while ((thisTime > 0 || getBlockingStatus()) && from.hasRemaining());
+ 
+             // If there is data left in the buffer the socket will be registered for
+             // write further up the stack. This is to ensure the socket is only
+
+==================================================
+NioEndpoint.java
+index ef88b34277..b6624aab1f 100644
+--- a/java/org/apache/tomcat/util/net/Nio2Endpoint.java
++++ b/java/org/apache/tomcat/util/net/Nio2Endpoint.java
+@@ -1158,16 +1158,15 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel> {
+          *              blocking case
+          */
+         @Override
+-        protected void doWrite(boolean block) throws IOException {
++        protected void doWrite(boolean block, ByteBuffer from) throws IOException {
+             Future<Integer> integer = null;
+             try {
+-                socketBufferHandler.configureWriteBufferForRead();
+                 do {
+-                    integer = getSocket().write(socketBufferHandler.getWriteBuffer());
++                    integer = getSocket().write(from);
+                     if (integer.get(getNio2WriteTimeout(), TimeUnit.MILLISECONDS).intValue() < 0) {
+                         throw new EOFException(sm.getString("iob.failedwrite"));
+                     }
+-                } while (socketBufferHandler.getWriteBuffer().hasRemaining());
++                } while (from.hasRemaining());
+             } catch (ExecutionException e) {
+                 if (e.getCause() instanceof IOException) {
+                     throw (IOException) e.getCause();
+
+==================================================
+SocketWrapperBase.java
+index 9646630b01..671bb9de2c 100644
+--- a/java/org/apache/tomcat/util/net/NioEndpoint.java
++++ b/java/org/apache/tomcat/util/net/NioEndpoint.java
+@@ -25,6 +25,7 @@ import java.net.InetSocketAddress;
+ import java.net.ServerSocket;
+ import java.net.Socket;
+ import java.net.SocketTimeoutException;
++import java.nio.ByteBuffer;
+ import java.nio.channels.CancelledKeyException;
+ import java.nio.channels.FileChannel;
+ import java.nio.channels.SelectionKey;
+@@ -1207,9 +1208,7 @@ public class NioEndpoint extends AbstractJsseEndpoint<NioChannel> {
+ 
+ 
+         @Override
+-        protected void doWrite(boolean block) throws IOException {
+-            socketBufferHandler.configureWriteBufferForRead();
+-
++        protected void doWrite(boolean block, ByteBuffer from) throws IOException {
+             long writeTimeout = getWriteTimeout();
+             Selector selector = null;
+             try {
+@@ -1218,12 +1217,13 @@ public class NioEndpoint extends AbstractJsseEndpoint<NioChannel> {
+                 // Ignore
+             }
+             try {
+-                pool.write(socketBufferHandler.getWriteBuffer(), getSocket(),
+-                        selector, writeTimeout, block);
++                pool.write(from, getSocket(), selector, writeTimeout, block);
+                 if (block) {
+                     // Make sure we are flushed
+                     do {
+-                        if (getSocket().flush(true, selector, writeTimeout)) break;
++                        if (getSocket().flush(true, selector, writeTimeout)) {
++                            break;
++                        }
+                     } while (true);
+                 }
+                 updateLastWrite();
+
+==================================================

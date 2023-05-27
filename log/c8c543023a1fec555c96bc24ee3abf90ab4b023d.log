@@ -1,0 +1,425 @@
+c8c543023a1fec555c96bc24ee3abf90ab4b023d
+==================================================
+Plumb in the basics (i.e. what I needed to get a request for http://localhost:8080/exmaple to progress) for reading the request. The response gets generated. Still figuring out how best to handle writing of the response.
+==================================================
+Mark Thomas
+==================================================
+Wed May 20 09:42:17 2015 +0000
+==================================================
+AbstractProcessor.java
+Plumb in the basics (i.e. what I needed to get a request for http://localhost:8080/exmaple to progress) for reading the request. The response gets generated. Still figuring out how best to handle writing of the response.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1680504 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AbstractProtocol.java
+index 35b7d93585..04d5edafc4 100644
+--- a/java/org/apache/coyote/AbstractProcessor.java
++++ b/java/org/apache/coyote/AbstractProcessor.java
+@@ -61,16 +61,32 @@ public abstract class AbstractProcessor implements ActionHook, Processor {
+         response = null;
+     }
+ 
++
++    /**
++     * Used by HTTP/2.
++     *
++     * @param coyoteRequest
++     * @param coyoteResponse
++     */
++    protected AbstractProcessor(Request coyoteRequest, Response coyoteResponse) {
++        this(null, coyoteRequest, coyoteResponse);
++    }
++
++
+     public AbstractProcessor(AbstractEndpoint<?> endpoint) {
++        this(endpoint, new Request(), new Response());
++    }
++
++
++    private AbstractProcessor(AbstractEndpoint<?> endpoint, Request coyoteRequest, Response coyoteResponse) {
+         this.endpoint = endpoint;
+         asyncStateMachine = new AsyncStateMachine(this);
+-        request = new Request();
+-        response = new Response();
++        request = coyoteRequest;
++        response = coyoteResponse;
+         response.setHook(this);
+         request.setResponse(response);
+     }
+ 
+-
+     /**
+      * Update the current error state to the new error state if the new error
+      * state is more severe than the current error state.
+
+==================================================
+UpgradeProtocol.java
+index 151580f236..7c19d1fe0e 100644
+--- a/java/org/apache/coyote/AbstractProtocol.java
++++ b/java/org/apache/coyote/AbstractProtocol.java
+@@ -648,7 +648,8 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+                         UpgradeProtocol upgradeProtocol =
+                                 getProtocol().getNegotiatedProtocol(negotiatedProtocol);
+                         if (upgradeProtocol != null) {
+-                            processor = upgradeProtocol.getProcessor(wrapper);
++                            processor = upgradeProtocol.getProcessor(
++                                    wrapper, getProtocol().getAdapter());
+                         } else if (negotiatedProtocol.equals("http/1.1")) {
+                             // Explicitly negotiated the default protocol.
+                             // Obtain a processor below.
+
+==================================================
+Http2Protocol.java
+index 79cb8a7df4..7b27925f0b 100644
+--- a/java/org/apache/coyote/UpgradeProtocol.java
++++ b/java/org/apache/coyote/UpgradeProtocol.java
+@@ -58,5 +58,5 @@ public interface UpgradeProtocol {
+      * @return A processor instance for processing a connection using this
+      *         protocol.
+      */
+-    public Processor getProcessor(SocketWrapperBase<?> socketWrapper);
++    public Processor getProcessor(SocketWrapperBase<?> socketWrapper, Adapter adapter);
+ }
+
+==================================================
+Http2UpgradeHandler.java
+index 3199952381..7c01391f1a 100644
+--- a/java/org/apache/coyote/http2/Http2Protocol.java
++++ b/java/org/apache/coyote/http2/Http2Protocol.java
+@@ -18,6 +18,7 @@ package org.apache.coyote.http2;
+ 
+ import java.nio.charset.StandardCharsets;
+ 
++import org.apache.coyote.Adapter;
+ import org.apache.coyote.Processor;
+ import org.apache.coyote.UpgradeProtocol;
+ import org.apache.coyote.http11.upgrade.UpgradeProcessorInternal;
+@@ -45,9 +46,9 @@ public class Http2Protocol implements UpgradeProtocol {
+     }
+ 
+     @Override
+-    public Processor getProcessor(SocketWrapperBase<?> socketWrapper) {
++    public Processor getProcessor(SocketWrapperBase<?> socketWrapper, Adapter adapter) {
+         UpgradeProcessorInternal processor =
+-                new UpgradeProcessorInternal(socketWrapper, null, new Http2UpgradeHandler());
++                new UpgradeProcessorInternal(socketWrapper, null, new Http2UpgradeHandler(adapter));
+         return processor;
+     }
+ }
+
+==================================================
+Stream.java
+index f69a600a76..cdcf1f0d2e 100644
+--- a/java/org/apache/coyote/http2/LocalStrings.properties
++++ b/java/org/apache/coyote/http2/LocalStrings.properties
+@@ -32,6 +32,8 @@ hpackhuffman.huffmanEncodedHpackValueDidNotEndWithEOS=Huffman encoded value in H
+ 
+ stream.header.debug=Stream [{0}] recieved HTTP header [{1}] with value [{2}]
+ 
++streamProcessor.httpupgrade.notsupported=HTTP upgrade is not supported within HTTP/2 streams
++
+ upgradeHandler.connectionError=An error occurred that requires the HTTP/2 connection to be closed.
+ upgradeHandler.payloadTooBig=The payload is [{0}] bytes long but the maximum frame size is [{1}]
+ upgradeHandler.processFrame=Processing frame of type [{0}] for stream [{2}] with flags [{1}] and payload size [{3}]
+
+==================================================
+StreamProcessor.java
+index 546bdf0ecd..13a3bd751d 100644
+--- a/java/org/apache/coyote/http2/Stream.java
++++ b/java/org/apache/coyote/http2/Stream.java
+@@ -16,9 +16,15 @@
+  */
+ package org.apache.coyote.http2;
+ 
++import java.io.IOException;
++
++import org.apache.coyote.OutputBuffer;
++import org.apache.coyote.Request;
++import org.apache.coyote.Response;
+ import org.apache.coyote.http2.HpackDecoder.HeaderEmitter;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
++import org.apache.tomcat.util.buf.ByteChunk;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+ public class Stream extends AbstractStream implements HeaderEmitter {
+@@ -26,13 +32,19 @@ public class Stream extends AbstractStream implements HeaderEmitter {
+     private static final Log log = LogFactory.getLog(Stream.class);
+     private static final StringManager sm = StringManager.getManager(Stream.class);
+ 
++    private final Http2UpgradeHandler handler;
++    private final Request coyoteRequest = new Request();
++    private final Response coyoteResponse = new Response();
++
+     private volatile long flowControlWindowSize;
+ 
+ 
+     public Stream(Integer identifier, Http2UpgradeHandler handler) {
+         super(identifier);
++        this.handler = handler;
+         setParentStream(handler);
+         flowControlWindowSize = handler.getRemoteSettings().getInitialWindowSize();
++        coyoteResponse.setOutputBuffer(new StreamOutputBuffer());
+     }
+ 
+ 
+@@ -47,7 +59,49 @@ public class Stream extends AbstractStream implements HeaderEmitter {
+             log.debug(sm.getString("stream.header.debug", getIdentifier(), name, value));
+         }
+ 
+-        // TODO: Do something with these headers
++        switch(name) {
++        case ":method": {
++            coyoteRequest.method().setString(value);
++            break;
++        }
++        case ":path": {
++            coyoteRequest.requestURI().setString(value);
++            // TODO: This is almost certainly wrong and needs to be decoded
++            coyoteRequest.decodedURI().setString(value);
++            break;
++        }
++        case ":authority": {
++            int i = value.lastIndexOf(':');
++            if (i > -1) {
++                coyoteRequest.serverName().setString(value.substring(0, i));
++                coyoteRequest.setServerPort(Integer.parseInt(value.substring(i + 1)));
++            } else {
++                coyoteRequest.serverName().setString(value);
++                boolean secure = Boolean.parseBoolean(handler.getProperty("secure"));
++                if (secure) {
++                    coyoteRequest.setServerPort(443);
++                } else {
++                    coyoteRequest.setServerPort(80);
++                }
++            }
++            break;
++        }
++        default: {
++            // Assume other HTTP header
++            coyoteRequest.getMimeHeaders().addValue(name).setString(value);
++        }
++        }
++    }
++
++
++    void writeHeaders() {
++        // Format the frames.
++        // TODO
++    }
++
++
++    void flushData() {
++        // TODO
+     }
+ 
+ 
+@@ -55,4 +109,33 @@ public class Stream extends AbstractStream implements HeaderEmitter {
+     protected final Log getLog() {
+         return log;
+     }
++
++
++    public Request getCoyoteRequest() {
++        return coyoteRequest;
++    }
++
++
++    public Response getCoyoteResponse() {
++        return coyoteResponse;
++    }
++
++
++    private class StreamOutputBuffer implements OutputBuffer {
++
++        private volatile long written = 0;
++
++        @Override
++        public int doWrite(ByteChunk chunk) throws IOException {
++            // TODO Blocking. Write to buffer. flushData() if full.
++            log.debug("Write [" + chunk.getLength() + "] bytes");
++            written += chunk.getLength();
++            return chunk.getLength();
++        }
++
++        @Override
++        public long getBytesWritten() {
++            return written;
++        }
++    }
+ }
+
+==================================================
+AprEndpoint.java
+new file mode 100644
+index 0000000000..b834f0def9
+--- /dev/null
++++ b/java/org/apache/coyote/http2/StreamProcessor.java
+@@ -0,0 +1,147 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.coyote.http2;
++
++import java.io.IOException;
++import java.nio.ByteBuffer;
++import java.util.concurrent.atomic.AtomicBoolean;
++
++import javax.servlet.http.HttpUpgradeHandler;
++
++import org.apache.coyote.AbstractProcessor;
++import org.apache.coyote.ActionCode;
++import org.apache.coyote.Adapter;
++import org.apache.juli.logging.Log;
++import org.apache.juli.logging.LogFactory;
++import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
++import org.apache.tomcat.util.net.SSLSupport;
++import org.apache.tomcat.util.net.SocketStatus;
++import org.apache.tomcat.util.net.SocketWrapperBase;
++import org.apache.tomcat.util.res.StringManager;
++
++public class StreamProcessor extends AbstractProcessor implements Runnable {
++
++    private static final Log log = LogFactory.getLog(StreamProcessor.class);
++    private static final StringManager sm = StringManager.getManager(StreamProcessor.class);
++
++    private final Stream stream;
++
++
++    public StreamProcessor(Stream stream, Adapter adapter, SocketWrapperBase<?> socketWrapper) {
++        super(stream.getCoyoteRequest(), stream.getCoyoteResponse());
++        this.stream = stream;
++        setAdapter(adapter);
++        setSocketWrapper(socketWrapper);
++    }
++
++
++    @Override
++    public void run() {
++        try {
++            adapter.service(request, response);
++            // Ensure the response is complete
++            response.action(ActionCode.CLIENT_FLUSH, null);
++        } catch (Exception e) {
++            // TODO
++            e.printStackTrace();
++        }
++    }
++
++
++    @Override
++    public SocketState process(SocketWrapperBase<?> socket) throws IOException {
++        // TODO Auto-generated method stub
++        return null;
++    }
++
++
++    @Override
++    public SocketState dispatch(SocketStatus status) {
++        // TODO Auto-generated method stub
++        return null;
++    }
++
++
++    @Override
++    public void action(ActionCode actionCode, Object param) {
++        switch (actionCode) {
++        case REQ_HOST_ATTRIBUTE: {
++            request.remoteHost().setString(socketWrapper.getRemoteHost());
++            break;
++        }
++        case IS_ERROR: {
++            ((AtomicBoolean) param).set(getErrorState().isError());
++            break;
++        }
++        case CLIENT_FLUSH: {
++            action(ActionCode.COMMIT, null);
++            stream.flushData();
++            break;
++        }
++        case COMMIT: {
++            if (!response.isCommitted()) {
++                response.setCommitted(true);
++                stream.writeHeaders();
++            }
++            break;
++        }
++        default:
++            // TODO
++            log.debug("TODO: Action: " + actionCode);
++        }
++    }
++
++
++    @Override
++    public void recycle() {
++        // TODO Auto-generated method stub
++
++    }
++
++
++    @Override
++    public void setSslSupport(SSLSupport sslSupport) {
++        // TODO Auto-generated method stub
++
++    }
++
++
++    @Override
++    public boolean isUpgrade() {
++        return false;
++    }
++
++
++    @Override
++    protected Log getLog() {
++        return log;
++    }
++
++
++    @Override
++    public HttpUpgradeHandler getHttpUpgradeHandler() {
++        // Should never happen
++        throw new IllegalStateException(sm.getString("streamProcessor.httpupgrade.notsupported"));
++    }
++
++
++    @Override
++    public ByteBuffer getLeftoverInput() {
++        // Should never happen
++        throw new IllegalStateException(sm.getString("streamProcessor.httpupgrade.notsupported"));
++    }
++}
+
+==================================================
+TestAbstractStream.java
+index 258cdbb7ac..2857c61274 100644
+--- a/java/org/apache/tomcat/util/net/AprEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AprEndpoint.java
+@@ -2510,7 +2510,7 @@ public class AprEndpoint extends AbstractEndpoint<Long> implements SNICallBack {
+             if (result > 0) {
+                 socketReadBuffer.position(socketReadBuffer.position() + result);
+                 return result;
+-            } else if (-result == Status.EAGAIN) {
++            } else if (result == 0 || -result == Status.EAGAIN) {
+                 return 0;
+             } else if (-result == Status.APR_EGENERAL && isSecure()) {
+                 // Not entirely sure why this is necessary. Testing to date has not
+
+==================================================

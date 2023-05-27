@@ -1,0 +1,285 @@
+076024bfc68e67995bd4198c2b313ad0cd6d86cc
+==================================================
+Add a dispatch parameter to the newly renamed processSocket() method and align BIO and APR with NIO that executes the SocketProcessor in-line if no Executor is available
+==================================================
+Mark Emlyn
+==================================================
+Fri Oct 4 11:21:42 2013 +0000
+==================================================
+AbstractAjpProcessor.java
+Add a dispatch parameter to the newly renamed processSocket() method and align BIO and APR with NIO that executes the SocketProcessor in-line if no Executor is available
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1529132 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Http11AprProcessor.java
+index 1af0ebb33e..577486ecc3 100644
+--- a/java/org/apache/coyote/ajp/AbstractAjpProcessor.java
++++ b/java/org/apache/coyote/ajp/AbstractAjpProcessor.java
+@@ -522,12 +522,12 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+         } else if (actionCode == ActionCode.ASYNC_COMPLETE) {
+             socketWrapper.clearDispatches();
+             if (asyncStateMachine.asyncComplete()) {
+-                endpoint.processSocket(socketWrapper, SocketStatus.OPEN_READ);
++                endpoint.processSocket(socketWrapper, SocketStatus.OPEN_READ, true);
+             }
+ 
+         } else if (actionCode == ActionCode.ASYNC_DISPATCH) {
+             if (asyncStateMachine.asyncDispatch()) {
+-                endpoint.processSocket(socketWrapper, SocketStatus.OPEN_READ);
++                endpoint.processSocket(socketWrapper, SocketStatus.OPEN_READ, true);
+             }
+ 
+         } else if (actionCode == ActionCode.ASYNC_DISPATCHED) {
+
+==================================================
+Http11Processor.java
+index 695de44c82..b2b721d7b7 100644
+--- a/java/org/apache/coyote/http11/Http11AprProcessor.java
++++ b/java/org/apache/coyote/http11/Http11AprProcessor.java
+@@ -464,14 +464,14 @@ public class Http11AprProcessor extends AbstractHttp11Processor<Long> {
+             comet = false;
+         } else if (actionCode == ActionCode.COMET_CLOSE) {
+             ((AprEndpoint)endpoint).processSocket(this.socketWrapper,
+-                    SocketStatus.OPEN_READ);
++                    SocketStatus.OPEN_READ, true);
+         } else if (actionCode == ActionCode.COMET_SETTIMEOUT) {
+             //no op
+         } else if (actionCode == ActionCode.ASYNC_COMPLETE) {
+             socketWrapper.clearDispatches();
+             if (asyncStateMachine.asyncComplete()) {
+                 ((AprEndpoint)endpoint).processSocket(this.socketWrapper,
+-                        SocketStatus.OPEN_READ);
++                        SocketStatus.OPEN_READ, true);
+             }
+         } else if (actionCode == ActionCode.ASYNC_SETTIMEOUT) {
+             if (param==null) {
+@@ -482,7 +482,7 @@ public class Http11AprProcessor extends AbstractHttp11Processor<Long> {
+         } else if (actionCode == ActionCode.ASYNC_DISPATCH) {
+             if (asyncStateMachine.asyncDispatch()) {
+                 ((AprEndpoint)endpoint).processSocket(this.socketWrapper,
+-                        SocketStatus.OPEN_READ);
++                        SocketStatus.OPEN_READ, true);
+             }
+         }
+ 
+
+==================================================
+AbstractEndpoint.java
+index e4b270eb2b..d9ce1cccf9 100644
+--- a/java/org/apache/coyote/http11/Http11Processor.java
++++ b/java/org/apache/coyote/http11/Http11Processor.java
+@@ -372,7 +372,7 @@ public class Http11Processor extends AbstractHttp11Processor<Socket> {
+             socketWrapper.clearDispatches();
+             if (asyncStateMachine.asyncComplete()) {
+                 ((JIoEndpoint) endpoint).processSocket(this.socketWrapper,
+-                        SocketStatus.OPEN_READ);
++                        SocketStatus.OPEN_READ, true);
+             }
+         } else if (actionCode == ActionCode.ASYNC_SETTIMEOUT) {
+             if (param == null) return;
+@@ -382,7 +382,7 @@ public class Http11Processor extends AbstractHttp11Processor<Socket> {
+         } else if (actionCode == ActionCode.ASYNC_DISPATCH) {
+             if (asyncStateMachine.asyncDispatch()) {
+                 ((JIoEndpoint) endpoint).processSocket(this.socketWrapper,
+-                        SocketStatus.OPEN_READ);
++                        SocketStatus.OPEN_READ, true);
+             }
+         }
+     }
+
+==================================================
+AprEndpoint.java
+index 27b359c8bf..ef4d629ec6 100644
+--- a/java/org/apache/tomcat/util/net/AbstractEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AbstractEndpoint.java
+@@ -628,9 +628,11 @@ public abstract class AbstractEndpoint<S> {
+      *
+      * @param socketWrapper The socket wrapper to process
+      * @param socketStatus  The input status to the processing
++     * @param dispatch      Should the processing be performed on a new
++     *                          container thread
+      */
+     public abstract void processSocket(SocketWrapper<S> socketWrapper,
+-            SocketStatus socketStatus);
++            SocketStatus socketStatus, boolean dispatch);
+ 
+ 
+     // ------------------------------------------------------- Lifecycle methods
+
+==================================================
+JIoEndpoint.java
+index 333f80ea64..91fbce3f3e 100644
+--- a/java/org/apache/tomcat/util/net/AprEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AprEndpoint.java
+@@ -852,36 +852,35 @@ public class AprEndpoint extends AbstractEndpoint<Long> {
+ 
+ 
+     @Override
+-    public void processSocket(SocketWrapper<Long> socket, SocketStatus status) {
++    public void processSocket(SocketWrapper<Long> socket, SocketStatus status,
++            boolean dispatch) {
+         try {
+             if (waitingRequests.remove(socket)) {
+                 SocketProcessor proc = new SocketProcessor(socket, status);
+-                ClassLoader loader = Thread.currentThread().getContextClassLoader();
+-                try {
+-                    //threads should not be created by the webapp classloader
+-                    if (Constants.IS_SECURITY_ENABLED) {
+-                        PrivilegedAction<Void> pa = new PrivilegedSetTccl(
+-                                getClass().getClassLoader());
+-                        AccessController.doPrivileged(pa);
+-                    } else {
+-                        Thread.currentThread().setContextClassLoader(
+-                                getClass().getClassLoader());
+-                    }
+-                    Executor executor = getExecutor();
+-                    if (executor == null) {
+-                        log.warn(sm.getString("endpoint.warn.noExector",
+-                                socket, status));
+-                        return;
+-                    } else {
++                Executor executor = getExecutor();
++                if (dispatch && executor != null) {
++                    ClassLoader loader = Thread.currentThread().getContextClassLoader();
++                    try {
++                        //threads should not be created by the webapp classloader
++                        if (Constants.IS_SECURITY_ENABLED) {
++                            PrivilegedAction<Void> pa = new PrivilegedSetTccl(
++                                    getClass().getClassLoader());
++                            AccessController.doPrivileged(pa);
++                        } else {
++                            Thread.currentThread().setContextClassLoader(
++                                    getClass().getClassLoader());
++                        }
+                         executor.execute(proc);
++                    } finally {
++                        if (Constants.IS_SECURITY_ENABLED) {
++                            PrivilegedAction<Void> pa = new PrivilegedSetTccl(loader);
++                            AccessController.doPrivileged(pa);
++                        } else {
++                            Thread.currentThread().setContextClassLoader(loader);
++                        }
+                     }
+-                } finally {
+-                    if (Constants.IS_SECURITY_ENABLED) {
+-                        PrivilegedAction<Void> pa = new PrivilegedSetTccl(loader);
+-                        AccessController.doPrivileged(pa);
+-                    } else {
+-                        Thread.currentThread().setContextClassLoader(loader);
+-                    }
++                } else {
++                    proc.run();
+                 }
+             }
+         } catch (RejectedExecutionException ree) {
+@@ -1062,7 +1061,7 @@ public class AprEndpoint extends AbstractEndpoint<Long> {
+                         long access = socket.getLastAccess();
+                         if (socket.getTimeout() > 0 &&
+                                 (now-access)>socket.getTimeout()) {
+-                            processSocket(socket,SocketStatus.TIMEOUT);
++                            processSocket(socket, SocketStatus.TIMEOUT, true);
+                         }
+                     }
+                 }
+
+==================================================
+NioEndpoint.java
+index ab5fbe7f2e..b4fd492404 100644
+--- a/java/org/apache/tomcat/util/net/JIoEndpoint.java
++++ b/java/org/apache/tomcat/util/net/JIoEndpoint.java
+@@ -26,6 +26,7 @@ import java.security.AccessController;
+ import java.security.PrivilegedAction;
+ import java.util.Iterator;
+ import java.util.concurrent.ConcurrentLinkedQueue;
++import java.util.concurrent.Executor;
+ import java.util.concurrent.RejectedExecutionException;
+ 
+ import org.apache.juli.logging.Log;
+@@ -169,7 +170,7 @@ public class JIoEndpoint extends AbstractEndpoint<Socket> {
+                     long access = socket.getLastAccess();
+                     if (socket.getTimeout() > 0 &&
+                             (now-access)>socket.getTimeout()) {
+-                        processSocket(socket,SocketStatus.TIMEOUT);
++                        processSocket(socket, SocketStatus.TIMEOUT, true);
+                     }
+                 }
+ 
+@@ -549,44 +550,41 @@ public class JIoEndpoint extends AbstractEndpoint<Socket> {
+     }
+ 
+ 
+-    /**
+-     * Process an existing async connection. If processing is required, passes
+-     * the wrapped socket to an executor for processing.
+-     *
+-     * @param socket    The socket associated with the client.
+-     * @param status    Only OPEN and TIMEOUT are used. The others are used for
+-     *                  Comet requests that are not supported by the BIO (JIO)
+-     *                  Connector.
+-     */
+     @Override
+     public void processSocket(SocketWrapper<Socket> socket,
+-            SocketStatus status) {
++            SocketStatus status, boolean dispatch) {
+         try {
+             if (waitingRequests.remove(socket)) {
+                 SocketProcessor proc = new SocketProcessor(socket,status);
+-                ClassLoader loader = Thread.currentThread().getContextClassLoader();
+-                try {
+-                    //threads should not be created by the webapp classloader
+-                    if (Constants.IS_SECURITY_ENABLED) {
+-                        PrivilegedAction<Void> pa = new PrivilegedSetTccl(
+-                                getClass().getClassLoader());
+-                        AccessController.doPrivileged(pa);
+-                    } else {
+-                        Thread.currentThread().setContextClassLoader(
+-                                getClass().getClassLoader());
+-                    }
+-                    // During shutdown, executor may be null - avoid NPE
+-                    if (!running) {
+-                        return;
+-                    }
+-                    getExecutor().execute(proc);
+-                } finally {
+-                    if (Constants.IS_SECURITY_ENABLED) {
+-                        PrivilegedAction<Void> pa = new PrivilegedSetTccl(loader);
+-                        AccessController.doPrivileged(pa);
+-                    } else {
+-                        Thread.currentThread().setContextClassLoader(loader);
++                Executor executor = getExecutor();
++                if (dispatch && executor != null) {
++                    ClassLoader loader = Thread.currentThread().getContextClassLoader();
++                    try {
++                        //threads should not be created by the webapp classloader
++                        if (Constants.IS_SECURITY_ENABLED) {
++                            PrivilegedAction<Void> pa =
++                                    new PrivilegedSetTccl(
++                                    getClass().getClassLoader());
++                            AccessController.doPrivileged(pa);
++                        } else {
++                            Thread.currentThread().setContextClassLoader(
++                                    getClass().getClassLoader());
++                        }
++                        // During shutdown, executor may be null - avoid NPE
++                        if (!running) {
++                            return;
++                        }
++                        getExecutor().execute(proc);
++                    } finally {
++                        if (Constants.IS_SECURITY_ENABLED) {
++                            PrivilegedAction<Void> pa = new PrivilegedSetTccl(loader);
++                            AccessController.doPrivileged(pa);
++                        } else {
++                            Thread.currentThread().setContextClassLoader(loader);
++                        }
+                     }
++                } else {
++                    proc.run();
+                 }
+             }
+         } catch (RejectedExecutionException ree) {
+
+==================================================

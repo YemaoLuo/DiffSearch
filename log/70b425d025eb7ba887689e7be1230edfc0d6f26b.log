@@ -1,0 +1,825 @@
+70b425d025eb7ba887689e7be1230edfc0d6f26b
+==================================================
+- Experimental Kubernetes aware cloud membership provider, based on code by Maxime Beck.
+==================================================
+Remy Maucherat
+==================================================
+Mon Oct 8 14:09:16 2018 +0000
+==================================================
+AbstractStreamProvider.java
+index 69fa43f24c..77ef000cca 100644
+--- a/build.xml
++++ b/build.xml
+@@ -213,6 +213,7 @@
+   <path id="compile.classpath">
+     <pathelement location="${jdt.jar}"/>
+     <pathelement location="${saaj-api.jar}"/>
++    <pathelement location="${openjson.jar}"/>
+   </path>
+ 
+   <path id="tomcat.classpath">
+@@ -2717,7 +2718,17 @@ skip.installer property in build.properties" />
+       <param name="checksum.value" value="${saaj-api.checksum.value}"/>
+     </antcall>
+ 
+-  </target>
++    <!-- Download openjson -->
++    <antcall target="downloadfile">
++      <param name="sourcefile" value="${openjson.loc}"/>
++      <param name="destfile" value="${openjson.jar}"/>
++      <param name="destdir" value="${openjson.home}"/>
++      <param name="checksum.enabled" value="${openjson.checksum.enabled}"/>
++      <param name="checksum.algorithm" value="${openjson.checksum.algorithm}"/>
++      <param name="checksum.value" value="${openjson.checksum.value}"/>
++    </antcall>
++
++ </target>
+ 
+   <target name="download-test-compile"
+           description="Download additional components for the tests" >
+
+==================================================
+CertificateStreamProvider.java
+new file mode 100644
+index 0000000000..ce37610ca4
+--- /dev/null
++++ b/java/org/apache/catalina/tribes/membership/cloud/AbstractStreamProvider.java
+@@ -0,0 +1,77 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.catalina.tribes.membership.cloud;
++
++import java.io.IOException;
++import java.net.URL;
++import java.net.URLConnection;
++import java.security.cert.CertificateException;
++import java.security.cert.X509Certificate;
++import java.util.Map;
++
++import javax.net.ssl.TrustManager;
++import javax.net.ssl.X509TrustManager;
++
++import org.apache.catalina.tribes.membership.Constants;
++import org.apache.catalina.tribes.util.StringManager;
++import org.apache.juli.logging.Log;
++import org.apache.juli.logging.LogFactory;
++
++public abstract class AbstractStreamProvider implements StreamProvider {
++    private static final Log log = LogFactory.getLog(AbstractStreamProvider.class);
++    protected static final StringManager sm = StringManager.getManager(Constants.Package);
++
++    protected static final TrustManager[] INSECURE_TRUST_MANAGERS = new TrustManager[] {
++            new X509TrustManager() {
++                public void checkClientTrusted(X509Certificate[] chain, String authType) throws CertificateException {}
++                public void checkServerTrusted(X509Certificate[] chain, String authType) throws CertificateException {}
++                public X509Certificate[] getAcceptedIssuers() {
++                    return null;
++                }
++            }
++        };
++
++    /**
++     * Open URL connection to the specified URL.
++     * @param url the url
++     * @param headers the headers map
++     * @param connectTimeout connection timeout in ms
++     * @param readTimeout read timeout in ms
++     * @return the URL connection
++     * @throws IOException when an error occurs
++     */
++    public URLConnection openConnection(String url, Map<String, String> headers, int connectTimeout, int readTimeout) throws IOException {
++        if (log.isDebugEnabled()) {
++            log.debug(String.format("%s opening connection: url [%s], headers [%s], connectTimeout [%s], readTimeout [%s]", getClass().getSimpleName(), url, headers, connectTimeout, readTimeout));
++        }
++        URLConnection connection = new URL(url).openConnection();
++        if (headers != null) {
++            for (Map.Entry<String, String> entry : headers.entrySet()) {
++                connection.addRequestProperty(entry.getKey(), entry.getValue());
++            }
++        }
++        if (connectTimeout < 0 || readTimeout < 0) {
++            throw new IllegalArgumentException(
++                String.format("Neither connectTimeout [%s] nor readTimeout [%s] can be less than 0 for URLConnection.", connectTimeout, readTimeout));
++        }
++        connection.setConnectTimeout(connectTimeout);
++        connection.setReadTimeout(readTimeout);
++        return connection;
++    }
++
++}
+
+==================================================
+CloudMembershipProvider.java
+new file mode 100644
+index 0000000000..9dc755b7cb
+--- /dev/null
++++ b/java/org/apache/catalina/tribes/membership/cloud/CertificateStreamProvider.java
+@@ -0,0 +1,129 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.catalina.tribes.membership.cloud;
++
++import java.io.FileInputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.net.URLConnection;
++import java.security.KeyStore;
++import java.security.PrivateKey;
++import java.security.cert.Certificate;
++import java.security.cert.CertificateFactory;
++import java.security.cert.X509Certificate;
++import java.util.Map;
++
++import javax.net.ssl.HttpsURLConnection;
++import javax.net.ssl.KeyManager;
++import javax.net.ssl.KeyManagerFactory;
++import javax.net.ssl.SSLContext;
++import javax.net.ssl.SSLSocketFactory;
++import javax.net.ssl.TrustManager;
++import javax.net.ssl.TrustManagerFactory;
++
++import org.apache.juli.logging.Log;
++import org.apache.juli.logging.LogFactory;
++import org.apache.tomcat.util.net.jsse.PEMFile;
++
++public class CertificateStreamProvider extends AbstractStreamProvider {
++
++    private static final Log log = LogFactory.getLog(CertificateStreamProvider.class);
++
++    private final SSLSocketFactory factory;
++
++    CertificateStreamProvider(String clientCertFile, String clientKeyFile, String clientKeyPassword, String clientKeyAlgo, String caCertFile) throws Exception {
++        // defaults - RSA and empty password
++        char[] password = (clientKeyPassword != null) ? clientKeyPassword.toCharArray() : new char[0];
++        String algorithm = (clientKeyAlgo != null) ? clientKeyAlgo : "RSA";
++
++        KeyManager[] keyManagers = configureClientCert(clientCertFile, clientKeyFile, password, algorithm);
++        TrustManager[] trustManagers = configureCaCert(caCertFile);
++        SSLContext context = SSLContext.getInstance("TLS");
++        context.init(keyManagers, trustManagers, null);
++        factory = context.getSocketFactory();
++    }
++
++    @Override
++    public InputStream openStream(String url, Map<String, String> headers, int connectTimeout, int readTimeout) throws IOException {
++        URLConnection connection = openConnection(url, headers, connectTimeout, readTimeout);
++        if (connection instanceof HttpsURLConnection) {
++            HttpsURLConnection httpsConnection = HttpsURLConnection.class.cast(connection);
++            //httpsConnection.setHostnameVerifier(InsecureStreamProvider.INSECURE_HOSTNAME_VERIFIER);
++            httpsConnection.setSSLSocketFactory(factory);
++            if (log.isDebugEnabled()) {
++                log.debug(String.format("Using HttpsURLConnection with SSLSocketFactory [%s] for url [%s].", factory, url));
++            }
++        } else {
++            if (log.isDebugEnabled()) {
++                log.debug(String.format("Using URLConnection for url [%s].", url));
++            }
++        }
++        return connection.getInputStream();
++    }
++
++    private static KeyManager[] configureClientCert(String clientCertFile, String clientKeyFile, char[] clientKeyPassword, String clientKeyAlgo) throws Exception {
++        try (InputStream certInputStream = new FileInputStream(clientCertFile)) {
++            CertificateFactory certFactory = CertificateFactory.getInstance("X509");
++            X509Certificate cert = (X509Certificate)certFactory.generateCertificate(certInputStream);
++
++            PEMFile pemFile = new PEMFile(clientKeyFile, new String(clientKeyPassword));
++            PrivateKey privKey = pemFile.getPrivateKey();
++
++            KeyStore keyStore = KeyStore.getInstance("JKS");
++            keyStore.load(null,  null);
++
++            String alias = cert.getSubjectX500Principal().getName();
++            keyStore.setKeyEntry(alias, privKey, clientKeyPassword, new Certificate[]{cert});
++
++            KeyManagerFactory keyManagerFactory = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
++            keyManagerFactory.init(keyStore, clientKeyPassword);
++
++            return keyManagerFactory.getKeyManagers();
++        } catch (IOException e) {
++            log.error(sm.getString("certificateStream.clientCertError", clientCertFile, clientKeyFile), e);
++            throw e;
++        }
++    }
++
++    private static TrustManager[] configureCaCert(String caCertFile) throws Exception {
++        if (caCertFile != null) {
++            try (InputStream pemInputStream = new FileInputStream(caCertFile)) {
++                CertificateFactory certFactory = CertificateFactory.getInstance("X509");
++                X509Certificate cert = (X509Certificate) certFactory.generateCertificate(pemInputStream);
++
++                KeyStore trustStore = KeyStore.getInstance("JKS");
++                trustStore.load(null);
++
++                String alias = cert.getSubjectX500Principal().getName();
++                trustStore.setCertificateEntry(alias, cert);
++
++                TrustManagerFactory trustManagerFactory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
++                trustManagerFactory.init(trustStore);
++
++                return trustManagerFactory.getTrustManagers();
++            } catch (Exception e) {
++                log.error(sm.getString("certificateStream.CACertError", caCertFile), e);
++                throw e;
++            }
++        } else {
++            log.warn(sm.getString("certificateStream.CACertUndefined"));
++            return InsecureStreamProvider.INSECURE_TRUST_MANAGERS;
++        }
++    }
++
++}
+
+==================================================
+CloudMembershipService.java
+new file mode 100644
+index 0000000000..bdfb3a6bcc
+--- /dev/null
++++ b/java/org/apache/catalina/tribes/membership/cloud/CloudMembershipProvider.java
+@@ -0,0 +1,141 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.catalina.tribes.membership.cloud;
++
++import java.io.IOException;
++import java.io.Serializable;
++import java.net.InetAddress;
++import java.security.AccessController;
++import java.security.MessageDigest;
++import java.security.NoSuchAlgorithmException;
++import java.security.PrivilegedAction;
++import java.time.Instant;
++import java.util.HashMap;
++import java.util.Map;
++import java.util.Properties;
++
++import org.apache.catalina.tribes.ChannelListener;
++import org.apache.catalina.tribes.Heartbeat;
++import org.apache.catalina.tribes.Member;
++import org.apache.catalina.tribes.membership.Constants;
++import org.apache.catalina.tribes.membership.Membership;
++import org.apache.catalina.tribes.membership.MembershipProviderBase;
++import org.apache.catalina.tribes.util.StringManager;
++import org.apache.juli.logging.Log;
++import org.apache.juli.logging.LogFactory;
++
++public abstract class CloudMembershipProvider extends MembershipProviderBase implements Heartbeat, ChannelListener {
++    private static final Log log = LogFactory.getLog(KubernetesMembershipProvider.class);
++    protected static final StringManager sm = StringManager.getManager(Constants.Package);
++
++    protected String url;
++    protected StreamProvider streamProvider;
++    protected int connectionTimeout;
++    protected int readTimeout;
++
++    protected Instant startTime;
++    protected MessageDigest md5;
++
++    protected Map<String, String> headers = new HashMap<>();
++
++    protected int port;
++    protected String hostName;
++
++    public CloudMembershipProvider() {
++        try {
++            md5 = MessageDigest.getInstance("md5");
++        } catch (NoSuchAlgorithmException e) {
++            // Ignore
++        }
++    }
++
++    // Get value of environment variable named keys[0]
++    // If keys[0] isn't found, try keys[1], keys[2], ...
++    // If nothing is found, return null
++    protected static String getEnv(String... keys) {
++        String val = null;
++
++        for (String key : keys) {
++            val = AccessController.doPrivileged((PrivilegedAction<String>) () -> System.getenv(key));
++            if (val != null)
++                break;
++        }
++
++        return val;
++    }
++
++    @Override
++    public void init(Properties properties) throws IOException {
++        startTime = Instant.now();
++
++        connectionTimeout = Integer.parseInt(properties.getProperty("connectionTimeout", "1000"));
++        readTimeout = Integer.parseInt(properties.getProperty("readTimeout", "1000"));
++
++        hostName = InetAddress.getLocalHost().getHostName();
++        port = Integer.parseInt(properties.getProperty("tcpListenPort"));
++    }
++
++    @Override
++    public void start(int level) throws Exception {
++        if (membership == null) {
++            membership = new Membership(service.getLocalMember(true));
++        }
++        service.getChannel().addChannelListener(this);
++    }
++
++    @Override
++    public boolean stop(int level) throws Exception {
++        return true;
++    }
++
++    @Override
++    public void heartbeat() {
++        log.debug("Fetching announced members");
++        Member[] announcedMembers = fetchMembers();
++        // Add new members or refresh the members in the membership
++        for (Member member : announcedMembers) {
++            if (membership.memberAlive(member)) {
++                membershipListener.memberAdded(member);
++            }
++        }
++        // Remove non refreshed members from the membership
++        Member[] expired = membership.expire(100); // TODO: is 100ms a good value?
++        for (Member member : expired) {
++            if (log.isDebugEnabled()) {
++                log.debug("Member is dead: " + member);
++            }
++            membershipListener.memberDisappeared(member);
++        }
++    }
++
++    /**
++     * Fetch current cluster members from the cloud orchestration.
++     * @return the member array
++     */
++    protected abstract Member[] fetchMembers();
++
++    @Override
++    public void messageReceived(Serializable msg, Member sender) {
++    }
++
++    @Override
++    public boolean accept(Serializable msg, Member sender) {
++        return false;
++    }
++
++}
+
+==================================================
+Constants.java
+new file mode 100644
+index 0000000000..d6159db45f
+--- /dev/null
++++ b/java/org/apache/catalina/tribes/membership/cloud/CloudMembershipService.java
+@@ -0,0 +1,215 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.catalina.tribes.membership.cloud;
++
++import java.io.IOException;
++import java.net.InetAddress;
++import java.security.MessageDigest;
++import java.security.NoSuchAlgorithmException;
++
++import javax.management.ObjectName;
++
++import org.apache.catalina.tribes.Member;
++import org.apache.catalina.tribes.MembershipProvider;
++import org.apache.catalina.tribes.MembershipService;
++import org.apache.catalina.tribes.jmx.JmxRegistry;
++import org.apache.catalina.tribes.membership.Constants;
++import org.apache.catalina.tribes.membership.MemberImpl;
++import org.apache.catalina.tribes.membership.MembershipServiceBase;
++import org.apache.catalina.tribes.util.StringManager;
++import org.apache.juli.logging.Log;
++import org.apache.juli.logging.LogFactory;
++
++public class CloudMembershipService extends MembershipServiceBase {
++    private static final Log log = LogFactory.getLog(CloudMembershipService.class);
++    protected static final StringManager sm = StringManager.getManager(Constants.Package);
++
++    public static final String MEMBERSHIP_PROVIDER_CLASS_NAME = "membershipProviderClassName";
++    private static final String KUBE = "kubernetes";
++    private static final String KUBE_PROVIDER_CLASS = "org.apache.catalina.cloud.membership.KubernetesMembershipProvider";
++
++    private MembershipProvider membershipProvider;
++    private MemberImpl localMember;
++
++    private byte[] payload;
++    private byte[] domain;
++
++    private ObjectName oname = null;
++
++    /**
++     * Return a property.
++     * @param name the property name
++     * @return the property value
++     */
++    public Object getProperty(String name) {
++        return properties.getProperty(name);
++    }
++
++    /**
++     * Set a property.
++     * @param name the property name
++     * @param value the property value
++     * @return <code>true</code> if the property was successfully set
++     */
++    public boolean setProperty(String name, String value) {
++        return (properties.setProperty(name, value) == null);
++    }
++
++    /**
++     * Return the membership provider class.
++     * @return the classname
++     */
++    public String getMembershipProviderClassName() {
++        return properties.getProperty(MEMBERSHIP_PROVIDER_CLASS_NAME);
++    }
++
++    /**
++     * Set the membership provider class.
++     * @param membershipProviderClassName the class name
++     */
++    public void setMembershipProviderClassName(String membershipProviderClassName) {
++        properties.setProperty(MEMBERSHIP_PROVIDER_CLASS_NAME, membershipProviderClassName);
++    }
++
++    @Override
++    public void start(int level) throws Exception {
++        if ((level & MembershipService.MBR_RX) == 0) {
++            return;
++        }
++
++        createOrUpdateLocalMember();
++        localMember.setServiceStartTime(System.currentTimeMillis());
++        localMember.setMemberAliveTime(100);
++        localMember.setPayload(payload);
++        localMember.setDomain(domain);
++
++        if (membershipProvider == null) {
++            String provider = getMembershipProviderClassName();
++            if (provider == null || KUBE.equals(provider)) {
++                provider = KUBE_PROVIDER_CLASS;
++            }
++            if (log.isDebugEnabled()) {
++                log.debug("Using membershipProvider: " + provider);
++            }
++            membershipProvider = (MembershipProvider) Class.forName(provider).newInstance();
++            membershipProvider.setMembershipListener(this);
++            membershipProvider.setMembershipService(this);
++            membershipProvider.init(properties);
++        }
++        membershipProvider.start(level);
++
++        JmxRegistry jmxRegistry = JmxRegistry.getRegistry(channel);
++        if (jmxRegistry != null) {
++            oname = jmxRegistry.registerJmx(",component=Membership", this);
++        }
++    }
++
++    @Override
++    public void stop(int level) {
++        try {
++            if (membershipProvider != null && membershipProvider.stop(level)) {
++                if (oname != null) {
++                    JmxRegistry.getRegistry(channel).unregisterJmx(oname);
++                    oname = null;
++                }
++                membershipProvider = null;
++                channel = null;
++            }
++        } catch (Exception e) {
++            log.error(sm.getString("cloudMembershipService.stopFail", Integer.valueOf(level)), e);
++        }
++    }
++
++    @Override
++    public Member getLocalMember(boolean incAliveTime) {
++        if (incAliveTime && localMember != null) {
++            localMember.setMemberAliveTime(System.currentTimeMillis() - localMember.getServiceStartTime());
++        }
++        return localMember;
++    }
++
++    @Override
++    public void setLocalMemberProperties(String listenHost, int listenPort, int securePort, int udpPort) {
++        if (log.isDebugEnabled()) {
++            log.debug(String.format("setLocalMemberProperties(%s, %d, %d, %d)", listenHost, listenPort, securePort, udpPort));
++        }
++        properties.setProperty("tcpListenHost", listenHost);
++        properties.setProperty("tcpListenPort", String.valueOf(listenPort));
++        properties.setProperty("udpListenPort", String.valueOf(udpPort));
++        properties.setProperty("tcpSecurePort", String.valueOf(securePort));
++
++        try {
++            createOrUpdateLocalMember();
++            localMember.setPayload(payload);
++            localMember.setDomain(domain);
++            localMember.getData(true, true);
++        } catch (IOException e) {
++            throw new IllegalArgumentException(e);
++        }
++    }
++
++    private void createOrUpdateLocalMember() throws IOException {
++        String host = properties.getProperty("tcpListenHost");
++        int port = Integer.parseInt(properties.getProperty("tcpListenPort"));
++        int securePort = Integer.parseInt(properties.getProperty("tcpSecurePort"));
++        int udpPort = Integer.parseInt(properties.getProperty("udpListenPort"));
++
++        if (localMember == null) {
++            localMember = new MemberImpl();
++            try {
++                // Set localMember unique ID to md5 hash of hostname
++                localMember.setUniqueId(MessageDigest.getInstance("md5")
++                        .digest(InetAddress.getLocalHost().getHostName().getBytes()));
++            } catch (NoSuchAlgorithmException e) {
++                throw new IOException(e);
++            }
++            localMember.setLocal(true);
++        }
++        localMember.setHostname(host);
++        localMember.setPort(port);
++        localMember.setSecurePort(securePort);
++        localMember.setUdpPort(udpPort);
++        localMember.getData(true, true);
++    }
++
++    @Override
++    public void setPayload(byte[] payload) {
++        this.payload = payload;
++        if (localMember != null) {
++            localMember.setPayload(payload);
++        }
++    }
++
++    @Override
++    public void setDomain(byte[] domain) {
++        this.domain = domain;
++        if (localMember != null) {
++            localMember.setDomain(domain);
++        }
++    }
++
++    @Override
++    public MembershipProvider getMembershipProvider() {
++        return membershipProvider;
++    }
++
++    public void setMembershipProvider(MembershipProvider memberProvider) {
++        this.membershipProvider = memberProvider;
++    }
++
++}
+
+==================================================
+InsecureStreamProvider.java
+new file mode 100644
+index 0000000000..96bb3a700e
+--- /dev/null
++++ b/java/org/apache/catalina/tribes/membership/cloud/Constants.java
+@@ -0,0 +1,22 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.catalina.tribes.membership.cloud;
++
++public class Constants {
++    public static final String Package = "org.apache.catalina.tribes.membership.cloud";
++}
+\ No newline at end of file
+
+==================================================
+KubernetesMembershipProvider.java
+new file mode 100644
+index 0000000000..c477c1e344
+--- /dev/null
++++ b/java/org/apache/catalina/tribes/membership/cloud/InsecureStreamProvider.java
+@@ -0,0 +1,69 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.catalina.tribes.membership.cloud;
++
++import java.io.IOException;
++import java.io.InputStream;
++import java.net.URLConnection;
++import java.util.Map;
++
++import javax.net.ssl.HostnameVerifier;
++import javax.net.ssl.HttpsURLConnection;
++import javax.net.ssl.SSLContext;
++import javax.net.ssl.SSLSession;
++import javax.net.ssl.SSLSocketFactory;
++
++import org.apache.juli.logging.Log;
++import org.apache.juli.logging.LogFactory;
++
++public class InsecureStreamProvider extends AbstractStreamProvider {
++    private static final Log log = LogFactory.getLog(InsecureStreamProvider.class);
++
++    private static final HostnameVerifier INSECURE_HOSTNAME_VERIFIER = new HostnameVerifier() {
++        public boolean verify(String arg0, SSLSession arg1) {
++            return true;
++        }
++    };
++
++    private final SSLSocketFactory factory;
++
++    InsecureStreamProvider() throws Exception {
++        SSLContext context = SSLContext.getInstance("TLS");
++        context.init(null,  INSECURE_TRUST_MANAGERS, null);
++        factory = context.getSocketFactory();
++    }
++
++    @Override
++    public InputStream openStream(String url, Map<String, String> headers, int connectTimeout, int readTimeout) throws IOException {
++        URLConnection connection = openConnection(url, headers, connectTimeout, readTimeout);
++        if (connection instanceof HttpsURLConnection) {
++            HttpsURLConnection httpsConnection = HttpsURLConnection.class.cast(connection);
++            httpsConnection.setHostnameVerifier(INSECURE_HOSTNAME_VERIFIER);
++            httpsConnection.setSSLSocketFactory(factory);
++            if (log.isDebugEnabled()) {
++                log.debug(String.format("Using HttpsURLConnection with SSLSocketFactory [%s] for url [%s].", factory, url));
++            }
++        } else {
++            if (log.isDebugEnabled()) {
++                log.debug(String.format("Using URLConnection for url [%s].", url));
++            }
++        }
++        return connection.getInputStream();
++    }
++
++}
+\ No newline at end of file
+
+==================================================
+StreamProvider.java
+new file mode 100644
+index 0000000000..4d6ad11550
+--- /dev/null
++++ b/java/org/apache/catalina/tribes/membership/cloud/LocalStrings.properties
+@@ -0,0 +1,30 @@
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.
++# The ASF licenses this file to You under the Apache License, Version 2.0
++# (the "License"); you may not use this file except in compliance with
++# the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++certificateStream.clientCertError=Could not create key manager for {0} ({1})
++certificateStream.CACertError=Could not create trust store for {0}
++certificateStream.CACertUndefined=CA cert undefined
++
++tokenStream.failedConnection=Failed connection to {0} with token {1} and CA {2}
++tokenStream.fileNotFound=CA cert file {0} not found
++tokenStream.trustManagerError=Could not create trust manager for {0}
++tokenStream.CACertUndefined=CA cert file undefined
++
++cloudMembershipService.stopFail=Unable to stop the static membership service, level: [{0}]
++
++kubernetesMembershipProvider.noNamespace=Namespace not set
++kubernetesMembershipProvider.jsonError=JSON error
++kubernetesMembershipProvider.memberError=Error creating member
++kubernetesMembershipProvider.streamError=Failed to open stream
+
+==================================================
+TokenStreamProvider.java
+new file mode 100644
+index 0000000000..18a582bf65
+--- /dev/null
++++ b/java/org/apache/catalina/tribes/membership/cloud/StreamProvider.java
+@@ -0,0 +1,35 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.catalina.tribes.membership.cloud;
++
++import java.io.IOException;
++import java.io.InputStream;
++import java.util.Map;
++
++public interface StreamProvider {
++    /**
++     * Open stream to the specified URL.
++     * @param url the url
++     * @param headers the headers map
++     * @param connectTimeout connection timeout in ms
++     * @param readTimeout read timeout in ms
++     * @return the stream
++     * @throws IOException when an error occurs
++     */
++    public InputStream openStream(String url, Map<String, String> headers, int connectTimeout, int readTimeout) throws IOException;
++}
+
+==================================================

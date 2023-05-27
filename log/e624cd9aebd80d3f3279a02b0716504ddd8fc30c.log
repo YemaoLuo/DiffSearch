@@ -1,0 +1,243 @@
+e624cd9aebd80d3f3279a02b0716504ddd8fc30c
+==================================================
+More work on the setting up h2c connections
+==================================================
+Mark Thomas
+==================================================
+Tue Jun 2 13:44:16 2015 +0000
+==================================================
+Http2Parser.java
+More work on the setting up h2c connections
+- clients must send a settings frame in the preface (as well as the upgrade)
+- refactor readFrame() so an expected type can be specified
+- ensure the first frame the server sends is a settings frame
+- restore sending the ack for a settings frame
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1683114 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Http2UpgradeHandler.java
+index d91c9fc5d5..bb68368a2f 100644
+--- a/java/org/apache/coyote/http2/Http2Parser.java
++++ b/java/org/apache/coyote/http2/Http2Parser.java
+@@ -72,6 +72,10 @@ class Http2Parser {
+      * @throws IOException If an IO error occurs while trying to read a frame
+      */
+     boolean readFrame(boolean block) throws IOException {
++        return readFrame(block, null);
++    }
++
++    private boolean readFrame(boolean block, Integer expected) throws IOException {
+         if (!input.fill(block, frameHeaderBuffer)) {
+             return false;
+         }
+@@ -81,6 +85,12 @@ class Http2Parser {
+         int flags = ByteUtil.getOneByte(frameHeaderBuffer, 4);
+         int streamId = ByteUtil.get31Bits(frameHeaderBuffer, 5);
+ 
++        if (expected != null && frameType != expected.intValue()) {
++            throw new Http2Exception(sm.getString("http2Parser.processFrame.unexpectedType",
++                    expected, Integer.toString(frameType)),
++                    streamId, Http2Exception.PROTOCOL_ERROR);
++        }
++
+         if (payloadSize > maxPayloadSize) {
+             throw new Http2Exception(sm.getString("http2Parser.payloadTooBig",
+                     Integer.toString(payloadSize), Integer.toString(maxPayloadSize)),
+@@ -282,15 +292,13 @@ class Http2Parser {
+             throw new Http2Exception(sm.getString("http2Parser.processFrameSettings.invalidPayloadSize",
+                     Integer.toString(payloadSize)), 0, Http2Exception.FRAME_SIZE_ERROR);
+         }
+-        if (payloadSize > 0 && (flags & 0x1) != 0) {
++        boolean ack = (flags & 0x1) != 0;
++        if (payloadSize > 0 && ack) {
+             throw new Http2Exception(sm.getString("http2Parser.processFrameSettings.ackWithNonZeroPayload"),
+                     0, Http2Exception.FRAME_SIZE_ERROR);
+         }
+ 
+-        if (payloadSize == 0) {
+-            // Either an ACK or an empty settings frame
+-            output.settingsEmpty((flags & 0x1) != 0);
+-        } else {
++        if (payloadSize != 0) {
+             // Process the settings
+             byte[] setting = new byte[6];
+             for (int i = 0; i < payloadSize / 6; i++) {
+@@ -300,6 +308,7 @@ class Http2Parser {
+                 output.setting(id, value);
+             }
+         }
++        output.settingsEnd(ack);
+     }
+ 
+ 
+@@ -389,7 +398,7 @@ class Http2Parser {
+      *
+      * @return <code>true</code> if a valid preface was read, otherwise false.
+      */
+-    boolean readConnectionPreface() {
++    boolean readConnectionPreface() throws IOException {
+         if (readPreface) {
+             return true;
+         }
+@@ -414,6 +423,9 @@ class Http2Parser {
+             }
+         }
+ 
++        // Must always be followed by a settings frame
++        readFrame(true, Integer.valueOf(FRAME_TYPE_SETTINGS));
++
+         readPreface = true;
+         return true;
+     }
+@@ -480,8 +492,8 @@ class Http2Parser {
+         void headersEnd(int streamId);
+ 
+         // Settings frames
+-        void settingsEmpty(boolean ack);
+         void setting(int identifier, long value) throws IOException;
++        void settingsEnd(boolean ack) throws IOException;
+ 
+         // Ping frames
+         void pingReceive(byte[] payload) throws IOException;
+
+==================================================
+Http2TestBase.java
+index a3be2e706b..e9df5e0492 100644
+--- a/java/org/apache/coyote/http2/LocalStrings.properties
++++ b/java/org/apache/coyote/http2/LocalStrings.properties
+@@ -36,6 +36,7 @@ http2Parser.payloadTooBig=The payload is [{0}] bytes long but the maximum frame
+ http2Parser.preface.invalid=Invalid connection preface [{0}] presented
+ http2Parser.preface.io=Unable to read connection preface
+ http2Parser.processFrame=Connection [{0}], Stream [{1}], Flags [{2}], Payload size [{3}]
++http2Parser.processFrame.unexpectedType=Expected frame type [{0}] but received frame type [{1}]
+ http2Parser.processFrameData.invalidStream=Data frame received for stream [0]
+ http2Parser.processFrameHeaders.invalidStream=Headers frame received for stream [0]
+ http2Parser.processFrameHeaders.decodingFailed=There was an error during the HPACK decoding of HTTP headers
+@@ -59,8 +60,6 @@ streamProcessor.httpupgrade.notsupported=HTTP upgrade is not supported within HT
+ upgradeHandler.connectionError=An error occurred that requires the HTTP/2 connection to be closed.
+ upgradeHandler.init=Connection [{0}]
+ upgradeHandler.ioerror=Connection [{0}]
+-upgradeHandler.invalidPreface=And invalid connection preface was received from the client
+-upgradeHandler.receivePrefaceNotSettings=The first frame received from the client was not a settings frame
+ upgradeHandler.sendPrefaceFail=Failed to send preface to client
+ upgradeHandler.socketCloseFailed=Error closing socket
+ upgradeHandler.unexpectedEos=Unexpected end of stream
+
+==================================================
+TestHttp2Section_3_2.java
+index 860501e821..179c9211a4 100644
+--- a/test/org/apache/coyote/http2/Http2TestBase.java
++++ b/test/org/apache/coyote/http2/Http2TestBase.java
+@@ -49,11 +49,13 @@ import org.apache.tomcat.util.codec.binary.Base64;
+  */
+ public abstract class Http2TestBase extends TomcatBaseTest {
+ 
+-    static final String EMPTY_HTTP2_SETTINGS;
++    private static final byte[] EMPTY_SETTINGS_FRAME =
++        { 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00 };
++    static final String EMPTY_HTTP2_SETTINGS_HEADER;
+ 
+     static {
+         byte[] empty = new byte[0];
+-        EMPTY_HTTP2_SETTINGS = "HTTP2-Settings: " + Base64.encodeBase64String(empty) + "\r\n";
++        EMPTY_HTTP2_SETTINGS_HEADER = "HTTP2-Settings: " + Base64.encodeBase64String(empty) + "\r\n";
+     }
+ 
+     private Socket s;
+@@ -73,12 +75,19 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+         openClientConnection();
+         doHttpUpgrade();
+         sendClientPreface();
+-        // Need to read 3 frames (settings, headers and response body)
++        // - 101 response acts as acknowledgement of the HTTP2-Settings header
++        // Need to read 4 frames
++        // - settings (server settings - must be first)
++        // - settings ack (for the settings frame in the client preface)
++        // - headers (for response)
++        // - data (for response body)
++        parser.readFrame(true);
+         parser.readFrame(true);
+         parser.readFrame(true);
+         parser.readFrame(true);
+ 
+-        Assert.assertEquals("0-Settings-Empty\n" +
++        Assert.assertEquals("0-Settings-End\n" +
++                "0-Settings-Ack\n" +
+                 "1-HeadersStart\n" +
+                 "1-Header-[:status]-[200]\n" +
+                 "1-HeadersEnd\n" +
+@@ -125,7 +134,7 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+ 
+ 
+     protected void doHttpUpgrade() throws IOException {
+-        doHttpUpgrade("h2c", EMPTY_HTTP2_SETTINGS, true);
++        doHttpUpgrade("h2c", EMPTY_HTTP2_SETTINGS_HEADER, true);
+     }
+ 
+     protected void doHttpUpgrade(String upgrade, String settings, boolean validate)
+@@ -234,6 +243,7 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+ 
+     private void sendClientPreface() throws IOException {
+         os.write(Http2Parser.CLIENT_PREFACE_START);
++        os.write(EMPTY_SETTINGS_FRAME);
+         os.flush();
+     }
+ 
+@@ -322,19 +332,19 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+ 
+ 
+         @Override
+-        public void settingsEmpty(boolean ack) {
+-            if (ack) {
+-                trace.append("0-Settings-Ack\n");
+-            } else {
+-                trace.append("0-Settings-Empty\n");
+-            }
++        public void setting(int identifier, long value) throws IOException {
++            trace.append("0-Settings-[" + identifier + "]-[" + value + "]\n");
++            remoteSettings.set(identifier, value);
+         }
+ 
+ 
+         @Override
+-        public void setting(int identifier, long value) throws IOException {
+-            trace.append("0-Settings-[" + identifier + "]-[" + value + "]\n");
+-            remoteSettings.set(identifier, value);
++        public void settingsEnd(boolean ack) {
++            if (ack) {
++                trace.append("0-Settings-Ack\n");
++            } else {
++                trace.append("0-Settings-End\n");
++            }
+         }
+ 
+ 
+
+==================================================
+TestHttp2Section_3_2_1.java
+index f93f3a499e..9ef115fe4b 100644
+--- a/test/org/apache/coyote/http2/TestHttp2Section_3_2.java
++++ b/test/org/apache/coyote/http2/TestHttp2Section_3_2.java
+@@ -39,7 +39,7 @@ public class TestHttp2Section_3_2 extends Http2TestBase {
+     public void testConnectionNoHttp2Support() throws Exception {
+         configureAndStartWebApplication();
+         openClientConnection();
+-        doHttpUpgrade("h2c", EMPTY_HTTP2_SETTINGS, false);
++        doHttpUpgrade("h2c", EMPTY_HTTP2_SETTINGS_HEADER, false);
+         parseHttp11Response();
+     }
+ 
+@@ -49,7 +49,7 @@ public class TestHttp2Section_3_2 extends Http2TestBase {
+         enableHttp2();
+         configureAndStartWebApplication();
+         openClientConnection();
+-        doHttpUpgrade("h2", EMPTY_HTTP2_SETTINGS, false);
++        doHttpUpgrade("h2", EMPTY_HTTP2_SETTINGS_HEADER, false);
+         parseHttp11Response();
+     }
+ 
+
+==================================================

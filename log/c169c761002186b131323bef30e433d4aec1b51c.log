@@ -1,0 +1,2224 @@
+c169c761002186b131323bef30e433d4aec1b51c
+==================================================
+Extend Lifecycle/MBean refactoring to ContainerBase
+==================================================
+Mark Emlyn
+==================================================
+Mon May 10 16:17:22 2010 +0000
+==================================================
+Container.java
+index 156e542f76..f9f3d94aaf 100644
+--- a/conf/server.xml
++++ b/conf/server.xml
+@@ -27,8 +27,6 @@
+   <Listener className="org.apache.catalina.core.JasperListener" />
+   <!-- Prevent memory leaks due to use of particular java/javax APIs-->
+   <Listener className="org.apache.catalina.core.JreMemoryLeakPreventionListener" />
+-  <!-- JMX Support for the Tomcat server. Documentation at /docs/non-existent.html -->
+-  <Listener className="org.apache.catalina.mbeans.ServerLifecycleListener" />
+   <Listener className="org.apache.catalina.mbeans.GlobalResourcesLifecycleListener" />
+ 
+   <!-- Global JNDI resources
+
+==================================================
+Context.java
+index daeaffcee3..7675e8b5eb 100644
+--- a/java/org/apache/catalina/Container.java
++++ b/java/org/apache/catalina/Container.java
+@@ -22,6 +22,7 @@ package org.apache.catalina;
+ import java.beans.PropertyChangeListener;
+ import java.io.IOException;
+ import javax.servlet.ServletException;
++import javax.management.ObjectName;
+ import javax.naming.directory.DirContext;
+ 
+ import org.apache.catalina.connector.Request;
+@@ -189,7 +190,7 @@ public interface Container extends Lifecycle {
+     /**
+      * Return the JMX name associated with this container.
+      */
+-    public String getObjectName();    
++    public ObjectName getObjectName();    
+ 
+     /**
+      * Return the Pipeline object that manages the Valves associated with
+
+==================================================
+AuthenticatorBase.java
+index 0e650be730..7fd3b722f2 100644
+--- a/java/org/apache/catalina/Context.java
++++ b/java/org/apache/catalina/Context.java
+@@ -1198,5 +1198,13 @@ public interface Context extends Container {
+      */
+     public void addServletContainerInitializer(
+             ServletContainerInitializer sci, Set<Class<?>> classes);
++    
++    /**
++     * Is this Context paused whilst it is reloaded?
++     * 
++     * @return
++     */
++    public boolean getPaused();
++
+ }
+ 
+
+==================================================
+MapperListener.java
+index 48abb02f92..7957c8a4dc 100644
+--- a/java/org/apache/catalina/connector/LocalStrings.properties
++++ b/java/org/apache/catalina/connector/LocalStrings.properties
+@@ -80,5 +80,8 @@ mapperListener.unregisterHost=Unregister host {0} at domain {1}
+ mapperListener.registerContext=Register Context {0} 
+ mapperListener.unregisterContext=Unregister Context {0}
+ mapperListener.registerWrapper=Register Wrapper {0} in Context {1}
++mapperListener.addMBeanListenerFail=Failed to add MBean notification listener for connector [{0}] in domain [{1}]. Adding Hosts, Contexts and Wrappers will not be visible to the connector.
++mapperListener.removeMBeanListenerFail=Failed to remove MBean notification listener for connector [{0}] in domain [{1}]. This may result in a memory leak.
++mapperLister.containerListenerFail=Failed to call method [{0}] on object [{1}]. Changes in the object state may not be correctly reflected in the mapper for connector [{2}] in domain [{3}].
+ 
+ inputBuffer.streamClosed=Stream closed
+
+==================================================
+ContainerBase.java
+index 67e48c15ea..f1acc437f5 100644
+--- a/java/org/apache/catalina/connector/MapperListener.java
++++ b/java/org/apache/catalina/connector/MapperListener.java
+@@ -16,27 +16,31 @@
+  */ 
+ package org.apache.catalina.connector;
+ 
+-import java.util.Iterator;
+-import java.util.Set;
+-
++import javax.management.InstanceNotFoundException;
++import javax.management.ListenerNotFoundException;
++import javax.management.MBeanException;
+ import javax.management.MBeanServer;
+ import javax.management.MBeanServerNotification;
++import javax.management.MalformedObjectNameException;
+ import javax.management.Notification;
+ import javax.management.NotificationListener;
+-import javax.management.ObjectInstance;
+ import javax.management.ObjectName;
++import javax.management.ReflectionException;
+ 
++import org.apache.catalina.Container;
+ import org.apache.catalina.ContainerEvent;
+ import org.apache.catalina.ContainerListener;
++import org.apache.catalina.Context;
++import org.apache.catalina.Engine;
+ import org.apache.catalina.Host;
+-import org.apache.catalina.core.StandardContext;
++import org.apache.catalina.Lifecycle;
++import org.apache.catalina.LifecycleState;
++import org.apache.catalina.Wrapper;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ 
+ 
+-import org.apache.tomcat.util.buf.MessageBytes;
+ import org.apache.tomcat.util.http.mapper.Mapper;
+-import org.apache.tomcat.util.http.mapper.MappingData;
+ import org.apache.tomcat.util.modeler.Registry;
+ 
+ import org.apache.tomcat.util.res.StringManager;
+@@ -60,17 +64,17 @@ public class MapperListener
+     /**
+      * Associated mapper.
+      */
+-    protected Mapper mapper = null;
++    private Mapper mapper = null;
+     
+     /**
+      * Associated connector
+      */
+-    protected Connector connector = null;
++    private Connector connector = null;
+ 
+     /**
+      * MBean server.
+      */
+-    protected MBeanServer mBeanServer = null;
++    private MBeanServer mBeanServer = null;
+ 
+ 
+     /**
+@@ -79,8 +83,10 @@ public class MapperListener
+     private static final StringManager sm =
+         StringManager.getManager(Constants.Package);
+ 
+-    // It should be null - and fail if not set
+-    private String domain="*";
++    /**
++     * The domain (effectively the engine) this mapper is associated with
++     */
++    private String domain = null;
+ 
+     // ----------------------------------------------------------- Constructors
+ 
+@@ -91,6 +97,12 @@ public class MapperListener
+     public MapperListener(Mapper mapper, Connector connector) {
+         this.mapper = mapper;
+         this.connector = connector;
++        
++        // Cache MBean server
++        mBeanServer = Registry.getRegistry(null, null).getMBeanServer();
++        
++        // TODO - Switch to container listener events for add/remove child and
++        // remove dependency on MBean server entirely.
+     }
+ 
+ 
+@@ -109,51 +121,52 @@ public class MapperListener
+      */
+     public void init() {
+ 
+-        try {
+-
+-            mBeanServer = Registry.getRegistry(null, null).getMBeanServer();
+-
+-            registerEngine();
+-
+-            // Query hosts
+-            String onStr = domain + ":type=Host,*";
+-            ObjectName objectName = new ObjectName(onStr);
+-            Set<ObjectInstance> set = mBeanServer.queryMBeans(objectName, null);
+-            Iterator<ObjectInstance> iterator = set.iterator();
+-            while (iterator.hasNext()) {
+-                ObjectInstance oi = iterator.next();
+-                registerHost(oi.getObjectName());
+-            }
+-
+-
+-            // Query contexts
+-            onStr = "*:j2eeType=WebModule,*";
+-            objectName = new ObjectName(onStr);
+-            set = mBeanServer.queryMBeans(objectName, null);
+-            iterator = set.iterator();
+-            while (iterator.hasNext()) {
+-                ObjectInstance oi = iterator.next();
+-                registerContext(oi.getObjectName());
+-            }
+-
+-            // Query wrappers
+-            onStr = "*:j2eeType=Servlet,*";
+-            objectName = new ObjectName(onStr);
+-            set = mBeanServer.queryMBeans(objectName, null);
+-            iterator = set.iterator();
+-            while (iterator.hasNext()) {
+-                ObjectInstance oi = iterator.next();
+-                registerWrapper(oi.getObjectName());
++        // Find any components that have already been initialized since the
++        // MBean listener won't be notified as those components will have
++        // already registered their MBeans
++        findDefaultHost();
++        
++        Engine engine = (Engine) connector.getService().getContainer();
++        
++        Container[] conHosts = engine.findChildren();
++        for (Container conHost : conHosts) {
++            Host host = (Host) conHost;
++            if (!LifecycleState.NEW.equals(host.getState())) {
++                registerHost(host);
++                    
++                Container[] conContexts = host.findChildren();
++                for (Container conContext : conContexts) {
++                    Context context = (Context) conContext;
++                    if (!LifecycleState.NEW.equals(context.getState())) {
++                        registerContext(context);
++                        
++                        Container[] conWrappers = context.findChildren();
++                        for (Container conWrapper : conWrappers) {
++                            Wrapper wrapper = (Wrapper) conWrapper;
++                            if (!LifecycleState.NEW.equals(wrapper.getState())) {
++                                registerWrapper(wrapper);
++                            }
++                        }
++                    }
++                }
+             }
+-
+-            onStr = "JMImplementation:type=MBeanServerDelegate";
+-            objectName = new ObjectName(onStr);
++        }
++        
++        ObjectName objectName;
++        try {
++            objectName = new ObjectName(
++                    "JMImplementation:type=MBeanServerDelegate");
+             mBeanServer.addNotificationListener(objectName, this, null, null);
+-
+-        } catch (Exception e) {
+-            log.warn("Error registering contexts",e);
++        } catch (MalformedObjectNameException e) {
++            log.error(sm.getString("mapperListener.addMBeanListenerFail",
++                    connector, domain), e);
++        } catch (NullPointerException e) {
++            log.error(sm.getString("mapperListener.addMBeanListenerFail",
++                    connector, domain), e);
++        } catch (InstanceNotFoundException e) {
++            log.error(sm.getString("mapperListener.addMBeanListenerFail",
++                    connector, domain), e);
+         }
+-
+     }
+ 
+     /**
+@@ -165,8 +178,18 @@ public class MapperListener
+             ObjectName objectName = new ObjectName(
+                     "JMImplementation:type=MBeanServerDelegate");
+             mBeanServer.removeNotificationListener(objectName, this);
+-        } catch (Exception e) {
+-            log.warn("Error unregistering MBeanServerDelegate", e);
++        } catch (InstanceNotFoundException e) {
++            log.error(sm.getString("mapperListener.removeMBeanListenerFail",
++                    connector, domain), e);
++        } catch (ListenerNotFoundException e) {
++            log.error(sm.getString("mapperListener.removeMBeanListenerFail",
++                    connector, domain), e);
++        } catch (MalformedObjectNameException e) {
++            log.error(sm.getString("mapperListener.removeMBeanListenerFail",
++                    connector, domain), e);
++        } catch (NullPointerException e) {
++            log.error(sm.getString("mapperListener.removeMBeanListenerFail",
++                    connector, domain), e);
+         }
+     }
+ 
+@@ -176,83 +199,54 @@ public class MapperListener
+     public void handleNotification(Notification notification,
+                                    java.lang.Object handback) {
+ 
+-        if (notification instanceof MBeanServerNotification) {
+-            ObjectName objectName = 
+-                ((MBeanServerNotification) notification).getMBeanName();
+-            String j2eeType = objectName.getKeyProperty("j2eeType");
+-            String engineName = null;
+-            if (j2eeType != null) {
+-                if ((j2eeType.equals("WebModule")) || 
+-                    (j2eeType.equals("Servlet"))) {
+-                    if (mBeanServer.isRegistered(objectName)) {
+-                        try {
+-                            engineName = (String)
+-                                mBeanServer.getAttribute(objectName, "engineName");
+-                        } catch (Exception e) {
+-                            // Ignore  
+-                        }
+-                    }
+-                }
+-            }
+-
+-            // At deployment time, engineName is always = null.
+-            if ( (!"*".equals(domain)) &&
+-                 ( !domain.equals(objectName.getDomain()) ) &&
+-                 ( (!domain.equals(engineName) ) &&
+-                   (engineName != null) ) )  {
+-                return;
+-            }
+-            if(log.isDebugEnabled())
+-                log.debug( "Handle " + objectName  + " type : " + notification.getType());    
+-            if (notification.getType().equals
++        if (!(notification instanceof MBeanServerNotification)) {
++            return;
++        }
++        
++        String methodName = null;
++        if (notification.getType().equals
+                 (MBeanServerNotification.REGISTRATION_NOTIFICATION)) {
+-                String type=objectName.getKeyProperty("type");
+-                if( "Host".equals( type ) && domain.equals(objectName.getDomain())) {
+-                    try {
+-                        registerHost(objectName);
+-                    } catch (Exception e) {
+-                        log.warn("Error registering Host " + objectName, e);  
+-                    }
+-                }
+-    
+-                if (j2eeType != null) {
+-                    if (j2eeType.equals("WebModule")) {
+-                        try {
+-                            registerContext(objectName);
+-                        } catch (Throwable t) {
+-                            log.warn("Error registering Context " + objectName,t);
+-                        }
+-                    } else if (j2eeType.equals("Servlet")) {
+-                        try {
+-                            registerWrapper(objectName);
+-                        } catch (Throwable t) {
+-                            log.warn("Error registering Wrapper " + objectName,t);
+-                        }
+-                    }
+-                }
+-            } else if (notification.getType().equals
+-                       (MBeanServerNotification.UNREGISTRATION_NOTIFICATION)) {
+-                String type=objectName.getKeyProperty("type");
+-                if( "Host".equals( type )&& domain.equals(objectName.getDomain())) {
+-                    try {
+-                        unregisterHost(objectName);
+-                    } catch (Exception e) {
+-                        log.warn("Error unregistering Host " + objectName,e);  
+-                    }
+-                }
+- 
+-                if (j2eeType != null) {
+-                    if (j2eeType.equals("WebModule")) {
+-                        try {
+-                            unregisterContext(objectName);
+-                        } catch (Throwable t) {
+-                            log.warn("Error unregistering webapp " + objectName,t);
+-                        }
+-                    }
++            methodName = "addContainerListener";
++        } else if (notification.getType().equals
++                (MBeanServerNotification.UNREGISTRATION_NOTIFICATION)) {
++            methodName = "removeContainerListener";
++        } else {
++            return;
++        }
++        
++        ObjectName objectName = 
++            ((MBeanServerNotification) notification).getMBeanName();
++        
++        // Check the domains match
++        if (domain.equals(objectName.getDomain())) {
++            // Only interested in Hosts, Contexts and Wrappers
++            
++            String type = objectName.getKeyProperty("type");
++            if (type == null) {
++                type = objectName.getKeyProperty("j2eeType");
++            }
++                
++            if ("Servlet".equals(type) || "WebModule".equals(type) ||
++                    "Host".equals(type)) {
++                try {
++                    mBeanServer.invoke(objectName, methodName,
++                            new Object[] {this},
++                            new String[] {"org.apache.catalinaContainerListener"});
++                } catch (ReflectionException e) {
++                    log.error(sm.getString(
++                            "mapperLister.containerListenerFail", methodName,
++                            objectName, connector, domain), e);
++                } catch (MBeanException e) {
++                    log.error(sm.getString(
++                            "mapperLister.containerListenerFail", methodName,
++                            objectName, connector, domain), e);
++                } catch (InstanceNotFoundException e) {
++                    log.error(sm.getString(
++                            "mapperLister.containerListenerFail", methodName,
++                            objectName, connector, domain), e);
+                 }
+             }
+         }
+-
+     }
+ 
+ 
+@@ -260,7 +254,25 @@ public class MapperListener
+ 
+     public void containerEvent(ContainerEvent event) {
+ 
+-        if (event.getType() == Host.ADD_ALIAS_EVENT) {
++        if (event.getType() == Lifecycle.AFTER_START_EVENT) {
++            Object obj = event.getSource();
++            if (obj instanceof Wrapper) {
++                registerWrapper((Wrapper) obj);
++            } else if (obj instanceof Context) {
++                registerContext((Context) obj);
++            } else if (obj instanceof Host) {
++                registerHost((Host) obj);
++            }
++        } else if (event.getType() == Lifecycle.AFTER_STOP_EVENT) {
++            Object obj = event.getSource();
++            if (obj instanceof Wrapper) {
++                unregisterWrapper((Wrapper) obj);
++            } else if (obj instanceof Context) {
++                unregisterContext((Context) obj);
++            } else if (obj instanceof Host) {
++                unregisterHost((Host) obj);
++            }
++        } else if (event.getType() == Host.ADD_ALIAS_EVENT) {
+             mapper.addHostAlias(((Host) event.getSource()).getName(),
+                     event.getData().toString());
+         } else if (event.getType() == Host.REMOVE_ALIAS_EVENT) {
+@@ -271,68 +283,52 @@ public class MapperListener
+     
+     // ------------------------------------------------------ Protected Methods
+ 
+-    private void registerEngine()
+-        throws Exception
+-    {
+-        ObjectName engineName = new ObjectName
+-            (domain + ":type=Engine");
+-        if ( ! mBeanServer.isRegistered(engineName)) return;
+-        String defaultHost = 
+-            (String) mBeanServer.getAttribute(engineName, "defaultHost");
+-        ObjectName hostName = new ObjectName
+-            (domain + ":type=Host," + "host=" + defaultHost);
+-        if (!mBeanServer.isRegistered(hostName)) {
+-
+-            // Get the hosts' list
+-            String onStr = domain + ":type=Host,*";
+-            ObjectName objectName = new ObjectName(onStr);
+-            Set<ObjectInstance> set = mBeanServer.queryMBeans(objectName, null);
+-            Iterator<ObjectInstance> iterator = set.iterator();
+-            String[] aliases;
+-            boolean isRegisteredWithAlias = false;
+-            
+-            while (iterator.hasNext()) {
++    private void findDefaultHost() {
++
++        Engine engine = (Engine) connector.getService().getContainer();
++        String defaultHost = engine.getDefaultHost();
+ 
+-                if (isRegisteredWithAlias) break;
++        boolean found = false;
++
++        if (defaultHost != null && defaultHost.length() >0) {
++            Container[] containers = engine.findChildren();
+             
+-                ObjectInstance oi = iterator.next();
+-                hostName = oi.getObjectName();
+-                aliases = (String[])
+-                    mBeanServer.invoke(hostName, "findAliases", null, null);
+-
+-                for (int i=0; i < aliases.length; i++){
+-                    if (aliases[i].equalsIgnoreCase(defaultHost)){
+-                        isRegisteredWithAlias = true;
++            for (Container container : containers) {
++                Host host = (Host) container;
++                if (defaultHost.equalsIgnoreCase(host.getName())) {
++                    found = true;
++                    break;
++                }
++                
++                String[] aliases = host.findAliases();
++                for (String alias : aliases) {
++                    if (defaultHost.equalsIgnoreCase(alias)) {
++                        found = true;
+                         break;
+                     }
+                 }
+             }
+-            
+-            if (!isRegisteredWithAlias && log.isWarnEnabled())
+-                log.warn(sm.getString("mapperListener.unknownDefaultHost", defaultHost));
+         }
+-        // This should probably be called later 
+-        if( defaultHost != null ) {
++
++        if(found) {
+             mapper.setDefaultHostName(defaultHost);
++        } else {
++            log.warn(sm.getString("mapperListener.unknownDefaultHost",
++                    defaultHost));
+         }
+     }
+ 
++    
+     /**
+      * Register host.
+      */
+-    private void registerHost(ObjectName objectName)
+-        throws Exception {
+-        String name=objectName.getKeyProperty("host");
+-        if( name != null ) {        
+-
+-            Host host =
+-                (Host) connector.getService().getContainer().findChild(name);
+-            String[] aliases = host.findAliases();
+-            mapper.addHost(name, aliases, objectName);
+-            host.addContainerListener(this);
+-            if(log.isDebugEnabled())
+-                log.debug(sm.getString
+-                     ("mapperListener.registerHost", name, domain));
++    private void registerHost(Host host) {
++        
++        String[] aliases = host.findAliases();
++        mapper.addHost(host.getName(), aliases, host.getObjectName());
++        if(log.isDebugEnabled()) {
++            log.debug(sm.getString
++                 ("mapperListener.registerHost", host.getName(), domain));
+         }
+     }
+ 
+@@ -340,207 +336,109 @@ public class MapperListener
+     /**
+      * Unregister host.
+      */
+-    private void unregisterHost(ObjectName objectName)
+-        throws Exception {
+-        String name=objectName.getKeyProperty("host");
+-        if( name != null ) { 
+-            Host host =
+-                (Host) connector.getService().getContainer().findChild(name);
++    private void unregisterHost(Host host) {
++
++        String hostname = host.getName();
+         
+-            mapper.removeHost(name);
+-            if (host != null) {
+-                host.removeContainerListener(this);
+-            }
+-            if(log.isDebugEnabled())
+-                log.debug(sm.getString
+-                        ("mapperListener.unregisterHost", name, domain));
+-        }
+-    }
++        mapper.removeHost(hostname);
+ 
++        if(log.isDebugEnabled())
++            log.debug(sm.getString("mapperListener.unregisterHost", hostname,
++                    domain));
++    }
+ 
++    
+     /**
+-     * Register context.
++     * Unregister wrapper.
+      */
+-    private void registerContext(ObjectName objectName)
+-        throws Exception {
++    private void unregisterWrapper(Wrapper wrapper) {
+ 
+-        String name = objectName.getKeyProperty("name");
+-        
+-        // If the domain is the same with ours or the engine 
+-        // name attribute is the same... - then it's ours
+-        String targetDomain=objectName.getDomain();
+-        if( ! domain.equals( targetDomain )) {
+-            try {
+-                targetDomain = (String) mBeanServer.getAttribute
+-                    (objectName, "engineName");
+-            } catch (Exception e) {
+-                // Ignore
+-            }
+-            if( ! domain.equals( targetDomain )) {
+-                // not ours
+-                return;
+-            }
++        String contextName = wrapper.getParent().getName();
++        if ("/".equals(contextName)) {
++            contextName = "";
+         }
++        String hostName = wrapper.getParent().getParent().getName();
+ 
+-        String hostName = null;
+-        String contextName = null;
+-        if (name.startsWith("//")) {
+-            name = name.substring(2);
+-        }
+-        int slash = name.indexOf("/");
+-        if (slash != -1) {
+-            hostName = name.substring(0, slash);
+-            contextName = name.substring(slash);
+-        } else {
+-            return;
+-        }
+-        // Special case for the root context
+-        if (contextName.equals("/")) {
+-            contextName = "";
++        String[] mappings = wrapper.findMappings();
++        
++        for (String mapping : mappings) {
++            mapper.removeWrapper(hostName, contextName, mapping);
+         }
++    }
+ 
+-        if(log.isDebugEnabled())
+-             log.debug(sm.getString
+-                  ("mapperListener.registerContext", contextName));
++    
++    /**
++     * Register context.
++     */
++    private void registerContext(Context context) {
+ 
+-        Object context = 
+-            mBeanServer.invoke(objectName, "findMappingObject", null, null);
+-            //mBeanServer.getAttribute(objectName, "mappingObject");
+-        javax.naming.Context resources = (javax.naming.Context)
+-            mBeanServer.invoke(objectName, "findStaticResources", null, null);
+-            //mBeanServer.getAttribute(objectName, "staticResources");
+-        String[] welcomeFiles = (String[])
+-            mBeanServer.getAttribute(objectName, "welcomeFiles");
++        String contextName = context.getName();
++        if ("/".equals(contextName)) {
++            contextName = "";
++        }
++        String hostName = context.getParent().getName();
++        
++        javax.naming.Context resources = context.getResources();
++        String[] welcomeFiles = context.findWelcomeFiles();
+ 
+-        mapper.addContext(hostName, contextName, context, 
+-                          welcomeFiles, resources);
++        mapper.addContext(hostName, contextName, context, welcomeFiles,
++                resources);
+ 
++        if(log.isDebugEnabled()) {
++            log.debug(sm.getString
++                 ("mapperListener.registerContext", contextName));
++        }
+     }
+ 
+ 
+     /**
+      * Unregister context.
+      */
+-    private void unregisterContext(ObjectName objectName)
+-        throws Exception {
+-
+-        String name = objectName.getKeyProperty("name");
+-
+-        // If the domain is the same with ours or the engine 
+-        // name attribute is the same... - then it's ours
+-        String targetDomain=objectName.getDomain();
+-        if( ! domain.equals( targetDomain )) {
+-            try {
+-                targetDomain = (String) mBeanServer.getAttribute
+-                    (objectName, "engineName");
+-            } catch (Exception e) {
+-                // Ignore
+-            }
+-            if( ! domain.equals( targetDomain )) {
+-                // not ours
+-                return;
+-            }
+-        }
++    private void unregisterContext(Context context) {
+ 
+-        String hostName = null;
+-        String contextName = null;
+-        if (name.startsWith("//")) {
+-            name = name.substring(2);
+-        }
+-        int slash = name.indexOf("/");
+-        if (slash != -1) {
+-            hostName = name.substring(0, slash);
+-            contextName = name.substring(slash);
+-        } else {
++        // Don't un-map a context that is paused
++        if (context.getPaused()){
+             return;
+         }
+-        // Special case for the root context
+-        if (contextName.equals("/")) {
++        
++        String contextName = context.getName();
++        if ("/".equals(contextName)) {
+             contextName = "";
+         }
+-
+-        // Don't un-map a context that is paused
+-        MessageBytes hostMB = MessageBytes.newInstance();
+-        hostMB.setString(hostName);
+-        MessageBytes contextMB = MessageBytes.newInstance();
+-        contextMB.setString(contextName);
+-        MappingData mappingData = new MappingData();
+-        mapper.map(hostMB, contextMB, mappingData);
+-        if (mappingData.context instanceof StandardContext &&
+-                ((StandardContext)mappingData.context).getPaused()) {
+-            return;
+-        } 
++        String hostName = context.getParent().getName();
+ 
+         if(log.isDebugEnabled())
+             log.debug(sm.getString
+                   ("mapperListener.unregisterContext", contextName));
+ 
+         mapper.removeContext(hostName, contextName);
+-
+     }
+ 
+ 
+     /**
+      * Register wrapper.
+      */
+-    private void registerWrapper(ObjectName objectName)
+-        throws Exception {
+-    
+-        // If the domain is the same with ours or the engine 
+-        // name attribute is the same... - then it's ours
+-        String targetDomain=objectName.getDomain();
+-        if( ! domain.equals( targetDomain )) {
+-            try {
+-                targetDomain=(String) mBeanServer.getAttribute(objectName, "engineName");
+-            } catch (Exception e) {
+-                // Ignore
+-            }
+-            if( ! domain.equals( targetDomain )) {
+-                // not ours
+-                return;
+-            }
+-            
+-        }
+-
+-        String wrapperName = objectName.getKeyProperty("name");
+-        String name = objectName.getKeyProperty("WebModule");
++    private void registerWrapper(Wrapper wrapper) {
+ 
+-        String hostName = null;
+-        String contextName = null;
+-        if (name.startsWith("//")) {
+-            name = name.substring(2);
+-        }
+-        int slash = name.indexOf("/");
+-        if (slash != -1) {
+-            hostName = name.substring(0, slash);
+-            contextName = name.substring(slash);
+-        } else {
+-            return;
+-        }
+-        // Special case for the root context
+-        if (contextName.equals("/")) {
++        String wrapperName = wrapper.getName();
++        String contextName = wrapper.getParent().getName();
++        if ("/".equals(contextName)) {
+             contextName = "";
+         }
+-        if(log.isDebugEnabled())
+-            log.debug(sm.getString
+-                  ("mapperListener.registerWrapper", 
+-                   wrapperName, contextName));
+-
+-        String[] mappings = (String[])
+-            mBeanServer.invoke(objectName, "findMappings", null, null);
+-        Object wrapper = 
+-            mBeanServer.invoke(objectName, "findMappingObject", null, null);
++        String hostName = wrapper.getParent().getParent().getName();
++        
++        String[] mappings = wrapper.findMappings();
+ 
+-        for (int i = 0; i < mappings.length; i++) {
++        for (String mapping : mappings) {
+             boolean jspWildCard = (wrapperName.equals("jsp")
+-                                   && mappings[i].endsWith("/*"));
+-            mapper.addWrapper(hostName, contextName, mappings[i], wrapper,
++                                   && mapping.endsWith("/*"));
++            mapper.addWrapper(hostName, contextName, mapping, wrapper,
+                               jspWildCard);
+         }
+ 
++        if(log.isDebugEnabled()) {
++            log.debug(sm.getString("mapperListener.registerWrapper",
++                    wrapperName, contextName));
++        }
+     }
+-
+-
+-
+-
+ }
+
+==================================================
+StandardContext.java
+index 83d7391955..b0a61e9872 100644
+--- a/java/org/apache/catalina/core/ContainerBase.java
++++ b/java/org/apache/catalina/core/ContainerBase.java
+@@ -14,8 +14,6 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+-
+-
+ package org.apache.catalina.core;
+ 
+ 
+@@ -31,8 +29,6 @@ import java.util.Iterator;
+ 
+ import javax.management.InstanceNotFoundException;
+ import javax.management.MBeanException;
+-import javax.management.MBeanRegistration;
+-import javax.management.MBeanServer;
+ import javax.management.MalformedObjectNameException;
+ import javax.management.ObjectName;
+ import javax.management.ReflectionException;
+@@ -55,12 +51,13 @@ import org.apache.catalina.Realm;
+ import org.apache.catalina.Valve;
+ import org.apache.catalina.connector.Request;
+ import org.apache.catalina.connector.Response;
++import org.apache.catalina.mbeans.MBeanUtils;
+ import org.apache.catalina.util.LifecycleBase;
++import org.apache.catalina.util.LifecycleMBeanBase;
+ import org.apache.tomcat.util.res.StringManager;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.naming.resources.ProxyDirContext;
+-import org.apache.tomcat.util.modeler.Registry;
+ 
+ 
+ /**
+@@ -124,9 +121,8 @@ import org.apache.tomcat.util.modeler.Registry;
+  * 
+  * @author Craig R. McClanahan
+  */
+-
+-public abstract class ContainerBase extends LifecycleBase
+-    implements Container, MBeanRegistration {
++public abstract class ContainerBase extends LifecycleMBeanBase
++        implements Container {
+ 
+     private static final org.apache.juli.logging.Log log=
+         org.apache.juli.logging.LogFactory.getLog( ContainerBase.class );
+@@ -1044,48 +1040,6 @@ public abstract class ContainerBase extends LifecycleBase
+         }
+     }
+ 
+-    /** Init method, part of the MBean lifecycle.
+-     *  If the container was added via JMX, it'll register itself with the 
+-     * parent, using the ObjectName conventions to locate the parent.
+-     * 
+-     *  If the container was added directly and it doesn't have an ObjectName,
+-     * it'll create a name and register itself with the JMX console. On destroy(), 
+-     * the object will unregister.
+-     * 
+-     * @throws Exception
+-     */ 
+-    @Override
+-    protected void initInternal() throws LifecycleException{
+-
+-        try {
+-            if( this.getParent() == null ) {
+-                // "Life" update
+-                ObjectName parentName;
+-                    parentName = getParentName();
+-    
+-                //log.info("Register " + parentName );
+-                if( parentName != null && 
+-                        mserver.isRegistered(parentName)) 
+-                {
+-                    mserver.invoke(parentName, "addChild", new Object[] { this },
+-                            new String[] {"org.apache.catalina.Container"});
+-                }
+-            }
+-        } catch (MalformedObjectNameException e) {
+-            throw new LifecycleException(e);
+-        } catch (InstanceNotFoundException e) {
+-            throw new LifecycleException(e);
+-        } catch (ReflectionException e) {
+-            throw new LifecycleException(e);
+-        } catch (MBeanException e) {
+-            throw new LifecycleException(e);
+-        }
+-    }
+-    
+-    public ObjectName getParentName() throws MalformedObjectNameException {
+-        return null;
+-    }
+-    
+     @Override
+     protected void destroyInternal() throws LifecycleException {
+ 
+@@ -1099,24 +1053,11 @@ public abstract class ContainerBase extends LifecycleBase
+             child.destroy();
+         }
+ 
+-        // unregister this component
+-        if ( oname != null ) {
+-            try {
+-                if( controller == oname ) {
+-                    Registry.getRegistry(null, null)
+-                        .unregisterComponent(oname);
+-                    if(log.isDebugEnabled())
+-                        log.debug("unregistering " + oname);
+-                }
+-            } catch( Throwable t ) {
+-                log.error("Error unregistering ", t );
+-            }
+-        }
+-
+         if (parent != null) {
+             parent.removeChild(this);
+         }
+ 
++        super.destroyInternal();
+     }
+ 
+     // ------------------------------------------------------- Pipeline Methods
+@@ -1248,83 +1189,10 @@ public abstract class ContainerBase extends LifecycleBase
+ 
+     
+     // -------------------- JMX and Registration  --------------------
+-    protected String type;
+-    protected String domain;
+-    protected String suffix;
+-    protected ObjectName oname;
+-    protected ObjectName controller;
+-    protected MBeanServer mserver;
+-
+-    public ObjectName getJmxName() {
+-        return oname;
+-    }
+-    
+-    public String getObjectName() {
+-        if (oname != null) {
+-            return oname.toString();
+-        } else return null;
+-    }
+-
+-    public String getDomain() {
+-        if( domain==null ) {
+-            Container parent=this;
+-            while( parent != null &&
+-                    !( parent instanceof StandardEngine) ) {
+-                parent=parent.getParent();
+-            }
+-            if( parent instanceof StandardEngine ) {
+-                domain=((StandardEngine)parent).getDomain();
+-            } 
+-        }
+-        return domain;
+-    }
+-
+-    public void setDomain(String domain) {
+-        this.domain=domain;
+-    }
+-    
+-    public String getType() {
+-        return type;
+-    }
+-
+-    protected String getJSR77Suffix() {
+-        return suffix;
+-    }
+-
+-    public ObjectName preRegister(MBeanServer server,
+-                                  ObjectName name) throws Exception {
+-        oname=name;
+-        mserver=server;
+-        if (name == null ){
+-            return null;
+-        }
+-
+-        domain=name.getDomain();
+-
+-        type=name.getKeyProperty("type");
+-        if( type==null ) {
+-            type=name.getKeyProperty("j2eeType");
+-        }
+-
+-        String j2eeApp=name.getKeyProperty("J2EEApplication");
+-        String j2eeServer=name.getKeyProperty("J2EEServer");
+-        if( j2eeApp==null ) {
+-            j2eeApp="none";
+-        }
+-        if( j2eeServer==null ) {
+-            j2eeServer="none";
+-        }
+-        suffix=",J2EEApplication=" + j2eeApp + ",J2EEServer=" + j2eeServer;
+-        return name;
+-    }
+ 
+-    public void postRegister(Boolean registrationDone) {
+-    }
+-
+-    public void preDeregister() throws Exception {
+-    }
+-
+-    public void postDeregister() {
++    @Override
++    protected String getDomainInternal() {
++        return MBeanUtils.getDomain(this);
+     }
+ 
+     public ObjectName[] getChildren() {
+@@ -1334,51 +1202,14 @@ public abstract class ContainerBase extends LifecycleBase
+         while( it.hasNext() ) {
+             Object next=it.next();
+             if( next instanceof ContainerBase ) {
+-                result[i++]=((ContainerBase)next).getJmxName();
++                result[i++]=((ContainerBase)next).getObjectName();
+             }
+         }
+         return result;
+     }
+ 
+-    public ObjectName createObjectName(String domain, ObjectName parent)
+-        throws Exception
+-    {
+-        if( log.isDebugEnabled())
+-            log.debug("Create ObjectName " + domain + " " + parent );
+-        return null;
+-    }
+-
+-    public String getContainerSuffix() {
+-        Container container=this;
+-        Container context=null;
+-        Container host=null;
+-        Container servlet=null;
+-        
+-        StringBuilder suffix=new StringBuilder();
+-        
+-        if( container instanceof StandardHost ) {
+-            host=container;
+-        } else if( container instanceof StandardContext ) {
+-            host=container.getParent();
+-            context=container;
+-        } else if( container instanceof StandardWrapper ) {
+-            context=container.getParent();
+-            host=context.getParent();
+-            servlet=container;
+-        }
+-        if( context!=null ) {
+-            String path=((StandardContext)context).getPath();
+-            suffix.append(",path=").append((path.equals("")) ? "/" : path);
+-        } 
+-        if( host!=null ) suffix.append(",host=").append( host.getName() );
+-        if( servlet != null ) {
+-            String name=container.getName();
+-            suffix.append(",servlet=");
+-            suffix.append((name=="") ? "/" : name);
+-        }
+-        return suffix.toString();
+-    }
+-
++    
++    // -------------------- Background Thread --------------------
+ 
+     /**
+      * Start the background thread that will periodically check for
+
+==================================================
+StandardEngine.java
+index 57941aa556..9a0a6e29de 100644
+--- a/java/org/apache/catalina/core/StandardContext.java
++++ b/java/org/apache/catalina/core/StandardContext.java
+@@ -36,11 +36,8 @@ import java.util.Set;
+ import java.util.Stack;
+ import java.util.TreeMap;
+ 
+-import javax.management.AttributeNotFoundException;
+ import javax.management.ListenerNotFoundException;
+ import javax.management.MBeanNotificationInfo;
+-import javax.management.MBeanServer;
+-import javax.management.MalformedObjectNameException;
+ import javax.management.Notification;
+ import javax.management.NotificationBroadcasterSupport;
+ import javax.management.NotificationEmitter;
+@@ -93,7 +90,6 @@ import org.apache.catalina.deploy.SecurityCollection;
+ import org.apache.catalina.deploy.SecurityConstraint;
+ import org.apache.catalina.loader.WebappLoader;
+ import org.apache.catalina.session.StandardManager;
+-import org.apache.catalina.startup.ContextConfig;
+ import org.apache.catalina.startup.TldConfig;
+ import org.apache.catalina.util.CharsetMapper;
+ import org.apache.catalina.util.ExtensionValidator;
+@@ -123,10 +119,9 @@ import org.apache.tomcat.util.scan.StandardJarScanner;
+  * @version $Id$
+  */
+ 
+-public class StandardContext
+-    extends ContainerBase
+-    implements Context, NotificationEmitter
+-{
++public class StandardContext extends ContainerBase
++        implements Context, NotificationEmitter {
++
+     private static final Log log = LogFactory.getLog(StandardContext.class);
+ 
+ 
+@@ -675,7 +670,6 @@ public class StandardContext
+     /** 
+      * Name of the engine. If null, the domain is used.
+      */ 
+-    private String engineName = null;
+     private String j2EEApplication="none";
+     private String j2EEServer="none";
+ 
+@@ -1608,15 +1602,6 @@ public class StandardContext
+ 
+     }
+ 
+-    public String getEngineName() {
+-        if( engineName != null ) return engineName;
+-        return domain;
+-    }
+-
+-    public void setEngineName(String engineName) {
+-        this.engineName = engineName;
+-    }
+-
+     public String getJ2EEApplication() {
+         return j2EEApplication;
+     }
+@@ -4528,14 +4513,12 @@ public class StandardContext
+         if(log.isDebugEnabled())
+             log.debug("Starting " + ("".equals(getName()) ? "ROOT" : getName()));
+ 
+-        // Set JMX object name for proper pipeline registration
+-        preRegisterJMX();
+-
+-        if ((oname != null) && 
+-            (Registry.getRegistry(null, null).getMBeanServer().isRegistered(oname))) {
+-            // As things depend on the JMX registration, the context
+-            // must be reregistered again once properly initialized
+-            Registry.getRegistry(null, null).unregisterComponent(oname);
++        // Send j2ee.state.starting notification 
++        if (this.getObjectName() != null) {
++            Notification notification = new Notification("j2ee.state.starting", 
++                                                        this.getObjectName(), 
++                                                        sequenceNumber++);
++            broadcaster.sendNotification(notification);
+         }
+ 
+         setConfigured(false);
+@@ -4562,26 +4545,6 @@ public class StandardContext
+             }
+         }
+ 
+-        // Look for a realm - that may have been configured earlier. 
+-        // If the realm is added after context - it'll set itself.
+-        // TODO: what is the use case for this ? 
+-        if( realm == null && mserver != null ) {
+-            ObjectName realmName=null;
+-            try {
+-                realmName=new ObjectName( getEngineName() + ":type=Realm,host=" + 
+-                        getHostname() + ",path=" + getPath());
+-                if( mserver.isRegistered(realmName ) ) {
+-                    mserver.invoke(realmName, "init", 
+-                            new Object[] {},
+-                            new String[] {}
+-                    );            
+-                }
+-            } catch( Throwable t ) {
+-                if(log.isDebugEnabled())
+-                    log.debug("No realm for this host " + realmName);
+-            }
+-        }
+-        
+         if (getLoader() == null) {
+             WebappLoader webappLoader = new WebappLoader(getParentClassLoader());
+             webappLoader.setDelegate(getDelegate());
+@@ -4632,8 +4595,6 @@ public class StandardContext
+         // Binding thread
+         ClassLoader oldCCL = bindThread();
+ 
+-        boolean mainOk = false;
+-
+         try {
+ 
+             if (ok) {
+@@ -4702,20 +4663,11 @@ public class StandardContext
+                     //and that it has its own manager
+                     getCluster().registerManager(manager);
+                 }
+-
+-                
+-                mainOk = true;
+-
+             }
+ 
+         } finally {
+             // Unbinding thread
+             unbindThread(oldCCL);
+-            if (!mainOk) {
+-                // An exception occurred
+-                // Register with JMX anyway, to allow management
+-                registerJMX();
+-            }
+         }
+ 
+         if (!getConfigured()) {
+@@ -4820,9 +4772,6 @@ public class StandardContext
+             log.error(sm.getString("standardContext.startFailed", getName()));
+         }
+ 
+-        // JMX registration
+-        registerJMX();
+-
+         startTime=System.currentTimeMillis();
+         
+         // Send j2ee.state.running notification 
+@@ -5031,21 +4980,17 @@ public class StandardContext
+             ((Lifecycle) loader).destroy();
+         }
+ 
+-        if( oname != null ) { 
+-            // Send j2ee.object.deleted notification 
+-            Notification notification = 
+-                new Notification("j2ee.object.deleted", this.getObjectName(), 
+-                                sequenceNumber++);
+-            broadcaster.sendNotification(notification);
+-        } 
+-        super.destroyInternal();
+-
+-        // Notify our interested LifecycleListeners
+-        fireLifecycleEvent(DESTROY_EVENT, null);
++        // Send j2ee.object.deleted notification 
++        Notification notification = 
++            new Notification("j2ee.object.deleted", this.getObjectName(), 
++                            sequenceNumber++);
++        broadcaster.sendNotification(notification);
+ 
+         synchronized (instanceListenersLock) {
+             instanceListeners = new String[0];
+         }
++
++        super.destroyInternal();
+     }
+     
+     private void resetContext() throws Exception {
+@@ -5067,7 +5012,7 @@ public class StandardContext
+         initializers.clear();
+         
+         if(log.isDebugEnabled())
+-            log.debug("resetContext " + oname);
++            log.debug("resetContext " + getObjectName());
+     }
+ 
+     /**
+@@ -5546,7 +5491,7 @@ public class StandardContext
+         if (children != null) {
+             result = new String[children.length];
+             for( int i=0; i< children.length; i++ ) {
+-                result[i] = ((StandardWrapper)children[i]).getObjectName();
++                result[i] = children[i].getObjectName().toString();
+             }
+         }
+ 
+@@ -5555,228 +5500,52 @@ public class StandardContext
+     
+ 
+     @Override
+-    public ObjectName createObjectName(String hostDomain, ObjectName parentName)
+-            throws MalformedObjectNameException
+-    {
+-        String onameStr;
+-        StandardHost hst=(StandardHost)getParent();
++    protected String getObjectNameKeyProperties() {
++
++        StringBuilder keyProperties =
++            new StringBuilder("j2eeType=WebModule,name=");
+         
+-        String pathName=getName();
+-        String hostName=getParent().getName();
+-        String name= "//" + ((hostName==null)? "DEFAULT" : hostName) +
+-                (("".equals(pathName))?"/":pathName );
+-
+-        String suffix=",J2EEApplication=" +
+-                getJ2EEApplication() + ",J2EEServer=" +
+-                getJ2EEServer();
+-
+-        onameStr="j2eeType=WebModule,name=" + name + suffix;
+-        if( log.isDebugEnabled())
+-            log.debug("Registering " + onameStr + " for " + oname);
++        String hostName = getParent().getName();
++        if (hostName == null) {
++            keyProperties.append("DEFAULT");
++        } else {
++            keyProperties.append(hostName);
++        }
+         
+-        // default case - no domain explictely set.
+-        if( getDomain() == null ) domain=hst.getDomain();
+-
+-        ObjectName oname=new ObjectName(getDomain() + ":" + onameStr);
+-        return oname;        
+-    }    
+-    
+-    private void preRegisterJMX() {
+-        try {
+-            StandardHost host = (StandardHost) getParent();
+-            if ((oname == null) 
+-                || (oname.getKeyProperty("j2eeType") == null)) {
+-                oname = createObjectName(host.getDomain(), host.getJmxName());
+-                controller = oname;
+-            }
+-        } catch(Exception ex) {
+-            if(log.isInfoEnabled())
+-                log.info("Error registering ctx with jmx " + this + " " +
+-                     oname + " " + ex.toString(), ex );
++        String pathName = getName();
++        if ("".equals(pathName)) {
++            keyProperties.append('/');
++        } else {
++            keyProperties.append(pathName);
+         }
+-    }
+ 
+-    private void registerJMX() {
+-        try {
+-            if (log.isDebugEnabled()) {
+-                log.debug("Checking for " + oname );
+-            }
+-            if(! Registry.getRegistry(null, null)
+-                .getMBeanServer().isRegistered(oname)) {
+-                controller = oname;
+-                Registry.getRegistry(null, null)
+-                    .registerComponent(this, oname, null);
+-                
+-                // Send j2ee.object.created notification 
+-                if (this.getObjectName() != null) {
+-                    Notification notification = new Notification(
+-                                                        "j2ee.object.created", 
+-                                                        this.getObjectName(), 
+-                                                        sequenceNumber++);
+-                    broadcaster.sendNotification(notification);
+-                }
+-            }
+-            Container children[] = findChildren();
+-            for (int i=0; children!=null && i<children.length; i++) {
+-                ((StandardWrapper)children[i]).registerJMX( this );
+-            }
+-        } catch (Exception ex) {
+-            if(log.isInfoEnabled())
+-                log.info("Error registering wrapper with jmx " + this + " " +
+-                    oname + " " + ex.toString(), ex );
+-        }
+-    }
++        keyProperties.append(",J2EEApplication=");
++        keyProperties.append(getJ2EEApplication());
++        keyProperties.append(",J2EEServer=");
++        keyProperties.append(getJ2EEServer());
+ 
+-    /** There are 2 cases:
+-     *   1.The context is created and registered by internal APIS
+-     *   2. The context is created by JMX, and it'll self-register.
+-     *
+-     * @param server The server
+-     * @param name The object name
+-     * @return ObjectName The name of the object
+-     * @throws Exception If an error occurs
+-     */
+-    @Override
+-    public ObjectName preRegister(MBeanServer server,
+-                                  ObjectName name)
+-            throws Exception
+-    {
+-        if( oname != null ) {
+-            //log.info( "Already registered " + oname + " " + name);
+-            // Temporary - /admin uses the old names
+-            return name;
+-        }
+-        return super.preRegister(server,name);
+-    }
+-
+-    @Override
+-    public void preDeregister() throws Exception {
+-        if (getState().isAvailable()) {
+-            try {
+-                stop();
+-            } catch( Exception ex ) {
+-                log.error( "error stopping ", ex);
+-            }
+-        }
++        return keyProperties.toString();
+     }
++    
+ 
+     @Override
+     protected void initInternal() throws LifecycleException {
+-
+-        if( this.getParent() == null ) {
+-            ObjectName parentName;
+-            try {
+-                parentName = getParentName();
+-            } catch (MalformedObjectNameException e1) {
+-                throw new LifecycleException(e1);
+-            }
+-            
+-            if( ! mserver.isRegistered(parentName)) {
+-                if(log.isDebugEnabled())
+-                    log.debug("No host, creating one " + parentName);
+-                StandardHost host=new StandardHost();
+-                host.setName(hostName);
+-                host.setAutoDeploy(false);
+-                try {
+-                    Registry.getRegistry(null, null)
+-                        .registerComponent(host, parentName, null);
+-                } catch (Exception e) {
+-                    throw new LifecycleException(e);
+-                }
+-                // We could do it the hard way...
+-                //mserver.invoke(parentName, "init", new Object[] {}, new String[] {} );
+-                // or same thing easier:
+-                host.init();
+-            }
+-            
+-            // Add the main configuration listener
+-            LifecycleListener config = null;
+-            try {
+-                String configClassName = null;
+-                try {
+-                    configClassName = String.valueOf(mserver.getAttribute(parentName, "configClass"));
+-                } catch (AttributeNotFoundException e) {
+-                    // Ignore, it's normal a host may not have this optional attribute
+-                }
+-                if (configClassName != null) {
+-                    Class<?> clazz = Class.forName(configClassName);
+-                    config = (LifecycleListener) clazz.newInstance();
+-                } else {
+-                    config = new ContextConfig();
+-                }
+-            } catch (Exception e) {
+-                log.warn("Error creating ContextConfig for " + parentName, e);
+-                throw new LifecycleException(e);
+-            }
+-            this.addLifecycleListener(config);
+-
+-            if (log.isDebugEnabled()) {
+-                log.debug("AddChild " + parentName + " " + this);
+-            }
+-            try {
+-                mserver.invoke(parentName, "addChild", new Object[] { this },
+-                        new String[] {"org.apache.catalina.Container"});
+-            } catch (Exception e) {
+-                throw new LifecycleException(e);
+-            }
+-        }
++        super.initInternal();
++        
+         if (processTlds) {
+             this.addLifecycleListener(new TldConfig());
+         }
+ 
+-        super.initInternal();
+-        
+-        // Notify our interested LifecycleListeners
+-        fireLifecycleEvent(INIT_EVENT, null);
+-
+-        // Send j2ee.state.starting notification 
++        // Send j2ee.object.created notification 
+         if (this.getObjectName() != null) {
+-            Notification notification = new Notification("j2ee.state.starting", 
+-                                                        this.getObjectName(), 
+-                                                        sequenceNumber++);
++            Notification notification = new Notification(
++                                                "j2ee.object.created", 
++                                                this.getObjectName(), 
++                                                sequenceNumber++);
+             broadcaster.sendNotification(notification);
+         }
+-        
+     }
+ 
+-    @Override
+-    public ObjectName getParentName() throws MalformedObjectNameException {
+-        // "Life" update
+-        String path=oname.getKeyProperty("name");
+-        if( path == null ) {
+-            log.error( "No name attribute " +name );
+-            return null;
+-        }
+-        if( ! path.startsWith( "//")) {
+-            log.error("Invalid name " + name);
+-        }
+-        path=path.substring(2);
+-        int delim=path.indexOf( "/" );
+-        hostName="localhost"; // Should be default...
+-        if( delim > 0 ) {
+-            hostName=path.substring(0, delim);
+-            path = path.substring(delim);
+-            if (path.equals("/")) {
+-                this.setName("");
+-            } else {
+-                this.setName(path);
+-            }
+-        } else {
+-            if(log.isDebugEnabled())
+-                log.debug("Setting path " +  path );
+-            this.setName( path );
+-        }
+-        // XXX The service and domain should be the same.
+-        String parentDomain=getEngineName();
+-        if( parentDomain == null ) parentDomain=domain;
+-        ObjectName parentName=new ObjectName( parentDomain + ":" +
+-                "type=Host,host=" + hostName);
+-        return parentName;
+-    }
+-    
+-    public void create() throws Exception{
+-        init();
+-    }
+ 
+     /* Remove a JMX notficationListener 
+      * @see javax.management.NotificationEmitter#removeNotificationListener(javax.management.NotificationListener, javax.management.NotificationFilter, java.lang.Object)
+@@ -6040,5 +5809,5 @@ public class StandardContext
+     public boolean isStatisticsProvider() {
+         return false;
+     }
+-    
++
+ }
+
+==================================================
+StandardHost.java
+index bb5dc37885..12fe38c244 100644
+--- a/java/org/apache/catalina/core/StandardEngine.java
++++ b/java/org/apache/catalina/core/StandardEngine.java
+@@ -16,10 +16,6 @@
+  */
+ package org.apache.catalina.core;
+ 
+-import javax.management.MBeanServer;
+-import javax.management.MalformedObjectNameException;
+-import javax.management.ObjectName;
+-
+ import org.apache.catalina.Container;
+ import org.apache.catalina.Engine;
+ import org.apache.catalina.Host;
+@@ -31,7 +27,6 @@ import org.apache.catalina.util.LifecycleBase;
+ import org.apache.catalina.util.ServerInfo;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+-import org.apache.tomcat.util.modeler.Registry;
+ 
+ /**
+  * Standard implementation of the <b>Engine</b> interface.  Each
+@@ -43,9 +38,7 @@ import org.apache.tomcat.util.modeler.Registry;
+  * @version $Id$
+  */
+ 
+-public class StandardEngine
+-    extends ContainerBase
+-    implements Engine {
++public class StandardEngine extends ContainerBase implements Engine {
+ 
+     private static final Log log = LogFactory.getLog(StandardEngine.class);
+ 
+@@ -152,19 +145,6 @@ public class StandardEngine
+ 
+     }
+     
+-    @Override
+-    public void setName(String name ) {
+-        if( domain != null ) {
+-            // keep name==domain, ignore override
+-            // we are already registered
+-            super.setName( domain );
+-            return;
+-        }
+-        // The engine name is used as domain
+-        domain=name; // XXX should we set it in init() ? It shouldn't matter
+-        super.setName( name );
+-    }
+-
+ 
+     /**
+      * Set the cluster-wide unique identifier for this Engine.
+@@ -266,39 +246,6 @@ public class StandardEngine
+     }
+ 
+ 
+-    @Override
+-    protected void initInternal() {
+-
+-        if( oname==null ) {
+-            // not registered in JMX yet - standalone mode
+-            try {
+-                if (domain==null) {
+-                    domain=getName();
+-                }
+-                if(log.isDebugEnabled())
+-                    log.debug( "Register " + domain );
+-                oname=new ObjectName(domain + ":type=Engine");
+-                controller=oname;
+-                Registry.getRegistry(null, null)
+-                    .registerComponent(this, oname, null);
+-            } catch( Throwable t ) {
+-                log.info("Error registering ", t );
+-            }
+-        }
+-
+-        if( service==null ) {
+-            // for consistency...: we are probably in embedded mode
+-            try {
+-                service=new StandardService();
+-                service.setContainer( this );
+-                service.init();
+-            } catch( Throwable t ) {
+-                log.error(t);
+-            }
+-        }
+-        
+-    }
+-    
+     /**
+      * Start this component and implement the requirements
+      * of {@link LifecycleBase#startInternal()}.
+@@ -309,23 +256,6 @@ public class StandardEngine
+     @Override
+     protected synchronized void startInternal() throws LifecycleException {
+         
+-        // Look for a realm - that may have been configured earlier. 
+-        // If the realm is added after context - it'll set itself.
+-        if( realm == null ) {
+-            ObjectName realmName=null;
+-            try {
+-                realmName=new ObjectName( domain + ":type=Realm");
+-                if( mserver.isRegistered(realmName ) ) {
+-                    mserver.invoke(realmName, "init", 
+-                            new Object[] {},
+-                            new String[] {}
+-                    );            
+-                }
+-            } catch( Throwable t ) {
+-                log.debug("No realm for this engine " + realmName);
+-            }
+-        }
+-            
+         // Log our server identification information
+         if(log.isInfoEnabled())
+             log.info( "Starting Servlet Engine: " + ServerInfo.getServerInfo());
+@@ -349,55 +279,11 @@ public class StandardEngine
+     }
+ 
+ 
+-    // ------------------------------------------------------ Protected Methods
+-
+-
+     // -------------------- JMX registration  --------------------
+ 
+     @Override
+-    public ObjectName preRegister(MBeanServer server,
+-                                  ObjectName name) throws Exception
+-    {
+-        super.preRegister(server,name);
+-
+-        this.setName( name.getDomain());
+-
+-        return name;
+-    }
+-
+-    @Override
+-    public ObjectName getParentName() throws MalformedObjectNameException {
+-        if (getService()==null) {
+-            return null;
+-        }
+-        String name = getService().getName();
+-        ObjectName serviceName=new ObjectName(domain +
+-                        ":type=Service,serviceName="+name);
+-        return serviceName;                
+-    }
+-    
+-    @Override
+-    public ObjectName createObjectName(String domain, ObjectName parent)
+-        throws Exception
+-    {
+-        if( log.isDebugEnabled())
+-            log.debug("Create ObjectName " + domain + " " + parent );
+-        return new ObjectName( domain + ":type=Engine");
++    protected String getObjectNameKeyProperties() {
++        return "type=Engine";
+     }
+ 
+-    
+-    @Override
+-    public String getDomain() {
+-        if (domain!=null) {
+-            return domain;
+-        } else { 
+-            return getName();
+-        }
+-    }
+-    
+-    @Override
+-    public void setDomain(String domain) {
+-        this.domain = domain;
+-    }
+-    
+ }
+
+==================================================
+StandardService.java
+index 61394569b5..19bae6f8c4 100644
+--- a/java/org/apache/catalina/core/StandardHost.java
++++ b/java/org/apache/catalina/core/StandardHost.java
+@@ -14,8 +14,6 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+-
+-
+ package org.apache.catalina.core;
+ 
+ 
+@@ -24,9 +22,6 @@ import java.util.List;
+ import java.util.Map;
+ import java.util.WeakHashMap;
+ 
+-import javax.management.MBeanServer;
+-import javax.management.ObjectName;
+-
+ import org.apache.catalina.Container;
+ import org.apache.catalina.Context;
+ import org.apache.catalina.Host;
+@@ -36,10 +31,10 @@ import org.apache.catalina.LifecycleException;
+ import org.apache.catalina.LifecycleListener;
+ import org.apache.catalina.Valve;
+ import org.apache.catalina.loader.WebappClassLoader;
++import org.apache.catalina.mbeans.MBeanUtils;
+ import org.apache.catalina.startup.HostConfig;
+ import org.apache.catalina.util.LifecycleBase;
+ import org.apache.catalina.valves.ValveBase;
+-import org.apache.tomcat.util.modeler.Registry;
+ 
+ 
+ /**
+@@ -52,11 +47,7 @@ import org.apache.tomcat.util.modeler.Registry;
+  * @version $Id$
+  */
+ 
+-public class StandardHost
+-    extends ContainerBase
+-    implements Host  
+- {
+-    /* Why do we implement deployer and delegate to deployer ??? */
++public class StandardHost extends ContainerBase implements Host {
+ 
+     private static final org.apache.juli.logging.Log log=
+         org.apache.juli.logging.LogFactory.getLog( StandardHost.class );
+@@ -803,23 +794,6 @@ public class StandardHost
+     @Override
+     protected synchronized void startInternal() throws LifecycleException {
+         
+-        // Look for a realm - that may have been configured earlier. 
+-        // If the realm is added after context - it'll set itself.
+-        if( realm == null ) {
+-            ObjectName realmName=null;
+-            try {
+-                realmName=new ObjectName( domain + ":type=Realm,host=" + getName());
+-                if( mserver.isRegistered(realmName ) ) {
+-                    mserver.invoke(realmName, "init", 
+-                            new Object[] {},
+-                            new String[] {}
+-                    );            
+-                }
+-            } catch( Throwable t ) {
+-                log.debug("No realm for this host " + realmName);
+-            }
+-        }
+-            
+         // Set error report valve
+         if ((errorReportValveClass != null)
+             && (!errorReportValveClass.equals(""))) {
+@@ -883,77 +857,22 @@ public class StandardHost
+     }
+ 
+     @Override
+-    protected void initInternal() {
+-        
+-        // already registered.
+-        if( getParent() == null ) {
+-            try {
+-                // Register with the Engine
+-                ObjectName serviceName=new ObjectName(domain + 
+-                                        ":type=Engine");
+-
+-                HostConfig deployer = new HostConfig();
+-                addLifecycleListener(deployer);                
+-                if( mserver.isRegistered( serviceName )) {
+-                    if(log.isDebugEnabled())
+-                        log.debug("Registering "+ serviceName +" with the Engine");
+-                    mserver.invoke( serviceName, "addChild",
+-                            new Object[] { this },
+-                            new String[] { "org.apache.catalina.Container" } );
+-                }
+-            } catch( Exception ex ) {
+-                log.error("Host registering failed!",ex);
+-            }
+-        }
+-        
+-        if( oname==null ) {
+-            // not registered in JMX yet - standalone mode
+-            try {
+-                StandardEngine engine=(StandardEngine)parent;
+-                domain=engine.getName();
+-                if(log.isDebugEnabled())
+-                    log.debug( "Register host " + getName() + " with domain "+ domain );
+-                oname=new ObjectName(domain + ":type=Host,host=" +
+-                        this.getName());
+-                controller = oname;
+-                Registry.getRegistry(null, null)
+-                    .registerComponent(this, oname, null);
+-            } catch( Throwable t ) {
+-                log.error("Host registering failed!", t );
+-            }
+-        }
+-    }
++    protected void initInternal() throws LifecycleException {
+ 
+-    @Override
+-    public void destroyInternal() throws LifecycleException {
+-        // destroy our child containers, if any
+-        Container children[] = findChildren();
+-        super.destroyInternal();
+-        for (int i = 0; i < children.length; i++) {
+-            if(children[i] instanceof StandardContext)
+-                ((StandardContext)children[i]).destroy();
+-        }
+-      
++        super.initInternal();
++
++        HostConfig deployer = new HostConfig();
++        addLifecycleListener(deployer);                
+     }
++
+     
+     @Override
+-    public ObjectName preRegister(MBeanServer server, ObjectName oname ) 
+-        throws Exception
+-    {
+-        ObjectName res=super.preRegister(server, oname);
+-        String name=oname.getKeyProperty("host");
+-        if( name != null )
+-            setName( name );
+-        return res;        
++    protected String getObjectNameKeyProperties() {
++
++        StringBuilder keyProperties = new StringBuilder("type=Host");
++        keyProperties.append(MBeanUtils.getContainerKeyProperties(this));
++
++        return keyProperties.toString();
+     }
+     
+-    @Override
+-    public ObjectName createObjectName(String domain, ObjectName parent)
+-        throws Exception
+-    {
+-        if( log.isDebugEnabled())
+-            log.debug("Create ObjectName " + domain + " " + parent );
+-        return new ObjectName( domain + ":type=Host,host=" + getName());
+-    }
+-
+ }
+
+==================================================
+StandardWrapper.java
+index 737c630a55..af346eb922 100644
+--- a/java/org/apache/catalina/core/StandardService.java
++++ b/java/org/apache/catalina/core/StandardService.java
+@@ -152,13 +152,6 @@ public class StandardService extends LifecycleMBeanBase implements Service {
+ 
+     }
+ 
+-    public ObjectName getContainerName() {
+-        if( container instanceof ContainerBase ) {
+-            return ((ContainerBase)container).getJmxName();
+-        }
+-        return null;
+-    }
+-
+ 
+     /**
+      * Return descriptive information about this Service implementation and
+
+==================================================
+WebappLoader.java
+index b61645292c..7c899c7e56 100644
+--- a/java/org/apache/catalina/core/StandardWrapper.java
++++ b/java/org/apache/catalina/core/StandardWrapper.java
+@@ -54,6 +54,7 @@ import org.apache.catalina.InstanceEvent;
+ import org.apache.catalina.InstanceListener;
+ import org.apache.catalina.LifecycleException;
+ import org.apache.catalina.Wrapper;
++import org.apache.catalina.mbeans.MBeanUtils;
+ import org.apache.catalina.security.SecurityUtil;
+ import org.apache.catalina.util.Enumerator;
+ import org.apache.catalina.util.InstanceSupport;
+@@ -76,8 +77,7 @@ import org.apache.juli.logging.LogFactory;
+  * @author Remy Maucherat
+  * @version $Id$
+  */
+-public class StandardWrapper
+-    extends ContainerBase
++public class StandardWrapper extends ContainerBase
+     implements ServletConfig, Wrapper, NotificationEmitter {
+ 
+     private static final Log log = LogFactory.getLog( StandardWrapper.class );
+@@ -346,11 +346,6 @@ public class StandardWrapper
+     }
+ 
+ 
+-    public String getEngineName() {
+-        return ((StandardContext)getParent()).getEngineName();
+-    }
+-
+-
+     /**
+      * Return descriptive information about this Container implementation and
+      * the corresponding version number, in the format
+@@ -1008,6 +1003,25 @@ public class StandardWrapper
+      */
+     public synchronized void load() throws ServletException {
+         instance = loadServlet();
++        
++        if (isJspServlet) {
++            StringBuilder oname =
++                new StringBuilder(MBeanUtils.getDomain(getParent()));
++            
++            oname.append(":type=JspMonitor,name=");
++            oname.append(getName());
++            
++            oname.append(getWebModuleKeyProperties());
++            
++            try {
++                jspMonitorON = new ObjectName(oname.toString());
++                Registry.getRegistry(null, null)
++                    .registerComponent(instance, jspMonitorON, null);
++            } catch( Exception ex ) {
++                log.info("Error registering JSP monitoring with jmx " +
++                         instance);
++            }
++        }
+     }
+ 
+ 
+@@ -1385,6 +1399,10 @@ public class StandardWrapper
+         // Deregister the destroyed instance
+         instance = null;
+ 
++        if (isJspServlet && jspMonitorON != null ) {
++            Registry.getRegistry(null, null).unregisterComponent(jspMonitorON);
++        }
++
+         if (singleThreadModel && (instancePool != null)) {
+             try {
+                 while (!instancePool.isEmpty()) {
+@@ -1654,14 +1672,8 @@ public class StandardWrapper
+         // Start up this component
+         super.startInternal();
+ 
+-        if( oname != null )
+-            registerJMX((StandardContext)getParent());
+-        
+-        // Load and initialize an instance of this servlet if requested
+-        // MOVED TO StandardContext START() METHOD
+-
+         setAvailable(0L);
+-        
++
+         // Send j2ee.state.running notification 
+         if (this.getObjectName() != null) {
+             Notification notification = 
+@@ -1712,73 +1724,68 @@ public class StandardWrapper
+             broadcaster.sendNotification(notification);
+         }
+         
+-        if( oname != null ) {
+-            Registry.getRegistry(null, null).unregisterComponent(oname);
+-            
+-            // Send j2ee.object.deleted notification 
+-            Notification notification = 
+-                new Notification("j2ee.object.deleted", this.getObjectName(), 
+-                                sequenceNumber++);
+-            broadcaster.sendNotification(notification);
+-        }
+-
+-        if (isJspServlet && jspMonitorON != null ) {
+-            Registry.getRegistry(null, null).unregisterComponent(jspMonitorON);
+-        }
++        // Send j2ee.object.deleted notification 
++        Notification notification = 
++            new Notification("j2ee.object.deleted", this.getObjectName(), 
++                            sequenceNumber++);
++        broadcaster.sendNotification(notification);
+ 
+     }
+ 
+-    protected void registerJMX(StandardContext ctx) {
+-
+-        String parentName = ctx.getName();
+-        parentName = ("".equals(parentName)) ? "/" : parentName;
++    
++    @Override
++    protected String getObjectNameKeyProperties() {
+ 
+-        String hostName = ctx.getParent().getName();
+-        hostName = (hostName==null) ? "DEFAULT" : hostName;
++        StringBuilder keyProperties =
++            new StringBuilder("j2eeType=Servlet,name=");
++        
++        keyProperties.append(getName());
++        
++        keyProperties.append(getWebModuleKeyProperties());
+ 
+-        String domain = ctx.getDomain();
++        return keyProperties.toString();
++    }
++        
+ 
+-        String webMod= "//" + hostName + parentName;
+-        String onameStr = domain + ":j2eeType=Servlet,name=" + getName() +
+-                          ",WebModule=" + webMod + ",J2EEApplication=" +
+-                          ctx.getJ2EEApplication() + ",J2EEServer=" +
+-                          ctx.getJ2EEServer();
+-        try {
+-            oname=new ObjectName(onameStr);
+-            controller=oname;
+-            Registry.getRegistry(null, null)
+-                .registerComponent(this, oname, null );
+-            
+-            // Send j2ee.object.created notification 
+-            if (this.getObjectName() != null) {
+-                Notification notification = new Notification(
+-                                                "j2ee.object.created", 
+-                                                this.getObjectName(), 
+-                                                sequenceNumber++);
+-                broadcaster.sendNotification(notification);
+-            }
+-        } catch( Exception ex ) {
+-            log.info("Error registering servlet with jmx " + this);
++    private String getWebModuleKeyProperties() {
++        
++        StringBuilder keyProperties = new StringBuilder(",WebModule=");
++        String hostName = getParent().getParent().getName();
++        if (hostName == null) {
++            keyProperties.append("DEFAULT");
++        } else {
++            keyProperties.append(hostName);
++        }
++        
++        String pathName = ((Context) getParent()).getPath();
++        if ("".equals(pathName)) {
++            keyProperties.append('/');
++        } else {
++            keyProperties.append(pathName);
+         }
+ 
+-        if (isJspServlet) {
+-            // Register JSP monitoring mbean
+-            onameStr = domain + ":type=JspMonitor,name=" + getName()
+-                       + ",WebModule=" + webMod
+-                       + ",J2EEApplication=" + ctx.getJ2EEApplication()
+-                       + ",J2EEServer=" + ctx.getJ2EEServer();
+-            try {
+-                jspMonitorON = new ObjectName(onameStr);
+-                Registry.getRegistry(null, null)
+-                    .registerComponent(instance, jspMonitorON, null);
+-            } catch( Exception ex ) {
+-                log.info("Error registering JSP monitoring with jmx " +
+-                         instance);
+-            }
++        StandardContext ctx = null;
++        if (parent instanceof StandardContext) {
++            ctx = (StandardContext) getParent();
++        }
++        
++        keyProperties.append(",J2EEApplication=");
++        if (ctx == null) {
++            keyProperties.append("none");
++        } else {
++            keyProperties.append(ctx.getJ2EEApplication());
++        }
++        keyProperties.append(",J2EEServer=");
++        if (ctx == null) {
++            keyProperties.append("none");
++        } else {
++            keyProperties.append(ctx.getJ2EEServer());
+         }
++        
++        return keyProperties.toString();
+     }
+     
+-
++    
+     /* Remove a JMX notficationListener 
+      * @see javax.management.NotificationEmitter#removeNotificationListener(javax.management.NotificationListener, javax.management.NotificationFilter, java.lang.Object)
+      */
+@@ -1870,6 +1877,4 @@ public class StandardWrapper
+     public boolean isStatisticsProvider() {
+         return false;
+     }
+-        
+-        
+ }
+
+==================================================
+MBeanFactory.java
+index fb2a114813..3d40a13a66 100644
+--- a/java/org/apache/catalina/loader/WebappLoader.java
++++ b/java/org/apache/catalina/loader/WebappLoader.java
+@@ -602,7 +602,7 @@ public class WebappLoader extends LifecycleMBeanBase
+                 path = "/";
+             }   
+             ObjectName cloname = new ObjectName
+-                (ctx.getEngineName() + ":type=WebappClassLoader,path="
++                (MBeanUtils.getDomain(ctx) + ":type=WebappClassLoader,path="
+                  + path + ",host=" + ctx.getParent().getName());
+             Registry.getRegistry(null, null)
+                 .registerComponent(classLoader, cloname, null);
+@@ -649,7 +649,7 @@ public class WebappLoader extends LifecycleMBeanBase
+                 path = "/";
+             }
+             ObjectName cloname = new ObjectName
+-                (ctx.getEngineName() + ":type=WebappClassLoader,path="
++                (MBeanUtils.getDomain(ctx) + ":type=WebappClassLoader,path="
+                  + path + ",host=" + ctx.getParent().getName());
+             Registry.getRegistry(null, null).unregisterComponent(cloname);
+         } catch (Throwable t) {
+
+==================================================
+ServerLifecycleListener.java
+index f2cc3198c3..bcb257b5a7 100644
+--- a/java/org/apache/catalina/mbeans/MBeanFactory.java
++++ b/java/org/apache/catalina/mbeans/MBeanFactory.java
+@@ -624,9 +624,7 @@ public class MBeanFactory {
+         }
+ 
+         // Return the corresponding MBean name
+-        ObjectName oname = context.getJmxName();
+-
+-        return (oname.toString());
++        return context.getObjectName().toString();
+ 
+     }
+ 
+@@ -711,7 +709,7 @@ public class MBeanFactory {
+         
+         ((Server) container).addService(service);
+         
+-        return engine.getJmxName().toString();
++        return engine.getObjectName().toString();
+     }
+     
+     
+
+==================================================
+HostConfig.java
+index 39c0f5c526..f68e3a02bc 100644
+--- a/java/org/apache/catalina/mbeans/ServerLifecycleListener.java
++++ b/java/org/apache/catalina/mbeans/ServerLifecycleListener.java
+@@ -59,8 +59,9 @@ import org.apache.juli.logging.LogFactory;
+  * @author Craig R. McClanahan
+  * @author Amy Roh
+  * @version $Id$
++ * 
++ * TODO: Is this still required? Possibly for resources. Need to check.
+  */
+-
+ public class ServerLifecycleListener
+     implements ContainerListener, LifecycleListener, PropertyChangeListener {
+ 
+
+==================================================
+LifecycleMBeanBase.java
+index daafaecc56..fe2c2905f7 100644
+--- a/java/org/apache/catalina/startup/HostConfig.java
++++ b/java/org/apache/catalina/startup/HostConfig.java
+@@ -1369,7 +1369,7 @@ public class HostConfig
+             log.debug(sm.getString("hostConfig.start"));
+ 
+         try {
+-            ObjectName hostON = new ObjectName(host.getObjectName());
++            ObjectName hostON = host.getObjectName();
+             oname = new ObjectName
+                 (hostON.getDomain() + ":type=Deployer,host=" + host.getName());
+             Registry.getRegistry(null, null).registerComponent
+
+==================================================
+TestRegistration.java
+index f27617b1fb..bf9ad0be33 100644
+--- a/java/org/apache/catalina/util/LifecycleMBeanBase.java
++++ b/java/org/apache/catalina/util/LifecycleMBeanBase.java
+@@ -88,7 +88,7 @@ public abstract class LifecycleMBeanBase extends LifecycleBase
+      * Obtain the domain under which this component will be / has been
+      * registered.
+      */
+-    public String getDomain() {
++    public final String getDomain() {
+         if (domain == null) {
+             domain = getDomainInternal();
+         }
+
+==================================================

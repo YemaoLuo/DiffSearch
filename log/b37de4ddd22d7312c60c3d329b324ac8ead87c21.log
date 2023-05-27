@@ -1,0 +1,206 @@
+b37de4ddd22d7312c60c3d329b324ac8ead87c21
+==================================================
+Simplify the processor interface by merging asyncDispatch and upgradeDispatch. There was no need for separate methods since the processor implementation is sufficient to distinguish between the two cases.
+==================================================
+Mark Thomas
+==================================================
+Tue Mar 24 14:20:37 2015 +0000
+==================================================
+AbstractProcessor.java
+Simplify the processor interface by merging asyncDispatch and upgradeDispatch. There was no need for separate methods since the processor implementation is sufficient to distinguish between the two cases.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1668904 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AbstractProtocol.java
+index e7b2ea3f1c..b9f7b531de 100644
+--- a/java/org/apache/coyote/AbstractProcessor.java
++++ b/java/org/apache/coyote/AbstractProcessor.java
+@@ -201,18 +201,14 @@ public abstract class AbstractProcessor implements ActionHook, Processor {
+     public abstract SocketState process(SocketWrapperBase<?> socket) throws IOException;
+ 
+     /**
+-     * Process in-progress Servlet 3.0 Async requests. These will start as HTTP
+-     * requests.
++     * Process an in-progress request that is not longer in standard HTTP mode.
++     * Uses currently include Servlet 3.0 Async and HTTP upgrade connections.
++     * Further uses may be added in the future. These will typically start as
++     * HTTP requests.
+      */
+     @Override
+-    public abstract SocketState asyncDispatch(SocketStatus status);
++    public abstract SocketState dispatch(SocketStatus status);
+ 
+-    /**
+-     * Processes data received on a connection that has been through an HTTP
+-     * upgrade.
+-     */
+-    @Override
+-    public abstract SocketState upgradeDispatch(SocketStatus status);
+ 
+     @Override
+     public abstract HttpUpgradeHandler getHttpUpgradeHandler();
+
+==================================================
+Processor.java
+index 6f2916e063..e9af66f772 100644
+--- a/java/org/apache/coyote/AbstractProtocol.java
++++ b/java/org/apache/coyote/AbstractProtocol.java
+@@ -642,19 +642,13 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+                         // these calls may result in a nested call to process()
+                         connections.put(socket, processor);
+                         DispatchType nextDispatch = dispatches.next();
+-                        if (processor.isUpgrade()) {
+-                            state = processor.upgradeDispatch(
+-                                    nextDispatch.getSocketStatus());
+-                        } else {
+-                            state = processor.asyncDispatch(
+-                                    nextDispatch.getSocketStatus());
+-                        }
++                        state = processor.dispatch(nextDispatch.getSocketStatus());
+                     } else if (status == SocketStatus.DISCONNECT) {
+                         // Do nothing here, just wait for it to get recycled
+-                    } else if (processor.isAsync()) {
+-                        state = processor.asyncDispatch(status);
++                    } else if (processor.isAsync() || processor.isUpgrade()) {
++                        state = processor.dispatch(status);
+                     } else if (state == SocketState.ASYNC_END) {
+-                        state = processor.asyncDispatch(status);
++                        state = processor.dispatch(status);
+                         if (state == SocketState.OPEN) {
+                             // There may be pipe-lined data to read. If the data
+                             // isn't processed now, execution will exit this
+@@ -663,8 +657,6 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+                             // pipe-lined data. To avoid this, process it now.
+                             state = processor.process(wrapper);
+                         }
+-                    } else if (processor.isUpgrade()) {
+-                        state = processor.upgradeDispatch(status);
+                     } else if (status == SocketStatus.OPEN_WRITE) {
+                         // Extra write event likely after async, ignore
+                         state = SocketState.LONG;
+
+==================================================
+AjpProcessor.java
+index 85e5e91596..0da2c0732b 100644
+--- a/java/org/apache/coyote/Processor.java
++++ b/java/org/apache/coyote/Processor.java
+@@ -36,11 +36,11 @@ public interface Processor {
+ 
+     SocketState process(SocketWrapperBase<?> socketWrapper) throws IOException;
+ 
+-    SocketState asyncDispatch(SocketStatus status);
++    SocketState dispatch(SocketStatus status);
++
+     SocketState asyncPostProcess();
+ 
+     HttpUpgradeHandler getHttpUpgradeHandler();
+-    SocketState upgradeDispatch(SocketStatus status);
+ 
+     void errorDispatch();
+ 
+
+==================================================
+Http11Processor.java
+index 82000b812d..410b9752dd 100644
+--- a/java/org/apache/coyote/ajp/AjpProcessor.java
++++ b/java/org/apache/coyote/ajp/AjpProcessor.java
+@@ -620,7 +620,7 @@ public class AjpProcessor extends AbstractProcessor {
+ 
+ 
+     @Override
+-    public SocketState asyncDispatch(SocketStatus status) {
++    public SocketState dispatch(SocketStatus status) {
+ 
+         if (status == SocketStatus.OPEN_WRITE && response.getWriteListener() != null) {
+             try {
+@@ -859,14 +859,6 @@ public class AjpProcessor extends AbstractProcessor {
+     }
+ 
+ 
+-    @Override
+-    public SocketState upgradeDispatch(SocketStatus status) {
+-        // Should never reach this code but in case we do...
+-        throw new IllegalStateException(
+-                sm.getString("ajpprocessor.httpupgrade.notsupported"));
+-    }
+-
+-
+     @Override
+     public HttpUpgradeHandler getHttpUpgradeHandler() {
+         // Should never reach this code but in case we do...
+
+==================================================
+UpgradeProcessorBase.java
+index a3c7c63d6a..4b611664e9 100644
+--- a/java/org/apache/coyote/http11/LocalStrings.properties
++++ b/java/org/apache/coyote/http11/LocalStrings.properties
+@@ -24,7 +24,6 @@ http11processor.socket.info=Exception getting socket information
+ http11processor.socket.ssl=Exception getting SSL attributes
+ http11processor.socket.sslreneg=Exception re-negotiating SSL connection
+ http11processor.sendfile.error=Error sending data using sendfile. May be caused by invalid request attributes for start/end points
+-http11Processor.upgrade=An internal error has occurred as upgraded connections should only be processed by the dedicated upgrade processor implementations
+ 
+ iib.available.readFail=A non-blocking read failed while attempting to determine if data was available
+ iib.eof.error=Unexpected EOF read on the socket
+
+==================================================
+UpgradeProcessorExternal.java
+index ca32dcb708..9743013ab7 100644
+--- a/java/org/apache/coyote/http11/upgrade/UpgradeProcessorBase.java
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeProcessorBase.java
+@@ -27,7 +27,6 @@ import org.apache.coyote.Processor;
+ import org.apache.coyote.Request;
+ import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
+ import org.apache.tomcat.util.net.SSLSupport;
+-import org.apache.tomcat.util.net.SocketStatus;
+ import org.apache.tomcat.util.net.SocketWrapperBase;
+ 
+ public abstract class UpgradeProcessorBase implements Processor, WebConnection {
+@@ -77,12 +76,6 @@ public abstract class UpgradeProcessorBase implements Processor, WebConnection {
+     }
+ 
+ 
+-    @Override
+-    public final SocketState asyncDispatch(SocketStatus status) {
+-        return null;
+-    }
+-
+-
+     @Override
+     public void errorDispatch() {
+         // NO-OP
+
+==================================================
+UpgradeProcessorInternal.java
+index 0d4c2a12d1..f158625746 100644
+--- a/java/org/apache/coyote/http11/upgrade/UpgradeProcessorExternal.java
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeProcessorExternal.java
+@@ -79,7 +79,7 @@ public class UpgradeProcessorExternal extends UpgradeProcessorBase {
+     // ------------------------------------------- Implemented Processor methods
+ 
+     @Override
+-    public final SocketState upgradeDispatch(SocketStatus status) {
++    public final SocketState dispatch(SocketStatus status) {
+         if (status == SocketStatus.OPEN_READ) {
+             upgradeServletInputStream.onDataAvailable();
+         } else if (status == SocketStatus.OPEN_WRITE) {
+
+==================================================
+SpdyProcessor.java
+index 74e887714c..54b361c123 100644
+--- a/java/org/apache/coyote/http11/upgrade/UpgradeProcessorInternal.java
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeProcessorInternal.java
+@@ -45,7 +45,7 @@ public class UpgradeProcessorInternal extends UpgradeProcessorBase {
+ 
+ 
+     @Override
+-    public SocketState upgradeDispatch(SocketStatus status) {
++    public SocketState dispatch(SocketStatus status) {
+         return internalHttpUpgradeHandler.upgradeDispatch(status);
+     }
+ 
+
+==================================================

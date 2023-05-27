@@ -1,0 +1,134 @@
+bbc04d62533eafe9d92d572f9869162dc930633d
+==================================================
+Fix https://bz.apache.org/bugzilla/show_bug.cgi?id=61164
+==================================================
+Mark Thomas
+==================================================
+Fri Jul 28 14:50:36 2017 +0000
+==================================================
+AbstractAccessLogValve.java
+Fix https://bz.apache.org/bugzilla/show_bug.cgi?id=61164
+Add support for the %X pattern in the AccessLogValve that reports the connection status at the end of the request. Patch provided by Zemian Deng.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1803278 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AbstractProcessor.java
+index febfbd5b89..0c0147f34d 100644
+--- a/java/org/apache/catalina/valves/AbstractAccessLogValve.java
++++ b/java/org/apache/catalina/valves/AbstractAccessLogValve.java
+@@ -30,7 +30,9 @@ import java.util.List;
+ import java.util.Locale;
+ import java.util.Map;
+ import java.util.TimeZone;
++import java.util.concurrent.atomic.AtomicBoolean;
+ 
++import javax.servlet.RequestDispatcher;
+ import javax.servlet.ServletException;
+ import javax.servlet.http.Cookie;
+ import javax.servlet.http.HttpSession;
+@@ -40,9 +42,11 @@ import org.apache.catalina.Globals;
+ import org.apache.catalina.LifecycleException;
+ import org.apache.catalina.LifecycleState;
+ import org.apache.catalina.Session;
++import org.apache.catalina.connector.ClientAbortException;
+ import org.apache.catalina.connector.Request;
+ import org.apache.catalina.connector.Response;
+ import org.apache.catalina.util.TLSUtil;
++import org.apache.coyote.ActionCode;
+ import org.apache.coyote.RequestInfo;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+@@ -83,7 +87,14 @@ import org.apache.tomcat.util.collections.SynchronizedStack;
+  * <li><b>%v</b> - Local server name
+  * <li><b>%D</b> - Time taken to process the request, in millis
+  * <li><b>%T</b> - Time taken to process the request, in seconds
++ * <li><b>%F</b> - Time taken to commit the response, in millis
+  * <li><b>%I</b> - current Request thread name (can compare later with stacktraces)
++ * <li><b>%X</b> - Connection status when response is completed:
++ *   <ul>
++ *   <li><code>X</code> = Connection aborted before the response completed.</li>
++ *   <li><code>+</code> = Connection may be kept alive after the response is sent.</li>
++ *   <li><code>-</code> = Connection will be closed after the response is sent.</li>
++ *   </ul>
+  * </ul>
+  * <p>In addition, the caller can specify one of the following aliases for
+  * commonly utilized patterns:</p>
+@@ -1506,6 +1517,47 @@ public abstract class AbstractAccessLogValve extends ValveBase implements Access
+         }
+     }
+ 
++    /**
++     * Write connection status when response is completed - %X
++     */
++    protected static class ConnectionStatusElement implements AccessLogElement {
++        @Override
++        public void addElement(CharArrayWriter buf, Date date, Request request, Response response, long time) {
++            if (response != null && request != null) {
++                boolean statusFound = false;
++
++                // Check whether connection IO is in "not allowed" state
++                AtomicBoolean isIoAllowed = new AtomicBoolean(false);
++                request.getCoyoteRequest().action(ActionCode.IS_IO_ALLOWED, isIoAllowed);
++                if (!isIoAllowed.get()) {
++                    buf.append('X');
++                    statusFound = true;
++                } else {
++                    // Check for connection aborted cond
++                    if (response.isError()) {
++                        Throwable ex = (Throwable) request.getAttribute(RequestDispatcher.ERROR_EXCEPTION);
++                        if (ex instanceof ClientAbortException) {
++                            buf.append('X');
++                            statusFound = true;
++                        }
++                    }
++                }
++
++                // If status is not found yet, cont to check whether connection is keep-alive or close
++                if (!statusFound) {
++                    String connStatus = response.getHeader(org.apache.coyote.http11.Constants.CONNECTION);
++                    if (org.apache.coyote.http11.Constants.CLOSE.equals(connStatus)) {
++                        buf.append('-');
++                    } else {
++                        buf.append('+');
++                    }
++                }
++            } else {
++                // Unknown connection status
++                buf.append('?');
++            }
++        }
++    }
+ 
+     /**
+      * Parse pattern string and create the array of AccessLogElement.
+@@ -1636,6 +1688,8 @@ public abstract class AbstractAccessLogValve extends ValveBase implements Access
+             return new LocalServerNameElement();
+         case 'I':
+             return new ThreadNameElement();
++        case 'X':
++            return new ConnectionStatusElement();
+         default:
+             return new StringElement("???" + pattern + "???");
+         }
+
+==================================================
+ActionCode.java
+index b21176881d..9dc2a5d68f 100644
+--- a/java/org/apache/coyote/AbstractProcessor.java
++++ b/java/org/apache/coyote/AbstractProcessor.java
+@@ -306,6 +306,10 @@ public abstract class AbstractProcessor extends AbstractProcessorLight implement
+             ((AtomicBoolean) param).set(getErrorState().isError());
+             break;
+         }
++        case IS_IO_ALLOWED: {
++            ((AtomicBoolean) param).set(getErrorState().isIoAllowed());
++            break;
++        }
+         case CLOSE_NOW: {
+             // Prevent further writes to the response
+             setSwallowResponse();
+
+==================================================

@@ -1,0 +1,958 @@
+7943611a8da048b514f595fde15f71343b6c24af
+==================================================
+Introduce a new method o.a.coyote.InputBuffer.doRead(ApplicationBufferHandler)
+==================================================
+Violeta Georgieva
+==================================================
+Thu Oct 6 11:30:44 2016 +0000
+==================================================
+InputBuffer.java
+Introduce a new method o.a.coyote.InputBuffer.doRead(ApplicationBufferHandler)
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1763559 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+InputBuffer.java
+index 15f78d21e8..bf122f69a4 100644
+--- a/java/org/apache/catalina/connector/InputBuffer.java
++++ b/java/org/apache/catalina/connector/InputBuffer.java
+@@ -36,6 +36,7 @@ import org.apache.tomcat.util.buf.B2CConverter;
+ import org.apache.tomcat.util.buf.ByteChunk;
+ import org.apache.tomcat.util.buf.CharChunk;
+ import org.apache.tomcat.util.collections.SynchronizedStack;
++import org.apache.tomcat.util.net.ApplicationBufferHandler;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+ /**
+@@ -48,7 +49,7 @@ import org.apache.tomcat.util.res.StringManager;
+  */
+ public class InputBuffer extends Reader
+     implements ByteChunk.ByteInputChannel, CharChunk.CharInputChannel,
+-               CharChunk.CharOutputChannel {
++               CharChunk.CharOutputChannel, ApplicationBufferHandler {
+ 
+     /**
+      * The string manager for this package.
+@@ -75,6 +76,7 @@ public class InputBuffer extends Reader
+      * The byte buffer.
+      */
+     private final ByteChunk bb;
++    private ByteBuffer tempRead;
+ 
+ 
+     /**
+@@ -146,6 +148,8 @@ public class InputBuffer extends Reader
+     public InputBuffer(int size) {
+ 
+         this.size = size;
++        tempRead = ByteBuffer.allocate(size);
++        tempRead.flip();
+         bb = new ByteChunk(size);
+         bb.setLimit(size);
+         bb.setByteInputChannel(this);
+@@ -314,8 +318,10 @@ public class InputBuffer extends Reader
+             state = BYTE_STATE;
+         }
+ 
+-        int result = coyoteRequest.doRead(bb);
+-
++        int result = coyoteRequest.doRead(this);
++        bb.setBytes(tempRead.array(), tempRead.arrayOffset() + tempRead.position(),
++                tempRead.remaining());
++        tempRead.position(0).limit(0);
+         return result;
+     }
+ 
+@@ -594,4 +600,22 @@ public class InputBuffer extends Reader
+         }
+ 
+     }
++
++
++    @Override
++    public void setByteBuffer(ByteBuffer buffer) {
++        tempRead = buffer;
++    }
++
++
++    @Override
++    public ByteBuffer getByteBuffer() {
++        return tempRead;
++    }
++
++
++    @Override
++    public void expand(int size) {
++        // no-op
++    }
+ }
+
+==================================================
+Request.java
+index 4f8eb99cea..b8012e9c58 100644
+--- a/java/org/apache/coyote/InputBuffer.java
++++ b/java/org/apache/coyote/InputBuffer.java
+@@ -19,6 +19,7 @@ package org.apache.coyote;
+ import java.io.IOException;
+ 
+ import org.apache.tomcat.util.buf.ByteChunk;
++import org.apache.tomcat.util.net.ApplicationBufferHandler;
+ 
+ /**
+  * This class is only for internal use in the protocol implementation. All
+@@ -40,4 +41,20 @@ public interface InputBuffer {
+      * @throws IOException If an I/O error occurs reading from the input stream
+      */
+     public int doRead(ByteChunk chunk) throws IOException;
++
++    /**
++     * Read from the input stream into the ByteBuffer provided by the
++     * ApplicaitonBufferHandler.
++     * IMPORTANT: the current model assumes that the protocol will 'own' the
++     * ByteBuffer and return a pointer to it.
++     *
++     * @param handler ApplicaitonBufferHandler that provides the buffer to read
++     *                data into.
++     *
++     * @return The number of bytes that have been added to the buffer or -1 for
++     *         end of stream
++     *
++     * @throws IOException If an I/O error occurs reading from the input stream
++     */
++    public int doRead(ApplicationBufferHandler handler) throws IOException;
+ }
+
+==================================================
+AjpProcessor.java
+index 2b5fc41881..c831af807e 100644
+--- a/java/org/apache/coyote/Request.java
++++ b/java/org/apache/coyote/Request.java
+@@ -29,6 +29,7 @@ import org.apache.tomcat.util.buf.UDecoder;
+ import org.apache.tomcat.util.http.MimeHeaders;
+ import org.apache.tomcat.util.http.Parameters;
+ import org.apache.tomcat.util.http.ServerCookies;
++import org.apache.tomcat.util.net.ApplicationBufferHandler;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+ /**
+@@ -516,6 +517,31 @@ public final class Request {
+     }
+ 
+ 
++    /**
++     * Read data from the input buffer and put it into ApplicationBufferHandler.
++     *
++     * The buffer is owned by the protocol implementation - it will be reused on
++     * the next read. The Adapter must either process the data in place or copy
++     * it to a separate buffer if it needs to hold it. In most cases this is
++     * done during byte-&gt;char conversions or via InputStream. Unlike
++     * InputStream, this interface allows the app to process data in place,
++     * without copy.
++     *
++     * @param handler The destination to which to copy the data
++     *
++     * @return The number of bytes copied
++     *
++     * @throws IOException If an I/O error occurs during the copy
++     */
++    public int doRead(ApplicationBufferHandler handler) throws IOException {
++        int n = inputBuffer.doRead(handler);
++        if (n > 0) {
++            bytesRead+=n;
++        }
++        return n;
++    }
++
++
+     // -------------------- debug --------------------
+ 
+     @Override
+
+==================================================
+Http11InputBuffer.java
+index 49dd2aca44..60edb55865 100644
+--- a/java/org/apache/coyote/ajp/AjpProcessor.java
++++ b/java/org/apache/coyote/ajp/AjpProcessor.java
+@@ -43,6 +43,7 @@ import org.apache.tomcat.util.buf.MessageBytes;
+ import org.apache.tomcat.util.http.MimeHeaders;
+ import org.apache.tomcat.util.net.AbstractEndpoint;
+ import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
++import org.apache.tomcat.util.net.ApplicationBufferHandler;
+ import org.apache.tomcat.util.net.SSLSupport;
+ import org.apache.tomcat.util.net.SocketWrapperBase;
+ import org.apache.tomcat.util.res.StringManager;
+@@ -1367,6 +1368,23 @@ public class AjpProcessor extends AbstractProcessor {
+             empty = true;
+             return chunk.getLength();
+         }
++
++        @Override
++        public int doRead(ApplicationBufferHandler handler) throws IOException {
++
++            if (endOfStream) {
++                return -1;
++            }
++            if (empty) {
++                if (!refillReadBuffer(true)) {
++                    return -1;
++                }
++            }
++            ByteChunk bc = bodyBytes.getByteChunk();
++            handler.setByteBuffer(ByteBuffer.wrap(bc.getBuffer(), bc.getStart(), bc.getLength()));
++            empty = true;
++            return handler.getByteBuffer().remaining();
++        }
+     }
+ 
+ 
+
+==================================================
+BufferedInputFilter.java
+index 7bb6ce9e1c..3a6b68ffdc 100644
+--- a/java/org/apache/coyote/http11/Http11InputBuffer.java
++++ b/java/org/apache/coyote/http11/Http11InputBuffer.java
+@@ -292,6 +292,16 @@ public class Http11InputBuffer implements InputBuffer, ApplicationBufferHandler
+ 
+     }
+ 
++    @Override
++    public int doRead(ApplicationBufferHandler handler) throws IOException {
++
++        if (lastActiveFilter == -1)
++            return inputStreamInputBuffer.doRead(handler);
++        else
++            return activeFilters[lastActiveFilter].doRead(handler);
++
++    }
++
+ 
+     // ------------------------------------------------------- Protected Methods
+ 
+@@ -1073,6 +1083,29 @@ public class Http11InputBuffer implements InputBuffer, ApplicationBufferHandler
+ 
+             return length;
+         }
++
++        @Override
++        public int doRead(ApplicationBufferHandler handler) throws IOException {
++
++            if (byteBuffer.position() >= byteBuffer.limit()) {
++                // The application is reading the HTTP request body which is
++                // always a blocking operation.
++                if (!fill(true))
++                    return -1;
++            }
++
++            int length = byteBuffer.remaining();
++            handler.setByteBuffer(byteBuffer.duplicate());
++            byteBuffer.position(byteBuffer.limit());
++
++            return length;
++        }
++    }
++
++
++    @Override
++    public void setByteBuffer(ByteBuffer buffer) {
++        byteBuffer = buffer;
+     }
+ 
+ 
+
+==================================================
+ChunkedInputFilter.java
+index 72e0d2934c..996c6f16c3 100644
+--- a/java/org/apache/coyote/http11/filters/BufferedInputFilter.java
++++ b/java/org/apache/coyote/http11/filters/BufferedInputFilter.java
+@@ -26,12 +26,13 @@ import org.apache.coyote.InputBuffer;
+ import org.apache.coyote.Request;
+ import org.apache.coyote.http11.InputFilter;
+ import org.apache.tomcat.util.buf.ByteChunk;
++import org.apache.tomcat.util.net.ApplicationBufferHandler;
+ 
+ /**
+  * Input filter responsible for reading and buffering the request body, so that
+  * it does not interfere with client SSL handshake messages.
+  */
+-public class BufferedInputFilter implements InputFilter {
++public class BufferedInputFilter implements InputFilter, ApplicationBufferHandler {
+ 
+     // -------------------------------------------------------------- Constants
+ 
+@@ -42,7 +43,7 @@ public class BufferedInputFilter implements InputFilter {
+     // ----------------------------------------------------- Instance Variables
+ 
+     private ByteBuffer buffered;
+-    private final ByteChunk tempRead = new ByteChunk(1024);
++    private ByteBuffer tempRead;
+     private InputBuffer buffer;
+     private boolean hasRead = false;
+ 
+@@ -82,11 +83,11 @@ public class BufferedInputFilter implements InputFilter {
+     public void setRequest(Request request) {
+         // save off the Request body
+         try {
+-            while (buffer.doRead(tempRead) >= 0) {
++            while (buffer.doRead(this) >= 0) {
+                 buffered.mark().position(buffered.limit()).limit(buffered.capacity());
+-                buffered.put(tempRead.getBytes(), tempRead.getStart(), tempRead.getLength());
++                buffered.put(tempRead);
+                 buffered.limit(buffered.position()).reset();
+-                tempRead.recycle();
++                tempRead = null;
+             }
+         } catch(IOException | BufferOverflowException ioe) {
+             // No need for i18n - this isn't going to get logged anywhere
+@@ -110,6 +111,20 @@ public class BufferedInputFilter implements InputFilter {
+         return chunk.getLength();
+     }
+ 
++    /**
++     * Fills the given ByteBuffer with the buffered request body.
++     */
++    @Override
++    public int doRead(ApplicationBufferHandler handler) throws IOException {
++        if (isFinished()) {
++            return -1;
++        }
++
++        handler.setByteBuffer(buffered);
++        hasRead = true;
++        return buffered.remaining();
++    }
++
+     @Override
+     public void setBuffer(InputBuffer buffer) {
+         this.buffer = buffer;
+@@ -124,7 +139,6 @@ public class BufferedInputFilter implements InputFilter {
+                 buffered.position(0).limit(0);
+             }
+         }
+-        tempRead.recycle();
+         hasRead = false;
+         buffer = null;
+     }
+@@ -149,4 +163,22 @@ public class BufferedInputFilter implements InputFilter {
+     public boolean isFinished() {
+         return hasRead || buffered.remaining() <= 0;
+     }
++
++
++    @Override
++    public void setByteBuffer(ByteBuffer buffer) {
++        tempRead = buffer;
++    }
++
++
++    @Override
++    public ByteBuffer getByteBuffer() {
++        return tempRead;
++    }
++
++
++    @Override
++    public void expand(int size) {
++        // no-op
++    }
+ }
+
+==================================================
+IdentityInputFilter.java
+index 47241d4fbd..0e59229acc 100644
+--- a/java/org/apache/coyote/http11/filters/ChunkedInputFilter.java
++++ b/java/org/apache/coyote/http11/filters/ChunkedInputFilter.java
+@@ -18,6 +18,7 @@ package org.apache.coyote.http11.filters;
+ 
+ import java.io.EOFException;
+ import java.io.IOException;
++import java.nio.ByteBuffer;
+ import java.nio.charset.StandardCharsets;
+ import java.util.Locale;
+ import java.util.Set;
+@@ -30,6 +31,7 @@ import org.apache.tomcat.util.buf.ByteChunk;
+ import org.apache.tomcat.util.buf.HexUtils;
+ import org.apache.tomcat.util.buf.MessageBytes;
+ import org.apache.tomcat.util.http.MimeHeaders;
++import org.apache.tomcat.util.net.ApplicationBufferHandler;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+ /**
+@@ -38,7 +40,7 @@ import org.apache.tomcat.util.res.StringManager;
+  *
+  * @author Remy Maucherat
+  */
+-public class ChunkedInputFilter implements InputFilter {
++public class ChunkedInputFilter implements InputFilter, ApplicationBufferHandler {
+ 
+     private static final StringManager sm = StringManager.getManager(
+             ChunkedInputFilter.class.getPackage().getName());
+@@ -72,28 +74,10 @@ public class ChunkedInputFilter implements InputFilter {
+     protected int remaining = 0;
+ 
+ 
+-    /**
+-     * Position in the buffer.
+-     */
+-    protected int pos = 0;
+-
+-
+-    /**
+-     * Last valid byte in the buffer.
+-     */
+-    protected int lastValid = 0;
+-
+-
+-    /**
+-     * Read bytes buffer.
+-     */
+-    protected byte[] buf = null;
+-
+-
+     /**
+      * Byte chunk used to read bytes.
+      */
+-    protected final ByteChunk readChunk = new ByteChunk();
++    protected ByteBuffer readChunk;
+ 
+ 
+     /**
+@@ -189,24 +173,83 @@ public class ChunkedInputFilter implements InputFilter {
+ 
+         int result = 0;
+ 
+-        if (pos >= lastValid) {
++        if (readChunk == null || readChunk.position() >= readChunk.limit()) {
++            if (readBytes() < 0) {
++                throwIOException(sm.getString("chunkedInputFilter.eos"));
++            }
++        }
++
++        if (remaining > readChunk.remaining()) {
++            result = readChunk.remaining();
++            remaining = remaining - result;
++            chunk.setBytes(readChunk.array(), readChunk.arrayOffset() + readChunk.position(), result);
++            readChunk.position(readChunk.limit());
++        } else {
++            result = remaining;
++            chunk.setBytes(readChunk.array(), readChunk.arrayOffset() + readChunk.position(), remaining);
++            readChunk.position(readChunk.position() + remaining);
++            remaining = 0;
++            //we need a CRLF
++            if ((readChunk.position() + 1) >= readChunk.limit()) {
++                //if we call parseCRLF we overrun the buffer here
++                //so we defer it to the next call BZ 11117
++                needCRLFParse = true;
++            } else {
++                parseCRLF(false); //parse the CRLF immediately
++            }
++        }
++
++        return result;
++    }
++
++    @Override
++    public int doRead(ApplicationBufferHandler handler) throws IOException {
++        if (endChunk) {
++            return -1;
++        }
++
++        checkError();
++
++        if(needCRLFParse) {
++            needCRLFParse = false;
++            parseCRLF(false);
++        }
++
++        if (remaining <= 0) {
++            if (!parseChunkHeader()) {
++                throwIOException(sm.getString("chunkedInputFilter.invalidHeader"));
++            }
++            if (endChunk) {
++                parseEndChunk();
++                return -1;
++            }
++        }
++
++        int result = 0;
++
++        if (readChunk == null || readChunk.position() >= readChunk.limit()) {
+             if (readBytes() < 0) {
+                 throwIOException(sm.getString("chunkedInputFilter.eos"));
+             }
+         }
+ 
+-        if (remaining > (lastValid - pos)) {
+-            result = lastValid - pos;
++        if (remaining > readChunk.remaining()) {
++            result = readChunk.remaining();
+             remaining = remaining - result;
+-            chunk.setBytes(buf, pos, result);
+-            pos = lastValid;
++            if (readChunk != handler.getByteBuffer()) {
++                handler.setByteBuffer(readChunk.duplicate());
++            }
++            readChunk.position(readChunk.limit());
+         } else {
+             result = remaining;
+-            chunk.setBytes(buf, pos, remaining);
+-            pos = pos + remaining;
++            if (readChunk != handler.getByteBuffer()) {
++                handler.setByteBuffer(readChunk.duplicate());
++                handler.getByteBuffer().limit(readChunk.position() + remaining);
++            }
++            readChunk.position(readChunk.position() + remaining);
+             remaining = 0;
+             //we need a CRLF
+-            if ((pos+1) >= lastValid) {
++            if ((readChunk.position() + 1) >= readChunk.limit()) {
+                 //if we call parseCRLF we overrun the buffer here
+                 //so we defer it to the next call BZ 11117
+                 needCRLFParse = true;
+@@ -238,7 +281,7 @@ public class ChunkedInputFilter implements InputFilter {
+         long swallowed = 0;
+         int read = 0;
+         // Consume extra bytes : parse the stream until the end chunk is found
+-        while ((read = doRead(readChunk)) >= 0) {
++        while ((read = doRead(this)) >= 0) {
+             swallowed += read;
+             if (maxSwallowSize > -1 && swallowed > maxSwallowSize) {
+                 throwIOException(sm.getString("inputFilter.maxSwallow"));
+@@ -246,7 +289,7 @@ public class ChunkedInputFilter implements InputFilter {
+         }
+ 
+         // Return the number of extra bytes which were consumed
+-        return lastValid - pos;
++        return readChunk.remaining();
+     }
+ 
+ 
+@@ -255,7 +298,7 @@ public class ChunkedInputFilter implements InputFilter {
+      */
+     @Override
+     public int available() {
+-        return lastValid - pos;
++        return readChunk != null ? readChunk.remaining() : 0;
+     }
+ 
+ 
+@@ -274,8 +317,9 @@ public class ChunkedInputFilter implements InputFilter {
+     @Override
+     public void recycle() {
+         remaining = 0;
+-        pos = 0;
+-        lastValid = 0;
++        if (readChunk != null) {
++            readChunk.position(0).limit(0);
++        }
+         endChunk = false;
+         needCRLFParse = false;
+         trailingHeaders.recycle();
+@@ -309,13 +353,7 @@ public class ChunkedInputFilter implements InputFilter {
+      * @throws IOException Read error
+      */
+     protected int readBytes() throws IOException {
+-
+-        int nRead = buffer.doRead(readChunk);
+-        pos = readChunk.getStart();
+-        lastValid = pos + nRead;
+-        buf = readChunk.getBytes();
+-
+-        return nRead;
++        return buffer.doRead(this);
+     }
+ 
+ 
+@@ -342,15 +380,16 @@ public class ChunkedInputFilter implements InputFilter {
+ 
+         while (!eol) {
+ 
+-            if (pos >= lastValid) {
++            if (readChunk == null || readChunk.position() >= readChunk.limit()) {
+                 if (readBytes() <= 0)
+                     return false;
+             }
+ 
+-            if (buf[pos] == Constants.CR || buf[pos] == Constants.LF) {
++            byte chr = readChunk.get(readChunk.position());
++            if (chr == Constants.CR || chr == Constants.LF) {
+                 parseCRLF(false);
+                 eol = true;
+-            } else if (buf[pos] == Constants.SEMI_COLON && !extension) {
++            } else if (chr == Constants.SEMI_COLON && !extension) {
+                 // First semi-colon marks the start of the extension. Further
+                 // semi-colons may appear to separate multiple chunk-extensions.
+                 // These need to be processed as part of parsing the extensions.
+@@ -358,7 +397,7 @@ public class ChunkedInputFilter implements InputFilter {
+                 extensionSize++;
+             } else if (!extension) {
+                 //don't read data after the trailer
+-                int charValue = HexUtils.getDec(buf[pos]);
++                int charValue = HexUtils.getDec(chr);
+                 if (charValue != -1 && readDigit < 8) {
+                     readDigit++;
+                     result = (result << 4) | charValue;
+@@ -379,7 +418,7 @@ public class ChunkedInputFilter implements InputFilter {
+ 
+             // Parsing the CRLF increments pos
+             if (!eol) {
+-                pos++;
++                readChunk.position(readChunk.position() + 1);
+             }
+         }
+ 
+@@ -410,18 +449,19 @@ public class ChunkedInputFilter implements InputFilter {
+         boolean crfound = false;
+ 
+         while (!eol) {
+-            if (pos >= lastValid) {
++            if (readChunk == null || readChunk.position() >= readChunk.limit()) {
+                 if (readBytes() <= 0) {
+                     throwIOException(sm.getString("chunkedInputFilter.invalidCrlfNoData"));
+                 }
+             }
+ 
+-            if (buf[pos] == Constants.CR) {
++            byte chr = readChunk.get(readChunk.position());
++            if (chr == Constants.CR) {
+                 if (crfound) {
+                     throwIOException(sm.getString("chunkedInputFilter.invalidCrlfCRCR"));
+                 }
+                 crfound = true;
+-            } else if (buf[pos] == Constants.LF) {
++            } else if (chr == Constants.LF) {
+                 if (!tolerant && !crfound) {
+                     throwIOException(sm.getString("chunkedInputFilter.invalidCrlfNoCR"));
+                 }
+@@ -430,7 +470,7 @@ public class ChunkedInputFilter implements InputFilter {
+                 throwIOException(sm.getString("chunkedInputFilter.invalidCrlf"));
+             }
+ 
+-            pos++;
++            readChunk.position(readChunk.position() + 1);
+         }
+     }
+ 
+@@ -454,13 +494,13 @@ public class ChunkedInputFilter implements InputFilter {
+         byte chr = 0;
+ 
+         // Read new bytes if needed
+-        if (pos >= lastValid) {
++        if (readChunk == null || readChunk.position() >= readChunk.limit()) {
+             if (readBytes() <0) {
+                throwEOFException(sm.getString("chunkedInputFilter.eosTrailer"));
+             }
+         }
+ 
+-        chr = buf[pos];
++        chr = readChunk.get(readChunk.position());
+ 
+         // CRLF terminates the request
+         if (chr == Constants.CR || chr == Constants.LF) {
+@@ -480,13 +520,13 @@ public class ChunkedInputFilter implements InputFilter {
+         while (!colon) {
+ 
+             // Read new bytes if needed
+-            if (pos >= lastValid) {
++            if (readChunk == null || readChunk.position() >= readChunk.limit()) {
+                 if (readBytes() <0) {
+                     throwEOFException(sm.getString("chunkedInputFilter.eosTrailer"));
+                 }
+             }
+ 
+-            chr = buf[pos];
++            chr = readChunk.get(readChunk.position());
+             if ((chr >= Constants.A) && (chr <= Constants.Z)) {
+                 chr = (byte) (chr - Constants.LC_OFFSET);
+             }
+@@ -497,7 +537,7 @@ public class ChunkedInputFilter implements InputFilter {
+                 trailingHeaders.append(chr);
+             }
+ 
+-            pos++;
++            readChunk.position(readChunk.position() + 1);
+ 
+         }
+         int colonPos = trailingHeaders.getEnd();
+@@ -518,15 +558,15 @@ public class ChunkedInputFilter implements InputFilter {
+             while (space) {
+ 
+                 // Read new bytes if needed
+-                if (pos >= lastValid) {
++                if (readChunk == null || readChunk.position() >= readChunk.limit()) {
+                     if (readBytes() <0) {
+                         throwEOFException(sm.getString("chunkedInputFilter.eosTrailer"));
+                     }
+                 }
+ 
+-                chr = buf[pos];
++                chr = readChunk.get(readChunk.position());
+                 if ((chr == Constants.SP) || (chr == Constants.HT)) {
+-                    pos++;
++                    readChunk.position(readChunk.position() + 1);
+                     // If we swallow whitespace, make sure it counts towards the
+                     // limit placed on trailing header size
+                     int newlimit = trailingHeaders.getLimit() -1;
+@@ -544,13 +584,13 @@ public class ChunkedInputFilter implements InputFilter {
+             while (!eol) {
+ 
+                 // Read new bytes if needed
+-                if (pos >= lastValid) {
++                if (readChunk == null || readChunk.position() >= readChunk.limit()) {
+                     if (readBytes() <0) {
+                         throwEOFException(sm.getString("chunkedInputFilter.eosTrailer"));
+                     }
+                 }
+ 
+-                chr = buf[pos];
++                chr = readChunk.get(readChunk.position());
+                 if (chr == Constants.CR || chr == Constants.LF) {
+                     parseCRLF(true);
+                     eol = true;
+@@ -562,7 +602,7 @@ public class ChunkedInputFilter implements InputFilter {
+                 }
+ 
+                 if (!eol) {
+-                    pos++;
++                    readChunk.position(readChunk.position() + 1);
+                 }
+             }
+ 
+@@ -570,13 +610,13 @@ public class ChunkedInputFilter implements InputFilter {
+             // is a LWS, then it's a multiline header
+ 
+             // Read new bytes if needed
+-            if (pos >= lastValid) {
++            if (readChunk == null || readChunk.position() >= readChunk.limit()) {
+                 if (readBytes() <0) {
+                     throwEOFException(sm.getString("chunkedInputFilter.eosTrailer"));
+                 }
+             }
+ 
+-            chr = buf[pos];
++            chr = readChunk.get(readChunk.position());
+             if ((chr != Constants.SP) && (chr != Constants.HT)) {
+                 validLine = false;
+             } else {
+@@ -620,4 +660,22 @@ public class ChunkedInputFilter implements InputFilter {
+             throw new IOException(sm.getString("chunkedInputFilter.error"));
+         }
+     }
++
++
++    @Override
++    public void setByteBuffer(ByteBuffer buffer) {
++        readChunk = buffer;
++    }
++
++
++    @Override
++    public ByteBuffer getByteBuffer() {
++        return readChunk;
++    }
++
++
++    @Override
++    public void expand(int size) {
++        // no-op
++    }
+ }
+
+==================================================
+SavedRequestInputFilter.java
+index 6cb5d05587..2f048b7802 100644
+--- a/java/org/apache/coyote/http11/filters/IdentityInputFilter.java
++++ b/java/org/apache/coyote/http11/filters/IdentityInputFilter.java
+@@ -24,6 +24,7 @@ import org.apache.coyote.InputBuffer;
+ import org.apache.coyote.Request;
+ import org.apache.coyote.http11.InputFilter;
+ import org.apache.tomcat.util.buf.ByteChunk;
++import org.apache.tomcat.util.net.ApplicationBufferHandler;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+ /**
+@@ -123,6 +124,40 @@ public class IdentityInputFilter implements InputFilter {
+ 
+     }
+ 
++    @Override
++    public int doRead(ApplicationBufferHandler handler) throws IOException {
++
++        int result = -1;
++
++        if (contentLength >= 0) {
++            if (remaining > 0) {
++                int nRead = buffer.doRead(handler);
++                if (nRead > remaining) {
++                    // The chunk is longer than the number of bytes remaining
++                    // in the body; changing the chunk length to the number
++                    // of bytes remaining
++                    handler.getByteBuffer().limit(handler.getByteBuffer().position() + (int) remaining);
++                    result = (int) remaining;
++                } else {
++                    result = nRead;
++                }
++                if (nRead > 0) {
++                    remaining = remaining - nRead;
++                }
++            } else {
++                // No more bytes left to be read : return -1 and clear the
++                // buffer
++                if (handler.getByteBuffer() != null) {
++                    handler.getByteBuffer().position(0).limit(0);
++                }
++                result = -1;
++            }
++        }
++
++        return result;
++
++    }
++
+ 
+     // ---------------------------------------------------- InputFilter Methods
+ 
+
+==================================================
+VoidInputFilter.java
+index 4dd59ee6d3..f85203d58c 100644
+--- a/java/org/apache/coyote/http11/filters/SavedRequestInputFilter.java
++++ b/java/org/apache/coyote/http11/filters/SavedRequestInputFilter.java
+@@ -18,10 +18,12 @@
+ package org.apache.coyote.http11.filters;
+ 
+ import java.io.IOException;
++import java.nio.ByteBuffer;
+ 
+ import org.apache.coyote.InputBuffer;
+ import org.apache.coyote.http11.InputFilter;
+ import org.apache.tomcat.util.buf.ByteChunk;
++import org.apache.tomcat.util.net.ApplicationBufferHandler;
+ 
+ /**
+  * Input filter responsible for replaying the request body when restoring the
+@@ -63,6 +65,18 @@ public class SavedRequestInputFilter implements InputFilter {
+         return writeLength;
+     }
+ 
++    @Override
++    public int doRead(ApplicationBufferHandler handler) throws IOException {
++        if(input.getOffset()>= input.getEnd())
++            return -1;
++
++        ByteBuffer byteBuffer = handler.getByteBuffer();
++        byteBuffer.position(byteBuffer.limit()).limit(byteBuffer.capacity());
++        input.substract(byteBuffer);
++
++        return byteBuffer.remaining();
++    }
++
+     /**
+      * Set the content length on the request.
+      */
+
+==================================================
+Stream.java
+index c395127d33..acd4a705bf 100644
+--- a/java/org/apache/coyote/http11/filters/VoidInputFilter.java
++++ b/java/org/apache/coyote/http11/filters/VoidInputFilter.java
+@@ -23,6 +23,7 @@ import org.apache.coyote.InputBuffer;
+ import org.apache.coyote.Request;
+ import org.apache.coyote.http11.InputFilter;
+ import org.apache.tomcat.util.buf.ByteChunk;
++import org.apache.tomcat.util.net.ApplicationBufferHandler;
+ 
+ /**
+  * Void input filter, which returns -1 when attempting a read. Used with a GET,
+@@ -54,6 +55,11 @@ public class VoidInputFilter implements InputFilter {
+         return -1;
+     }
+ 
++    @Override
++    public int doRead(ApplicationBufferHandler handler) throws IOException {
++        return -1;
++    }
++
+ 
+     // ---------------------------------------------------- InputFilter Methods
+ 
+
+==================================================
+ApplicationBufferHandler.java
+index a9db97736d..d2b65ab084 100644
+--- a/java/org/apache/coyote/http2/Stream.java
++++ b/java/org/apache/coyote/http2/Stream.java
+@@ -32,6 +32,7 @@ import org.apache.coyote.http2.HpackDecoder.HeaderEmitter;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.buf.ByteChunk;
++import org.apache.tomcat.util.net.ApplicationBufferHandler;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+ public class Stream extends AbstractStream implements HeaderEmitter {
+@@ -660,6 +661,62 @@ public class Stream extends AbstractStream implements HeaderEmitter {
+             return written;
+         }
+ 
++        @Override
++        public int doRead(ApplicationBufferHandler applicationBufferHandler) throws IOException {
++
++            ensureBuffersExist();
++
++            int written = -1;
++
++            // Ensure that only one thread accesses inBuffer at a time
++            synchronized (inBuffer) {
++                while (inBuffer.position() == 0 && !isInputFinished()) {
++                    // Need to block until some data is written
++                    try {
++                        if (log.isDebugEnabled()) {
++                            log.debug(sm.getString("stream.inputBuffer.empty"));
++                        }
++                        inBuffer.wait();
++                        if (reset) {
++                            // TODO: i18n
++                            throw new IOException("HTTP/2 Stream reset");
++                        }
++                    } catch (InterruptedException e) {
++                        // Possible shutdown / rst or similar. Use an
++                        // IOException to signal to the client that further I/O
++                        // isn't possible for this Stream.
++                        throw new IOException(e);
++                    }
++                }
++
++                if (inBuffer.position() > 0) {
++                    // Data is available in the inBuffer. Copy it to the
++                    // outBuffer.
++                    inBuffer.flip();
++                    written = inBuffer.remaining();
++                    if (log.isDebugEnabled()) {
++                        log.debug(sm.getString("stream.inputBuffer.copy",
++                                Integer.toString(written)));
++                    }
++                    inBuffer.get(outBuffer, 0, written);
++                    inBuffer.clear();
++                } else if (isInputFinished()) {
++                    return -1;
++                } else {
++                    // Should never happen
++                    throw new IllegalStateException();
++                }
++            }
++
++            applicationBufferHandler.setByteBuffer(ByteBuffer.wrap(outBuffer, 0,  written));
++
++            // Increment client-side flow control windows by the number of bytes
++            // read
++            handler.writeWindowUpdate(Stream.this, written, true);
++
++            return written;
++        }
++
+ 
+         void registerReadInterest() {
+             synchronized (inBuffer) {
+
+==================================================

@@ -1,0 +1,123 @@
+a1cbdab44b243515a5e8a9fec3c6fa1ac9ba254a
+==================================================
+Fix BZ 64080 - graceful close
+==================================================
+Mark Thomas
+==================================================
+Thu Nov 19 11:06:55 2020 +0000
+==================================================
+StandardService.java
+Fix BZ 64080 - graceful close
+
+https://bz.apache.org/bugzilla/show_bug.cgi?id=64080
+
+
+
+==================================================
+AbstractProtocol.java
+index 05965cac8c..5597cb01b9 100644
+--- a/java/org/apache/catalina/core/StandardService.java
++++ b/java/org/apache/catalina/core/StandardService.java
+@@ -105,8 +105,21 @@ public class StandardService extends LifecycleMBeanBase implements Service {
+     protected final MapperListener mapperListener = new MapperListener(this);
+ 
+ 
++    private long gracefulStopAwaitMillis = 0;
++
++
+     // ------------------------------------------------------------- Properties
+ 
++    public long getGracefulStopAwaitMillis() {
++        return gracefulStopAwaitMillis;
++    }
++
++
++    public void setGracefulStopAwaitMillis(long gracefulStopAwaitMillis) {
++        this.gracefulStopAwaitMillis = gracefulStopAwaitMillis;
++    }
++
++
+     @Override
+     public Mapper getMapper() {
+         return mapper;
+@@ -453,21 +466,33 @@ public class StandardService extends LifecycleMBeanBase implements Service {
+     @Override
+     protected void stopInternal() throws LifecycleException {
+ 
+-        // Pause connectors first
+         synchronized (connectorsLock) {
++            // Initiate a graceful stop for each connector
++            // This will only work if the bindOnInit==false which is not the
++            // default.
+             for (Connector connector: connectors) {
+-                connector.pause();
+-                // Close server socket if bound on start
+-                // Note: test is in AbstractEndpoint
+                 connector.getProtocolHandler().closeServerSocketGraceful();
+             }
++
++            // Wait for the graceful shutdown to complete
++            long waitMillis = gracefulStopAwaitMillis;
++            if (waitMillis > 0) {
++                for (Connector connector: connectors) {
++                    waitMillis = connector.getProtocolHandler().awaitConnectionsClose(waitMillis);
++                }
++            }
++
++            // Pause the connectors
++            for (Connector connector: connectors) {
++                connector.pause();
++            }
+         }
+ 
+         if(log.isInfoEnabled())
+             log.info(sm.getString("standardService.stop.name", this.name));
+         setState(LifecycleState.STOPPING);
+ 
+-        // Stop our defined Container second
++        // Stop our defined Container once the Connectors are all paused
+         if (engine != null) {
+             synchronized (engine) {
+                 engine.stop();
+
+==================================================
+ProtocolHandler.java
+index 3009a36899..595cfb2ec3 100644
+--- a/java/org/apache/coyote/LocalStrings.properties
++++ b/java/org/apache/coyote/LocalStrings.properties
+@@ -34,6 +34,7 @@ abstractProcessor.pushrequest.notsupported=Server push requests are not supporte
+ abstractProcessor.setErrorState=Error state [{0}] reported while processing request
+ abstractProcessor.socket.ssl=Exception getting SSL attributes
+ 
++abstractProtocol.closeConnectionsAwait=Waiting [{0}] milliseconds for existing connections to [{1}] to complete and close.
+ abstractProtocol.mbeanDeregistrationFailed=Failed to deregister MBean named [{0}] from MBean server [{1}]
+ abstractProtocol.processorRegisterError=Error registering request processor
+ abstractProtocol.processorUnregisterError=Error unregistering request processor
+
+==================================================
+AbstractEndpoint.java
+index c6e156538f..dfa5a25c36 100644
+--- a/java/org/apache/coyote/ProtocolHandler.java
++++ b/java/org/apache/coyote/ProtocolHandler.java
+@@ -135,6 +135,19 @@ public interface ProtocolHandler {
+     public void closeServerSocketGraceful();
+ 
+ 
++    /**
++     * Wait for the client connections to the server to close gracefully. The
++     * method will return when all of the client connections have closed or the
++     * method has been waiting for {@code waitTimeMillis}.
++     *
++     * @param waitMillis    The maximum time to wait in milliseconds for the
++     *                      client connections to close.
++     *
++     * @return The wait time, if any remaining when the method returned
++     */
++    public long awaitConnectionsClose(long waitMillis);
++
++
+     /**
+      * Requires APR/native library
+      *
+
+==================================================

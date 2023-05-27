@@ -1,0 +1,169 @@
+3a1824fe286232ada14ac95fda541e7744e31ab4
+==================================================
+Manually apply PR #346 - fix BZ64644 add write/read idle session timeout
+==================================================
+Mark Thomas
+==================================================
+Tue Sep 1 13:53:31 2020 +0100
+==================================================
+Constants.java
+Manually apply PR #346 - fix BZ64644 add write/read idle session timeout
+
+https://bz.apache.org/bugzilla/show_bug.cgi?id=64644
+
+
+==================================================
+WsFrameBase.java
+index 8c3c505ffc..22e9f17689 100644
+--- a/java/org/apache/tomcat/websocket/LocalStrings.properties
++++ b/java/org/apache/tomcat/websocket/LocalStrings.properties
+@@ -98,11 +98,13 @@ wsRemoteEndpoint.tooMuchData=Ping or pong may not send more than 125 bytes
+ wsRemoteEndpoint.writeTimeout=Blocking write timeout
+ wsRemoteEndpoint.wrongState=The remote endpoint was in state [{0}] which is an invalid state for called method
+ 
+-# Note the following message is used as a close reason in a WebSocket control
++# Note the following messages are used as a close reason in a WebSocket control
+ # frame and therefore must be 123 bytes (not characters) or less in length.
+ # Messages are encoded using UTF-8 where a single character may be encoded in
+ # as many as 4 bytes.
+-wsSession.timeout=The WebSocket session [{0}] timeout expired
++wsSession.timeout=The WebSocket session [{0}] idle timeout expired
++wsSession.timeoutRead=The WebSocket session [{0}] read idle timeout expired
++wsSession.timeoutWrite=The WebSocket session [{0}] write idle timeout expired
+ 
+ wsSession.closed=The WebSocket session [{0}] has been closed and no method (apart from close()) may be called on a closed session
+ wsSession.created=Created WebSocket session [{0}]
+
+==================================================
+WsRemoteEndpointImplBase.java
+index a5d2aaa051..3bb9bb1729 100644
+--- a/java/org/apache/tomcat/websocket/WsFrameBase.java
++++ b/java/org/apache/tomcat/websocket/WsFrameBase.java
+@@ -113,7 +113,7 @@ public abstract class WsFrameBase {
+ 
+     protected void processInputBuffer() throws IOException {
+         while (!isSuspended()) {
+-            wsSession.updateLastActive();
++            wsSession.updateLastActiveRead();
+             if (state == State.NEW_FRAME) {
+                 if (!processInitialHeader()) {
+                     break;
+
+==================================================
+WsSession.java
+index ba542a4317..0324e50b75 100644
+--- a/java/org/apache/tomcat/websocket/WsRemoteEndpointImplBase.java
++++ b/java/org/apache/tomcat/websocket/WsRemoteEndpointImplBase.java
+@@ -275,7 +275,7 @@ public abstract class WsRemoteEndpointImplBase implements RemoteEndpoint {
+ 
+     private void sendMessageBlock(byte opCode, ByteBuffer payload, boolean last,
+             long timeoutExpiry) throws IOException {
+-        wsSession.updateLastActive();
++        wsSession.updateLastActiveWrite();
+ 
+         BlockingSendHandler bsh = new BlockingSendHandler();
+ 
+@@ -340,7 +340,7 @@ public abstract class WsRemoteEndpointImplBase implements RemoteEndpoint {
+     void startMessage(byte opCode, ByteBuffer payload, boolean last,
+             SendHandler handler) {
+ 
+-        wsSession.updateLastActive();
++        wsSession.updateLastActiveWrite();
+ 
+         List<MessagePart> messageParts = new ArrayList<>();
+         messageParts.add(new MessagePart(last, 0, opCode, payload,
+@@ -423,7 +423,7 @@ public abstract class WsRemoteEndpointImplBase implements RemoteEndpoint {
+             writeMessagePart(mpNext);
+         }
+ 
+-        wsSession.updateLastActive();
++        wsSession.updateLastActiveWrite();
+ 
+         // Some handlers, such as the IntermediateMessageHandler, do not have a
+         // nested handler so handler may be null.
+
+==================================================
+TestWsWebSocketContainer.java
+index b52d4022b2..c185e8abed 100644
+--- a/java/org/apache/tomcat/websocket/WsSession.java
++++ b/java/org/apache/tomcat/websocket/WsSession.java
+@@ -97,7 +97,8 @@ public class WsSession implements Session {
+     private volatile int maxBinaryMessageBufferSize = Constants.DEFAULT_BUFFER_SIZE;
+     private volatile int maxTextMessageBufferSize = Constants.DEFAULT_BUFFER_SIZE;
+     private volatile long maxIdleTimeout = 0;
+-    private volatile long lastActive = System.currentTimeMillis();
++    private volatile long lastActiveRead = System.currentTimeMillis();
++    private volatile long lastActiveWrite = System.currentTimeMillis();
+     private Map<FutureToSendHandler, FutureToSendHandler> futures = new ConcurrentHashMap<>();
+ 
+     /**
+@@ -805,25 +806,59 @@ public class WsSession implements Session {
+     }
+ 
+ 
+-    protected void updateLastActive() {
+-        lastActive = System.currentTimeMillis();
++    protected void updateLastActiveRead() {
++        lastActiveRead = System.currentTimeMillis();
++    }
++
++
++    protected void updateLastActiveWrite() {
++        lastActiveWrite = System.currentTimeMillis();
+     }
+ 
+ 
+     protected void checkExpiration() {
++        // Local copies to ensure consistent behaviour during method execution
+         long timeout = maxIdleTimeout;
+-        if (timeout < 1) {
+-            return;
++        long timeoutRead = getMaxIdleTimeoutRead();
++        long timeoutWrite = getMaxIdleTimeoutWrite();
++
++        long currentTime = System.currentTimeMillis();
++        String key = null;
++
++        if (timeoutRead > 0 && (currentTime - lastActiveRead) > timeoutRead) {
++            key = "wsSession.timeoutRead";
++        } else if (timeoutWrite > 0 && (currentTime - lastActiveWrite) > timeoutRead) {
++            key = "wsSession.timeoutWrite";
++        } else if (timeout > 0 && (currentTime - lastActiveRead) > timeout &&
++                (currentTime - lastActiveWrite) > timeout) {
++            key = "wsSession.timeout";
+         }
+ 
+-        if (System.currentTimeMillis() - lastActive > timeout) {
+-            String msg = sm.getString("wsSession.timeout", getId());
++        if (key != null) {
++            String msg = sm.getString(key, getId());
+             if (log.isDebugEnabled()) {
+                 log.debug(msg);
+             }
+-            doClose(new CloseReason(CloseCodes.GOING_AWAY, msg),
+-                    new CloseReason(CloseCodes.CLOSED_ABNORMALLY, msg));
++            doClose(new CloseReason(CloseCodes.GOING_AWAY, msg), new CloseReason(CloseCodes.CLOSED_ABNORMALLY, msg));
++        }
++    }
++
++
++    private long getMaxIdleTimeoutRead() {
++        Object timeout = userProperties.get(Constants.READ_IDLE_TIMEOUT_MS);
++        if (timeout instanceof Long) {
++            return ((Long) timeout).longValue();
++        }
++        return 0;
++    }
++
++
++    private long getMaxIdleTimeoutWrite() {
++        Object timeout = userProperties.get(Constants.WRITE_IDLE_TIMEOUT_MS);
++        if (timeout instanceof Long) {
++            return ((Long) timeout).longValue();
+         }
++        return 0;
+     }
+ 
+ 
+
+==================================================

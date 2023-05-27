@@ -1,0 +1,245 @@
+9fe0440c7dbe7828fb36fd61c644398e92caa4f5
+==================================================
+More robust solution to the problem of blocking writes not be closed when the web application stops. Futures used for blocking writes are registered with the session and the session completes them with an exception if they are outstanding when the session closes.
+==================================================
+Mark Emlyn
+==================================================
+Thu Sep 19 10:56:51 2013 +0000
+==================================================
+FutureToSendHandler.java
+More robust solution to the problem of blocking writes not be closed when the web application stops. Futures used for blocking writes are registered with the session and the session completes them with an exception if they are outstanding when the session closes.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1524687 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+WsRemoteEndpointImplBase.java
+index 8565ad3cc7..300a767256 100644
+--- a/java/org/apache/tomcat/websocket/LocalStrings.properties
++++ b/java/org/apache/tomcat/websocket/LocalStrings.properties
+@@ -71,12 +71,19 @@ wsSession.closed=The WebSocket session has been closed and no method (apart from
+ wsSession.duplicateHandlerBinary=A binary message handler has already been configured
+ wsSession.duplicateHandlerPong=A pong message handler has already been configured
+ wsSession.duplicateHandlerText=A text message handler has already been configured
+-wsSession.sendCloseFail=Failed to send close message to remote endpoint
+ wsSession.invalidHandlerTypePong=A pong message handler must implement MessageHandler.Basic
++wsSession.messageFailed=Unable to write the complete message as the WebSocket connection has been closed
++wsSession.sendCloseFail=Failed to send close message to remote endpoint
+ wsSession.removeHandlerFailed=Unable to remove the handler [{0}] as it was not registered with this session
+ wsSession.unknownHandler=Unable to add the message handler [{0}] as it was for the unrecognised type [{1}]
+ wsSession.unknownHandlerType=Unable to add the message handler [{0}] as it was wrapped as the unrecognised type [{1}]
+ 
++# Note the following message is used as a close reason in a WebSocket control
++# frame and therefore must be 123 bytes (not characters) or less in length.
++# Messages are encoded using UTF-8 where a single character may be encoded in
++# as many as 4 bytes.
++wsWebSocketContainer.shutdown=The web application is stopping
++
+ wsWebSocketContainer.asynchronousChannelGroupFail=Unable to create dedicated AsynchronousChannelGroup for WebSocket clients which is required to prevent memory leaks in complex class loader environments like J2EE containers
+ wsWebSocketContainer.asynchronousSocketChannelFail=Unable to open a connection to the server
+ wsWebSocketContainer.defaultConfiguratorFaill=Failed to create the default configurator
+@@ -90,4 +97,5 @@ wsWebSocketContainer.maxBuffer=This implementation limits the maximum size of a
+ wsWebSocketContainer.missingAnnotation=Cannot use POJO class [{0}] as it is not annotated with @ClientEndpoint
+ wsWebSocketContainer.pathNoHost=No host was specified in URI
+ wsWebSocketContainer.pathWrongScheme=The scheme [{0}] is not supported
++wsWebSocketContainer.sessionCloseFail=Session with ID [{0}] did not close cleanly
+ wsWebSocketContainer.sslEngineFail=Unable to create SSLEngine to support SSL/TLS connections
+
+==================================================
+WsSession.java
+index 7ea7e54d2b..4823556113 100644
+--- a/java/org/apache/tomcat/websocket/WsRemoteEndpointImplBase.java
++++ b/java/org/apache/tomcat/websocket/WsRemoteEndpointImplBase.java
+@@ -119,7 +119,7 @@ public abstract class WsRemoteEndpointImplBase implements RemoteEndpoint {
+ 
+ 
+     public Future<Void> sendBytesByFuture(ByteBuffer data) {
+-        FutureToSendHandler f2sh = new FutureToSendHandler();
++        FutureToSendHandler f2sh = new FutureToSendHandler(wsSession);
+         sendBytesByCompletion(data, f2sh);
+         return f2sh;
+     }
+@@ -156,7 +156,7 @@ public abstract class WsRemoteEndpointImplBase implements RemoteEndpoint {
+ 
+ 
+     public Future<Void> sendStringByFuture(String text) {
+-        FutureToSendHandler f2sh = new FutureToSendHandler();
++        FutureToSendHandler f2sh = new FutureToSendHandler(wsSession);
+         sendStringByCompletion(text, f2sh);
+         return f2sh;
+     }
+@@ -191,7 +191,7 @@ public abstract class WsRemoteEndpointImplBase implements RemoteEndpoint {
+             // trigger a session close and depending on timing the client
+             // session may close before we can read the timeout.
+             long timeout = getBlockingSendTimeout();
+-            FutureToSendHandler f2sh = new FutureToSendHandler();
++            FutureToSendHandler f2sh = new FutureToSendHandler(wsSession);
+             TextMessageSendHandler tmsh = new TextMessageSendHandler(f2sh, part,
+                     last, encoder, encoderBuffer, this);
+             tmsh.write();
+@@ -213,7 +213,7 @@ public abstract class WsRemoteEndpointImplBase implements RemoteEndpoint {
+         // trigger a session close and depending on timing the client
+         // session may close before we can read the timeout.
+         long timeout = getBlockingSendTimeout();
+-        FutureToSendHandler f2sh = new FutureToSendHandler();
++        FutureToSendHandler f2sh = new FutureToSendHandler(wsSession);
+         startMessage(opCode, payload, last, f2sh);
+         try {
+             if (timeout == -1) {
+@@ -448,7 +448,7 @@ public abstract class WsRemoteEndpointImplBase implements RemoteEndpoint {
+     }
+ 
+     public Future<Void> sendObjectByFuture(Object obj) {
+-        FutureToSendHandler f2sh = new FutureToSendHandler();
++        FutureToSendHandler f2sh = new FutureToSendHandler(wsSession);
+         sendObjectByCompletion(obj, f2sh);
+         return f2sh;
+     }
+
+==================================================
+WsWebSocketContainer.java
+index a6f0655d04..825ea47d81 100644
+--- a/java/org/apache/tomcat/websocket/WsSession.java
++++ b/java/org/apache/tomcat/websocket/WsSession.java
+@@ -38,6 +38,7 @@ import javax.websocket.Extension;
+ import javax.websocket.MessageHandler;
+ import javax.websocket.PongMessage;
+ import javax.websocket.RemoteEndpoint;
++import javax.websocket.SendResult;
+ import javax.websocket.Session;
+ import javax.websocket.WebSocketContainer;
+ 
+@@ -92,6 +93,7 @@ public class WsSession implements Session {
+             Constants.DEFAULT_BUFFER_SIZE;
+     private volatile long maxIdleTimeout = 0;
+     private volatile long lastActive = System.currentTimeMillis();
++    private Map<FutureToSendHandler,FutureToSendHandler> futures = new ConcurrentHashMap<>();
+ 
+     /**
+      * Creates a new WebSocket session for communication between the two
+@@ -415,6 +417,12 @@ public class WsSession implements Session {
+ 
+             state = State.CLOSED;
+         }
++
++        IOException ioe = new IOException(sm.getString("wsSession.messageFailed"));
++        SendResult sr = new SendResult(ioe);
++        for (FutureToSendHandler f2sh : futures.keySet()) {
++            f2sh.onResult(sr);
++        }
+     }
+ 
+ 
+@@ -510,6 +518,25 @@ public class WsSession implements Session {
+         }
+     }
+ 
++
++    /**
++     * Make the session aware of a {@link FutureToSendHandler} that will need to
++     * be forcibly closed if the session closes before the
++     * {@link FutureToSendHandler} completes.
++     */
++    protected void registerFuture(FutureToSendHandler f2sh) {
++        futures.put(f2sh, f2sh);
++    }
++
++
++    /**
++     * Remove a {@link FutureToSendHandler} from the set of tracked instances.
++     */
++    protected void unregisterFuture(FutureToSendHandler f2sh) {
++        futures.remove(f2sh);
++    }
++
++
+     @Override
+     public URI getRequestURI() {
+         checkState();
+
+==================================================
+WsContextListener.java
+index 709022ed37..025be44393 100644
+--- a/java/org/apache/tomcat/websocket/WsWebSocketContainer.java
++++ b/java/org/apache/tomcat/websocket/WsWebSocketContainer.java
+@@ -55,6 +55,8 @@ import javax.net.ssl.SSLException;
+ import javax.net.ssl.TrustManagerFactory;
+ import javax.websocket.ClientEndpoint;
+ import javax.websocket.ClientEndpointConfig;
++import javax.websocket.CloseReason;
++import javax.websocket.CloseReason.CloseCodes;
+ import javax.websocket.DeploymentException;
+ import javax.websocket.Endpoint;
+ import javax.websocket.Extension;
+@@ -740,6 +742,27 @@ public class WsWebSocketContainer
+         this.defaultAsyncTimeout = timeout;
+     }
+ 
++
++    /**
++     * Cleans up the resources still in use by WebSocket sessions created from
++     * this container. This includes closing sessions and cancelling
++     * {@link Future}s associated with blocking read/writes.
++     */
++    public void destroy() {
++        CloseReason cr = new CloseReason(
++                CloseCodes.GOING_AWAY, sm.getString("wsWebSocketContainer.shutdown"));
++
++        for (WsSession session : sessions.keySet()) {
++            try {
++                session.close(cr);
++            } catch (IOException ioe) {
++                log.debug(sm.getString(
++                        "wsWebSocketContainer.sessionCloseFail", session.getId()), ioe);
++            }
++        }
++    }
++
++
+     // ----------------------------------------------- BackgroundProcess methods
+ 
+     @Override
+
+==================================================
+WsSci.java
+index 9a75f361c2..27ea702c49 100644
+--- a/java/org/apache/tomcat/websocket/server/WsContextListener.java
++++ b/java/org/apache/tomcat/websocket/server/WsContextListener.java
+@@ -21,10 +21,11 @@ import javax.servlet.ServletContextEvent;
+ import javax.servlet.ServletContextListener;
+ 
+ /**
+- * In normal usage, this {@link ServletContextListener} is not required as the
+- * {@link WsSci} performs all the necessary bootstrap. If the {@link WsSci} is
+- * disabled, this listener must be added manually to every
+- * {@link javax.servlet.ServletContext} that uses WebSocket to bootstrap the
++ * In normal usage, this {@link ServletContextListener} does not need to be
++ * explicitly configured as the {@link WsSci} performs all the necessary
++ * bootstrap and installs this listener in the {@link ServletContext}. If the
++ * {@link WsSci} is disabled, this listener must be added manually to every
++ * {@link ServletContext} that uses WebSocket to bootstrap the
+  * {@link WsServerContainer} correctly.
+  */
+ public class WsContextListener implements ServletContextListener {
+@@ -35,12 +36,16 @@ public class WsContextListener implements ServletContextListener {
+         // Don't trigger WebSocket initialization if a WebSocket Server
+         // Container is already present
+         if (sc.getAttribute(Constants.SERVER_CONTAINER_SERVLET_CONTEXT_ATTRIBUTE) == null) {
+-            WsSci.init(sce.getServletContext());
++            WsSci.init(sce.getServletContext(), false);
+         }
+     }
+ 
+     @Override
+     public void contextDestroyed(ServletContextEvent sce) {
+-        // NOOP
++        ServletContext sc = sce.getServletContext();
++        Object obj = sc.getAttribute(Constants.SERVER_CONTAINER_SERVLET_CONTEXT_ATTRIBUTE);
++        if (obj instanceof WsServerContainer) {
++            ((WsServerContainer) obj).destroy();
++        }
+     }
+ }
+
+==================================================

@@ -1,0 +1,277 @@
+c8ea62eaa6f9d86dd4b33ec9de4079f773421948
+==================================================
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=50903
+==================================================
+Mark Emlyn
+==================================================
+Tue Mar 15 17:48:15 2011 +0000
+==================================================
+AjpProcessor.java
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=50903
+If a connector is stopped, not not process any keep-alive connections. The exact behaviours are:
+- HTTP BIO - blocks until request line is read and then returns 503
+- HTTP NIO - uses polling, so returns 503 immediately connector is stopped
+- HTTP APR - blocks until request line is read and then returns 503
+- AJP BIO - blocks until request packet is received and then returns 503 - subsequent requests will timeout
+- AJP APR - no change - subsequent requests will timeout
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1081882 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Http11AprProcessor.java
+index 3c5ac23d21..b018b028ae 100644
+--- a/java/org/apache/coyote/ajp/AjpProcessor.java
++++ b/java/org/apache/coyote/ajp/AjpProcessor.java
+@@ -287,6 +287,13 @@ public class AjpProcessor extends AbstractAjpProcessor {
+                 error = true;
+             }
+ 
++            if (endpoint.isPaused()) {
++                // 503 - Service unavailable
++                response.setStatus(503);
++                adapter.log(request, response, 0);
++                error = true;
++            }
++
+             // Process the request in the adapter
+             if (!error) {
+                 try {
+
+==================================================
+Http11NioProcessor.java
+index 0471e97aae..2f4f1aabd6 100644
+--- a/java/org/apache/coyote/http11/Http11AprProcessor.java
++++ b/java/org/apache/coyote/http11/Http11AprProcessor.java
+@@ -249,15 +249,24 @@ public class Http11AprProcessor extends AbstractHttp11Processor {
+                     openSocket = true;
+                     // Add the socket to the poller
+                     endpoint.getPoller().add(socketRef);
+-                    break;
++                    if (endpoint.isPaused()) {
++                        // 503 - Service unavailable
++                        response.setStatus(503);
++                        adapter.log(request, response, 0);
++                        error = true;
++                    } else {
++                        break;
++                    }
+                 }
+-                request.setStartTime(System.currentTimeMillis());
+-                keptAlive = true;
+-                if (!disableUploadTimeout) {
+-                    Socket.timeoutSet(socketRef,
+-                            connectionUploadTimeout * 1000);
++                if (!endpoint.isPaused()) {
++                    request.setStartTime(System.currentTimeMillis());
++                    keptAlive = true;
++                    if (!disableUploadTimeout) {
++                        Socket.timeoutSet(socketRef,
++                                connectionUploadTimeout * 1000);
++                    }
++                    inputBuffer.parseHeaders();
+                 }
+-                inputBuffer.parseHeaders();
+             } catch (IOException e) {
+                 error = true;
+                 break;
+
+==================================================
+Http11Processor.java
+index 571a9d66a9..e03dec4d15 100644
+--- a/java/org/apache/coyote/http11/Http11NioProcessor.java
++++ b/java/org/apache/coyote/http11/Http11NioProcessor.java
+@@ -330,20 +330,29 @@ public class Http11NioProcessor extends AbstractHttp11Processor {
+                         // associated with socket
+                         recycle = false;
+                     }
+-                    break;
+-                }
+-                keptAlive = true;
+-                if ( !inputBuffer.parseHeaders() ) {
+-                    //we've read part of the request, don't recycle it
+-                    //instead associate it with the socket
+-                    openSocket = true;
+-                    recycle = false;
+-                    break;
++                    if (endpoint.isPaused()) {
++                        // 503 - Service unavailable
++                        response.setStatus(503);
++                        adapter.log(request, response, 0);
++                        error = true;
++                    } else {
++                        break;
++                    }
+                 }
+-                request.setStartTime(System.currentTimeMillis());
+-                if (!disableUploadTimeout) { //only for body, not for request headers
+-                    socket.getIOChannel().socket().setSoTimeout(
+-                            connectionUploadTimeout);
++                if (!endpoint.isPaused()) {
++                    keptAlive = true;
++                    if ( !inputBuffer.parseHeaders() ) {
++                        //we've read part of the request, don't recycle it
++                        //instead associate it with the socket
++                        openSocket = true;
++                        recycle = false;
++                        break;
++                    }
++                    request.setStartTime(System.currentTimeMillis());
++                    if (!disableUploadTimeout) { //only for body, not for request headers
++                        socket.getIOChannel().socket().setSoTimeout(
++                                connectionUploadTimeout);
++                    }
+                 }
+             } catch (IOException e) {
+                 if (log.isDebugEnabled()) {
+
+==================================================
+TestConnector.java
+index 1d7361b5ff..74ad4d0ae3 100644
+--- a/java/org/apache/coyote/http11/Http11Processor.java
++++ b/java/org/apache/coyote/http11/Http11Processor.java
+@@ -194,14 +194,21 @@ public class Http11Processor extends AbstractHttp11Processor {
+                     }
+                 }
+                 inputBuffer.parseRequestLine(false);
+-                request.setStartTime(System.currentTimeMillis());
+-                keptAlive = true;
+-                if (disableUploadTimeout) {
+-                    socket.getSocket().setSoTimeout(soTimeout);
++                if (endpoint.isPaused()) {
++                    // 503 - Service unavailable
++                    response.setStatus(503);
++                    adapter.log(request, response, 0);
++                    error = true;
+                 } else {
+-                    socket.getSocket().setSoTimeout(connectionUploadTimeout);
++                    request.setStartTime(System.currentTimeMillis());
++                    keptAlive = true;
++                    if (disableUploadTimeout) {
++                        socket.getSocket().setSoTimeout(soTimeout);
++                    } else {
++                        socket.getSocket().setSoTimeout(connectionUploadTimeout);
++                    }
++                    inputBuffer.parseHeaders();
+                 }
+-                inputBuffer.parseHeaders();
+             } catch (IOException e) {
+                 error = true;
+                 break;
+
+==================================================
+TesterServlet.java
+new file mode 100644
+index 0000000000..c84e3f6afd
+--- /dev/null
++++ b/test/org/apache/catalina/connector/TestConnector.java
+@@ -0,0 +1,59 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.catalina.connector;
++
++import org.apache.catalina.Context;
++import org.apache.catalina.Wrapper;
++import org.apache.catalina.startup.TesterServlet;
++import org.apache.catalina.startup.Tomcat;
++import org.apache.catalina.startup.TomcatBaseTest;
++import org.apache.tomcat.util.buf.ByteChunk;
++
++/**
++ * Test cases for {@link Connector}. 
++ */
++public class TestConnector extends TomcatBaseTest {
++
++    public void testStop() throws Exception {
++        Tomcat tomcat = getTomcatInstance();
++        
++        Context root = tomcat.addContext("", TEMP_DIR);
++        Wrapper w =
++            Tomcat.addServlet(root, "tester", new TesterServlet());
++        w.setAsyncSupported(true);
++        root.addServletMapping("/", "tester");
++
++        Connector connector = tomcat.getConnector();
++        
++        tomcat.start();
++
++        ByteChunk bc = new ByteChunk();
++        int rc = getUrl("http://localhost:" + getPort() + "/", bc, null, null);
++        
++        assertEquals(200, rc);
++        assertEquals("OK", bc.toString());
++        
++        rc = -1;
++        bc.recycle();
++
++        connector.stop();
++
++        rc = getUrl("http://localhost:" + getPort() + "/", bc, 1000,
++                null, null);
++        assertEquals(503, rc);
++    }
++}
+
+==================================================
+TomcatBaseTest.java
+new file mode 100644
+index 0000000000..5334ce840e
+--- /dev/null
++++ b/test/org/apache/catalina/startup/TesterServlet.java
+@@ -0,0 +1,39 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.catalina.startup;
++
++import java.io.IOException;
++import java.io.PrintWriter;
++
++import javax.servlet.ServletException;
++import javax.servlet.http.HttpServlet;
++import javax.servlet.http.HttpServletRequest;
++import javax.servlet.http.HttpServletResponse;
++
++public class TesterServlet extends HttpServlet {
++
++    private static final long serialVersionUID = 1L;
++
++    @Override
++    protected void doGet(HttpServletRequest req, HttpServletResponse resp)
++            throws ServletException, IOException {
++        
++        resp.setContentType("text/plain");
++        PrintWriter out = resp.getWriter();
++        out.print("OK");
++    }
++}
+
+==================================================

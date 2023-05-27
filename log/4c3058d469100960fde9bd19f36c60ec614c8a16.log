@@ -1,0 +1,190 @@
+4c3058d469100960fde9bd19f36c60ec614c8a16
+==================================================
+Enable configuration of allowed trailer headers
+==================================================
+Mark Thomas
+==================================================
+Wed Oct 19 13:31:36 2016 +0000
+==================================================
+Http2Protocol.java
+Enable configuration of allowed trailer headers
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1765590 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Http2UpgradeHandler.java
+index ec35c87523..381b323c5e 100644
+--- a/java/org/apache/coyote/http2/Http2Protocol.java
++++ b/java/org/apache/coyote/http2/Http2Protocol.java
+@@ -17,7 +17,14 @@
+ package org.apache.coyote.http2;
+ 
+ import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.Collections;
+ import java.util.Enumeration;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Locale;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
+ 
+ import org.apache.coyote.Adapter;
+ import org.apache.coyote.Processor;
+@@ -54,6 +61,9 @@ public class Http2Protocol implements UpgradeProtocol {
+     // If a lower initial value is required, set it here but DO NOT change the
+     // default defined above.
+     private int initialWindowSize = DEFAULT_INITIAL_WINDOW_SIZE;
++    private Set<String> allowedTrailerHeaders =
++            Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
++
+ 
+     @Override
+     public String getHttpUpgradeName(boolean isSSLEnabled) {
+@@ -93,7 +103,7 @@ public class Http2Protocol implements UpgradeProtocol {
+         result.setMaxConcurrentStreams(getMaxConcurrentStreams());
+         result.setMaxConcurrentStreamExecution(getMaxConcurrentStreamExecution());
+         result.setInitialWindowSize(getInitialWindowSize());
+-
++        result.setAllowedTrailerHeaders(allowedTrailerHeaders);
+         return result;
+     }
+ 
+@@ -178,4 +188,43 @@ public class Http2Protocol implements UpgradeProtocol {
+     public void setInitialWindowSize(int initialWindowSize) {
+         this.initialWindowSize = initialWindowSize;
+     }
++
++
++    public void setAllowedTrailerHeaders(String commaSeparatedHeaders) {
++        // Jump through some hoops so we don't end up with an empty set while
++        // doing updates.
++        Set<String> toRemove = new HashSet<>();
++        toRemove.addAll(allowedTrailerHeaders);
++        if (commaSeparatedHeaders != null) {
++            String[] headers = commaSeparatedHeaders.split(",");
++            for (String header : headers) {
++                String trimmedHeader = header.trim().toLowerCase(Locale.ENGLISH);
++                if (toRemove.contains(trimmedHeader)) {
++                    toRemove.remove(trimmedHeader);
++                } else {
++                    allowedTrailerHeaders.add(trimmedHeader);
++                }
++            }
++            allowedTrailerHeaders.removeAll(toRemove);
++        }
++    }
++
++
++    public String getAllowedTrailerHeaders() {
++        // Chances of a size change between these lines are small enough that a
++        // sync is unnecessary.
++        List<String> copy = new ArrayList<>(allowedTrailerHeaders.size());
++        copy.addAll(allowedTrailerHeaders);
++        StringBuilder result = new StringBuilder();
++        boolean first = true;
++        for (String header : copy) {
++            if (first) {
++                first = false;
++            } else {
++                result.append(',');
++            }
++            result.append(header);
++        }
++        return result.toString();
++    }
+ }
+
+==================================================
+Stream.java
+index b7ba166d37..1e9e67e1ff 100644
+--- a/java/org/apache/coyote/http2/Http2UpgradeHandler.java
++++ b/java/org/apache/coyote/http2/Http2UpgradeHandler.java
+@@ -20,6 +20,7 @@ import java.io.EOFException;
+ import java.io.IOException;
+ import java.nio.ByteBuffer;
+ import java.nio.charset.StandardCharsets;
++import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.Iterator;
+@@ -144,6 +145,10 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
+     private AtomicInteger streamConcurrency = null;
+     private Queue<StreamProcessor> queuedProcessors = null;
+ 
++    // Limits
++    private Set<String> allowedTrailerHeaders = Collections.emptySet();
++
++
+     Http2UpgradeHandler(Adapter adapter, Request coyoteRequest) {
+         super (STREAM_ID_ZERO);
+         this.adapter = adapter;
+@@ -1051,6 +1056,11 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
+     }
+ 
+ 
++    boolean isTrailerHeaderAllowed(String headerName) {
++        return allowedTrailerHeaders.contains(headerName);
++    }
++
++
+     // ------------------------------------------- Configuration getters/setters
+ 
+     public long getReadTimeout() {
+@@ -1098,6 +1108,11 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
+     }
+ 
+ 
++    public void setAllowedTrailerHeaders(Set<String> allowedTrailerHeaders) {
++        this.allowedTrailerHeaders = allowedTrailerHeaders;
++    }
++
++
+     // ----------------------------------------------- Http2Parser.Input methods
+ 
+     @Override
+
+==================================================
+Http2TestBase.java
+index c25c184e91..9c342e3be6 100644
+--- a/java/org/apache/coyote/http2/Stream.java
++++ b/java/org/apache/coyote/http2/Stream.java
+@@ -268,6 +268,9 @@ class Stream extends AbstractStream implements HeaderEmitter {
+             break;
+         }
+         default: {
++            if (headerState == HEADER_STATE_TRAILER && !handler.isTrailerHeaderAllowed(name)) {
++                break;
++            }
+             if ("expect".equals(name) && "100-continue".equals(value)) {
+                 coyoteRequest.setExpectation(true);
+             }
+
+==================================================
+TestHttp2Section_8_1.java
+index 49b385043d..95b085e4b3 100644
+--- a/test/org/apache/coyote/http2/Http2TestBase.java
++++ b/test/org/apache/coyote/http2/Http2TestBase.java
+@@ -69,7 +69,8 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+         EMPTY_HTTP2_SETTINGS_HEADER = "HTTP2-Settings: " + Base64.encodeBase64String(empty) + "\r\n";
+     }
+ 
+-    private static final String TRAILER_HEADER_NAME = "X-TrailerTest";
++    protected static final String TRAILER_HEADER_NAME = "X-TrailerTest";
++    protected static final String TRAILER_HEADER_VALUE = "test";
+ 
+     private Socket s;
+     protected HpackEncoder hpackEncoder;
+@@ -354,7 +355,7 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+         // Trailers
+         if (trailersPayload != null) {
+             MimeHeaders trailerHeaders = new MimeHeaders();
+-            trailerHeaders.addValue(TRAILER_HEADER_NAME).setString("xxxx");
++            trailerHeaders.addValue(TRAILER_HEADER_NAME).setString(TRAILER_HEADER_VALUE);
+             hpackEncoder.encode(trailerHeaders, trailersPayload);
+ 
+             trailersPayload.flip();
+
+==================================================

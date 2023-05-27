@@ -1,0 +1,215 @@
+7ff693d5075ddfb2581fe7df911fc686dc535124
+==================================================
+Parse annotations on fields or methods
+==================================================
+remm remm@apache.org
+==================================================
+Mon Apr 19 10:49:04 2021 +0200
+==================================================
+ContextConfig.java
+Parse annotations on fields or methods
+
+BZ 65244: Use that info for HandlesTypes since it is supposed to also
+include annotations used on fields and methods.
+
+
+==================================================
+ClassParser.java
+index bc684993db..058d412c87 100644
+--- a/java/org/apache/catalina/startup/ContextConfig.java
++++ b/java/org/apache/catalina/startup/ContextConfig.java
+@@ -2426,7 +2426,7 @@ public class ContextConfig implements LifecycleListener {
+         }
+ 
+         if (handlesTypesAnnotations) {
+-            AnnotationEntry[] annotationEntries = javaClass.getAnnotationEntries();
++            AnnotationEntry[] annotationEntries = javaClass.getAllAnnotationEntries();
+             if (annotationEntries != null) {
+                 for (Map.Entry<Class<?>, Set<ServletContainerInitializer>> entry :
+                         typeInitializerMap.entrySet()) {
+
+==================================================
+JavaClass.java
+index 303be90911..89dab31198 100644
+--- a/java/org/apache/tomcat/util/bcel/classfile/ClassParser.java
++++ b/java/org/apache/tomcat/util/bcel/classfile/ClassParser.java
+@@ -22,6 +22,8 @@ import java.io.DataInput;
+ import java.io.DataInputStream;
+ import java.io.IOException;
+ import java.io.InputStream;
++import java.util.ArrayList;
++import java.util.List;
+ 
+ import org.apache.tomcat.util.bcel.Const;
+ 
+@@ -47,6 +49,7 @@ public final class ClassParser {
+     private String[] interfaceNames; // Names of implemented interfaces
+     private ConstantPool constantPool; // collection of constants
+     private Annotations runtimeVisibleAnnotations; // "RuntimeVisibleAnnotations" attribute defined in the class
++    private List<Annotations> runtimeVisibleMethodOfFieldAnnotations; // "RuntimeVisibleAnnotations" attribute defined elsewhere
+     private static final int BUFSIZE = 8192;
+ 
+     private static final String[] INTERFACES_EMPTY_ARRAY = new String[0];
+@@ -91,41 +94,49 @@ public final class ClassParser {
+         // Read class methods, i.e., the functions in the class
+         readMethods();
+         // Read class attributes
+-        readAttributes();
++        readAttributes(false);
+ 
+         // Return the information we have gathered in a new object
+         return new JavaClass(class_name, superclassName,
+                 accessFlags, constantPool, interfaceNames,
+-                runtimeVisibleAnnotations);
++                runtimeVisibleAnnotations, runtimeVisibleMethodOfFieldAnnotations);
+     }
+ 
+ 
+     /**
+      * Reads information about the attributes of the class.
++     * @param fieldOrMethod false if processing a class
+      * @throws  IOException
+      * @throws  ClassFormatException
+      */
+-    private void readAttributes() throws IOException, ClassFormatException {
++    private void readAttributes(boolean fieldOrMethod) throws IOException, ClassFormatException {
+         final int attributes_count = dataInputStream.readUnsignedShort();
+         for (int i = 0; i < attributes_count; i++) {
+             ConstantUtf8 c;
+             String name;
+             int name_index;
+             int length;
+-            // Get class name from constant pool via `name_index' indirection
++            // Get class name from constant pool via 'name_index' indirection
+             name_index = dataInputStream.readUnsignedShort();
+             c = (ConstantUtf8) constantPool.getConstant(name_index,
+                     Const.CONSTANT_Utf8);
+             name = c.getBytes();
+             // Length of data in bytes
+             length = dataInputStream.readInt();
+-
+             if (name.equals("RuntimeVisibleAnnotations")) {
+-                if (runtimeVisibleAnnotations != null) {
+-                    throw new ClassFormatException(
+-                            "RuntimeVisibleAnnotations attribute is not allowed more than once in a class file");
++                if (fieldOrMethod) {
++                    Annotations fieldOrMethodAnnotations = new Annotations(dataInputStream, constantPool);
++                    if (runtimeVisibleMethodOfFieldAnnotations == null) {
++                        runtimeVisibleMethodOfFieldAnnotations = new ArrayList<>();
++                    }
++                    runtimeVisibleMethodOfFieldAnnotations.add(fieldOrMethodAnnotations);
++                } else {
++                    if (runtimeVisibleAnnotations != null) {
++                        throw new ClassFormatException(
++                                "RuntimeVisibleAnnotations attribute is not allowed more than once in a class file");
++                    }
++                    runtimeVisibleAnnotations = new Annotations(dataInputStream, constantPool);
+                 }
+-                runtimeVisibleAnnotations = new Annotations(dataInputStream, constantPool);
+             } else {
+                 // All other attributes are skipped
+                 Utility.skipFully(dataInputStream, length);
+@@ -183,7 +194,12 @@ public final class ClassParser {
+     private void readFields() throws IOException, ClassFormatException {
+         final int fields_count = dataInputStream.readUnsignedShort();
+         for (int i = 0; i < fields_count; i++) {
+-            Utility.swallowFieldOrMethod(dataInputStream);
++            // file.readUnsignedShort(); // Unused access flags
++            // file.readUnsignedShort(); // name index
++            // file.readUnsignedShort(); // signature index
++            Utility.skipFully(dataInputStream, 6);
++
++            readAttributes(true);
+         }
+     }
+ 
+@@ -229,7 +245,12 @@ public final class ClassParser {
+     private void readMethods() throws IOException, ClassFormatException {
+         final int methods_count = dataInputStream.readUnsignedShort();
+         for (int i = 0; i < methods_count; i++) {
+-            Utility.swallowFieldOrMethod(dataInputStream);
++            // file.readUnsignedShort(); // Unused access flags
++            // file.readUnsignedShort(); // name index
++            // file.readUnsignedShort(); // signature index
++            Utility.skipFully(dataInputStream, 6);
++
++            readAttributes(true);
+         }
+     }
+ 
+
+==================================================
+Utility.java
+index 46473adca2..14ef3a1dbd 100644
+--- a/java/org/apache/tomcat/util/bcel/classfile/JavaClass.java
++++ b/java/org/apache/tomcat/util/bcel/classfile/JavaClass.java
+@@ -17,6 +17,9 @@
+  */
+ package org.apache.tomcat.util.bcel.classfile;
+ 
++import java.util.HashMap;
++import java.util.List;
++
+ /**
+  * Represents a Java class, i.e., the data structures, constant pool,
+  * fields, methods and commands contained in a Java .class file.
+@@ -32,6 +35,7 @@ public class JavaClass {
+     private final String superclassName;
+     private final String[] interfaceNames;
+     private final Annotations runtimeVisibleAnnotations; // "RuntimeVisibleAnnotations" attribute defined in the class
++    private final List<Annotations> runtimeVisibleMethodOfFieldAnnotations; // "RuntimeVisibleAnnotations" attribute defined elsewhere
+ 
+     /**
+      * Constructor gets all contents as arguments.
+@@ -42,12 +46,14 @@ public class JavaClass {
+      * @param constant_pool Array of constants
+      * @param interfaceNames Implemented interfaces
+      * @param runtimeVisibleAnnotations "RuntimeVisibleAnnotations" attribute defined on the Class, or null
++     * @param runtimeVisibleMethodOfFieldAnnotations "RuntimeVisibleAnnotations" attribute defined on the fields or methids, or null
+      */
+     JavaClass(final String className, final String superclassName,
+             final int accessFlags, final ConstantPool constant_pool, final String[] interfaceNames,
+-            final Annotations runtimeVisibleAnnotations) {
++            final Annotations runtimeVisibleAnnotations, final List<Annotations> runtimeVisibleMethodOfFieldAnnotations) {
+         this.accessFlags = accessFlags;
+         this.runtimeVisibleAnnotations = runtimeVisibleAnnotations;
++        this.runtimeVisibleMethodOfFieldAnnotations = runtimeVisibleMethodOfFieldAnnotations;
+         this.className = className;
+         this.superclassName = superclassName;
+         this.interfaceNames = interfaceNames;
+@@ -73,6 +79,33 @@ public class JavaClass {
+         return null;
+     }
+ 
++    /**
++     * Return annotations entries from "RuntimeVisibleAnnotations" attribute on
++     * the class, fields or methods if there is any.
++     *
++     * @return An array of entries or {@code null}
++     */
++    public AnnotationEntry[] getAllAnnotationEntries() {
++        HashMap<String, AnnotationEntry> annotationEntries = new HashMap<>();
++        if (runtimeVisibleAnnotations != null) {
++            for (AnnotationEntry annotationEntry : runtimeVisibleAnnotations.getAnnotationEntries()) {
++                annotationEntries.put(annotationEntry.getAnnotationType(), annotationEntry);
++            }
++        }
++        if (runtimeVisibleMethodOfFieldAnnotations != null) {
++            for (Annotations annotations : runtimeVisibleMethodOfFieldAnnotations.toArray(new Annotations[0])) {
++                for (AnnotationEntry annotationEntry : annotations.getAnnotationEntries()) {
++                    annotationEntries.putIfAbsent(annotationEntry.getAnnotationType(), annotationEntry);
++                }
++            }
++        }
++        if (annotationEntries.isEmpty()) {
++            return null;
++        } else {
++            return annotationEntries.values().toArray(new AnnotationEntry[0]);
++        }
++    }
++
+     /**
+      * @return Class name.
+      */
+
+==================================================

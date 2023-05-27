@@ -1,0 +1,508 @@
+b2bab804b543bfe181fe435efe35628ce0e21b39
+==================================================
+More work towards using Charset rather than String internally to reduce the number of calls required to B2CConverter.getCharset() or equivalent during a request.
+==================================================
+Mark Thomas
+==================================================
+Thu May 4 19:00:35 2017 +0000
+==================================================
+InputBuffer.java
+More work towards using Charset rather than String internally to reduce the number of calls required to B2CConverter.getCharset() or equivalent during a request.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1793854 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+OutputBuffer.java
+index df397a8f80..a97924e086 100644
+--- a/java/org/apache/catalina/connector/LocalStrings.properties
++++ b/java/org/apache/catalina/connector/LocalStrings.properties
+@@ -58,6 +58,7 @@ coyoteRequest.maxPostSizeExceeded=The multi-part request contained parameter dat
+ coyoteRequest.noAsync=Unable to start async because the following classes in the processing chain do not support async [{0}]
+ coyoteRequest.noMultipartConfig=Unable to process parts as no multi-part configuration has been provided
+ 
++coyoteResponse.encoding.invalid=The encoding [{0}] is not recognised by the JRE
+ coyoteResponse.getOutputStream.ise=getWriter() has already been called for this response
+ coyoteResponse.getWriter.ise=getOutputStream() has already been called for this response
+ coyoteResponse.reset.ise=Cannot call reset() after response has been committed
+
+==================================================
+Request.java
+index c88b862104..f0a75efaa0 100644
+--- a/java/org/apache/catalina/connector/OutputBuffer.java
++++ b/java/org/apache/catalina/connector/OutputBuffer.java
+@@ -34,7 +34,6 @@ import javax.servlet.http.HttpServletResponse;
+ import org.apache.catalina.Globals;
+ import org.apache.coyote.ActionCode;
+ import org.apache.coyote.Response;
+-import org.apache.tomcat.util.buf.B2CConverter;
+ import org.apache.tomcat.util.buf.C2BConverter;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+@@ -526,17 +525,16 @@ public class OutputBuffer extends Writer {
+             return;
+         }
+ 
+-        String enc = null;
++        Charset charset = null;
+ 
+         if (coyoteResponse != null) {
+-            enc = coyoteResponse.getCharacterEncoding();
++            charset = coyoteResponse.getCharset();
+         }
+ 
+-        if (enc == null) {
+-            enc = org.apache.coyote.Constants.DEFAULT_CHARACTER_ENCODING;
++        if (charset == null) {
++            charset = org.apache.coyote.Constants.DEFAULT_BODY_CHARSET;
+         }
+ 
+-        final Charset charset = getCharset(enc);
+         conv = encoders.get(charset);
+ 
+         if (conv == null) {
+@@ -546,24 +544,6 @@ public class OutputBuffer extends Writer {
+     }
+ 
+ 
+-    private static Charset getCharset(final String encoding) throws IOException {
+-        if (Globals.IS_SECURITY_ENABLED) {
+-            try {
+-                return AccessController.doPrivileged(new PrivilegedGetCharset(encoding));
+-            } catch (PrivilegedActionException ex) {
+-                Exception e = ex.getException();
+-                if (e instanceof IOException) {
+-                    throw (IOException) e;
+-                } else {
+-                    throw new IOException(ex);
+-                }
+-            }
+-        } else {
+-            return B2CConverter.getCharset(encoding);
+-        }
+-    }
+-
+-
+     private static C2BConverter createConverter(final Charset charset) throws IOException {
+         if (Globals.IS_SECURITY_ENABLED) {
+             try {
+@@ -862,19 +842,4 @@ public class OutputBuffer extends Writer {
+             return new C2BConverter(charset);
+         }
+     }
+-
+-
+-    private static class PrivilegedGetCharset implements PrivilegedExceptionAction<Charset> {
+-
+-        private final String encoding;
+-
+-        public PrivilegedGetCharset(String encoding) {
+-            this.encoding = encoding;
+-        }
+-
+-        @Override
+-        public Charset run() throws IOException {
+-            return B2CConverter.getCharset(encoding);
+-        }
+-    }
+ }
+
+==================================================
+Response.java
+index fcde33e9e3..8ad51bda0e 100644
+--- a/java/org/apache/catalina/connector/Request.java
++++ b/java/org/apache/catalina/connector/Request.java
+@@ -971,14 +971,17 @@ public class Request implements HttpServletRequest {
+      */
+     @Override
+     public String getCharacterEncoding() {
+-        String result = coyoteRequest.getCharacterEncoding();
+-        if (result == null) {
+-            Context context = getContext();
+-            if (context != null) {
+-                result =  context.getRequestCharacterEncoding();
+-            }
++        Charset charset = coyoteRequest.getCharset();
++        if (charset != null) {
++            return charset.name();
+         }
+-        return result;
++
++        Context context = getContext();
++        if (context != null) {
++            return context.getRequestCharacterEncoding();
++        }
++
++        return null;
+     }
+ 
+ 
+@@ -1591,18 +1594,17 @@ public class Request implements HttpServletRequest {
+      * @since Servlet 2.3
+      */
+     @Override
+-    public void setCharacterEncoding(String enc)
+-        throws UnsupportedEncodingException {
++    public void setCharacterEncoding(String enc) throws UnsupportedEncodingException {
+ 
+         if (usingReader) {
+             return;
+         }
+ 
+         // Confirm that the encoding name is valid
+-        B2CConverter.getCharset(enc);
++        Charset charset = B2CConverter.getCharset(enc);
+ 
+         // Save the validated encoding
+-        coyoteRequest.setCharacterEncoding(enc);
++        coyoteRequest.setCharset(charset);
+     }
+ 
+ 
+@@ -3134,10 +3136,10 @@ public class Request implements HttpServletRequest {
+                     parameters.setQueryStringEncoding(enc);
+                 }
+             } else {
+-                parameters.setEncoding(org.apache.coyote.Constants.DEFAULT_CHARACTER_ENCODING);
++                parameters.setEncoding(org.apache.coyote.Constants.DEFAULT_BODY_CHARSET.name());
+                 if (useBodyEncodingForURI) {
+                     parameters.setQueryStringEncoding(
+-                            org.apache.coyote.Constants.DEFAULT_CHARACTER_ENCODING);
++                            org.apache.coyote.Constants.DEFAULT_BODY_CHARSET.name());
+                 }
+             }
+             // Note: If !useBodyEncodingForURI, the query string encoding is
+
+==================================================
+SecurityClassLoad.java
+index 951bea47d2..c6d8f647a4 100644
+--- a/java/org/apache/catalina/connector/Response.java
++++ b/java/org/apache/catalina/connector/Response.java
+@@ -18,6 +18,7 @@ package org.apache.catalina.connector;
+ 
+ import java.io.IOException;
+ import java.io.PrintWriter;
++import java.io.UnsupportedEncodingException;
+ import java.net.MalformedURLException;
+ import java.net.URL;
+ import java.nio.charset.Charset;
+@@ -53,6 +54,7 @@ import org.apache.catalina.util.SessionConfig;
+ import org.apache.coyote.ActionCode;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
++import org.apache.tomcat.util.buf.B2CConverter;
+ import org.apache.tomcat.util.buf.CharChunk;
+ import org.apache.tomcat.util.buf.UEncoder;
+ import org.apache.tomcat.util.buf.UEncoder.SafeCharsSet;
+@@ -549,16 +551,21 @@ public class Response implements HttpServletResponse {
+      */
+     @Override
+     public String getCharacterEncoding() {
+-        String result = getCoyoteResponse().getCharacterEncoding();
+-        if (result == null) {
+-            Context context = getContext();
+-            if (context != null) {
+-                result =  context.getResponseCharacterEncoding();
+-            }
++        Charset charset = getCoyoteResponse().getCharset();
++        if (charset != null) {
++            return charset.name();
+         }
++
++        Context context = getContext();
++        String result = null;
++        if (context != null) {
++            result =  context.getResponseCharacterEncoding();
++        }
++
+         if (result == null) {
+-            result = org.apache.coyote.Constants.DEFAULT_CHARACTER_ENCODING;
++            result = org.apache.coyote.Constants.DEFAULT_BODY_CHARSET.name();
+         }
++
+         return result;
+     }
+ 
+@@ -794,7 +801,12 @@ public class Response implements HttpServletResponse {
+         if (m[1] != null) {
+             // Ignore charset if getWriter() has already been called
+             if (!usingWriter) {
+-                getCoyoteResponse().setCharacterEncoding(m[1]);
++                try {
++                    getCoyoteResponse().setCharset(B2CConverter.getCharset(m[1]));
++                } catch (UnsupportedEncodingException e) {
++                    log.warn(sm.getString("coyoteResponse.encoding.invalid", m[1]), e);
++                }
++
+                 isCharacterEncodingSet = true;
+             }
+         }
+@@ -826,7 +838,12 @@ public class Response implements HttpServletResponse {
+             return;
+         }
+ 
+-        getCoyoteResponse().setCharacterEncoding(charset);
++        try {
++            getCoyoteResponse().setCharset(B2CConverter.getCharset(charset));
++        } catch (UnsupportedEncodingException e) {
++            log.warn(sm.getString("coyoteResponse.encoding.invalid", charset), e);
++            return;
++        }
+         isCharacterEncodingSet = true;
+     }
+ 
+@@ -863,7 +880,11 @@ public class Response implements HttpServletResponse {
+ 
+         String charset = getContext().getCharset(locale);
+         if (charset != null) {
+-            getCoyoteResponse().setCharacterEncoding(charset);
++            try {
++                getCoyoteResponse().setCharset(B2CConverter.getCharset(charset));
++            } catch (UnsupportedEncodingException e) {
++                log.warn(sm.getString("coyoteResponse.encoding.invalid", charset), e);
++            }
+         }
+     }
+ 
+
+==================================================
+SSIServletExternalResolver.java
+index 86be2f2e2c..e6600d3948 100644
+--- a/java/org/apache/catalina/security/SecurityClassLoad.java
++++ b/java/org/apache/catalina/security/SecurityClassLoad.java
+@@ -143,7 +143,6 @@ public final class SecurityClassLoad {
+         loader.loadClass(basePackage + "RequestFacade$GetSessionPrivilegedAction");
+         loader.loadClass(basePackage + "ResponseFacade$FlushBufferPrivilegedAction");
+         loader.loadClass(basePackage + "OutputBuffer$PrivilegedCreateConverter");
+-        loader.loadClass(basePackage + "OutputBuffer$PrivilegedGetCharset");
+         loader.loadClass(basePackage + "CoyoteInputStream$PrivilegedAvailable");
+         loader.loadClass(basePackage + "CoyoteInputStream$PrivilegedClose");
+         loader.loadClass(basePackage + "CoyoteInputStream$PrivilegedRead");
+
+==================================================
+Constants.java
+index e8eb4baf5a..3e9d0683a4 100644
+--- a/java/org/apache/catalina/ssi/SSIServletExternalResolver.java
++++ b/java/org/apache/catalina/ssi/SSIServletExternalResolver.java
+@@ -18,10 +18,9 @@ package org.apache.catalina.ssi;
+ 
+ 
+ import java.io.IOException;
+-import java.io.UnsupportedEncodingException;
+ import java.net.URL;
+ import java.net.URLConnection;
+-import java.net.URLDecoder;
++import java.nio.charset.Charset;
+ import java.util.Collection;
+ import java.util.Date;
+ import java.util.Enumeration;
+@@ -37,6 +36,7 @@ import org.apache.catalina.connector.Connector;
+ import org.apache.catalina.connector.Request;
+ import org.apache.coyote.Constants;
+ import org.apache.tomcat.util.buf.B2CConverter;
++import org.apache.tomcat.util.buf.UDecoder;
+ import org.apache.tomcat.util.http.RequestUtil;
+ 
+ /**
+@@ -244,35 +244,32 @@ public class SSIServletExternalResolver implements SSIExternalResolver {
+                 } else if (nameParts[2].equals("UNESCAPED")) {
+                     requiredParts = 3;
+                     if (queryString != null) {
+-                        String uriEncoding = null;
++                        Charset uriCharset = null;
++                        Charset requestCharset = null;
+                         boolean useBodyEncodingForURI = false;
+ 
+                         // Get encoding settings from request / connector if
+                         // possible
+-                        String requestEncoding = req.getCharacterEncoding();
+                         if (req instanceof Request) {
++                            requestCharset = ((Request)req).getCoyoteRequest().getCharset();
+                             Connector connector =  ((Request)req).getConnector();
+-                            uriEncoding = connector.getURIEncoding();
++                            uriCharset = connector.getURICharset();
+                             useBodyEncodingForURI = connector.getUseBodyEncodingForURI();
+                         }
+ 
+-                        String queryStringEncoding;
++                        Charset queryStringCharset;
+ 
+                         // If valid, apply settings from request / connector
+-                        if (useBodyEncodingForURI && requestEncoding != null) {
+-                            queryStringEncoding = requestEncoding;
+-                        } else if (uriEncoding != null) {
+-                            queryStringEncoding = uriEncoding;
++                        if (useBodyEncodingForURI && requestCharset != null) {
++                            queryStringCharset = requestCharset;
++                        } else if (uriCharset != null) {
++                            queryStringCharset = uriCharset;
+                         } else {
+                             // Use default as a last resort
+-                            queryStringEncoding = Constants.DEFAULT_CHARACTER_ENCODING;
++                            queryStringCharset = Constants.DEFAULT_URI_CHARSET;
+                         }
+ 
+-                        try {
+-                            retVal = URLDecoder.decode(queryString, queryStringEncoding);
+-                        } catch (UnsupportedEncodingException e) {
+-                            retVal = queryString;
+-                        }
++                        retVal = UDecoder.URLDecode(queryString, queryStringCharset);
+                     }
+                 }
+             }
+
+==================================================
+Request.java
+index 12641d03c2..7883f74e5f 100644
+--- a/java/org/apache/coyote/LocalStrings.properties
++++ b/java/org/apache/coyote/LocalStrings.properties
+@@ -46,6 +46,7 @@ request.notAsync=It is only valid to switch to non-blocking IO within async proc
+ request.nullReadListener=The listener passed to setReadListener() may not be null
+ request.readListenerSet=The non-blocking read listener has already been set
+ 
++response.encoding.invalid=The encoding [{0}] is not recognised by the JRE
+ response.notAsync=It is only valid to switch to non-blocking IO within async processing or HTTP upgrade processing
+ response.notNonBlocking=It is invalid to call isReady() when the response has not been put into non-blocking mode
+ response.nullWriteListener=The listener passed to setWriteListener() may not be null
+
+==================================================
+Response.java
+index eca5bd8fcc..42d90d1515 100644
+--- a/java/org/apache/coyote/Request.java
++++ b/java/org/apache/coyote/Request.java
+@@ -17,12 +17,15 @@
+ package org.apache.coyote;
+ 
+ import java.io.IOException;
++import java.io.UnsupportedEncodingException;
++import java.nio.charset.Charset;
+ import java.util.HashMap;
+ import java.util.Map;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ import javax.servlet.ReadListener;
+ 
++import org.apache.tomcat.util.buf.B2CConverter;
+ import org.apache.tomcat.util.buf.MessageBytes;
+ import org.apache.tomcat.util.buf.UDecoder;
+ import org.apache.tomcat.util.http.MimeHeaders;
+@@ -127,7 +130,7 @@ public final class Request {
+      */
+     private long contentLength = -1;
+     private MessageBytes contentTypeMB = null;
+-    private String charEncoding = null;
++    private Charset charset = null;
+     /**
+      * Is there an expectation ?
+      */
+@@ -290,24 +293,54 @@ public final class Request {
+      * @return The value set via {@link #setCharacterEncoding(String)} or if no
+      *         call has been made to that method try to obtain if from the
+      *         content type.
++     *
++     * @deprecated This method will be removed in Tomcat 9.0.x
+      */
++    @Deprecated
+     public String getCharacterEncoding() {
++        Charset charset = getCharset();
++        if (charset == null) {
++            return null;
++        }
++        return charset.name();
++    }
++
+ 
+-        if (charEncoding != null) {
+-            return charEncoding;
++    /**
++     * Get the character encoding used for this request.
++     *
++     * @return The value set via {@link #setCharacterEncoding(String)} or if no
++     *         call has been made to that method try to obtain if from the
++     *         content type.
++     */
++    public Charset getCharset() {
++        if (charset != null) {
++            return charset;
+         }
+ 
+-        charEncoding = getCharsetFromContentType(getContentType());
++        charset = getCharsetFromContentType(getContentType());
+ 
+-        return charEncoding;
++        return charset;
+     }
+ 
+ 
+-    public void setCharacterEncoding(String enc) {
+-        this.charEncoding = enc;
++    /**
++     * @param enc The new encoding
++     *
++     * @throws UnsupportedEncodingException If the encoding is invalid
++     *
++     * @deprecated This method will be removed in Tomcat 9.0.x
++     */
++    @Deprecated
++    public void setCharacterEncoding(String enc) throws UnsupportedEncodingException {
++        setCharset(B2CConverter.getCharset(enc));
+     }
+ 
+ 
++    public void setCharset(Charset charset) {
++        this.charset = charset;
++    }
++
+     public void setContentLength(long len) {
+         this.contentLength = len;
+     }
+@@ -576,7 +609,7 @@ public final class Request {
+ 
+         contentLength = -1;
+         contentTypeMB = null;
+-        charEncoding = null;
++        charset = null;
+         expectation = false;
+         headers.recycle();
+         trailerFields.clear();
+@@ -638,14 +671,14 @@ public final class Request {
+      *
+      * @param contentType a content type header
+      */
+-    private static String getCharsetFromContentType(String contentType) {
++    private static Charset getCharsetFromContentType(String contentType) {
+ 
+         if (contentType == null) {
+-            return (null);
++            return null;
+         }
+         int start = contentType.indexOf("charset=");
+         if (start < 0) {
+-            return (null);
++            return null;
+         }
+         String encoding = contentType.substring(start + 8);
+         int end = encoding.indexOf(';');
+@@ -657,8 +690,16 @@ public final class Request {
+             && (encoding.endsWith("\""))) {
+             encoding = encoding.substring(1, encoding.length() - 1);
+         }
+-        return (encoding.trim());
+ 
++        Charset result = null;
++
++        try {
++            result = B2CConverter.getCharset(encoding.trim());
++        } catch (UnsupportedEncodingException e) {
++            // Ignore
++        }
++
++        return result;
+     }
+ 
+ }
+
+==================================================

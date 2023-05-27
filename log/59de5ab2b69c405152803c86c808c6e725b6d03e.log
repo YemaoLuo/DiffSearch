@@ -1,0 +1,392 @@
+59de5ab2b69c405152803c86c808c6e725b6d03e
+==================================================
+First pass at adding h2c support
+==================================================
+Mark Thomas
+==================================================
+Fri May 29 15:48:20 2015 +0000
+==================================================
+UpgradeProtocol.java
+First pass at adding h2c support
+The requirement to process the initial HTTP/1.1 request as HTTP/2 stream 1 makes for some interesting code paths.
+The main motivation behind this is so I can start writing some unit tests for the HTTP/2 protocol implementation and it will be a lot easier to write and debug these if I can do it in the clear.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1682507 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AbstractHttp11Protocol.java
+index 07f456b223..1de9fb4732 100644
+--- a/java/org/apache/coyote/UpgradeProtocol.java
++++ b/java/org/apache/coyote/UpgradeProtocol.java
+@@ -16,6 +16,7 @@
+  */
+ package org.apache.coyote;
+ 
++import org.apache.coyote.http11.upgrade.InternalHttpUpgradeHandler;
+ import org.apache.tomcat.util.net.SocketWrapperBase;
+ 
+ public interface UpgradeProtocol {
+@@ -66,4 +67,14 @@ public interface UpgradeProtocol {
+      *         protocol.
+      */
+     public Processor getProcessor(SocketWrapperBase<?> socketWrapper, Adapter adapter);
++
++
++    /**
++     * @param adapter The Adapter to use to configure the new upgrade handler
++     * @param request A copy (may be incomplete) of the request that triggered
++     *                the upgrade
++     *
++     * @return An instance of the HTTP upgrade handler for this protocol
++     */
++    public InternalHttpUpgradeHandler getInteralUpgradeHandler(Adapter adapter, Request request);
+ }
+
+==================================================
+Http11Processor.java
+index c4972aecd3..8e66882790 100644
+--- a/java/org/apache/coyote/http11/AbstractHttp11Protocol.java
++++ b/java/org/apache/coyote/http11/AbstractHttp11Protocol.java
+@@ -293,6 +293,7 @@ public abstract class AbstractHttp11Protocol<S> extends AbstractProtocol<S> {
+      * The upgrade protocol instances configured.
+      */
+     private final List<UpgradeProtocol> upgradeProtocols = new ArrayList<>();
++    @Override
+     public void addUpgradeProtocol(UpgradeProtocol upgradeProtocol) {
+         upgradeProtocols.add(upgradeProtocol);
+     }
+@@ -650,7 +651,7 @@ public abstract class AbstractHttp11Protocol<S> extends AbstractProtocol<S> {
+             Http11Processor processor = new Http11Processor(
+                     proto.getMaxHttpHeaderSize(), proto.getEndpoint(), proto.getMaxTrailerSize(),
+                     proto.allowedTrailerHeaders, proto.getMaxExtensionSize(),
+-                    proto.getMaxSwallowSize());
++                    proto.getMaxSwallowSize(), proto.httpUpgradeProtocols);
+             proto.configureProcessor(processor);
+             register(processor);
+             return processor;
+
+==================================================
+ConnectionPrefaceParser.java
+index 68fe16a15b..521e84ddee 100644
+--- a/java/org/apache/coyote/http11/Http11Processor.java
++++ b/java/org/apache/coyote/http11/Http11Processor.java
+@@ -20,6 +20,7 @@ import java.io.IOException;
+ import java.io.InterruptedIOException;
+ import java.nio.ByteBuffer;
+ import java.util.Locale;
++import java.util.Map;
+ import java.util.Set;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.regex.Pattern;
+@@ -32,7 +33,9 @@ import org.apache.coyote.AbstractProcessor;
+ import org.apache.coyote.ActionCode;
+ import org.apache.coyote.AsyncContextCallback;
+ import org.apache.coyote.ErrorState;
++import org.apache.coyote.Request;
+ import org.apache.coyote.RequestInfo;
++import org.apache.coyote.UpgradeProtocol;
+ import org.apache.coyote.http11.filters.BufferedInputFilter;
+ import org.apache.coyote.http11.filters.ChunkedInputFilter;
+ import org.apache.coyote.http11.filters.ChunkedOutputFilter;
+@@ -42,6 +45,7 @@ import org.apache.coyote.http11.filters.IdentityOutputFilter;
+ import org.apache.coyote.http11.filters.SavedRequestInputFilter;
+ import org.apache.coyote.http11.filters.VoidInputFilter;
+ import org.apache.coyote.http11.filters.VoidOutputFilter;
++import org.apache.coyote.http11.upgrade.InternalHttpUpgradeHandler;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.ExceptionUtils;
+@@ -238,8 +242,15 @@ public class Http11Processor extends AbstractProcessor {
+     protected SSLSupport sslSupport;
+ 
+ 
++    /**
++     * UpgradeProtocol information
++     */
++    private final Map<String,UpgradeProtocol> httpUpgradeProtocols;
++
++
+     public Http11Processor(int maxHttpHeaderSize, AbstractEndpoint<?> endpoint,int maxTrailerSize,
+-            Set<String> allowedTrailerHeaders, int maxExtensionSize, int maxSwallowSize) {
++            Set<String> allowedTrailerHeaders, int maxExtensionSize, int maxSwallowSize,
++            Map<String,UpgradeProtocol> httpUpgradeProtocols) {
+ 
+         super(endpoint);
+         userDataHelper = new UserDataHelper(log);
+@@ -271,6 +282,8 @@ public class Http11Processor extends AbstractProcessor {
+         outputBuffer.addFilter(new GzipOutputFilter());
+ 
+         pluggableFilterIndex = inputBuffer.getFilters().length;
++
++        this.httpUpgradeProtocols = httpUpgradeProtocols;
+     }
+ 
+ 
+@@ -1014,6 +1027,25 @@ public class Http11Processor extends AbstractProcessor {
+                 getAdapter().log(request, response, 0);
+             }
+ 
++            // Has an upgrade been requested?
++            String connection = request.getHeader(Constants.CONNECTION);
++            if (connection != null && connection.toLowerCase().contains("upgrade")) {
++                // Check the protocol
++                String requestedProtocol = request.getHeader("Upgrade");
++
++                UpgradeProtocol upgradeProtocol = httpUpgradeProtocols.get(requestedProtocol);
++                if (upgradeProtocol != null) {
++                    // TODO Figure out how to handle request bodies at this
++                    // point.
++
++                    InternalHttpUpgradeHandler upgradeHandler =
++                            upgradeProtocol.getInteralUpgradeHandler(
++                                    getAdapter(), cloneRequest(request));
++                    action(ActionCode.UPGRADE, upgradeHandler);
++                    return SocketState.UPGRADING;
++                }
++            }
++
+             if (!getErrorState().isError()) {
+                 // Setting up filters, and parse some request headers
+                 rp.setStage(org.apache.coyote.Constants.STAGE_PREPARE);
+@@ -1143,6 +1175,20 @@ public class Http11Processor extends AbstractProcessor {
+     }
+ 
+ 
++    private Request cloneRequest(Request source) throws IOException {
++        Request dest = new Request();
++
++        // Transfer the minimal information required for the copy of the Request
++        // that is passed to the HTTP upgrade process
++
++        dest.decodedURI().duplicate(source.decodedURI());
++        dest.method().duplicate(source.method());
++        dest.getMimeHeaders().duplicate(source.getMimeHeaders());
++        dest.requestURI().duplicate(source.requestURI());
++
++        return dest;
++
++    }
+     private boolean handleIncompleteRequestLineRead() {
+         // Haven't finished reading the request so keep the socket
+         // open
+
+==================================================
+Http2Protocol.java
+index 795e1ef80f..e8cdf5f9a9 100644
+--- a/java/org/apache/coyote/http2/ConnectionPrefaceParser.java
++++ b/java/org/apache/coyote/http2/ConnectionPrefaceParser.java
+@@ -41,10 +41,10 @@ public class ConnectionPrefaceParser {
+     private volatile boolean error = false;
+ 
+ 
+-    public boolean parse(SocketWrapperBase<?> socketWrapper) {
++    public boolean parse(SocketWrapperBase<?> socketWrapper, boolean block) {
+         int read = 0;
+         try {
+-            read = socketWrapper.read(false, data, pos, EXPECTED.length - pos);
++            read = socketWrapper.read(block, data, pos, EXPECTED.length - pos);
+         } catch (IOException ioe) {
+             log.error(sm.getString("connectionPrefaceParser.ioError"), ioe);
+             error = true;
+
+==================================================
+Http2UpgradeHandler.java
+index 8bf5b000bb..1a29005756 100644
+--- a/java/org/apache/coyote/http2/Http2Protocol.java
++++ b/java/org/apache/coyote/http2/Http2Protocol.java
+@@ -20,7 +20,9 @@ import java.nio.charset.StandardCharsets;
+ 
+ import org.apache.coyote.Adapter;
+ import org.apache.coyote.Processor;
++import org.apache.coyote.Request;
+ import org.apache.coyote.UpgradeProtocol;
++import org.apache.coyote.http11.upgrade.InternalHttpUpgradeHandler;
+ import org.apache.coyote.http11.upgrade.UpgradeProcessorInternal;
+ import org.apache.tomcat.util.net.SocketWrapperBase;
+ 
+@@ -51,8 +53,15 @@ public class Http2Protocol implements UpgradeProtocol {
+ 
+     @Override
+     public Processor getProcessor(SocketWrapperBase<?> socketWrapper, Adapter adapter) {
+-        UpgradeProcessorInternal processor =
+-                new UpgradeProcessorInternal(socketWrapper, null, new Http2UpgradeHandler(adapter));
++        UpgradeProcessorInternal processor = new UpgradeProcessorInternal(socketWrapper, null,
++                getInteralUpgradeHandler(adapter, null));
+         return processor;
+     }
++
++
++    @Override
++    public InternalHttpUpgradeHandler getInteralUpgradeHandler(Adapter adapter,
++            Request coyoteRequest) {
++        return new Http2UpgradeHandler(adapter, coyoteRequest);
++    }
+ }
+
+==================================================
+Stream.java
+index ca950aef19..ca6ac8fe08 100644
+--- a/java/org/apache/coyote/http2/Http2UpgradeHandler.java
++++ b/java/org/apache/coyote/http2/Http2UpgradeHandler.java
+@@ -32,11 +32,13 @@ import java.util.concurrent.atomic.AtomicInteger;
+ import javax.servlet.http.WebConnection;
+ 
+ import org.apache.coyote.Adapter;
++import org.apache.coyote.Request;
+ import org.apache.coyote.Response;
+ import org.apache.coyote.http11.upgrade.InternalHttpUpgradeHandler;
+ import org.apache.coyote.http2.HpackEncoder.State;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
++import org.apache.tomcat.util.codec.binary.Base64;
+ import org.apache.tomcat.util.http.MimeHeaders;
+ import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
+ import org.apache.tomcat.util.net.SSLSupport;
+@@ -92,6 +94,10 @@ public class Http2UpgradeHandler extends AbstractStream implements InternalHttpU
+ 
+     private static final byte[] GOAWAY = { 0x07, 0x00, 0x00, 0x00, 0x00 };
+ 
++    private static final String HTTP2_SETTINGS_HEADER = "HTTP2-Settings";
++    private static final byte[] HTTP2_UPGRADE_ACK = ("HTTP/1.1 101 Switching Protocols\r\n" +
++                "Connection: Upgrade\r\nUpgrade: h2c\r\n\r\n").getBytes(StandardCharsets.ISO_8859_1);
++
+     private final int connectionId;
+ 
+     private final Adapter adapter;
+@@ -119,28 +125,85 @@ public class Http2UpgradeHandler extends AbstractStream implements InternalHttpU
+     private long backLogSize = 0;
+ 
+ 
+-    public Http2UpgradeHandler(Adapter adapter) {
++    public Http2UpgradeHandler(Adapter adapter, Request coyoteRequest) {
+         super (STREAM_ID_ZERO);
+         this.adapter = adapter;
+         this.connectionId = connectionIdGenerator.getAndIncrement();
++
++        // Initial HTTP request becomes stream 0.
++        if (coyoteRequest != null) {
++            Integer key = Integer.valueOf(1);
++            Stream stream = new Stream(key, this, coyoteRequest);
++            streams.put(key, stream);
++            maxRemoteStreamId = 1;
++        }
+     }
+ 
+ 
+     @Override
+-    public void init(WebConnection unused) {
++    public void init(WebConnection webConnection) {
+         if (log.isDebugEnabled()) {
+             log.debug(sm.getString("upgradeHandler.init", Long.toString(connectionId)));
+         }
+ 
+         initialized = true;
++        Stream stream = null;
++
++        if (webConnection != null) {
++            // HTTP/2 started via HTTP upgrade.
++            // The initial HTTP/1.1 request is available as Stream 1.
++
++            try {
++                // Acknowledge the upgrade request
++                socketWrapper.write(true, HTTP2_UPGRADE_ACK, 0, HTTP2_UPGRADE_ACK.length);
++                socketWrapper.flush(true);
++
++                // Process the initial settings frame
++                stream = getStream(1);
++                String base64Settings = stream.getCoyoteRequest().getHeader(HTTP2_SETTINGS_HEADER);
++                byte[] settings = Base64.decodeBase64(base64Settings);
++
++                if (settings.length % 6 != 0) {
++                    // Invalid payload length for settings
++                    // TODO i18n
++                    throw new IllegalStateException();
++                }
++
++                for (int i = 0; i < settings.length % 6; i++) {
++                    int id = ByteUtil.getTwoBytes(settings, i * 6);
++                    int value = ByteUtil.getFourBytes(settings, (i * 6) + 2);
++                    remoteSettings.set(id, value);
++                }
++
++                firstFrame = false;
++                hpackDecoder = new HpackDecoder(remoteSettings.getHeaderTableSize());
++                hpackEncoder = new HpackEncoder(localSettings.getHeaderTableSize());
++
++                if (!connectionPrefaceParser.parse(socketWrapper, true)) {
++                    // TODO i18n
++                    throw new IllegalStateException();
++                }
++            } catch (IOException ioe) {
++                // TODO i18n
++                throw new IllegalStateException();
++            }
++        }
+ 
+         // Send the initial settings frame
+         try {
+             socketWrapper.write(true, SETTINGS_EMPTY, 0, SETTINGS_EMPTY.length);
+             socketWrapper.flush(true);
++
+         } catch (IOException ioe) {
+             throw new IllegalStateException(sm.getString("upgradeHandler.sendPrefaceFail"), ioe);
+         }
++
++        if (webConnection != null) {
++            // Process the initial request on a container thread
++            StreamProcessor streamProcessor = new StreamProcessor(stream, adapter, socketWrapper);
++            streamProcessor.setSslSupport(sslSupport);
++            socketWrapper.getEndpoint().getExecutor().execute(streamProcessor);
++        }
+     }
+ 
+ 
+@@ -175,7 +238,7 @@ public class Http2UpgradeHandler extends AbstractStream implements InternalHttpU
+             // Gets set to null once the connection preface has been
+             // successfully parsed.
+             if (connectionPrefaceParser != null) {
+-                if (!connectionPrefaceParser.parse(socketWrapper)) {
++                if (!connectionPrefaceParser.parse(socketWrapper, false)) {
+                     if (connectionPrefaceParser.isError()) {
+                         // Any errors will have already been logged.
+                         close();
+
+==================================================
+TestAbstractStream.java
+index f699e29b20..f4bbfa4110 100644
+--- a/java/org/apache/coyote/http2/Stream.java
++++ b/java/org/apache/coyote/http2/Stream.java
+@@ -38,19 +38,26 @@ public class Stream extends AbstractStream implements HeaderEmitter {
+     private volatile int weight = Constants.DEFAULT_WEIGHT;
+ 
+     private final Http2UpgradeHandler handler;
+-    private final Request coyoteRequest = new Request();
++    private final Request coyoteRequest;
+     private final Response coyoteResponse = new Response();
+     private final StreamInputBuffer inputBuffer = new StreamInputBuffer();
+     private final StreamOutputBuffer outputBuffer = new StreamOutputBuffer();
+ 
+ 
+     public Stream(Integer identifier, Http2UpgradeHandler handler) {
++        this(identifier, handler, new Request());
++    }
++
++
++    public Stream(Integer identifier, Http2UpgradeHandler handler, Request coyoteRequest) {
+         super(identifier);
+         this.handler = handler;
+         setParentStream(handler);
+         setWindowSize(handler.getRemoteSettings().getInitialWindowSize());
+-        coyoteRequest.setInputBuffer(inputBuffer);
+-        coyoteResponse.setOutputBuffer(outputBuffer);
++        this.coyoteRequest = coyoteRequest;
++        this.coyoteRequest.setInputBuffer(inputBuffer);
++        this.coyoteResponse.setOutputBuffer(outputBuffer);
++        this.coyoteRequest.setResponse(coyoteResponse);
+     }
+ 
+ 
+
+==================================================

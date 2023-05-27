@@ -1,0 +1,813 @@
+6650205974619771f9ffe19d1b7a5490ce468e9d
+==================================================
+Update Tomcat's internal fork of Commons FileUpload
+==================================================
+Mark Thomas
+==================================================
+Wed Sep 1 17:12:12 2021 +0100
+==================================================
+Request.java
+index 7b10d6a417..73ecd41718 100644
+--- a/MERGE.txt
++++ b/MERGE.txt
+@@ -51,7 +51,7 @@ FileUpload
+ Sub-tree:
+ src/main/java/org/apache/commons/fileupload2
+ The SHA1 ID / tag for the most recent commit to be merged to Tomcat is:
+-ee0a7131b6b87586b28542de354951414dedac3f (2021-01-15)
++33d2d79230bb851642435821b380904d24752ee1 (2021-09-01)
+ 
+ Note: Tomcat's copy of fileupload also includes classes copied manually from
+       Commons IO.
+
+==================================================
+ApplicationPart.java
+index a9c247f5b0..82f4a5a0f2 100644
+--- a/java/org/apache/catalina/connector/Request.java
++++ b/java/org/apache/catalina/connector/Request.java
+@@ -106,7 +106,6 @@ import org.apache.tomcat.util.http.Parameters.FailReason;
+ import org.apache.tomcat.util.http.ServerCookie;
+ import org.apache.tomcat.util.http.ServerCookies;
+ import org.apache.tomcat.util.http.fileupload.FileItem;
+-import org.apache.tomcat.util.http.fileupload.FileUploadException;
+ import org.apache.tomcat.util.http.fileupload.disk.DiskFileItemFactory;
+ import org.apache.tomcat.util.http.fileupload.impl.InvalidContentTypeException;
+ import org.apache.tomcat.util.http.fileupload.impl.SizeException;
+@@ -2930,7 +2929,7 @@ public class Request implements HttpServletRequest {
+                 parameters.setParseFailedReason(FailReason.POST_TOO_LARGE);
+                 checkSwallowInput();
+                 partsParseException = new IllegalStateException(e);
+-            } catch (FileUploadException e) {
++            } catch (IOException e) {
+                 parameters.setParseFailedReason(FailReason.IO_ERROR);
+                 partsParseException = new IOException(e);
+             } catch (IllegalStateException e) {
+
+==================================================
+FileItem.java
+index fe7273269b..ec10e36289 100644
+--- a/java/org/apache/catalina/core/ApplicationPart.java
++++ b/java/org/apache/catalina/core/ApplicationPart.java
+@@ -123,7 +123,7 @@ public class ApplicationPart implements Part {
+         }
+     }
+ 
+-    public String getString(String encoding) throws UnsupportedEncodingException {
++    public String getString(String encoding) throws UnsupportedEncodingException, IOException {
+         return fileItem.getString(encoding);
+     }
+ 
+
+==================================================
+FileUpload.java
+index 29aa496b30..d1e0523f12 100644
+--- a/java/org/apache/tomcat/util/http/fileupload/FileItem.java
++++ b/java/org/apache/tomcat/util/http/fileupload/FileItem.java
+@@ -20,6 +20,7 @@ import java.io.File;
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.io.OutputStream;
++import java.io.UncheckedIOException;
+ import java.io.UnsupportedEncodingException;
+ 
+ /**
+@@ -104,8 +105,10 @@ public interface FileItem extends FileItemHeadersSupport {
+      * Returns the contents of the file item as an array of bytes.
+      *
+      * @return The contents of the file item as an array of bytes.
++     *
++     * @throws UncheckedIOException if an I/O error occurs
+      */
+-    byte[] get();
++    byte[] get() throws UncheckedIOException;
+ 
+     /**
+      * Returns the contents of the file item as a String, using the specified
+@@ -118,8 +121,9 @@ public interface FileItem extends FileItemHeadersSupport {
+      *
+      * @throws UnsupportedEncodingException if the requested character
+      *                                      encoding is not available.
++     * @throws IOException if an I/O error occurs
+      */
+-    String getString(String encoding) throws UnsupportedEncodingException;
++    String getString(String encoding) throws UnsupportedEncodingException, IOException;
+ 
+     /**
+      * Returns the contents of the file item as a String, using the default
+
+==================================================
+FileUploadBase.java
+index 9be9caaa08..f0cfebcf08 100644
+--- a/java/org/apache/tomcat/util/http/fileupload/FileUpload.java
++++ b/java/org/apache/tomcat/util/http/fileupload/FileUpload.java
+@@ -43,7 +43,7 @@ public class FileUpload
+     // ----------------------------------------------------------- Constructors
+ 
+     /**
+-     * Constructs an uninitialised instance of this class.
++     * Constructs an uninitialized instance of this class.
+      *
+      * A factory must be
+      * configured, using {@code setFileItemFactory()}, before attempting
+
+==================================================
+MultipartStream.java
+index 30a582ca4c..7d678c24d8 100644
+--- a/java/org/apache/tomcat/util/http/fileupload/FileUploadBase.java
++++ b/java/org/apache/tomcat/util/http/fileupload/FileUploadBase.java
+@@ -26,7 +26,6 @@ import java.util.Map;
+ import java.util.Objects;
+ 
+ import org.apache.tomcat.util.http.fileupload.impl.FileItemIteratorImpl;
+-import org.apache.tomcat.util.http.fileupload.impl.FileItemStreamImpl;
+ import org.apache.tomcat.util.http.fileupload.impl.FileUploadIOException;
+ import org.apache.tomcat.util.http.fileupload.impl.IOFileUploadException;
+ import org.apache.tomcat.util.http.fileupload.util.FileItemHeadersImpl;
+@@ -70,10 +69,7 @@ public abstract class FileUploadBase {
+         if (contentType == null) {
+             return false;
+         }
+-        if (contentType.toLowerCase(Locale.ENGLISH).startsWith(MULTIPART)) {
+-            return true;
+-        }
+-        return false;
++        return contentType.toLowerCase(Locale.ENGLISH).startsWith(MULTIPART);
+     }
+ 
+     // ----------------------------------------------------- Manifest constants
+@@ -278,12 +274,13 @@ public abstract class FileUploadBase {
+         boolean successful = false;
+         try {
+             final FileItemIterator iter = getItemIterator(ctx);
+-            final FileItemFactory fileItemFactory = Objects.requireNonNull(getFileItemFactory(), "No FileItemFactory has been set.");
++            final FileItemFactory fileItemFactory = Objects.requireNonNull(getFileItemFactory(),
++                    "No FileItemFactory has been set.");
+             final byte[] buffer = new byte[Streams.DEFAULT_BUFFER_SIZE];
+             while (iter.hasNext()) {
+                 final FileItemStream item = iter.next();
+                 // Don't use getName() here to prevent an InvalidFileNameException.
+-                final String fileName = ((FileItemStreamImpl) item).getName();
++                final String fileName = item.getName();
+                 final FileItem fileItem = fileItemFactory.createItem(item.getFieldName(), item.getContentType(),
+                                                    item.isFormField(), fileName);
+                 items.add(fileItem);
+@@ -337,12 +334,7 @@ public abstract class FileUploadBase {
+ 
+         for (final FileItem fileItem : items) {
+             final String fieldName = fileItem.getFieldName();
+-            List<FileItem> mappedItems = itemsMap.get(fieldName);
+-
+-            if (mappedItems == null) {
+-                mappedItems = new ArrayList<>();
+-                itemsMap.put(fieldName, mappedItems);
+-            }
++            List<FileItem> mappedItems = itemsMap.computeIfAbsent(fieldName, k -> new ArrayList<>());
+ 
+             mappedItems.add(fileItem);
+         }
+
+==================================================
+ParameterParser.java
+index 595a975a4f..ab6e8e58ad 100644
+--- a/java/org/apache/tomcat/util/http/fileupload/MultipartStream.java
++++ b/java/org/apache/tomcat/util/http/fileupload/MultipartStream.java
+@@ -401,7 +401,7 @@ public class MultipartStream {
+     public boolean readBoundary()
+             throws FileUploadIOException, MalformedStreamException {
+         final byte[] marker = new byte[2];
+-        boolean nextChunk = false;
++        boolean nextChunk;
+ 
+         head += boundaryLength;
+         try {
+@@ -532,7 +532,7 @@ public class MultipartStream {
+             baos.write(b);
+         }
+ 
+-        String headers = null;
++        String headers;
+         if (headerEncoding != null) {
+             try {
+                 headers = baos.toString(headerEncoding);
+
+==================================================
+DiskFileItem.java
+index d5b90c2393..91a97aeae0 100644
+--- a/java/org/apache/tomcat/util/http/fileupload/ParameterParser.java
++++ b/java/org/apache/tomcat/util/http/fileupload/ParameterParser.java
+@@ -233,8 +233,8 @@ public class ParameterParser {
+         char separator = separators[0];
+         if (str != null) {
+             int idx = str.length();
+-            for (char separator2 : separators) {
+-                int tmp = str.indexOf(separator2);
++            for (final char separator2 : separators) {
++                final int tmp = str.indexOf(separator2);
+                 if (tmp != -1 && tmp < idx) {
+                     idx = tmp;
+                     separator = separator2;
+@@ -299,12 +299,12 @@ public class ParameterParser {
+             return new HashMap<>();
+         }
+         final HashMap<String, String> params = new HashMap<>();
+-        this.chars = charArray;
++        this.chars = charArray.clone();
+         this.pos = offset;
+         this.len = length;
+ 
+-        String paramName = null;
+-        String paramValue = null;
++        String paramName;
++        String paramValue;
+         while (hasChar()) {
+             paramName = parseToken(new char[] {
+                     '=', separator });
+@@ -326,7 +326,7 @@ public class ParameterParser {
+             if (hasChar() && (charArray[pos] == separator)) {
+                 pos++; // skip separator
+             }
+-            if ((paramName != null) && (paramName.length() > 0)) {
++            if ((paramName != null) && !paramName.isEmpty()) {
+                 paramName = RFC2231Utility.stripDelimiter(paramName);
+                 if (this.lowerCaseNames) {
+                     paramName = paramName.toLowerCase(Locale.ENGLISH);
+
+==================================================
+FileItemIteratorImpl.java
+index bfe18847a6..55273b51d4 100644
+--- a/java/org/apache/tomcat/util/http/fileupload/disk/DiskFileItem.java
++++ b/java/org/apache/tomcat/util/http/fileupload/disk/DiskFileItem.java
+@@ -25,7 +25,9 @@ import java.io.FileOutputStream;
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.io.OutputStream;
++import java.io.UncheckedIOException;
+ import java.io.UnsupportedEncodingException;
++import java.nio.file.Files;
+ import java.util.Map;
+ import java.util.UUID;
+ import java.util.concurrent.atomic.AtomicInteger;
+@@ -191,7 +193,7 @@ public class DiskFileItem
+     public InputStream getInputStream()
+         throws IOException {
+         if (!isInMemory()) {
+-            return new FileInputStream(dfos.getFile());
++            return Files.newInputStream(dfos.getFile().toPath());
+         }
+ 
+         if (cachedContent == null) {
+@@ -268,13 +270,14 @@ public class DiskFileItem
+     public long getSize() {
+         if (size >= 0) {
+             return size;
+-        } else if (cachedContent != null) {
++        }
++        if (cachedContent != null) {
+             return cachedContent.length;
+-        } else if (dfos.isInMemory()) {
++        }
++        if (dfos.isInMemory()) {
+             return dfos.getData().length;
+-        } else {
+-            return dfos.getFile().length();
+         }
++        return dfos.getFile().length();
+     }
+ 
+     /**
+@@ -284,28 +287,25 @@ public class DiskFileItem
+      *
+      * @return The contents of the file as an array of bytes
+      * or {@code null} if the data cannot be read
++     *
++     * @throws UncheckedIOException if an I/O error occurs
+      */
+     @Override
+-    public byte[] get() {
++    public byte[] get() throws UncheckedIOException {
+         if (isInMemory()) {
+             if (cachedContent == null && dfos != null) {
+                 cachedContent = dfos.getData();
+             }
+-            return cachedContent;
++            return cachedContent != null ? cachedContent.clone() : new byte[0];
+         }
+ 
+         byte[] fileData = new byte[(int) getSize()];
+-        InputStream fis = null;
+ 
+-        try {
+-            fis = new FileInputStream(dfos.getFile());
++        try (InputStream fis = Files.newInputStream(dfos.getFile().toPath())) {
+             IOUtils.readFully(fis, fileData);
+-        } catch (final IOException e) {
+-            fileData = null;
+-        } finally {
+-            IOUtils.closeQuietly(fis);
++        } catch (IOException e) {
++            throw new UncheckedIOException(e);
+         }
+-
+         return fileData;
+     }
+ 
+@@ -323,7 +323,7 @@ public class DiskFileItem
+      */
+     @Override
+     public String getString(final String charset)
+-        throws UnsupportedEncodingException {
++        throws UnsupportedEncodingException, IOException {
+         return new String(get(), charset);
+     }
+ 
+@@ -338,15 +338,15 @@ public class DiskFileItem
+      */
+     @Override
+     public String getString() {
+-        final byte[] rawdata = get();
+-        String charset = getCharSet();
+-        if (charset == null) {
+-            charset = defaultCharset;
+-        }
+         try {
+-            return new String(rawdata, charset);
+-        } catch (final UnsupportedEncodingException e) {
+-            return new String(rawdata);
++            byte[] rawData = get();
++            String charset = getCharSet();
++            if (charset == null) {
++                charset = defaultCharset;
++            }
++            return new String(rawData, charset);
++        } catch (final IOException e) {
++            return new String(new byte[0]);
+         }
+     }
+ 
+@@ -373,46 +373,14 @@ public class DiskFileItem
+     @Override
+     public void write(final File file) throws Exception {
+         if (isInMemory()) {
+-            FileOutputStream fout = null;
+-            try {
+-                fout = new FileOutputStream(file);
++            try (OutputStream fout = Files.newOutputStream(file.toPath())) {
+                 fout.write(get());
+-                fout.close();
+-            } finally {
+-                IOUtils.closeQuietly(fout);
++            } catch (IOException e) {
++                throw new IOException("Unexpected output data");
+             }
+         } else {
+             final File outputFile = getStoreLocation();
+-            if (outputFile != null) {
+-                // Save the length of the file
+-                size = outputFile.length();
+-                /*
+-                 * The uploaded file is being stored on disk
+-                 * in a temporary location so move it to the
+-                 * desired file.
+-                 */
+-                if (file.exists()) {
+-                    if (!file.delete()) {
+-                        throw new FileUploadException(
+-                                "Cannot write uploaded file to disk!");
+-                    }
+-                }
+-                if (!outputFile.renameTo(file)) {
+-                    BufferedInputStream in = null;
+-                    BufferedOutputStream out = null;
+-                    try {
+-                        in = new BufferedInputStream(
+-                            new FileInputStream(outputFile));
+-                        out = new BufferedOutputStream(
+-                                new FileOutputStream(file));
+-                        IOUtils.copy(in, out);
+-                        out.close();
+-                    } finally {
+-                        IOUtils.closeQuietly(in);
+-                        IOUtils.closeQuietly(out);
+-                    }
+-                }
+-            } else {
++            if (outputFile == null) {
+                 /*
+                  * For whatever reason we cannot write the
+                  * file to disk.
+@@ -420,6 +388,30 @@ public class DiskFileItem
+                 throw new FileUploadException(
+                     "Cannot write uploaded file to disk!");
+             }
++            // Save the length of the file
++            size = outputFile.length();
++            /*
++             * The uploaded file is being stored on disk
++             * in a temporary location so move it to the
++             * desired file.
++             */
++            if (file.exists() && !file.delete()) {
++                throw new FileUploadException(
++                        "Cannot write uploaded file to disk!");
++            }
++            if (!outputFile.renameTo(file)) {
++                BufferedInputStream in = null;
++                BufferedOutputStream out = null;
++                try {
++                    in = new BufferedInputStream(new FileInputStream(outputFile));
++                    out = new BufferedOutputStream(new FileOutputStream(file));
++                    IOUtils.copy(in, out);
++                    out.close();
++                } finally {
++                    IOUtils.closeQuietly(in);
++                    IOUtils.closeQuietly(out);
++                }
++            }
+         }
+     }
+ 
+@@ -503,11 +495,9 @@ public class DiskFileItem
+      * @return An {@link java.io.OutputStream OutputStream} that can be used
+      *         for storing the contents of the file.
+      *
+-     * @throws IOException if an error occurs.
+      */
+     @Override
+-    public OutputStream getOutputStream()
+-        throws IOException {
++    public OutputStream getOutputStream() {
+         if (dfos == null) {
+             final File outputFile = getTempFile();
+             dfos = new DeferredFileOutputStream(sizeThreshold, outputFile);
+
+==================================================
+FileItemStreamImpl.java
+index 6e2d574eb7..29e89f622f 100644
+--- a/java/org/apache/tomcat/util/http/fileupload/impl/FileItemIteratorImpl.java
++++ b/java/org/apache/tomcat/util/http/fileupload/impl/FileItemIteratorImpl.java
+@@ -42,9 +42,24 @@ import org.apache.tomcat.util.http.fileupload.util.LimitedInputStream;
+  * {@link FileUploadBase#getItemIterator(RequestContext)}.
+  */
+ public class FileItemIteratorImpl implements FileItemIterator {
++    /**
++     * The file uploads processing utility.
++     * @see FileUploadBase
++     */
+     private final FileUploadBase fileUploadBase;
++    /**
++     * The request context.
++     * @see RequestContext
++     */
+     private final RequestContext ctx;
+-    private long sizeMax, fileSizeMax;
++    /**
++     * The maximum allowed size of a complete request.
++     */
++    private long sizeMax;
++    /**
++     * The maximum allowed size of a single uploaded file.
++     */
++    private long fileSizeMax;
+ 
+ 
+     @Override
+@@ -326,10 +341,11 @@ public class FileItemIteratorImpl implements FileItemIterator {
+         final List<FileItem> items = new ArrayList<>();
+         while (hasNext()) {
+             final FileItemStream fis = next();
+-            final FileItem fi = fileUploadBase.getFileItemFactory().createItem(fis.getFieldName(), fis.getContentType(), fis.isFormField(), fis.getName());
++            final FileItem fi = fileUploadBase.getFileItemFactory().createItem(fis.getFieldName(),
++                    fis.getContentType(), fis.isFormField(), fis.getName());
+             items.add(fi);
+         }
+         return items;
+     }
+ 
+-}
+\ No newline at end of file
++}
+
+==================================================
+package-info.java
+index dd02e6db9a..bab5d98b24 100644
+--- a/java/org/apache/tomcat/util/http/fileupload/impl/FileItemStreamImpl.java
++++ b/java/org/apache/tomcat/util/http/fileupload/impl/FileItemStreamImpl.java
+@@ -33,6 +33,11 @@ import org.apache.tomcat.util.http.fileupload.util.Streams;
+  * Default implementation of {@link FileItemStream}.
+  */
+ public class FileItemStreamImpl implements FileItemStream {
++    /**
++     * The File Item iterator implementation.
++     *
++     * @see FileItemIteratorImpl
++     */
+     private final FileItemIteratorImpl fileItemIteratorImpl;
+ 
+     /**
+@@ -48,7 +53,7 @@ public class FileItemStreamImpl implements FileItemStream {
+     /**
+      * The file items file name.
+      */
+-    final String name;
++    private final String name;
+ 
+     /**
+      * Whether the file item is a form field.
+@@ -87,18 +92,16 @@ public class FileItemStreamImpl implements FileItemStream {
+         contentType = pContentType;
+         formField = pFormField;
+         final long fileSizeMax = fileItemIteratorImpl.getFileSizeMax();
+-        if (fileSizeMax != -1) { // Check if limit is already exceeded
+-            if (pContentLength != -1
+-                    && pContentLength > fileSizeMax) {
+-                final FileSizeLimitExceededException e =
+-                        new FileSizeLimitExceededException(
+-                                String.format("The field %s exceeds its maximum permitted size of %s bytes.",
+-                                        fieldName, Long.valueOf(fileSizeMax)),
+-                                pContentLength, fileSizeMax);
+-                e.setFileName(pName);
+-                e.setFieldName(pFieldName);
+-                throw new FileUploadIOException(e);
+-            }
++        if (fileSizeMax != -1 && pContentLength != -1
++                && pContentLength > fileSizeMax) {
++            final FileSizeLimitExceededException e =
++                    new FileSizeLimitExceededException(
++                            String.format("The field %s exceeds its maximum permitted size of %s bytes.",
++                                    fieldName, Long.valueOf(fileSizeMax)),
++                            pContentLength, fileSizeMax);
++            e.setFileName(pName);
++            e.setFieldName(pFieldName);
++            throw new FileUploadIOException(e);
+         }
+         // OK to construct stream now
+         final ItemInputStream itemStream = fileItemIteratorImpl.getMultiPartStream().newInputStream();
+
+==================================================
+ServletFileUpload.java
+new file mode 100644
+index 0000000000..134a3f6f3a
+--- /dev/null
++++ b/java/org/apache/tomcat/util/http/fileupload/impl/package-info.java
+@@ -0,0 +1,21 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ * Implementations and exceptions utils.
++ */
++package org.apache.tomcat.util.http.fileupload.impl;
+
+==================================================
+FileItemHeadersImpl.java
+index bfb871d055..da07201538 100644
+--- a/java/org/apache/tomcat/util/http/fileupload/servlet/ServletFileUpload.java
++++ b/java/org/apache/tomcat/util/http/fileupload/servlet/ServletFileUpload.java
+@@ -73,7 +73,7 @@ public class ServletFileUpload extends FileUpload {
+     // ----------------------------------------------------------- Constructors
+ 
+     /**
+-     * Constructs an uninitialised instance of this class. A factory must be
++     * Constructs an uninitialized instance of this class. A factory must be
+      * configured, using {@code setFileItemFactory()}, before attempting
+      * to parse requests.
+      *
+
+==================================================
+Streams.java
+index 1047dc38ce..ebf1fec3eb 100644
+--- a/java/org/apache/tomcat/util/http/fileupload/util/FileItemHeadersImpl.java
++++ b/java/org/apache/tomcat/util/http/fileupload/util/FileItemHeadersImpl.java
+@@ -87,11 +87,7 @@ public class FileItemHeadersImpl implements FileItemHeaders, Serializable {
+      */
+     public synchronized void addHeader(final String name, final String value) {
+         final String nameLower = name.toLowerCase(Locale.ENGLISH);
+-        List<String> headerValueList = headerNameToValueListMap.get(nameLower);
+-        if (null == headerValueList) {
+-            headerValueList = new ArrayList<>();
+-            headerNameToValueListMap.put(nameLower, headerValueList);
+-        }
++        List<String> headerValueList = headerNameToValueListMap.computeIfAbsent(nameLower, k -> new ArrayList<>());
+         headerValueList.add(value);
+     }
+ 
+
+==================================================
+MimeUtility.java
+index 1ba61064c9..03c1f90486 100644
+--- a/java/org/apache/tomcat/util/http/fileupload/util/Streams.java
++++ b/java/org/apache/tomcat/util/http/fileupload/util/Streams.java
+@@ -21,7 +21,6 @@ import java.io.IOException;
+ import java.io.InputStream;
+ import java.io.OutputStream;
+ 
+-import org.apache.tomcat.util.http.fileupload.IOUtils;
+ import org.apache.tomcat.util.http.fileupload.InvalidFileNameException;
+ 
+ /**
+@@ -63,7 +62,8 @@ public final class Streams {
+      * @return Number of bytes, which have been copied.
+      * @throws IOException An I/O error occurred.
+      */
+-    public static long copy(final InputStream inputStream, final OutputStream outputStream, final boolean closeOutputStream)
++    public static long copy(final InputStream inputStream, final OutputStream outputStream,
++                            final boolean closeOutputStream)
+             throws IOException {
+         return copy(inputStream, outputStream, closeOutputStream, new byte[DEFAULT_BUFFER_SIZE]);
+     }
+@@ -90,9 +90,8 @@ public final class Streams {
+             final OutputStream outputStream, final boolean closeOutputStream,
+             final byte[] buffer)
+     throws IOException {
+-        OutputStream out = outputStream;
+-        InputStream in = inputStream;
+-        try {
++        try (OutputStream out = outputStream;
++              InputStream in = inputStream) {
+             long total = 0;
+             for (;;) {
+                 final int res = in.read(buffer);
+@@ -112,16 +111,9 @@ public final class Streams {
+                 } else {
+                     out.flush();
+                 }
+-                out = null;
+             }
+             in.close();
+-            in = null;
+             return total;
+-        } finally {
+-            IOUtils.closeQuietly(in);
+-            if (closeOutputStream) {
+-                IOUtils.closeQuietly(out);
+-            }
+         }
+     }
+ 
+
+==================================================
+ParseException.java
+index a4da181299..70a4fb3b45 100644
+--- a/java/org/apache/tomcat/util/http/fileupload/util/mime/MimeUtility.java
++++ b/java/org/apache/tomcat/util/http/fileupload/util/mime/MimeUtility.java
+@@ -19,6 +19,7 @@ package org.apache.tomcat.util.http.fileupload.util.mime;
+ import java.io.ByteArrayOutputStream;
+ import java.io.IOException;
+ import java.io.UnsupportedEncodingException;
++import java.nio.charset.StandardCharsets;
+ import java.util.HashMap;
+ import java.util.Locale;
+ import java.util.Map;
+@@ -32,11 +33,6 @@ import org.apache.tomcat.util.codec.binary.Base64;
+  */
+ public final class MimeUtility {
+ 
+-    /**
+-     * The {@code US-ASCII} charset identifier constant.
+-     */
+-    private static final String US_ASCII_CHARSET = "US-ASCII";
+-
+     /**
+      * The marker to indicate text is encoded with BASE64 algorithm.
+      */
+@@ -68,8 +64,15 @@ public final class MimeUtility {
+     private static final Map<String, String> MIME2JAVA = new HashMap<>();
+ 
+     static {
++        MIME2JAVA.put("iso-2022-cn", "ISO2022CN");
++        MIME2JAVA.put("iso-2022-kr", "ISO2022KR");
++        MIME2JAVA.put("utf-8", "UTF8");
++        MIME2JAVA.put("utf8", "UTF8");
+         MIME2JAVA.put("ja_jp.iso2022-7", "ISO2022JP");
+         MIME2JAVA.put("ja_jp.eucjp", "EUCJIS");
++        MIME2JAVA.put("euc-kr", "KSC5601");
++        MIME2JAVA.put("euckr", "KSC5601");
++        MIME2JAVA.put("us-ascii", "ISO-8859-1");
+         MIME2JAVA.put("x-us-ascii", "ISO-8859-1");
+     }
+ 
+@@ -117,14 +120,13 @@ public final class MimeUtility {
+                 while (offset < endOffset) {
+                     // step over the white space characters.
+                     ch = text.charAt(offset);
+-                    if (LINEAR_WHITESPACE.indexOf(ch) != -1) { // whitespace found
+-                        offset++;
+-                    } else {
++                    if (LINEAR_WHITESPACE.indexOf(ch) == -1) {
+                         // record the location of the first non lwsp and drop down to process the
+                         // token characters.
+                         endWhiteSpace = offset;
+                         break;
+                     }
++                    offset++;
+                 }
+             } else {
+                 // we have a word token.  We need to scan over the word and then try to parse it.
+@@ -133,11 +135,10 @@ public final class MimeUtility {
+                 while (offset < endOffset) {
+                     // step over the non white space characters.
+                     ch = text.charAt(offset);
+-                    if (LINEAR_WHITESPACE.indexOf(ch) == -1) { // not white space
+-                        offset++;
+-                    } else {
++                    if (LINEAR_WHITESPACE.indexOf(ch) != -1) {
+                         break;
+                     }
++                    offset++;
+ 
+                     //NB:  Trailing whitespace on these header strings will just be discarded.
+                 }
+@@ -151,7 +152,7 @@ public final class MimeUtility {
+ 
+                         // are any whitespace characters significant?  Append 'em if we've got 'em.
+                         if (!previousTokenEncoded && startWhiteSpace != -1) {
+-                            decodedText.append(text.substring(startWhiteSpace, endWhiteSpace));
++                            decodedText.append(text, startWhiteSpace, endWhiteSpace);
+                             startWhiteSpace = -1;
+                         }
+                         // this is definitely a decoded token.
+@@ -169,7 +170,7 @@ public final class MimeUtility {
+                 // this is a normal token, so it doesn't matter what the previous token was.  Add the white space
+                 // if we have it.
+                 if (startWhiteSpace != -1) {
+-                    decodedText.append(text.substring(startWhiteSpace, endWhiteSpace));
++                    decodedText.append(text, startWhiteSpace, endWhiteSpace);
+                     startWhiteSpace = -1;
+                 }
+                 // this is not a decoded token.
+@@ -190,8 +191,8 @@ public final class MimeUtility {
+      * @param word   The possibly encoded word value.
+      *
+      * @return The decoded word.
+-     * @throws ParseException
+-     * @throws UnsupportedEncodingException
++     * @throws ParseException in case of a parse error of the RFC 2047
++     * @throws UnsupportedEncodingException Thrown when Invalid RFC 2047 encoding was found
+      */
+     private static String decodeWord(final String word) throws ParseException, UnsupportedEncodingException {
+         // encoded words start with the characters "=?".  If this not an encoded word, we throw a
+@@ -226,7 +227,7 @@ public final class MimeUtility {
+         final String encodedText = word.substring(encodingPos + 1, encodedTextPos);
+ 
+         // seems a bit silly to encode a null string, but easy to deal with.
+-        if (encodedText.length() == 0) {
++        if (encodedText.isEmpty()) {
+             return "";
+         }
+ 
+@@ -239,7 +240,7 @@ public final class MimeUtility {
+             if (encoding.equals(BASE64_ENCODING_MARKER)) {
+                 decodedData = Base64.decodeBase64(encodedText);
+             } else if (encoding.equals(QUOTEDPRINTABLE_ENCODING_MARKER)) { // maybe quoted printable.
+-                byte[] encodedData = encodedText.getBytes(US_ASCII_CHARSET);
++                byte[] encodedData = encodedText.getBytes(StandardCharsets.US_ASCII);
+                 QuotedPrintableDecoder.decode(encodedData, out);
+                 decodedData = out.toByteArray();
+             } else {
+
+==================================================
+QuotedPrintableDecoder.java
+index ea102a9430..bf31a539aa 100644
+--- a/java/org/apache/tomcat/util/http/fileupload/util/mime/ParseException.java
++++ b/java/org/apache/tomcat/util/http/fileupload/util/mime/ParseException.java
+@@ -31,7 +31,7 @@ final class ParseException extends Exception {
+      *
+      * @param message the detail message.
+      */
+-    public ParseException(final String message) {
++    ParseException(final String message) {
+         super(message);
+     }
+ 
+
+==================================================
+RFC2231Utility.java
+index b7a75de4e9..3a563b948d 100644
+--- a/java/org/apache/tomcat/util/http/fileupload/util/mime/QuotedPrintableDecoder.java
++++ b/java/org/apache/tomcat/util/http/fileupload/util/mime/QuotedPrintableDecoder.java
+@@ -44,8 +44,7 @@ final class QuotedPrintableDecoder {
+      * @param out    The output stream used to return the decoded data.
+      *
+      * @return the number of bytes produced.
+-     * @throws IOException if a problem occurs during either decoding or
+-     *            writing to the stream
++     * @throws IOException if an IO error occurs
+      */
+     public static int decode(final byte[] data, final OutputStream out) throws IOException {
+         int off = 0;
+
+==================================================

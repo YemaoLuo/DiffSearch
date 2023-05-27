@@ -1,0 +1,203 @@
+f6baef98988a1f98392df287cc6ea7ed763d60b1
+==================================================
+Partial fix for https://bz.apache.org/bugzilla/show_bug.cgi?id=61566
+==================================================
+Mark Thomas
+==================================================
+Wed Dec 13 10:42:15 2017 +0000
+==================================================
+HTMLManagerServlet.java
+Partial fix for https://bz.apache.org/bugzilla/show_bug.cgi?id=61566
+Certificate chains are now exposed for virtual hosts configured using a Java key store.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1817997 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+ManagerServlet.java
+index d306660739..b129e1aedd 100644
+--- a/java/org/apache/catalina/manager/LocalStrings.properties
++++ b/java/org/apache/catalina/manager/LocalStrings.properties
+@@ -48,9 +48,11 @@ htmlManagerServlet.deployWar=WAR or Directory URL:
+ htmlManagerServlet.diagnosticsLeak=Check to see if a web application has caused a memory leak on stop, reload or undeploy
+ htmlManagerServlet.diagnosticsLeakButton=Find leaks
+ htmlManagerServlet.diagnosticsLeakWarning=This diagnostic check will trigger a full garbage collection. Use it with extreme caution on production systems.
+-htmlManagerServlet.diagnosticsSsl=SSL connector configuration diagnostics
+-htmlManagerServlet.diagnosticsSslConnectorCipherButton=Connector ciphers
+-htmlManagerServlet.diagnosticsSslConnectorCipherText=List the configured ciphers for each connector
++htmlManagerServlet.diagnosticsSsl=TLS connector configuration diagnostics
++htmlManagerServlet.diagnosticsSslConnectorCipherButton=Ciphers
++htmlManagerServlet.diagnosticsSslConnectorCipherText=List the configured TLS virtual hosts and the ciphers for each
++htmlManagerServlet.diagnosticsSslConnectorCertsButton=Certificates
++htmlManagerServlet.diagnosticsSslConnectorCertsText=List the configured TLS virtual hosts and the certificate chain for each
+ htmlManagerServlet.diagnosticsTitle=Diagnostics
+ htmlManagerServlet.findleaksList=\
+   The following web applications were stopped (reloaded, undeployed), but their\n\
+@@ -72,6 +74,7 @@ htmlManagerServlet.serverTitle=Server Information
+ htmlManagerServlet.serverVersion=Tomcat Version
+ htmlManagerServlet.title=Tomcat Web Application Manager
+ managerServlet.alreadyContext=FAIL - Application already exists at path [{0}]
++managerServlet.certsNotAvailable=Certificate information cannot be obtained from this connector at runtime
+ managerServlet.deleteFail=FAIL - Unable to delete [{0}]. The continued presence of this file may cause problems.
+ managerServlet.deployed=OK - Deployed application at context path [{0}]
+ managerServlet.deployFailed=FAIL - Failed to deploy application at context path [{0}]
+
+==================================================
+SSLContext.java
+index 465fd0ba33..12e529a939 100644
+--- a/java/org/apache/catalina/manager/ManagerServlet.java
++++ b/java/org/apache/catalina/manager/ManagerServlet.java
+@@ -22,6 +22,8 @@ import java.io.FileInputStream;
+ import java.io.FileOutputStream;
+ import java.io.IOException;
+ import java.io.PrintWriter;
++import java.security.cert.Certificate;
++import java.security.cert.X509Certificate;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Enumeration;
+@@ -30,6 +32,7 @@ import java.util.LinkedHashSet;
+ import java.util.List;
+ import java.util.Locale;
+ import java.util.Map;
++import java.util.Set;
+ 
+ import javax.management.MBeanServer;
+ import javax.management.MalformedObjectNameException;
+@@ -62,7 +65,9 @@ import org.apache.catalina.util.ServerInfo;
+ import org.apache.tomcat.util.Diagnostics;
+ import org.apache.tomcat.util.ExceptionUtils;
+ import org.apache.tomcat.util.modeler.Registry;
++import org.apache.tomcat.util.net.SSLContext;
+ import org.apache.tomcat.util.net.SSLHostConfig;
++import org.apache.tomcat.util.net.SSLHostConfigCertificate;
+ import org.apache.tomcat.util.res.StringManager;
+ import org.apache.tomcat.util.security.Escape;
+ 
+@@ -1712,4 +1717,48 @@ public class ManagerServlet extends HttpServlet implements ContainerServlet {
+         }
+         return result;
+     }
++
++
++    protected Map<String,List<String>> getConnectorCerts() {
++        Map<String,List<String>> result = new HashMap<>();
++
++        Engine e = (Engine) host.getParent();
++        Service s = e.getService();
++        Connector connectors[] = s.findConnectors();
++        for (Connector connector : connectors) {
++            if (Boolean.TRUE.equals(connector.getProperty("SSLEnabled"))) {
++                SSLHostConfig[] sslHostConfigs = connector.getProtocolHandler().findSslHostConfigs();
++                for (SSLHostConfig sslHostConfig : sslHostConfigs) {
++                    Set<SSLHostConfigCertificate> sslHostConfigCerts =
++                            sslHostConfig.getCertificates();
++                    for (SSLHostConfigCertificate sslHostConfigCert : sslHostConfigCerts) {
++                        String name = connector.toString() + "-" + sslHostConfig.getHostName() +
++                                "-" + sslHostConfigCert.getType();
++                        List<String> certList = new ArrayList<>();
++                        SSLContext sslContext = sslHostConfigCert.getSslContext();
++                        String alias = sslHostConfigCert.getCertificateKeyAlias();
++                        if (alias == null) {
++                            alias = "tomcat";
++                        }
++                        X509Certificate[] certs = sslContext.getCertificateChain(alias);
++                        if (certs == null) {
++                            certList.add(sm.getString("managerServlet.certsNotAvailable"));
++                        } else {
++                            for (Certificate cert : certs) {
++                                certList.add(cert.toString());
++                            }
++                        }
++                        result.put(name, certList);
++                    }
++                }
++            } else {
++                List<String> certList = new ArrayList<>(1);
++                certList.add(sm.getString("managerServlet.notSslConnector"));
++                result.put(connector.toString(), certList);
++            }
++        }
++
++        return result;
++    }
++
+ }
+
+==================================================
+JSSESSLContext.java
+index 57cacab4e2..2585a11843 100644
+--- a/java/org/apache/tomcat/util/net/SSLContext.java
++++ b/java/org/apache/tomcat/util/net/SSLContext.java
+@@ -19,6 +19,7 @@ package org.apache.tomcat.util.net;
+ 
+ import java.security.KeyManagementException;
+ import java.security.SecureRandom;
++import java.security.cert.X509Certificate;
+ 
+ import javax.net.ssl.KeyManager;
+ import javax.net.ssl.SSLEngine;
+@@ -47,4 +48,5 @@ public interface SSLContext {
+ 
+     public SSLParameters getSupportedSSLParameters();
+ 
++    public X509Certificate[] getCertificateChain(String alias);
+ }
+
+==================================================
+OpenSSLContext.java
+index c4ec83df3f..127a4ce29a 100644
+--- a/java/org/apache/tomcat/util/net/jsse/JSSESSLContext.java
++++ b/java/org/apache/tomcat/util/net/jsse/JSSESSLContext.java
+@@ -20,6 +20,7 @@ package org.apache.tomcat.util.net.jsse;
+ import java.security.KeyManagementException;
+ import java.security.NoSuchAlgorithmException;
+ import java.security.SecureRandom;
++import java.security.cert.X509Certificate;
+ 
+ import javax.net.ssl.KeyManager;
+ import javax.net.ssl.SSLEngine;
+@@ -27,12 +28,15 @@ import javax.net.ssl.SSLParameters;
+ import javax.net.ssl.SSLServerSocketFactory;
+ import javax.net.ssl.SSLSessionContext;
+ import javax.net.ssl.TrustManager;
++import javax.net.ssl.X509KeyManager;
+ 
+ import org.apache.tomcat.util.net.SSLContext;
+ 
+ class JSSESSLContext implements SSLContext {
+ 
+     private javax.net.ssl.SSLContext context;
++    private KeyManager[] kms;
++
+     JSSESSLContext(String protocol) throws NoSuchAlgorithmException {
+         context = javax.net.ssl.SSLContext.getInstance(protocol);
+     }
+@@ -40,6 +44,7 @@ class JSSESSLContext implements SSLContext {
+     @Override
+     public void init(KeyManager[] kms, TrustManager[] tms, SecureRandom sr)
+             throws KeyManagementException {
++        this.kms = kms;
+         context.init(kms, tms, sr);
+     }
+ 
+@@ -67,4 +72,16 @@ class JSSESSLContext implements SSLContext {
+         return context.getSupportedSSLParameters();
+     }
+ 
++    @Override
++    public X509Certificate[] getCertificateChain(String alias) {
++        X509Certificate[] result = null;
++        if (kms != null) {
++            for (int i = 0; i < kms.length && result == null; i++) {
++                if (kms[i] instanceof X509KeyManager) {
++                    result = ((X509KeyManager) kms[i]).getCertificateChain(alias);
++                }
++            }
++        }
++        return result;
++    }
+ }
+
+==================================================

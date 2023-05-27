@@ -1,0 +1,184 @@
+6e5ab3da37ea0d8cd85dfb92903f3d28fecde6ee
+==================================================
+59706: Add stream concurrency control (patch v3), after more testing, etc. It is not enabled by default.
+==================================================
+Remy Maucherat
+==================================================
+Thu Jun 23 14:22:39 2016 +0000
+==================================================
+Http2Protocol.java
+59706: Add stream concurrency control (patch v3), after more testing, etc. It is not enabled by default.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1749898 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Http2UpgradeHandler.java
+index 92e136ac6e..614712f4e2 100644
+--- a/java/org/apache/coyote/http2/Http2Protocol.java
++++ b/java/org/apache/coyote/http2/Http2Protocol.java
+@@ -35,6 +35,9 @@ public class Http2Protocol implements UpgradeProtocol {
+     static final long DEFAULT_WRITE_TIMEOUT = 10000;
+     // The HTTP/2 specification recommends a minimum default of 100
+     static final long DEFAULT_MAX_CONCURRENT_STREAMS = 200;
++    // Maximum amount of streams which can be concurrently executed over
++    // a single connection
++    static final int DEFAULT_MAX_CONCURRENT_STREAM_EXECUTION = 200;
+     // This default is defined by the HTTP/2 specification
+     static final int DEFAULT_INITIAL_WINDOW_SIZE = (1 << 16) - 1;
+ 
+@@ -47,6 +50,7 @@ public class Http2Protocol implements UpgradeProtocol {
+     private long keepAliveTimeout = DEFAULT_KEEP_ALIVE_TIMEOUT;
+     private long writeTimeout = DEFAULT_WRITE_TIMEOUT;
+     private long maxConcurrentStreams = DEFAULT_MAX_CONCURRENT_STREAMS;
++    private int maxConcurrentStreamExecution = DEFAULT_MAX_CONCURRENT_STREAM_EXECUTION;
+     // If a lower initial value is required, set it here but DO NOT change the
+     // default defined above.
+     private int initialWindowSize = DEFAULT_INITIAL_WINDOW_SIZE;
+@@ -87,6 +91,7 @@ public class Http2Protocol implements UpgradeProtocol {
+         result.setKeepAliveTimeout(getKeepAliveTimeout());
+         result.setWriteTimeout(getWriteTimeout());
+         result.setMaxConcurrentStreams(getMaxConcurrentStreams());
++        result.setMaxConcurrentStreamExecution(getMaxConcurrentStreamExecution());
+         result.setInitialWindowSize(getInitialWindowSize());
+ 
+         return result;
+@@ -155,6 +160,16 @@ public class Http2Protocol implements UpgradeProtocol {
+     }
+ 
+ 
++    public int getMaxConcurrentStreamExecution() {
++        return maxConcurrentStreamExecution;
++    }
++
++
++    public void setMaxConcurrentStreamExecution(int maxConcurrentStreamExecution) {
++        this.maxConcurrentStreamExecution = maxConcurrentStreamExecution;
++    }
++
++
+     public int getInitialWindowSize() {
+         return initialWindowSize;
+     }
+
+==================================================
+StreamProcessor.java
+index a61d5764d9..0e59f60cee 100644
+--- a/java/org/apache/coyote/http2/Http2UpgradeHandler.java
++++ b/java/org/apache/coyote/http2/Http2UpgradeHandler.java
+@@ -139,6 +139,10 @@ public class Http2UpgradeHandler extends AbstractStream implements InternalHttpU
+     private final Map<AbstractStream,int[]> backLogStreams = new ConcurrentHashMap<>();
+     private long backLogSize = 0;
+ 
++    // Stream concurrency control
++    private int maxConcurrentStreamExecution = Http2Protocol.DEFAULT_MAX_CONCURRENT_STREAM_EXECUTION;
++    private AtomicInteger streamConcurrency = null;
++    private Queue<StreamProcessor> queuedProcessors = null;
+ 
+     public Http2UpgradeHandler(Adapter adapter, Request coyoteRequest) {
+         super (STREAM_ID_ZERO);
+@@ -174,6 +178,12 @@ public class Http2UpgradeHandler extends AbstractStream implements InternalHttpU
+             return;
+         }
+ 
++        // Init concurrency control if needed
++        if (maxConcurrentStreamExecution < localSettings.getMaxConcurrentStreams()) {
++            streamConcurrency = new AtomicInteger(0);
++            queuedProcessors = new ConcurrentLinkedQueue<>();
++        }
++
+         parser = new Http2Parser(connectionId, this, this);
+ 
+         Stream stream = null;
+@@ -242,7 +252,7 @@ public class Http2UpgradeHandler extends AbstractStream implements InternalHttpU
+ 
+         if (webConnection != null) {
+             // Process the initial request on a container thread
+-            StreamProcessor streamProcessor = new StreamProcessor(stream, adapter, socketWrapper);
++            StreamProcessor streamProcessor = new StreamProcessor(this, stream, adapter, socketWrapper);
+             streamProcessor.setSslSupport(sslSupport);
+             socketWrapper.getEndpoint().getExecutor().execute(streamProcessor);
+         }
+@@ -389,6 +399,33 @@ public class Http2UpgradeHandler extends AbstractStream implements InternalHttpU
+     }
+ 
+ 
++    private int increaseStreamConcurrency() {
++        return streamConcurrency.incrementAndGet();
++    }
++
++    private int decreaseStreamConcurrency() {
++        return streamConcurrency.decrementAndGet();
++    }
++
++    private int getStreamConcurrency() {
++        return streamConcurrency.get();
++    }
++
++    void executeQueuedStream() {
++        if (streamConcurrency == null) {
++            return;
++        }
++        decreaseStreamConcurrency();
++        if (getStreamConcurrency() < maxConcurrentStreamExecution) {
++            StreamProcessor streamProcessor = queuedProcessors.poll();
++            if (streamProcessor != null) {
++                increaseStreamConcurrency();
++                socketWrapper.getEndpoint().getExecutor().execute(streamProcessor);
++            }
++        }
++    }
++
++
+     void sendStreamReset(StreamException se) throws IOException {
+ 
+         if (log.isDebugEnabled()) {
+@@ -990,8 +1027,11 @@ public class Http2UpgradeHandler extends AbstractStream implements InternalHttpU
+         pushStream.sentPushPromise();
+ 
+         // Process this stream on a container thread
+-        StreamProcessor streamProcessor = new StreamProcessor(pushStream, adapter, socketWrapper);
++        StreamProcessor streamProcessor = new StreamProcessor(this, pushStream, adapter, socketWrapper);
+         streamProcessor.setSslSupport(sslSupport);
++        if (streamConcurrency != null) {
++            increaseStreamConcurrency();
++        }
+         socketWrapper.getEndpoint().getExecutor().execute(streamProcessor);
+     }
+ 
+@@ -1050,6 +1090,11 @@ public class Http2UpgradeHandler extends AbstractStream implements InternalHttpU
+     }
+ 
+ 
++    public void setMaxConcurrentStreamExecution(int maxConcurrentStreamExecution) {
++        this.maxConcurrentStreamExecution = maxConcurrentStreamExecution;
++    }
++
++
+     public void setInitialWindowSize(int initialWindowSize) {
+         localSettings.set(Setting.INITIAL_WINDOW_SIZE, initialWindowSize);
+     }
+@@ -1205,9 +1250,18 @@ public class Http2UpgradeHandler extends AbstractStream implements InternalHttpU
+         Stream stream = getStream(streamId, connectionState.get().isNewStreamAllowed());
+         if (stream != null) {
+             // Process this stream on a container thread
+-            StreamProcessor streamProcessor = new StreamProcessor(stream, adapter, socketWrapper);
++            StreamProcessor streamProcessor = new StreamProcessor(this, stream, adapter, socketWrapper);
+             streamProcessor.setSslSupport(sslSupport);
+-            socketWrapper.getEndpoint().getExecutor().execute(streamProcessor);
++            if (streamConcurrency == null) {
++                socketWrapper.getEndpoint().getExecutor().execute(streamProcessor);
++            } else {
++                if (getStreamConcurrency() < maxConcurrentStreamExecution) {
++                    increaseStreamConcurrency();
++                    socketWrapper.getEndpoint().getExecutor().execute(streamProcessor);
++                } else {
++                    queuedProcessors.offer(streamProcessor);
++                }
++            }
+         }
+     }
+ 
+
+==================================================

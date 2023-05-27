@@ -1,0 +1,260 @@
+ace164c1e4aa5bade3aaf5cac2fbc2add41d9523
+==================================================
+Direct buffers need explicit cleanup to ensure complete reliability without OOMs.
+==================================================
+Remy Maucherat
+==================================================
+Wed Jun 10 12:45:26 2015 +0000
+==================================================
+SecurityClassLoad.java
+Direct buffers need explicit cleanup to ensure complete reliability without OOMs.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1684663 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+ByteBufferUtils.java
+index ceb5448af1..3761dbdd39 100644
+--- a/java/org/apache/catalina/security/SecurityClassLoad.java
++++ b/java/org/apache/catalina/security/SecurityClassLoad.java
+@@ -263,6 +263,7 @@ public final class SecurityClassLoad {
+             throws Exception {
+         final String basePackage = "org.apache.tomcat.";
+         // buf
++        loader.loadClass(basePackage + "util.buf.ByteBufferUtils");
+         loader.loadClass(basePackage + "util.buf.HexUtils");
+         loader.loadClass(basePackage + "util.buf.StringCache");
+         loader.loadClass(basePackage + "util.buf.StringCache$ByteEntry");
+
+==================================================
+AprEndpoint.java
+index 52d7dc2816..d26320b08f 100644
+--- a/java/org/apache/tomcat/util/buf/ByteBufferUtils.java
++++ b/java/org/apache/tomcat/util/buf/ByteBufferUtils.java
+@@ -16,10 +16,29 @@
+  */
+ package org.apache.tomcat.util.buf;
+ 
++import java.lang.reflect.InvocationTargetException;
++import java.lang.reflect.Method;
+ import java.nio.ByteBuffer;
+ 
+ public class ByteBufferUtils {
+ 
++    private static final Method cleanerMethod;
++    private static final Method cleanMethod;
++
++    static {
++        try {
++            ByteBuffer tempBuffer = ByteBuffer.allocateDirect(0);
++            cleanerMethod = tempBuffer.getClass().getMethod("cleaner");
++            cleanerMethod.setAccessible(true);
++            Object cleanerObject = cleanerMethod.invoke(tempBuffer);
++            cleanMethod = cleanerObject.getClass().getMethod("clean");
++            cleanMethod.invoke(cleanerObject);
++        } catch (IllegalAccessException | IllegalArgumentException
++                | InvocationTargetException | NoSuchMethodException | SecurityException e) {
++            throw new ExceptionInInitializerError(e);
++        }
++    }
++
+     private ByteBufferUtils() {
+         // Hide the default constructor since this is a utility class.
+     }
+@@ -56,8 +75,10 @@ public class ByteBufferUtils {
+         }
+ 
+         ByteBuffer out;
++        boolean direct = false;
+         if (in.isDirect()) {
+             out = ByteBuffer.allocateDirect(newSize);
++            direct = true;
+         } else {
+             out = ByteBuffer.allocate(newSize);
+         }
+@@ -66,6 +87,20 @@ public class ByteBufferUtils {
+         in.flip();
+         out.put(in);
+ 
++        if (direct) {
++            cleanDirectBuffer(in);
++        }
++
+         return out;
+     }
++
++    public static void cleanDirectBuffer(ByteBuffer buf) {
++        try {
++            cleanMethod.invoke(cleanerMethod.invoke(buf));
++        } catch (IllegalAccessException | IllegalArgumentException
++                | InvocationTargetException | SecurityException e) {
++            // Ignore
++        }
++    }
++
+ }
+
+==================================================
+Nio2Channel.java
+index 05d18fd7bc..44a959e777 100644
+--- a/java/org/apache/tomcat/util/net/AprEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AprEndpoint.java
+@@ -51,6 +51,7 @@ import org.apache.tomcat.jni.Sockaddr;
+ import org.apache.tomcat.jni.Socket;
+ import org.apache.tomcat.jni.Status;
+ import org.apache.tomcat.util.ExceptionUtils;
++import org.apache.tomcat.util.buf.ByteBufferUtils;
+ import org.apache.tomcat.util.net.AbstractEndpoint.Acceptor.AcceptorState;
+ import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
+ import org.apache.tomcat.util.net.SSLHostConfig.Type;
+@@ -2569,6 +2570,9 @@ public class AprEndpoint extends AbstractEndpoint<Long> implements SNICallBack {
+                     return;
+                 }
+                 closed = true;
++                if (sslOutputBuffer != null) {
++                    ByteBufferUtils.cleanDirectBuffer(sslOutputBuffer);
++                }
+                 ((AprEndpoint) getEndpoint()).getPoller().close(getSocket().longValue());
+             }
+         }
+
+==================================================
+Nio2Endpoint.java
+index edee7cde50..2e76998146 100644
+--- a/java/org/apache/tomcat/util/net/Nio2Channel.java
++++ b/java/org/apache/tomcat/util/net/Nio2Channel.java
+@@ -55,6 +55,13 @@ public class Nio2Channel implements AsynchronousByteChannel {
+         bufHandler.reset();
+     }
+ 
++    /**
++     * Free the channel memory
++     */
++    public void free() {
++        bufHandler.free();
++    }
++
+     public SocketWrapperBase<Nio2Channel> getSocket() {
+         return socket;
+     }
+
+==================================================
+NioChannel.java
+index 832c84a756..dd993971a7 100644
+--- a/java/org/apache/tomcat/util/net/Nio2Endpoint.java
++++ b/java/org/apache/tomcat/util/net/Nio2Endpoint.java
+@@ -1660,7 +1660,9 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel> {
+                             // Close socket and pool
+                             closeSocket(socket);
+                             if (running && !paused) {
+-                                nioChannels.push(socket.getSocket());
++                                if (!nioChannels.push(socket.getSocket())) {
++                                    socket.getSocket().free();
++                                }
+                             }
+                         } else if (state == Handler.SocketState.LONG) {
+                             if (socket.isAsync()) {
+@@ -1673,7 +1675,9 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel> {
+                     } else if (handshake == -1 ) {
+                         closeSocket(socket);
+                         if (running && !paused) {
+-                            nioChannels.push(socket.getSocket());
++                            if (!nioChannels.push(socket.getSocket())) {
++                                socket.getSocket().free();
++                            }
+                         }
+                     }
+                 } catch (VirtualMachineError vme) {
+
+==================================================
+NioEndpoint.java
+index e2bcd8862e..9bdbbd29ed 100644
+--- a/java/org/apache/tomcat/util/net/NioChannel.java
++++ b/java/org/apache/tomcat/util/net/NioChannel.java
+@@ -65,6 +65,13 @@ public class NioChannel implements ByteChannel {
+     }
+ 
+ 
++    /**
++     * Free the channel memory
++     */
++    public void free() {
++        bufHandler.free();
++    }
++
+     /**
+      * Returns true if the network buffer has been flushed out and is empty.
+      *
+
+==================================================
+SecureNio2Channel.java
+index ca336267da..1c06a8af02 100644
+--- a/java/org/apache/tomcat/util/net/NioEndpoint.java
++++ b/java/org/apache/tomcat/util/net/NioEndpoint.java
+@@ -1536,7 +1536,9 @@ public class NioEndpoint extends AbstractJsseEndpoint<NioChannel> {
+                                     // We do NOT want to do this more than once - see BZ
+                                     // 57340.
+                                     if (running && !paused) {
+-                                        nioChannels.push(socket);
++                                        if (!nioChannels.push(socket)) {
++                                            socket.free();
++                                        }
+                                     }
+                                     socket = null;
+                                 }
+@@ -1550,7 +1552,9 @@ public class NioEndpoint extends AbstractJsseEndpoint<NioChannel> {
+                             socket.getPoller().cancelledKey(key);
+                         }
+                         if (running && !paused) {
+-                            nioChannels.push(socket);
++                            if (!nioChannels.push(socket)) {
++                                socket.free();
++                            }
+                         }
+                         socket = null;
+                         ka = null;
+
+==================================================
+SecureNioChannel.java
+index e5c441e533..b982fa757c 100644
+--- a/java/org/apache/tomcat/util/net/SecureNio2Channel.java
++++ b/java/org/apache/tomcat/util/net/SecureNio2Channel.java
+@@ -122,6 +122,14 @@ public class SecureNio2Channel extends Nio2Channel  {
+         closing = false;
+     }
+ 
++    @Override
++    public void free() {
++        super.free();
++        if (endpoint.getSocketProperties().getDirectSslBuffer()) {
++            ByteBufferUtils.cleanDirectBuffer(netInBuffer);
++            ByteBufferUtils.cleanDirectBuffer(netOutBuffer);
++        }
++    }
+ 
+     private class FutureFlush implements Future<Boolean> {
+         private Future<Integer> integer;
+
+==================================================
+SocketBufferHandler.java
+index c2d5637be0..f76488e46e 100644
+--- a/java/org/apache/tomcat/util/net/SecureNioChannel.java
++++ b/java/org/apache/tomcat/util/net/SecureNioChannel.java
+@@ -93,6 +93,14 @@ public class SecureNioChannel extends NioChannel  {
+         netInBuffer.clear();
+     }
+ 
++    @Override
++    public void free() {
++        super.free();
++        if (endpoint.getSocketProperties().getDirectSslBuffer()) {
++            ByteBufferUtils.cleanDirectBuffer(netInBuffer);
++            ByteBufferUtils.cleanDirectBuffer(netOutBuffer);
++        }
++    }
+ 
+ //===========================================================================================
+ //                  NIO SSL METHODS
+
+==================================================

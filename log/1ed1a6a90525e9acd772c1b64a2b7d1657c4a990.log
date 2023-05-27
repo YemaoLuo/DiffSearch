@@ -1,0 +1,229 @@
+1ed1a6a90525e9acd772c1b64a2b7d1657c4a990
+==================================================
+Check for unexpected EOS. Close the connection if one is seen.
+==================================================
+Mark Emlyn
+==================================================
+Wed Feb 22 19:20:46 2012 +0000
+==================================================
+StreamInbound.java
+Check for unexpected EOS. Close the connection if one is seen.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1292456 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+WsInputStream.java
+index 9dd5bbeec3..a3bfd5d115 100644
+--- a/java/org/apache/catalina/websocket/StreamInbound.java
++++ b/java/org/apache/catalina/websocket/StreamInbound.java
+@@ -51,49 +51,58 @@ public abstract class StreamInbound implements UpgradeInbound {
+     @Override
+     public SocketState onData() throws IOException {
+         // Must be start the start of a frame or series of frames
+-        WsInputStream wsIs = new WsInputStream(processor);
+ 
+-        WsFrameHeader header = wsIs.getFrameHeader();
++        try {
++            WsInputStream wsIs = new WsInputStream(processor);
+ 
+-        // TODO User defined extensions may define values for rsv
+-        if (header.getRsv() > 0) {
+-            getOutbound().close(1002, null);
+-            return SocketState.CLOSED;
+-        }
++            WsFrameHeader header = wsIs.getFrameHeader();
++
++            // TODO User defined extensions may define values for rsv
++            if (header.getRsv() > 0) {
++                getOutbound().close(1002, null);
++                return SocketState.CLOSED;
++            }
+ 
+-        byte opCode = header.getOpCode();
++            byte opCode = header.getOpCode();
+ 
+-        if (opCode == Constants.OPCODE_BINARY) {
+-            onBinaryData(wsIs);
+-            return SocketState.UPGRADED;
+-        } else if (opCode == Constants.OPCODE_TEXT) {
+-            InputStreamReader r =
+-                    new InputStreamReader(wsIs, B2CConverter.UTF_8);
+-            onTextData(r);
+-            return SocketState.UPGRADED;
+-        }
++            if (opCode == Constants.OPCODE_BINARY) {
++                onBinaryData(wsIs);
++                return SocketState.UPGRADED;
++            } else if (opCode == Constants.OPCODE_TEXT) {
++                InputStreamReader r =
++                        new InputStreamReader(wsIs, B2CConverter.UTF_8);
++                onTextData(r);
++                return SocketState.UPGRADED;
++            }
+ 
+-        // Must be a control frame and control frames:
+-        // - have a limited payload length
+-        // - must not be fragmented
+-        if (wsIs.getPayloadLength() > 125 || !wsIs.getFrameHeader().getFin()) {
++            // Must be a control frame and control frames:
++            // - have a limited payload length
++            // - must not be fragmented
++            if (wsIs.getPayloadLength() > 125 || !wsIs.getFrameHeader().getFin()) {
++                getOutbound().close(1002, null);
++                return SocketState.CLOSED;
++            }
++
++            if (opCode == Constants.OPCODE_CLOSE){
++                doClose(wsIs);
++                return SocketState.CLOSED;
++            } else if (opCode == Constants.OPCODE_PING) {
++                doPing(wsIs);
++                return SocketState.UPGRADED;
++            } else if (opCode == Constants.OPCODE_PONG) {
++                doPong(wsIs);
++                return SocketState.UPGRADED;
++            }
++
++            // Unknown OpCode
+             getOutbound().close(1002, null);
+             return SocketState.CLOSED;
+-        }
+-
+-        if (opCode == Constants.OPCODE_CLOSE){
+-            doClose(wsIs);
++        } catch (IOException ioe) {
++            // Given something must have gone to reach this point, this might
++            // not work but try it anyway.
++            getOutbound().close(1002, null);
+             return SocketState.CLOSED;
+-        } else if (opCode == Constants.OPCODE_PING) {
+-            doPing(wsIs);
+-            return SocketState.UPGRADED;
+-        } else if (opCode == Constants.OPCODE_PONG) {
+-            doPong(wsIs);
+-            return SocketState.UPGRADED;
+         }
+-
+-        getOutbound().close(1002, null);
+-        return SocketState.CLOSED;
+     }
+ 
+     private void doClose(WsInputStream is) throws IOException {
+
+==================================================
+UpgradeAprProcessor.java
+index 444cbcb0b9..819f394497 100644
+--- a/java/org/apache/catalina/websocket/WsInputStream.java
++++ b/java/org/apache/catalina/websocket/WsInputStream.java
+@@ -51,11 +51,10 @@ public class WsInputStream extends java.io.InputStream {
+ 
+         // TODO: Handle control frames between fragments
+ 
+-        int i = processor.read();
+-        this.wsFrameHeader = new WsFrameHeader(i);
++        this.wsFrameHeader = new WsFrameHeader(processorRead());
+ 
+         // Client data must be masked
+-        i = processor.read();
++        int i = processorRead();
+         if ((i & 0x80) == 0) {
+             // TODO: StringManager / i18n
+             throw new IOException("Client frame not masked");
+@@ -64,11 +63,11 @@ public class WsInputStream extends java.io.InputStream {
+         payloadLength = i & 0x7F;
+         if (payloadLength == 126) {
+             byte[] extended = new byte[2];
+-            processor.read(extended);
++            processorRead(extended);
+             payloadLength = Conversions.byteArrayToLong(extended);
+         } else if (payloadLength == 127) {
+             byte[] extended = new byte[8];
+-            processor.read(extended);
++            processorRead(extended);
+             payloadLength = Conversions.byteArrayToLong(extended);
+         }
+         remaining = payloadLength;
+@@ -89,6 +88,30 @@ public class WsInputStream extends java.io.InputStream {
+     }
+ 
+ 
++    // ----------------------------------- Guaranteed read methods for processor
++
++    private int processorRead() throws IOException {
++        int result = processor.read();
++        if (result == -1) {
++            // TODO i18n
++            throw new IOException("End of stream before end of frame");
++        }
++        return result;
++    }
++
++
++    private void processorRead(byte[] bytes) throws IOException {
++        int read = 0;
++        int last = 0;
++        while (read < bytes.length) {
++            last = processor.read(bytes, read, bytes.length - read);
++            if (last == -1) {
++                // TODO i18n
++                throw new IOException("End of stream before end of frame");
++            }
++        }
++    }
++
+     // ----------------------------------------------------- InputStream methods
+ 
+     @Override
+
+==================================================
+UpgradeBioProcessor.java
+index 211b022843..d2684151d9 100644
+--- a/java/org/apache/coyote/http11/upgrade/UpgradeAprProcessor.java
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeAprProcessor.java
+@@ -67,7 +67,7 @@ public class UpgradeAprProcessor extends UpgradeProcessor<Long> {
+ 
+ 
+     @Override
+-    public int read(byte[] bytes) throws IOException {
+-        return Socket.recv(socket, bytes, 0, bytes.length);
++    public int read(byte[] bytes, int off, int len) throws IOException {
++        return Socket.recv(socket, bytes, off, len);
+     }
+ }
+
+==================================================
+UpgradeNioProcessor.java
+index 2f10c93001..592b0a2e0f 100644
+--- a/java/org/apache/coyote/http11/upgrade/UpgradeBioProcessor.java
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeBioProcessor.java
+@@ -68,7 +68,7 @@ public class UpgradeBioProcessor extends UpgradeProcessor<Socket> {
+ 
+ 
+     @Override
+-    public int read(byte[] bytes) throws IOException {
+-        return inputStream.read(bytes);
++    public int read(byte[] bytes, int off, int len) throws IOException {
++        return inputStream.read(bytes, off, len);
+     }
+ }
+
+==================================================
+UpgradeProcessor.java
+index cc28089789..5fa317278f 100644
+--- a/java/org/apache/coyote/http11/upgrade/UpgradeNioProcessor.java
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeNioProcessor.java
+@@ -91,8 +91,8 @@ public class UpgradeNioProcessor extends UpgradeProcessor<NioChannel> {
+     }
+ 
+     @Override
+-    public int read(byte[] bytes) throws IOException {
+-        return readSocket(true, bytes, 0, bytes.length);
++    public int read(byte[] bytes, int off, int len) throws IOException {
++        return readSocket(true, bytes, off, len);
+     }
+ 
+ 
+
+==================================================

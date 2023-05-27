@@ -1,0 +1,343 @@
+52e87a111919055348fc1eb107d49bb79666c223
+==================================================
+IPv6 improvements:
+==================================================
+Mark Thomas
+==================================================
+Thu Dec 1 11:17:38 2016 +0000
+==================================================
+AbstractEndpoint.java
+IPv6 improvements:
+- use IPv6 by default if available on Windows with APR
+- new option to configure whether APR with IPv6 also uses IPv4 on dual stack systems
+- improve unlock accept logic to better handle cases where only IPv4 or only IPv6 are configured
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1772170 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AbstractJsseEndpoint.java
+index da911e69af..7a003ff1f5 100644
+--- a/java/org/apache/tomcat/util/net/AbstractEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AbstractEndpoint.java
+@@ -16,6 +16,7 @@
+  */
+ package org.apache.tomcat.util.net;
+ 
++import java.io.IOException;
+ import java.io.OutputStreamWriter;
+ import java.net.InetAddress;
+ import java.net.InetSocketAddress;
+@@ -378,7 +379,19 @@ public abstract class AbstractEndpoint<S> {
+     public int getPort() { return port; }
+     public void setPort(int port ) { this.port=port; }
+ 
+-    public abstract int getLocalPort();
++
++    public final int getLocalPort() {
++        try {
++            InetSocketAddress localAddress = getLocalAddress();
++            if (localAddress == null) {
++                return -1;
++            }
++            return localAddress.getPort();
++        } catch (IOException ioe) {
++            return -1;
++        }
++    }
++
+ 
+     /**
+      * Address for the server socket.
+@@ -387,6 +400,22 @@ public abstract class AbstractEndpoint<S> {
+     public InetAddress getAddress() { return address; }
+     public void setAddress(InetAddress address) { this.address = address; }
+ 
++
++    /**
++     * Obtain the network address the server socket is bound to. This primarily
++     * exists to enable the correct address to be used when unlocking the server
++     * socket since it removes the guess-work involved if no address is
++     * specifically set.
++     *
++     * @return The network address that the server socket is listening on or
++     *         null if the server socket is not currently bound.
++     *
++     * @throws IOException If there is a problem determining the currently bound
++     *                     socket
++     */
++    protected abstract InetSocketAddress getLocalAddress() throws IOException;
++
++
+     /**
+      * Allows the server developer to specify the acceptCount (backlog) that
+      * should be used for server sockets. By default, this value
+@@ -761,35 +790,40 @@ public abstract class AbstractEndpoint<S> {
+             return;
+         }
+ 
+-        InetSocketAddress saddr = null;
++        InetSocketAddress unlockAddress = null;
++        InetSocketAddress localAddress = null;
+         try {
+-            // Need to create a connection to unlock the accept();
+-            if (address == null) {
+-                saddr = new InetSocketAddress("localhost", getLocalPort());
+-            } else if (address.isAnyLocalAddress()) {
++            localAddress = getLocalAddress();
++        } catch (IOException ioe) {
++            // TODO i18n
++            getLog().debug("Unable to determine local address for " + getName(), ioe);
++        }
++        if (localAddress == null) {
++            // TODO i18n
++            getLog().warn("Failed to unlock acceptor for " + getName() + " because the local address was not available.");
++            return;
++        }
++
++        try {
++            if (localAddress.getAddress().isAnyLocalAddress()) {
+                 // Need a local address of the same type (IPv4 or IPV6) as the
+                 // configured bind address since the connector may be configured
+                 // to not map between types.
+-                InetAddress localAddress = null;
+                 Enumeration<NetworkInterface> networkInterfaces = NetworkInterface.getNetworkInterfaces();
+-                while (localAddress == null && networkInterfaces.hasMoreElements()) {
++                while (unlockAddress == null && networkInterfaces.hasMoreElements()) {
+                     NetworkInterface networkInterface = networkInterfaces.nextElement();
+                     Enumeration<InetAddress> inetAddresses = networkInterface.getInetAddresses();
+-                    while (localAddress == null && inetAddresses.hasMoreElements()) {
++                    while (unlockAddress == null && inetAddresses.hasMoreElements()) {
+                         InetAddress inetAddress = inetAddresses.nextElement();
+-                        if (address.getClass().isAssignableFrom(inetAddress.getClass())) {
+-                            localAddress = inetAddress;
++                        if (localAddress.getAddress().getClass().isAssignableFrom(inetAddress.getClass())) {
++                            unlockAddress = new InetSocketAddress(inetAddress, localAddress.getPort());
+                         }
+                     }
+                 }
+-                // Fall-back option
+-                if (localAddress == null) {
+-                    saddr = new InetSocketAddress("localhost", getLocalPort());
+-                }
+-                saddr = new InetSocketAddress(localAddress, getLocalPort());
+             } else {
+-                saddr = new InetSocketAddress(address, getLocalPort());
++                unlockAddress = localAddress;
+             }
++
+             try (java.net.Socket s = new java.net.Socket()) {
+                 int stmo = 2 * 1000;
+                 int utmo = 2 * 1000;
+@@ -800,9 +834,9 @@ public abstract class AbstractEndpoint<S> {
+                 s.setSoTimeout(stmo);
+                 s.setSoLinger(getSocketProperties().getSoLingerOn(),getSocketProperties().getSoLingerTime());
+                 if (getLog().isDebugEnabled()) {
+-                    getLog().debug("About to unlock socket for:"+saddr);
++                    getLog().debug("About to unlock socket for:" + unlockAddress);
+                 }
+-                s.connect(saddr,utmo);
++                s.connect(unlockAddress,utmo);
+                 if (getDeferAccept()) {
+                     /*
+                      * In the case of a deferred accept / accept filters we need to
+@@ -817,7 +851,7 @@ public abstract class AbstractEndpoint<S> {
+                     sw.flush();
+                 }
+                 if (getLog().isDebugEnabled()) {
+-                    getLog().debug("Socket unlock completed for:"+saddr);
++                    getLog().debug("Socket unlock completed for:" + unlockAddress);
+                 }
+ 
+                 // Wait for upto 1000ms acceptor threads to unlock
+
+==================================================
+AprEndpoint.java
+index c315addf18..bab291d59d 100644
+--- a/java/org/apache/tomcat/util/net/AbstractJsseEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AbstractJsseEndpoint.java
+@@ -16,6 +16,10 @@
+  */
+ package org.apache.tomcat.util.net;
+ 
++import java.io.IOException;
++import java.net.InetSocketAddress;
++import java.net.SocketAddress;
++import java.nio.channels.NetworkChannel;
+ import java.util.ArrayList;
+ import java.util.Iterator;
+ import java.util.LinkedHashSet;
+@@ -235,4 +239,21 @@ public abstract class AbstractJsseEndpoint<S> extends AbstractEndpoint<S> {
+             }
+         }
+     }
++
++
++    protected abstract NetworkChannel getServerSocket();
++
++
++    @Override
++    protected final InetSocketAddress getLocalAddress() throws IOException {
++        NetworkChannel serverSock = getServerSocket();
++        if (serverSock == null) {
++            return null;
++        }
++        SocketAddress sa = serverSock.getLocalAddress();
++        if (sa instanceof InetSocketAddress) {
++            return (InetSocketAddress) sa;
++        }
++        return null;
++    }
+ }
+
+==================================================
+Nio2Endpoint.java
+index de191f1b72..92d55aa41e 100644
+--- a/java/org/apache/tomcat/util/net/AprEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AprEndpoint.java
+@@ -18,6 +18,7 @@ package org.apache.tomcat.util.net;
+ 
+ import java.io.EOFException;
+ import java.io.IOException;
++import java.net.InetSocketAddress;
+ import java.net.SocketTimeoutException;
+ import java.nio.ByteBuffer;
+ import java.nio.charset.StandardCharsets;
+@@ -127,6 +128,11 @@ public class AprEndpoint extends AbstractEndpoint<Long> implements SNICallBack {
+     public boolean getDeferAccept() { return deferAccept; }
+ 
+ 
++    private boolean ipv6v6only = false;
++    public void setIpv6v6only(boolean ipv6v6only) { this.ipv6v6only = ipv6v6only; }
++    public boolean getIpv6v6only() { return ipv6v6only; }
++
++
+     /**
+      * Size of the sendfile (= concurrent files which can be served).
+      */
+@@ -189,23 +195,32 @@ public class AprEndpoint extends AbstractEndpoint<Long> implements SNICallBack {
+     }
+ 
+ 
+-    /**
+-     * Port in use.
+-     */
+     @Override
+-    public int getLocalPort() {
++    public InetSocketAddress getLocalAddress() throws IOException {
+         long s = serverSock;
+         if (s == 0) {
+-            return -1;
++            return null;
+         } else {
+             long sa;
+             try {
+                 sa = Address.get(Socket.APR_LOCAL, s);
+-                Sockaddr addr = Address.getInfo(sa);
+-                return addr.port;
++            } catch (IOException ioe) {
++                // re-throw
++                throw ioe;
+             } catch (Exception e) {
+-                return -1;
++                // wrap
++                throw new IOException(e);
++            }
++            Sockaddr addr = Address.getInfo(sa);
++            if (addr.hostname == null) {
++                // any local address
++                if (addr.family == Socket.APR_INET6) {
++                    return new InetSocketAddress("::", addr.port);
++                } else {
++                    return new InetSocketAddress("0.0.0.0", addr.port);
++                }
+             }
++            return new InetSocketAddress(addr.hostname, addr.port);
+         }
+     }
+ 
+@@ -288,8 +303,9 @@ public class AprEndpoint extends AbstractEndpoint<Long> implements SNICallBack {
+         int family = Socket.APR_INET;
+         if (Library.APR_HAVE_IPV6) {
+             if (addressStr == null) {
+-                if (!OS.IS_BSD && !OS.IS_WIN32 && !OS.IS_WIN64)
++                if (!OS.IS_BSD) {
+                     family = Socket.APR_UNSPEC;
++                }
+             } else if (addressStr.indexOf(':') >= 0) {
+                 family = Socket.APR_UNSPEC;
+             }
+@@ -304,6 +320,13 @@ public class AprEndpoint extends AbstractEndpoint<Long> implements SNICallBack {
+         if (OS.IS_UNIX) {
+             Socket.optSet(serverSock, Socket.APR_SO_REUSEADDR, 1);
+         }
++        if (Library.APR_HAVE_IPV6) {
++            if (getIpv6v6only()) {
++                Socket.optSet(serverSock, Socket.APR_IPV6_V6ONLY, 1);
++            } else {
++                Socket.optSet(serverSock, Socket.APR_IPV6_V6ONLY, 0);
++            }
++        }
+         // Deal with the firewalls that tend to drop the inactive sockets
+         Socket.optSet(serverSock, Socket.APR_SO_KEEPALIVE, 1);
+         // Bind the server socket
+
+==================================================
+NioEndpoint.java
+index 0d24e3e77c..1f6956672e 100644
+--- a/java/org/apache/tomcat/util/net/Nio2Endpoint.java
++++ b/java/org/apache/tomcat/util/net/Nio2Endpoint.java
+@@ -30,6 +30,7 @@ import java.nio.channels.AsynchronousSocketChannel;
+ import java.nio.channels.ClosedChannelException;
+ import java.nio.channels.CompletionHandler;
+ import java.nio.channels.FileChannel;
++import java.nio.channels.NetworkChannel;
+ import java.nio.channels.ReadPendingException;
+ import java.nio.channels.WritePendingException;
+ import java.nio.file.StandardOpenOption;
+@@ -113,29 +114,6 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel> {
+     }
+ 
+ 
+-    /**
+-     * Port in use.
+-     */
+-    @Override
+-    public int getLocalPort() {
+-        AsynchronousServerSocketChannel ssc = serverSock;
+-        if (ssc == null) {
+-            return -1;
+-        } else {
+-            try {
+-                SocketAddress sa = ssc.getLocalAddress();
+-                if (sa instanceof InetSocketAddress) {
+-                    return ((InetSocketAddress) sa).getPort();
+-                } else {
+-                    return -1;
+-                }
+-            } catch (IOException e) {
+-                return -1;
+-            }
+-        }
+-    }
+-
+-
+     // --------------------------------------------------------- Public Methods
+ 
+     /**
+@@ -405,6 +383,12 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel> {
+     }
+ 
+ 
++    @Override
++    protected NetworkChannel getServerSocket() {
++        return serverSock;
++    }
++
++
+     // --------------------------------------------------- Acceptor Inner Class
+ 
+     /**
+
+==================================================

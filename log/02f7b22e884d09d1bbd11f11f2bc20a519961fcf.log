@@ -1,0 +1,486 @@
+02f7b22e884d09d1bbd11f11f2bc20a519961fcf
+==================================================
+Add message size limit support for message handlers
+==================================================
+Mark Emlyn
+==================================================
+Wed Jun 26 14:15:08 2013 +0000
+==================================================
+Util.java
+index 5ff22b8246..44b4727f04 100644
+--- a/java/org/apache/tomcat/websocket/LocalStrings.properties
++++ b/java/org/apache/tomcat/websocket/LocalStrings.properties
+@@ -43,6 +43,7 @@ wsFrame.controlNoFin=A control frame was sent that did not have the fin bit set.
+ wsFrame.invalidOpCode= A WebSocket frame was sent with an unrecognised opCode of [{0}]
+ wsFrame.invalidUtf8=A WebSocket text frame was received that could not be decoded to UTF-8 because it contained invalid byte sequences
+ wsFrame.invalidUtf8Close=A WebSocket close frame was received with a close reason that contained invalid UTF-8 byte sequences
++wsFrame.messageTooBig=The message was [{0}] bytes long but the MessageHandler has a limit of [{1}] bytes
+ wsFrame.noContinuation=A new message was started when a continuation frame was expected
+ wsFrame.notMasked=The client frame was not masked but all client frames must be masked
+ wsFrame.oneByteCloseCode=The client sent a close frame with a single byte payload which is not valid
+
+==================================================
+WrappedMessageHandler.java
+index 6502ee7566..15ef7d4bca 100644
+--- a/java/org/apache/tomcat/websocket/Util.java
++++ b/java/org/apache/tomcat/websocket/Util.java
+@@ -343,7 +343,7 @@ public class Util {
+                     new PojoMessageHandlerWholeBinary(listener,
+                             getOnMessageMethod(listener), null,
+                             endpointConfig, null, new Object[1], 0, true, -1,
+-                            false),
++                            false, -1),
+                     MessageHandlerResultType.BINARY);
+             results.add(result);
+         } else if (InputStream.class.isAssignableFrom(target)) {
+@@ -351,14 +351,15 @@ public class Util {
+                     new PojoMessageHandlerWholeBinary(listener,
+                             getOnMessageMethod(listener), null,
+                             endpointConfig, null, new Object[1], 0, true, -1,
+-                            true),
++                            true, -1),
+                     MessageHandlerResultType.BINARY);
+             results.add(result);
+         } else if (Reader.class.isAssignableFrom(target)) {
+             MessageHandlerResult result = new MessageHandlerResult(
+                     new PojoMessageHandlerWholeText(listener,
+                             getOnMessageMethod(listener), null,
+-                            endpointConfig, null, new Object[1], 0, true, -1),
++                            endpointConfig, null, new Object[1], 0, true, -1,
++                            -1),
+                     MessageHandlerResultType.BINARY);
+             results.add(result);
+         } else {
+@@ -376,7 +377,7 @@ public class Util {
+                         new PojoMessageHandlerWholeBinary(listener, m, null,
+                                 endpointConfig,
+                                 decoderMatch.getBinaryDecoders(), new Object[1],
+-                                0, false, -1, false),
++                                0, false, -1, false, -1),
+                         MessageHandlerResultType.BINARY);
+                 results.add(result);
+             }
+@@ -385,7 +386,7 @@ public class Util {
+                         new PojoMessageHandlerWholeText(listener, m, null,
+                                 endpointConfig,
+                                 decoderMatch.getTextDecoders(), new Object[1],
+-                                0, false, -1),
++                                0, false, -1, -1),
+                         MessageHandlerResultType.TEXT);
+                 results.add(result);
+             }
+
+==================================================
+WsFrameBase.java
+new file mode 100644
+index 0000000000..c4004b3faa
+--- /dev/null
++++ b/java/org/apache/tomcat/websocket/WrappedMessageHandler.java
+@@ -0,0 +1,25 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.tomcat.websocket;
++
++import javax.websocket.MessageHandler;
++
++public interface WrappedMessageHandler {
++    long getMaxMessageSize();
++
++    MessageHandler getWrappedHandler();
++}
+
+==================================================
+WsSession.java
+index 0e7165449e..93952de51c 100644
+--- a/java/org/apache/tomcat/websocket/WsFrameBase.java
++++ b/java/org/apache/tomcat/websocket/WsFrameBase.java
+@@ -329,9 +329,21 @@ public abstract class WsFrameBase {
+ 
+ 
+     @SuppressWarnings("unchecked")
+-    private void sendMessageText(boolean last) {
++    private void sendMessageText(boolean last) throws WsIOException {
+         MessageHandler mh = wsSession.getTextMessageHandler();
+         if (mh != null) {
++            if (mh instanceof WrappedMessageHandler) {
++                long maxMessageSize =
++                        ((WrappedMessageHandler) mh).getMaxMessageSize();
++                if (maxMessageSize > -1 &&
++                        messageBufferText.remaining() > maxMessageSize) {
++                    throw new WsIOException(new CloseReason(CloseCodes.TOO_BIG,
++                            sm.getString("wsFrame.messageTooBig",
++                                    Long.valueOf(messageBufferText.remaining()),
++                                    Long.valueOf(maxMessageSize))));
++                }
++            }
++
+             if (mh instanceof MessageHandler.Partial<?>) {
+                 ((MessageHandler.Partial<String>) mh).onMessage(
+                         messageBufferText.toString(), last);
+@@ -494,9 +506,20 @@ public abstract class WsFrameBase {
+ 
+ 
+     @SuppressWarnings("unchecked")
+-    private void sendMessageBinary(ByteBuffer msg, boolean last) {
++    private void sendMessageBinary(ByteBuffer msg, boolean last)
++            throws WsIOException {
+         MessageHandler mh = wsSession.getBinaryMessageHandler();
+         if (mh != null) {
++            if (mh instanceof WrappedMessageHandler) {
++                long maxMessageSize =
++                        ((WrappedMessageHandler) mh).getMaxMessageSize();
++                if (maxMessageSize > -1 && msg.remaining() > maxMessageSize) {
++                    throw new WsIOException(new CloseReason(CloseCodes.TOO_BIG,
++                            sm.getString("wsFrame.messageTooBig",
++                                    Long.valueOf(msg.remaining()),
++                                    Long.valueOf(maxMessageSize))));
++                }
++            }
+             if (mh instanceof MessageHandler.Partial<?>) {
+                 ((MessageHandler.Partial<ByteBuffer>) mh).onMessage(msg, last);
+             } else {
+
+==================================================
+PojoMessageHandlerBase.java
+index d70b01698c..ea3a52e571 100644
+--- a/java/org/apache/tomcat/websocket/WsSession.java
++++ b/java/org/apache/tomcat/websocket/WsSession.java
+@@ -44,7 +44,6 @@ import javax.websocket.WebSocketContainer;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.res.StringManager;
+-import org.apache.tomcat.websocket.pojo.PojoMessageHandlerBase;
+ 
+ public class WsSession implements Session {
+ 
+@@ -239,9 +238,8 @@ public class WsSession implements Session {
+ 
+         MessageHandler wrapped = null;
+ 
+-        if (listener instanceof PojoMessageHandlerBase) {
+-            wrapped =
+-                    ((PojoMessageHandlerBase<?>) listener).getWrappedHandler();
++        if (listener instanceof WrappedMessageHandler) {
++            wrapped = ((WrappedMessageHandler) listener).getWrappedHandler();
+         }
+ 
+         if (wrapped == null) {
+
+==================================================
+PojoMessageHandlerPartialBase.java
+index 90ef8ffc07..0cc955a7cd 100644
+--- a/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerBase.java
++++ b/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerBase.java
+@@ -25,12 +25,15 @@ import javax.websocket.MessageHandler;
+ import javax.websocket.RemoteEndpoint;
+ import javax.websocket.Session;
+ 
++import org.apache.tomcat.websocket.WrappedMessageHandler;
++
+ /**
+  * Common implementation code for the POJO message handlers.
+  *
+  * @param <T>   The type of message to handle
+  */
+-public abstract class PojoMessageHandlerBase<T> {
++public abstract class PojoMessageHandlerBase<T>
++        implements WrappedMessageHandler {
+ 
+     protected final Object pojo;
+     protected final Method method;
+@@ -39,11 +42,11 @@ public abstract class PojoMessageHandlerBase<T> {
+     protected final int indexPayload;
+     protected final boolean convert;
+     protected final int indexSession;
+-
++    protected final long maxMessageSize;
+ 
+     public PojoMessageHandlerBase(Object pojo, Method method,
+             Session session, Object[] params, int indexPayload, boolean convert,
+-            int indexSession) {
++            int indexSession, long maxMessageSize) {
+         this.pojo = pojo;
+         this.method = method;
+         this.session = session;
+@@ -51,6 +54,7 @@ public abstract class PojoMessageHandlerBase<T> {
+         this.indexPayload = indexPayload;
+         this.convert = convert;
+         this.indexSession = indexSession;
++        this.maxMessageSize = maxMessageSize;
+     }
+ 
+ 
+@@ -81,11 +85,18 @@ public abstract class PojoMessageHandlerBase<T> {
+      * match requests to remove handlers if the original handler has been
+      * wrapped.
+      */
+-    public MessageHandler getWrappedHandler() {
++    @Override
++    public final MessageHandler getWrappedHandler() {
+         if (pojo instanceof MessageHandler) {
+             return (MessageHandler) pojo;
+         } else {
+             return null;
+         }
+     }
++
++
++    @Override
++    public final long getMaxMessageSize() {
++        return maxMessageSize;
++    }
+ }
+
+==================================================
+PojoMessageHandlerPartialBinary.java
+index 127d3a17da..59fa245e6a 100644
+--- a/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerPartialBase.java
++++ b/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerPartialBase.java
+@@ -39,9 +39,10 @@ public abstract class PojoMessageHandlerPartialBase<T>
+ 
+     public PojoMessageHandlerPartialBase(Object pojo, Method method,
+             Session session, Object[] params, int indexPayload,
+-            boolean convert, int indexBoolean, int indexSession) {
++            boolean convert, int indexBoolean, int indexSession,
++            long maxMessageSize) {
+         super(pojo, method, session, params, indexPayload, convert,
+-                indexSession);
++                indexSession, maxMessageSize);
+         this.indexBoolean = indexBoolean;
+     }
+ 
+
+==================================================
+PojoMessageHandlerPartialText.java
+index 1f51f1d8d5..97f7660fce 100644
+--- a/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerPartialBinary.java
++++ b/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerPartialBinary.java
+@@ -29,8 +29,8 @@ public class PojoMessageHandlerPartialBinary
+ 
+     public PojoMessageHandlerPartialBinary(Object pojo, Method method,
+             Session session, Object[] params, int indexPayload, boolean convert,
+-            int indexBoolean, int indexSession) {
++            int indexBoolean, int indexSession, long maxMessageSize) {
+         super(pojo, method, session, params, indexPayload, convert, indexBoolean,
+-                indexSession);
++                indexSession, maxMessageSize);
+     }
+ }
+
+==================================================
+PojoMessageHandlerWholeBase.java
+index 271dfcd987..dc35eb7a76 100644
+--- a/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerPartialText.java
++++ b/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerPartialText.java
+@@ -28,8 +28,8 @@ public class PojoMessageHandlerPartialText
+ 
+     public PojoMessageHandlerPartialText(Object pojo, Method method,
+             Session session, Object[] params, int indexPayload, boolean convert,
+-            int indexBoolean, int indexSession) {
++            int indexBoolean, int indexSession, long maxMessageSize) {
+         super(pojo, method, session, params, indexPayload, convert, indexBoolean,
+-                indexSession);
++                indexSession, maxMessageSize);
+     }
+ }
+
+==================================================
+PojoMessageHandlerWholeBinary.java
+index bfdc970064..6edc178fe7 100644
+--- a/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerWholeBase.java
++++ b/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerWholeBase.java
+@@ -36,9 +36,9 @@ public abstract class PojoMessageHandlerWholeBase<T>
+ 
+     public PojoMessageHandlerWholeBase(Object pojo, Method method,
+             Session session, Object[] params, int indexPayload,
+-            boolean convert, int indexSession) {
++            boolean convert, int indexSession, long maxMessageSize) {
+         super(pojo, method, session, params, indexPayload, convert,
+-                indexSession);
++                indexSession, maxMessageSize);
+     }
+ 
+ 
+
+==================================================
+PojoMessageHandlerWholePong.java
+index 8aa837dcec..fb357c7705 100644
+--- a/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerWholeBinary.java
++++ b/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerWholeBinary.java
+@@ -49,9 +49,9 @@ public class PojoMessageHandlerWholeBinary
+             Session session, EndpointConfig config,
+             List<Class<? extends Decoder>> decoderClazzes, Object[] params,
+             int indexPayload, boolean convert, int indexSession,
+-            boolean isForInputStream) {
++            boolean isForInputStream, long maxMessageSize) {
+         super(pojo, method, session, params, indexPayload, convert,
+-                indexSession);
++                indexSession, maxMessageSize);
+         try {
+             if (decoderClazzes != null) {
+                 for (Class<? extends Decoder> decoderClazz : decoderClazzes) {
+
+==================================================
+PojoMessageHandlerWholeText.java
+index c2962cbfe9..762814dff4 100644
+--- a/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerWholePong.java
++++ b/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerWholePong.java
+@@ -30,7 +30,8 @@ public class PojoMessageHandlerWholePong
+     public PojoMessageHandlerWholePong(Object pojo, Method method,
+             Session session, Object[] params, int indexPayload, boolean convert,
+             int indexSession) {
+-        super(pojo, method, session, params, indexPayload, convert, indexSession);
++        super(pojo, method, session, params, indexPayload, convert,
++                indexSession, -1);
+     }
+ 
+     @Override
+
+==================================================
+PojoMethodMapping.java
+index 0e1a4b5dc4..5332bcb0ac 100644
+--- a/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerWholeText.java
++++ b/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerWholeText.java
+@@ -48,9 +48,10 @@ public class PojoMessageHandlerWholeText
+     public PojoMessageHandlerWholeText(Object pojo, Method method,
+             Session session, EndpointConfig config,
+             List<Class<? extends Decoder>> decoderClazzes, Object[] params,
+-            int indexPayload, boolean convert, int indexSession) {
++            int indexPayload, boolean convert, int indexSession,
++            long maxMessageSize) {
+         super(pojo, method, session, params, indexPayload, convert,
+-                indexSession);
++                indexSession, maxMessageSize);
+ 
+         // Check for primitives
+         Class<?> type = method.getParameterTypes()[indexPayload];
+@@ -61,21 +62,23 @@ public class PojoMessageHandlerWholeText
+             primitiveType = null;
+         }
+ 
+-        try {
+-            for (Class<? extends Decoder> decoderClazz : decoderClazzes) {
+-                if (Text.class.isAssignableFrom(decoderClazz)) {
+-                    Text<?> decoder = (Text<?>) decoderClazz.newInstance();
+-                    decoder.init(config);
+-                    decoders.add(decoder);
+-                } else if (TextStream.class.isAssignableFrom(decoderClazz)) {
+-                    TextStream<?> decoder =
+-                            (TextStream<?>) decoderClazz.newInstance();
+-                    decoder.init(config);
+-                    decoders.add(decoder);
+-                } else {
+-                    // Binary decoder - ignore it
++        try {if (decoderClazzes != null) {
++                for (Class<? extends Decoder> decoderClazz : decoderClazzes) {
++                    if (Text.class.isAssignableFrom(decoderClazz)) {
++                        Text<?> decoder = (Text<?>) decoderClazz.newInstance();
++                        decoder.init(config);
++                        decoders.add(decoder);
++                    } else if (TextStream.class.isAssignableFrom(
++                            decoderClazz)) {
++                        TextStream<?> decoder =
++                                (TextStream<?>) decoderClazz.newInstance();
++                        decoder.init(config);
++                        decoders.add(decoder);
++                    } else {
++                        // Binary decoder - ignore it
++                    }
+                 }
+-            }
++        }
+         } catch (IllegalAccessException | InstantiationException e) {
+             throw new IllegalArgumentException(e);
+         }
+
+==================================================
+TestWsWebSocketContainer.java
+index 087ab7bf85..51023120ac 100644
+--- a/java/org/apache/tomcat/websocket/pojo/PojoMethodMapping.java
++++ b/java/org/apache/tomcat/websocket/pojo/PojoMethodMapping.java
+@@ -268,6 +268,7 @@ public class PojoMethodMapping {
+         private Map<Integer,PojoPathParam> indexPathParams = new HashMap<>();
+         private int indexPayload = -1;
+         private boolean useDecoder = false;
++        private long maxMessageSize = -1;
+ 
+         public MessageMethod(Method m, List<DecoderEntry> decoderEntries) {
+             this.m = m;
+@@ -491,6 +492,8 @@ public class PojoMethodMapping {
+                         "pojoMethodMapping.partialObject",
+                         m.getName(), m.getDeclaringClass().getName()));
+             }
++
++            maxMessageSize = m.getAnnotation(OnMessage.class).maxMessageSize();
+         }
+ 
+ 
+@@ -526,27 +529,27 @@ public class PojoMethodMapping {
+                 if (indexString != -1) {
+                     mh = new PojoMessageHandlerWholeText(pojo, m,  session,
+                             config, decoders, params, indexString, false,
+-                            indexSession);
++                            indexSession, maxMessageSize);
+                 } else if (indexPrimitive != -1) {
+                     mh = new PojoMessageHandlerWholeText(pojo, m, session,
+                             config, decoders, params, indexPrimitive, false,
+-                            indexSession);
++                            indexSession, maxMessageSize);
+                 } else if (indexByteArray != -1) {
+                     mh = new PojoMessageHandlerWholeBinary(pojo, m, session,
+                             config, decoders, params, indexByteArray, true,
+-                            indexSession, false);
++                            indexSession, false, maxMessageSize);
+                 } else if (indexByteBuffer != -1) {
+                     mh = new PojoMessageHandlerWholeBinary(pojo, m, session,
+                             config, decoders, params, indexByteBuffer, false,
+-                            indexSession, false);
++                            indexSession, false, maxMessageSize);
+                 } else if (indexInputStream != -1) {
+                     mh = new PojoMessageHandlerWholeBinary(pojo, m, session,
+                             config, decoders, params, indexInputStream, true,
+-                            indexSession, true);
++                            indexSession, true, maxMessageSize);
+                 } else if (indexReader != -1) {
+                     mh = new PojoMessageHandlerWholeText(pojo, m, session,
+                             config, decoders, params, indexReader, true,
+-                            indexSession);
++                            indexSession, maxMessageSize);
+                 } else {
+                     mh = new PojoMessageHandlerWholePong(pojo, m, session,
+                             params, indexPong, false, indexSession);
+@@ -556,15 +559,15 @@ public class PojoMethodMapping {
+                 if (indexString != -1) {
+                     mh = new PojoMessageHandlerPartialText(pojo, m, session,
+                             params, indexString, false, indexBoolean,
+-                            indexSession);
++                            indexSession, maxMessageSize);
+                 } else if (indexByteArray != -1) {
+                     mh = new PojoMessageHandlerPartialBinary(pojo, m, session,
+                             params, indexByteArray, true, indexBoolean,
+-                            indexSession);
++                            indexSession, maxMessageSize);
+                 } else {
+                     mh = new PojoMessageHandlerPartialBinary(pojo, m, session,
+                             params, indexByteBuffer, false, indexBoolean,
+-                            indexSession);
++                            indexSession, maxMessageSize);
+                 }
+             }
+             return mh;
+
+==================================================

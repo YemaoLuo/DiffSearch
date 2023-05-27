@@ -1,0 +1,124 @@
+e1fb169adb953e826fecb4b15a178636aa7c3a13
+==================================================
+Align async close implementation with Servlet 6.1 clarification
+==================================================
+Mark Thomas
+==================================================
+Tue Dec 13 11:22:51 2022 +0000
+==================================================
+AbstractProcessor.java
+Align async close implementation with Servlet 6.1 clarification
+
+Includes a test case
+
+
+
+==================================================
+AbstractProcessorLight.java
+index 50743ffece..6d3be069c7 100644
+--- a/java/org/apache/coyote/AbstractProcessor.java
++++ b/java/org/apache/coyote/AbstractProcessor.java
+@@ -193,7 +193,7 @@ public abstract class AbstractProcessor extends AbstractProcessorLight implement
+ 
+ 
+     @Override
+-    public SocketState asyncPostProcess() {
++    public SocketState asyncPostProcess() throws IOException {
+         return asyncStateMachine.asyncPostProcess();
+     }
+ 
+@@ -570,7 +570,11 @@ public abstract class AbstractProcessor extends AbstractProcessorLight implement
+             break;
+         }
+         case ASYNC_POST_PROCESS: {
+-            asyncStateMachine.asyncPostProcess();
++            try {
++                asyncStateMachine.asyncPostProcess();
++            } catch (IOException e) {
++                handleIOException(e);
++            }
+             break;
+         }
+ 
+
+==================================================
+AsyncStateMachine.java
+index 709530dfc8..9ba345fa66 100644
+--- a/java/org/apache/coyote/AbstractProcessorLight.java
++++ b/java/org/apache/coyote/AbstractProcessorLight.java
+@@ -192,7 +192,7 @@ public abstract class AbstractProcessorLight implements Processor {
+      */
+     protected abstract SocketState dispatch(SocketEvent status) throws IOException;
+ 
+-    protected abstract SocketState asyncPostProcess();
++    protected abstract SocketState asyncPostProcess() throws IOException;
+ 
+     protected abstract Log getLog();
+ }
+
+==================================================
+Http11OutputBuffer.java
+index b400788831..50b16316a9 100644
+--- a/java/org/apache/coyote/AsyncStateMachine.java
++++ b/java/org/apache/coyote/AsyncStateMachine.java
+@@ -16,6 +16,7 @@
+  */
+ package org.apache.coyote;
+ 
++import java.io.IOException;
+ import java.util.concurrent.atomic.AtomicLong;
+ 
+ import org.apache.juli.logging.Log;
+@@ -264,7 +265,7 @@ class AsyncStateMachine {
+      * current state. For example, as per SRV.2.3.3.3 can now process calls to
+      * complete() or dispatch().
+      */
+-    synchronized SocketState asyncPostProcess() {
++    synchronized SocketState asyncPostProcess() throws IOException {
+         if (state == AsyncState.COMPLETE_PENDING) {
+             clearNonBlockingListeners();
+             updateState(AsyncState.COMPLETING);
+@@ -277,6 +278,9 @@ class AsyncStateMachine {
+             updateState(AsyncState.STARTED);
+             return SocketState.LONG;
+         } else if (state == AsyncState.MUST_COMPLETE || state == AsyncState.COMPLETING) {
++            if (processor.getErrorState().isIoAllowed() && processor.flushBufferedWrite()) {
++                return SocketState.LONG;
++            }
+             asyncCtxt.fireOnComplete();
+             updateState(AsyncState.DISPATCHED);
+             asyncCtxt.decrementInProgressAsyncCount();
+@@ -285,6 +289,9 @@ class AsyncStateMachine {
+             updateState(AsyncState.DISPATCHING);
+             return SocketState.ASYNC_END;
+         } else if (state == AsyncState.DISPATCHING) {
++            if (processor.getErrorState().isIoAllowed() && processor.flushBufferedWrite()) {
++                return SocketState.LONG;
++            }
+             updateState(AsyncState.DISPATCHED);
+             asyncCtxt.decrementInProgressAsyncCount();
+             return SocketState.ASYNC_END;
+
+==================================================
+TestNonBlockingAPI.java
+index 570b90c0d7..e7206a50bd 100644
+--- a/java/org/apache/coyote/http11/Http11OutputBuffer.java
++++ b/java/org/apache/coyote/http11/Http11OutputBuffer.java
+@@ -565,14 +565,7 @@ public class Http11OutputBuffer implements HttpOutputBuffer {
+ 
+         @Override
+         public void end() throws IOException {
+-            /*
+-             * TODO
+-             * As of Servlet 6.1, this flush is (currently) meant to be
+-             * non-blocking if the output stream is in non-blocking mode. That
+-             * requirement creates various complications I want to discuss with
+-             * the EG before I try implementing it.
+-             */
+-            socketWrapper.flush(true);
++            socketWrapper.flush(response.getWriteListener() == null);
+         }
+ 
+         @Override
+
+==================================================

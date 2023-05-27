@@ -1,0 +1,201 @@
+c65a429f06f4e4a025a306e377211863d9ff2a0c
+==================================================
+Add first stab in letting interceptors have dynamic attributes
+==================================================
+Filip Hanik
+==================================================
+Mon Nov 17 04:42:57 2008 +0000
+==================================================
+ConnectionPool.java
+Add first stab in letting interceptors have dynamic attributes
+
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@718171 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+JdbcInterceptor.java
+index ba19a65fc2..cec75c8290 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/ConnectionPool.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/ConnectionPool.java
+@@ -122,12 +122,12 @@ public class ConnectionPool {
+             //build the proxy handler
+             handler = new ProxyConnection(this,con);
+             //set up the interceptor chain
+-            String[] proxies = getPoolProperties().getJdbcInterceptorsAsArray();
++            PoolProperties.InterceptorDefinition[] proxies = getPoolProperties().getJdbcInterceptorsAsArray();
+             for (int i=proxies.length-1; i>=0; i--) {
+                 try {
+                     JdbcInterceptor interceptor =
+-                        (JdbcInterceptor) Class.forName(proxies[i], true, //should this be the class loader?
+-                                Thread.currentThread().getContextClassLoader()).newInstance();
++                        (JdbcInterceptor) Class.forName(proxies[i].getClassName(), true, Thread.currentThread().getContextClassLoader()).newInstance(); //should this be the class loader?
++                    interceptor.setProperties(proxies[i].getProperties());
+                     interceptor.setNext(handler);
+                     interceptor.reset(this, con); //initialize
+                     handler = interceptor;
+
+==================================================
+PoolProperties.java
+index 171d003080..8b77e7eaba 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/JdbcInterceptor.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/JdbcInterceptor.java
+@@ -18,6 +18,10 @@ package org.apache.tomcat.jdbc.pool;
+ 
+ import java.lang.reflect.InvocationHandler;
+ import java.lang.reflect.Method;
++import java.util.ArrayList;
++import java.util.List;
++
++import org.apache.tomcat.jdbc.pool.PoolProperties.InterceptorProperty;
+ 
+ /**
+  * @author Filip Hanik
+@@ -27,7 +31,9 @@ public abstract class JdbcInterceptor implements InvocationHandler {
+     public  static final String CLOSE_VAL = "close";
+     public  static final String TOSTRING_VAL = "toString";
+     public  static final String ISCLOSED_VAL = "isClosed"; 
+-
++    
++    protected List<InterceptorProperty> properties = null; 
++    
+     private JdbcInterceptor next = null;
+ 
+     public JdbcInterceptor() {
+@@ -55,4 +61,13 @@ public abstract class JdbcInterceptor implements InvocationHandler {
+      * @param con - the pooled connection
+      */
+     public abstract void reset(ConnectionPool parent, PooledConnection con);
++
++    public List<InterceptorProperty> getProperties() {
++        return properties;
++    }
++
++    public void setProperties(List<InterceptorProperty> properties) {
++        this.properties = properties;
++    }
++    
+ }
+
+==================================================
+ConnectionPoolMBean.java
+index b3f8ece2e2..5ce697002b 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/PoolProperties.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/PoolProperties.java
+@@ -18,8 +18,11 @@ package org.apache.tomcat.jdbc.pool;
+ 
+ 
+ import java.lang.reflect.Method;
++import java.util.ArrayList;
++import java.util.List;
+ import java.util.Properties;
+ import java.util.concurrent.atomic.AtomicInteger;
++
+ /**
+  * @author Filip Hanik
+  *
+@@ -61,6 +64,8 @@ public class PoolProperties {
+     private String jdbcInterceptors=null;
+     private boolean fairQueue = false;
+ 
++    private InterceptorDefinition[] interceptors = null;
++    
+     public boolean isFairQueue() {
+         return fairQueue;
+     }
+@@ -201,11 +206,34 @@ public class PoolProperties {
+         return jdbcInterceptors;
+     }
+ 
+-    public String[] getJdbcInterceptorsAsArray() {
+-        if (jdbcInterceptors==null) return new String[0];
+-        else {
+-            return jdbcInterceptors.split(";");
++    public InterceptorDefinition[] getJdbcInterceptorsAsArray() {
++        if (interceptors == null) {
++            if (jdbcInterceptors==null) {
++                interceptors = new InterceptorDefinition[0];
++            } else {
++                String[] interceptorValues = jdbcInterceptors.split(";");
++                InterceptorDefinition[] definitions = new InterceptorDefinition[interceptorValues.length];
++                for (int i=0; i<interceptorValues.length; i++) {
++                    int propIndex = interceptorValues[i].indexOf("(");
++                    if (propIndex<0) {
++                        definitions[i] = new InterceptorDefinition(interceptorValues[i]);
++                    } else {
++                        String name = interceptorValues[i].substring(0,propIndex);
++                        definitions[i] = new InterceptorDefinition(name);
++                        String propsAsString = interceptorValues[i].substring(propIndex+1, interceptorValues[i].length());
++                        String[] props = propsAsString.split(",");
++                        for (int j=0; j<props.length; j++) {
++                            int pidx = props[j].indexOf("=");
++                            String propName = props[j].substring(0,pidx);
++                            String propValue = props[j].substring(pidx+1);
++                            definitions[i].addProperty(new InterceptorProperty(propName,propValue));
++                        }
++                    }
++                }
++                interceptors = definitions;
++            }
+         }
++        return interceptors;
+     }
+ 
+     public void setAccessToUnderlyingConnectionAllowed(boolean
+@@ -337,6 +365,7 @@ public class PoolProperties {
+ 
+     public void setJdbcInterceptors(String jdbcInterceptors) {
+         this.jdbcInterceptors = jdbcInterceptors;
++        this.interceptors = null;
+     }
+ 
+     public String toString() {
+@@ -395,4 +424,45 @@ public class PoolProperties {
+         result = result || (isTestWhileIdle() && getValidationQuery()!=null);
+         return result;
+     }
++    
++    public static class InterceptorDefinition {
++        protected String className;
++        protected List<InterceptorProperty> properties = new ArrayList<InterceptorProperty>();
++
++        public InterceptorDefinition(String className) {
++            this.className = className;
++        }
++
++        public String getClassName() {
++            return className;
++        }
++        public void addProperty(String name, String value) {
++            InterceptorProperty p = new InterceptorProperty(name,value);
++            addProperty(p);
++        }
++        
++        public void addProperty(InterceptorProperty p) {
++            properties.add(p);
++        }
++        
++        public List<InterceptorProperty> getProperties() {
++            return properties;
++        }
++    } 
++    
++    public static class InterceptorProperty {
++        String name;
++        String value;
++        public InterceptorProperty(String name, String value) {
++            this.name = name;
++            this.value = value;
++        }
++        public String getName() {
++            return name;
++        }
++        public String getValue() {
++            return value;
++        }
++    }
++
+ }
+
+==================================================

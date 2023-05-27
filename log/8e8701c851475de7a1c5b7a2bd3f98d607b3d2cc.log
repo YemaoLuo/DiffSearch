@@ -1,0 +1,2466 @@
+8e8701c851475de7a1c5b7a2bd3f98d607b3d2cc
+==================================================
+Add an HTTP header parser. The driver for this was an attempt to fix https://issues.apache.org/bugzilla/show_bug.cgi?id=52811
+==================================================
+Mark Emlyn
+==================================================
+Tue Mar 13 14:39:24 2012 +0000
+==================================================
+Response.java
+index 0b7e8c416c..ccfd2dc196 100644
+--- a/build.xml
++++ b/build.xml
+@@ -455,11 +455,12 @@
+         <exclude name="res/checkstyle/header-al2.txt"/>
+         <!-- Exclude auto-generated files -->
+         <exclude name="java/org/apache/el/parser/ELParser*.java" />
+-        <exclude name="java/org/apache/el/parser/JJTELParserState.java" />
+         <exclude name="java/org/apache/el/parser/Node.java" />
+-        <exclude name="java/org/apache/el/parser/ParseException.java" />
+-        <exclude name="java/org/apache/el/parser/SimpleCharStream.java" />
+-        <exclude name="java/org/apache/el/parser/Token*.java" />
++        <exclude name="java/org/apache/tomcat/util/http/parser/HttpParser*.java" />
++        <exclude name="java/org/apache/**/parser/JJT*ParserState.java" />
++        <exclude name="java/org/apache/**/parser/ParseException.java" />
++        <exclude name="java/org/apache/**/parser/SimpleCharStream.java" />
++        <exclude name="java/org/apache/**/parser/Token*.java" />
+         <!-- Exclude these else Gump runs validate on them -->
+         <exclude name="**/org/apache/tomcat/dbcp/**"/>
+         <exclude name="**/tomcat-deps/**"/>
+
+==================================================
+AstAttribute.java
+index fe560c4993..5a5d0688b2 100644
+--- a/java/org/apache/coyote/Response.java
++++ b/java/org/apache/coyote/Response.java
+@@ -18,10 +18,14 @@
+ package org.apache.coyote;
+ 
+ import java.io.IOException;
++import java.io.StringReader;
+ import java.util.Locale;
+ 
+ import org.apache.tomcat.util.buf.ByteChunk;
+ import org.apache.tomcat.util.http.MimeHeaders;
++import org.apache.tomcat.util.http.parser.AstMediaType;
++import org.apache.tomcat.util.http.parser.HttpParser;
++import org.apache.tomcat.util.http.parser.ParseException;
+ 
+ /**
+  * Response object.
+@@ -424,71 +428,38 @@ public final class Response {
+      *
+      * @param type the content type
+      */
+-    @SuppressWarnings("deprecation")
+     public void setContentType(String type) {
+ 
+-        int semicolonIndex = -1;
+-
+         if (type == null) {
+             this.contentType = null;
+             return;
+         }
+ 
+-        /*
+-         * Remove the charset param (if any) from the Content-Type, and use it
+-         * to set the response encoding.
+-         * The most recent response encoding setting will be appended to the
+-         * response's Content-Type (as its charset param) by getContentType();
+-         */
+-        boolean hasCharset = false;
+-        int len = type.length();
+-        int index = type.indexOf(';');
+-        while (index != -1) {
+-            semicolonIndex = index;
+-            index++;
+-            // Yes, isSpace() is deprecated but it does exactly what we need
+-            while (index < len && Character.isSpace(type.charAt(index))) {
+-                index++;
+-            }
+-            if (index+8 < len
+-                    && type.charAt(index) == 'c'
+-                    && type.charAt(index+1) == 'h'
+-                    && type.charAt(index+2) == 'a'
+-                    && type.charAt(index+3) == 'r'
+-                    && type.charAt(index+4) == 's'
+-                    && type.charAt(index+5) == 'e'
+-                    && type.charAt(index+6) == 't'
+-                    && type.charAt(index+7) == '=') {
+-                hasCharset = true;
+-                break;
+-            }
+-            index = type.indexOf(';', index);
+-        }
+-
+-        if (!hasCharset) {
++        AstMediaType m = null;
++        HttpParser hp = new HttpParser(new StringReader(type));
++        try {
++             m = hp.MediaType();
++        } catch (ParseException e) {
++            // Invalid - Assume no charset and just pass through whatever
++            // the user provided.
+             this.contentType = type;
+             return;
+         }
+ 
+-        this.contentType = type.substring(0, semicolonIndex);
+-        String tail = type.substring(index+8);
+-        int nextParam = tail.indexOf(';');
+-        String charsetValue = null;
+-        if (nextParam != -1) {
+-            this.contentType += tail.substring(nextParam);
+-            charsetValue = tail.substring(0, nextParam);
+-        } else {
+-            charsetValue = tail;
+-        }
++        this.contentType = m.toStringNoCharset();
++
++        String charsetValue = m.getCharset().trim();
+ 
+-        // The charset value may be quoted, but must not contain any quotes.
+         if (charsetValue != null && charsetValue.length() > 0) {
+-            charsetSet=true;
+-            charsetValue = charsetValue.replace('"', ' ');
+-            this.characterEncoding = charsetValue.trim();
++            charsetSet = true;
++            this.characterEncoding = charsetValue;
+         }
+     }
+ 
++    public void setContentTypeNoCharset(String type) {
++        this.contentType = type;
++    }
++
+     public String getContentType() {
+ 
+         String ret = contentType;
+
+==================================================
+AstMediaType.java
+new file mode 100644
+index 0000000000..105c09fffc
+--- /dev/null
++++ b/java/org/apache/tomcat/util/http/parser/AstAttribute.java
+@@ -0,0 +1,36 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.tomcat.util.http.parser;
++
++/**
++ * Represents an attribute as per section 3.6 of RFC 2616. Originally generated
++ * by <a href="http://javacc.java.net/doc/JJTree.html"> JJTree</a>.
++ */
++public class AstAttribute extends SimpleNode {
++    public AstAttribute(int id) {
++        super(id);
++    }
++
++    public AstAttribute(HttpParser p, int id) {
++        super(p, id);
++    }
++
++    @Override
++    public String toString() {
++        return value.toString();
++    }
++}
+
+==================================================
+AstParameter.java
+new file mode 100644
+index 0000000000..4cefddc84e
+--- /dev/null
++++ b/java/org/apache/tomcat/util/http/parser/AstMediaType.java
+@@ -0,0 +1,69 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.tomcat.util.http.parser;
++
++/**
++ * Represents a media-type as per section 3.7 of RFC 2616. Originally generated
++ * by <a href="http://javacc.java.net/doc/JJTree.html"> JJTree</a>.
++ */
++public class AstMediaType extends SimpleNode {
++    public AstMediaType(int id) {
++        super(id);
++    }
++
++    public AstMediaType(HttpParser p, int id) {
++        super(p, id);
++    }
++
++    @Override
++    public String toString() {
++        StringBuilder sb = new StringBuilder();
++        sb.append(children[0].toString());
++        sb.append("/");
++        sb.append(children[1].toString());
++        for (int i = 2; i < children.length; i++) {
++            sb.append(";");
++            sb.append(children[i].toString());
++        }
++        return sb.toString();
++    }
++
++    public String toStringNoCharset() {
++        StringBuilder sb = new StringBuilder();
++        sb.append(children[0].toString());
++        sb.append("/");
++        sb.append(children[1].toString());
++        for (int i = 2; i < children.length; i++) {
++            AstParameter p = (AstParameter) children[i];
++            if (!"charset".equals(p.children[0].jjtGetValue())) {
++                sb.append(";");
++                sb.append(p.toString());
++            }
++        }
++        return sb.toString();
++    }
++
++    public String getCharset() {
++        for (int i = 2; i < children.length; i++) {
++            AstParameter p = (AstParameter) children[i];
++            if ("charset".equals(p.children[0].jjtGetValue())) {
++                return p.children[1].jjtGetValue().toString();
++            }
++        }
++        return null;
++    }
++}
+
+==================================================
+AstSubType.java
+new file mode 100644
+index 0000000000..4e4ebdbea3
+--- /dev/null
++++ b/java/org/apache/tomcat/util/http/parser/AstParameter.java
+@@ -0,0 +1,40 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.tomcat.util.http.parser;
++
++/**
++ * Represents a parameter as per section 3.6 of RFC 2616. Originally generated
++ * by <a href="http://javacc.java.net/doc/JJTree.html"> JJTree</a>.
++ */
++public class AstParameter extends SimpleNode {
++    public AstParameter(int id) {
++        super(id);
++    }
++
++    public AstParameter(HttpParser p, int id) {
++        super(p, id);
++    }
++
++    @Override
++    public String toString() {
++        StringBuilder sb = new StringBuilder();
++        sb.append(children[0].toString());
++        sb.append("=");
++        sb.append(children[1].toString());
++        return sb.toString();
++    }
++}
+
+==================================================
+AstType.java
+new file mode 100644
+index 0000000000..b1b6dec1f3
+--- /dev/null
++++ b/java/org/apache/tomcat/util/http/parser/AstSubType.java
+@@ -0,0 +1,36 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.tomcat.util.http.parser;
++
++/**
++ * Represents a sub-type as per section 3.7 of RFC 2616. Originally generated by
++ * <a href="http://javacc.java.net/doc/JJTree.html"> JJTree</a>.
++ */
++public class AstSubType extends SimpleNode {
++    public AstSubType(int id) {
++        super(id);
++    }
++
++    public AstSubType(HttpParser p, int id) {
++        super(p, id);
++    }
++
++    @Override
++    public String toString() {
++        return value.toString();
++    }
++}
+
+==================================================
+AstValue.java
+new file mode 100644
+index 0000000000..97d36d88f1
+--- /dev/null
++++ b/java/org/apache/tomcat/util/http/parser/AstType.java
+@@ -0,0 +1,36 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.tomcat.util.http.parser;
++
++/**
++ * Represents a type as per section 3.7 of RFC 2616. Originally generated by <a
++ * href="http://javacc.java.net/doc/JJTree.html"> JJTree</a>.
++ */
++public class AstType extends SimpleNode {
++    public AstType(int id) {
++        super(id);
++    }
++
++    public AstType(HttpParser p, int id) {
++        super(p, id);
++    }
++
++    @Override
++    public String toString() {
++        return value.toString();
++    }
++}
+
+==================================================
+HttpParser.java
+new file mode 100644
+index 0000000000..7dd91e12f0
+--- /dev/null
++++ b/java/org/apache/tomcat/util/http/parser/AstValue.java
+@@ -0,0 +1,48 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.tomcat.util.http.parser;
++
++/**
++ * Represents a value as per section 3.6 of RFC 2616. Originally generated by <a
++ * href="http://javacc.java.net/doc/JJTree.html"> JJTree</a>.
++ */
++public class AstValue extends SimpleNode {
++    @Override
++    public Object jjtGetValue() {
++        String s = value.toString();
++        if (s.charAt(0) == '\"') {
++            // Quoted
++            return s.substring(1, s.length() - 1).replaceAll("\\\"", "\"");
++        } else {
++            // Unquoted
++            return s;
++        }
++    }
++
++    public AstValue(int id) {
++        super(id);
++    }
++
++    public AstValue(HttpParser p, int id) {
++        super(p, id);
++    }
++
++    @Override
++    public String toString() {
++        return value.toString();
++    }
++}
+
+==================================================
+HttpParserConstants.java
+new file mode 100644
+index 0000000000..d03de6fb1d
+--- /dev/null
++++ b/java/org/apache/tomcat/util/http/parser/HttpParser.jjt
+@@ -0,0 +1,132 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/*
++ * Parsing HTTP headers as per RFC2616 is not always as simple as it first
++ * appears. For headers that only use tokens the simple approach will normally
++ * be sufficient. However, for the other headers, while simple code meets 99.9%
++ * of cases, there are often some edge cases that make things far more
++ * complicated.
++ *
++ * The purpose of this parser is to let the parser worry about the edge cases.
++ * It provides strict parsing of HTTP header values assuming that wrapped header
++ * lines have already been unwrapped. (The Tomcat header processing code does
++ * the unwrapping.)
++ *
++ * Provides parsing of the following HTTP header values as per RFC 2616:
++ * - Content-Type
++ *
++ * Support for additional headers will be provided as required.
++ */
++
++/* Option Declaration */
++options
++{
++    STATIC=false;
++    NODE_PREFIX="Ast";
++    MULTI=true;
++    NODE_DEFAULT_VOID=true;
++    JAVA_UNICODE_ESCAPE=false;
++    UNICODE_INPUT=true;
++    BUILD_NODE_FILES=true;
++}
++
++
++/* Parser Declaration */
++PARSER_BEGIN( HttpParser )
++package org.apache.tomcat.util.http.parser;
++public class HttpParser
++{
++}
++PARSER_END( HttpParser )
++
++
++/*
++ * Content-Type
++ */
++AstMediaType MediaType() #MediaType : {}
++{
++    Type() <FORWARD_SLASH> SubType() ( <SEMI_COLON> Parameter())* <EOF> {
++        return jjtThis;
++    }
++}
++
++void Type() #Type : { Token t = null; }
++{
++    t=<HTTP_TOKEN> { jjtThis.jjtSetValue(t.image.trim()); }
++}
++
++void SubType() #SubType :{ Token t = null; }
++{
++    t=<HTTP_TOKEN> { jjtThis.jjtSetValue(t.image.trim()); }
++}
++
++void Parameter() #Parameter : {}
++{
++    Attribute() <EQUALS> Value()
++}
++
++void Attribute() # Attribute : { Token t = null; }
++{
++    t=<HTTP_TOKEN> { jjtThis.jjtSetValue(t.image.trim()); }
++}
++
++void Value() #Value : { Token t = null; }
++{
++    t=<HTTP_TOKEN> { jjtThis.jjtSetValue(t.image.trim()); } | t=<QUOTED_STRING> { jjtThis.jjtSetValue(t.image.trim()); }
++}
++
++
++<DEFAULT> TOKEN:
++{
++  < SEMI_COLON :    ";" >
++| < EQUALS :        "=" >
++| < FORWARD_SLASH : "/" >
++| < SP :            " " >
++| < HT :            "\t" >
++| < LWS :           (<HT> | <SP>)+ >
++| < HTTP_TOKEN :    (<LWS>)? (<HTTP_TOKEN_CHAR>)+ (<LWS>)? >
++| < QUOTED_STRING : (<LWS>)? <START_QUOTE> <QUOTED_TEXT> <END_QUOTE> (<LWS>)? >
++| < START_QUOTE :   "\"" > : IN_QUOTED_TEXT
++| < #HTTP_TOKEN_CHAR:
++     [
++     "\u0021",
++     "\u0023"-"\u0027",
++     "\u002a"-"\u002b",
++     "\u002d"-"\u002e",
++     "\u0030"-"\u0039",
++     "\u0041"-"\u005a",
++     "\u005e"-"\u007a",
++     "\u007c",
++     "\u007e"
++     ]
++  >
++}
++
++<IN_QUOTED_TEXT> TOKEN :
++{
++  < #QUOTED_TEXT :   (("\\" (<QUOTED_TEXT_CHAR> | "\"")) | <QUOTED_TEXT_CHAR>)* >
++| < #END_QUOTE :     "\"" >
++| < #QUOTED_TEXT_CHAR:
++     [
++     "\u0009",
++     "\u0020"-"\u0021",
++     "\u0023"-"\u005b",
++     "\u005d"-"\u00ff"
++     ]
++  >
++}
+\ No newline at end of file
+
+==================================================
+HttpParserTokenManager.java
+new file mode 100644
+index 0000000000..081e7aa0d9
+--- /dev/null
++++ b/java/org/apache/tomcat/util/http/parser/HttpParserConstants.java
+@@ -0,0 +1,63 @@
++/* Generated By:JJTree&JavaCC: Do not edit this line. HttpParserConstants.java */
++package org.apache.tomcat.util.http.parser;
++
++
++/**
++ * Token literal values and constants.
++ * Generated by org.javacc.parser.OtherFilesGen#start()
++ */
++public interface HttpParserConstants {
++
++  /** End of File. */
++  int EOF = 0;
++  /** RegularExpression Id. */
++  int SEMI_COLON = 1;
++  /** RegularExpression Id. */
++  int EQUALS = 2;
++  /** RegularExpression Id. */
++  int FORWARD_SLASH = 3;
++  /** RegularExpression Id. */
++  int SP = 4;
++  /** RegularExpression Id. */
++  int HT = 5;
++  /** RegularExpression Id. */
++  int LWS = 6;
++  /** RegularExpression Id. */
++  int HTTP_TOKEN = 7;
++  /** RegularExpression Id. */
++  int QUOTED_STRING = 8;
++  /** RegularExpression Id. */
++  int START_QUOTE = 9;
++  /** RegularExpression Id. */
++  int HTTP_TOKEN_CHAR = 10;
++  /** RegularExpression Id. */
++  int QUOTED_TEXT = 11;
++  /** RegularExpression Id. */
++  int END_QUOTE = 12;
++  /** RegularExpression Id. */
++  int QUOTED_TEXT_CHAR = 13;
++
++  /** Lexical state. */
++  int DEFAULT = 0;
++  /** Lexical state. */
++  int IN_QUOTED_TEXT = 1;
++
++  /** Literal token values. */
++  String[] tokenImage = {
++    "<EOF>",
++    "\";\"",
++    "\"=\"",
++    "\"/\"",
++    "\" \"",
++    "\"\\t\"",
++    "<LWS>",
++    "<HTTP_TOKEN>",
++    "<QUOTED_STRING>",
++    "\"\\\"\"",
++    "<HTTP_TOKEN_CHAR>",
++    "<QUOTED_TEXT>",
++    "\"\\\"\"",
++    "<QUOTED_TEXT_CHAR>",
++  };
++
++}
+
+==================================================
+HttpParserTreeConstants.java
+new file mode 100644
+index 0000000000..fea82427a1
+--- /dev/null
++++ b/java/org/apache/tomcat/util/http/parser/HttpParserTokenManager.java
+@@ -0,0 +1,468 @@
++/* Generated By:JJTree&JavaCC: Do not edit this line. HttpParserTokenManager.java */
++package org.apache.tomcat.util.http.parser;
++
++/** Token Manager. */
++@SuppressWarnings("all") // Ignore warnings in generated code
++public class HttpParserTokenManager implements HttpParserConstants
++{
++
++  /** Debug output. */
++  public  java.io.PrintStream debugStream = System.out;
++  /** Set debug output. */
++  public  void setDebugStream(java.io.PrintStream ds) { debugStream = ds; }
++private final int jjStopStringLiteralDfa_0(int pos, long active0)
++{
++   switch (pos)
++   {
++      default :
++         return -1;
++   }
++}
++private final int jjStartNfa_0(int pos, long active0)
++{
++   return jjMoveNfa_0(jjStopStringLiteralDfa_0(pos, active0), pos + 1);
++}
++private int jjStopAtPos(int pos, int kind)
++{
++   jjmatchedKind = kind;
++   jjmatchedPos = pos;
++   return pos + 1;
++}
++private int jjMoveStringLiteralDfa0_0()
++{
++   switch(curChar)
++   {
++      case 9:
++         return jjStartNfaWithStates_0(0, 5, 12);
++      case 32:
++         return jjStartNfaWithStates_0(0, 4, 12);
++      case 34:
++         return jjStartNfaWithStates_0(0, 9, 13);
++      case 47:
++         return jjStopAtPos(0, 3);
++      case 59:
++         return jjStopAtPos(0, 1);
++      case 61:
++         return jjStopAtPos(0, 2);
++      default :
++         return jjMoveNfa_0(8, 0);
++   }
++}
++private int jjStartNfaWithStates_0(int pos, int kind, int state)
++{
++   jjmatchedKind = kind;
++   jjmatchedPos = pos;
++   try { curChar = input_stream.readChar(); }
++   catch(java.io.IOException e) { return pos + 1; }
++   return jjMoveNfa_0(state, pos + 1);
++}
++static final long[] jjbitVec0 = {
++   0x0L, 0x0L, 0xffffffffffffffffL, 0xffffffffffffffffL
++};
++private int jjMoveNfa_0(int startState, int curPos)
++{
++   int startsAt = 0;
++   jjnewStateCnt = 12;
++   int i = 1;
++   jjstateSet[0] = startState;
++   int kind = 0x7fffffff;
++   for (;;)
++   {
++      if (++jjround == 0x7fffffff)
++         ReInitRounds();
++      if (curChar < 64)
++      {
++         long l = 1L << curChar;
++         do
++         {
++            switch(jjstateSet[--i])
++            {
++               case 13:
++                  if ((0xfffffffb00000200L & l) != 0L)
++                     jjCheckNAddStates(0, 2);
++                  else if (curChar == 34)
++                  {
++                     if (kind > 8)
++                        kind = 8;
++                     jjCheckNAdd(7);
++                  }
++                  break;
++               case 12:
++                  if ((0x3ff6cfa00000000L & l) != 0L)
++                  {
++                     if (kind > 7)
++                        kind = 7;
++                     jjCheckNAddTwoStates(0, 1);
++                  }
++                  else if ((0x100000200L & l) != 0L)
++                     jjCheckNAddTwoStates(11, 2);
++                  else if (curChar == 34)
++                     jjCheckNAddStates(0, 2);
++                  if ((0x100000200L & l) != 0L)
++                     jjCheckNAddTwoStates(10, 0);
++                  if ((0x100000200L & l) != 0L)
++                  {
++                     if (kind > 6)
++                        kind = 6;
++                     jjCheckNAdd(9);
++                  }
++                  break;
++               case 8:
++                  if ((0x3ff6cfa00000000L & l) != 0L)
++                  {
++                     if (kind > 7)
++                        kind = 7;
++                     jjCheckNAddTwoStates(0, 1);
++                  }
++                  else if ((0x100000200L & l) != 0L)
++                  {
++                     if (kind > 6)
++                        kind = 6;
++                     jjCheckNAddStates(3, 7);
++                  }
++                  else if (curChar == 34)
++                     jjCheckNAddStates(0, 2);
++                  break;
++               case 0:
++                  if ((0x3ff6cfa00000000L & l) == 0L)
++                     break;
++                  if (kind > 7)
++                     kind = 7;
++                  jjCheckNAddTwoStates(0, 1);
++                  break;
++               case 1:
++                  if ((0x100000200L & l) == 0L)
++                     break;
++                  if (kind > 7)
++                     kind = 7;
++                  jjCheckNAdd(1);
++                  break;
++               case 2:
++                  if (curChar == 34)
++                     jjCheckNAddStates(0, 2);
++                  break;
++               case 4:
++                  if ((0xffffffff00000200L & l) != 0L)
++                     jjCheckNAddStates(0, 2);
++                  break;
++               case 5:
++                  if ((0xfffffffb00000200L & l) != 0L)
++                     jjCheckNAddStates(0, 2);
++                  break;
++               case 6:
++                  if (curChar != 34)
++                     break;
++                  if (kind > 8)
++                     kind = 8;
++                  jjCheckNAdd(7);
++                  break;
++               case 7:
++                  if ((0x100000200L & l) == 0L)
++                     break;
++                  if (kind > 8)
++                     kind = 8;
++                  jjCheckNAdd(7);
++                  break;
++               case 9:
++                  if ((0x100000200L & l) == 0L)
++                     break;
++                  if (kind > 6)
++                     kind = 6;
++                  jjCheckNAdd(9);
++                  break;
++               case 10:
++                  if ((0x100000200L & l) != 0L)
++                     jjCheckNAddTwoStates(10, 0);
++                  break;
++               case 11:
++                  if ((0x100000200L & l) != 0L)
++                     jjCheckNAddTwoStates(11, 2);
++                  break;
++               default : break;
++            }
++         } while(i != startsAt);
++      }
++      else if (curChar < 128)
++      {
++         long l = 1L << (curChar & 077);
++         do
++         {
++            switch(jjstateSet[--i])
++            {
++               case 13:
++                  if ((0xffffffffefffffffL & l) != 0L)
++                     jjCheckNAddStates(0, 2);
++                  else if (curChar == 92)
++                     jjstateSet[jjnewStateCnt++] = 4;
++                  break;
++               case 12:
++               case 0:
++                  if ((0x57ffffffc7fffffeL & l) == 0L)
++                     break;
++                  if (kind > 7)
++                     kind = 7;
++                  jjCheckNAddTwoStates(0, 1);
++                  break;
++               case 8:
++                  if ((0x57ffffffc7fffffeL & l) == 0L)
++                     break;
++                  if (kind > 7)
++                     kind = 7;
++                  jjCheckNAddTwoStates(0, 1);
++                  break;
++               case 3:
++                  if (curChar == 92)
++                     jjstateSet[jjnewStateCnt++] = 4;
++                  break;
++               case 4:
++                  if ((0xffffffffefffffffL & l) != 0L)
++                     jjCheckNAddStates(0, 2);
++                  break;
++               case 5:
++                  if ((0xffffffffefffffffL & l) != 0L)
++                     jjCheckNAddStates(0, 2);
++                  break;
++               default : break;
++            }
++         } while(i != startsAt);
++      }
++      else
++      {
++         int hiByte = (int)(curChar >> 8);
++         int i1 = hiByte >> 6;
++         long l1 = 1L << (hiByte & 077);
++         int i2 = (curChar & 0xff) >> 6;
++         long l2 = 1L << (curChar & 077);
++         do
++         {
++            switch(jjstateSet[--i])
++            {
++               case 13:
++               case 5:
++               case 4:
++                  if (jjCanMove_0(hiByte, i1, i2, l1, l2))
++                     jjCheckNAddStates(0, 2);
++                  break;
++               default : break;
++            }
++         } while(i != startsAt);
++      }
++      if (kind != 0x7fffffff)
++      {
++         jjmatchedKind = kind;
++         jjmatchedPos = curPos;
++         kind = 0x7fffffff;
++      }
++      ++curPos;
++      if ((i = jjnewStateCnt) == (startsAt = 12 - (jjnewStateCnt = startsAt)))
++         return curPos;
++      try { curChar = input_stream.readChar(); }
++      catch(java.io.IOException e) { return curPos; }
++   }
++}
++private int jjMoveStringLiteralDfa0_1()
++{
++   return 1;
++}
++static final int[] jjnextStates = {
++   3, 5, 6, 9, 10, 0, 11, 2,
++};
++private static final boolean jjCanMove_0(int hiByte, int i1, int i2, long l1, long l2)
++{
++   switch(hiByte)
++   {
++      case 0:
++         return ((jjbitVec0[i2] & l2) != 0L);
++      default :
++         return false;
++   }
++}
++
++/** Token literal values. */
++public static final String[] jjstrLiteralImages = {
++"", "\73", "\75", "\57", "\40", "\11", null, null, null, "\42", null, null,
++null, null, };
++
++/** Lexer state names. */
++public static final String[] lexStateNames = {
++   "DEFAULT",
++   "IN_QUOTED_TEXT",
++};
++
++/** Lex State array. */
++public static final int[] jjnewLexState = {
++   -1, -1, -1, -1, -1, -1, -1, -1, -1, 1, -1, -1, -1, -1,
++};
++protected SimpleCharStream input_stream;
++private final int[] jjrounds = new int[12];
++private final int[] jjstateSet = new int[24];
++protected char curChar;
++/** Constructor. */
++public HttpParserTokenManager(SimpleCharStream stream){
++   if (SimpleCharStream.staticFlag)
++      throw new Error("ERROR: Cannot use a static CharStream class with a non-static lexical analyzer.");
++   input_stream = stream;
++}
++
++/** Constructor. */
++public HttpParserTokenManager(SimpleCharStream stream, int lexState){
++   this(stream);
++   SwitchTo(lexState);
++}
++
++/** Reinitialise parser. */
++public void ReInit(SimpleCharStream stream)
++{
++   jjmatchedPos = jjnewStateCnt = 0;
++   curLexState = defaultLexState;
++   input_stream = stream;
++   ReInitRounds();
++}
++private void ReInitRounds()
++{
++   int i;
++   jjround = 0x80000001;
++   for (i = 12; i-- > 0;)
++      jjrounds[i] = 0x80000000;
++}
++
++/** Reinitialise parser. */
++public void ReInit(SimpleCharStream stream, int lexState)
++{
++   ReInit(stream);
++   SwitchTo(lexState);
++}
++
++/** Switch to specified lex state. */
++public void SwitchTo(int lexState)
++{
++   if (lexState >= 2 || lexState < 0)
++      throw new TokenMgrError("Error: Ignoring invalid lexical state : " + lexState + ". State unchanged.", TokenMgrError.INVALID_LEXICAL_STATE);
++   else
++      curLexState = lexState;
++}
++
++protected Token jjFillToken()
++{
++   final Token t;
++   final String curTokenImage;
++   final int beginLine;
++   final int endLine;
++   final int beginColumn;
++   final int endColumn;
++   String im = jjstrLiteralImages[jjmatchedKind];
++   curTokenImage = (im == null) ? input_stream.GetImage() : im;
++   beginLine = input_stream.getBeginLine();
++   beginColumn = input_stream.getBeginColumn();
++   endLine = input_stream.getEndLine();
++   endColumn = input_stream.getEndColumn();
++   t = Token.newToken(jjmatchedKind, curTokenImage);
++
++   t.beginLine = beginLine;
++   t.endLine = endLine;
++   t.beginColumn = beginColumn;
++   t.endColumn = endColumn;
++
++   return t;
++}
++
++int curLexState = 0;
++int defaultLexState = 0;
++int jjnewStateCnt;
++int jjround;
++int jjmatchedPos;
++int jjmatchedKind;
++
++/** Get the next Token. */
++public Token getNextToken()
++{
++  Token matchedToken;
++  int curPos = 0;
++
++  EOFLoop :
++  for (;;)
++  {
++   try
++   {
++      curChar = input_stream.BeginToken();
++   }
++   catch(java.io.IOException e)
++   {
++      jjmatchedKind = 0;
++      matchedToken = jjFillToken();
++      return matchedToken;
++   }
++
++   switch(curLexState)
++   {
++     case 0:
++       jjmatchedKind = 0x7fffffff;
++       jjmatchedPos = 0;
++       curPos = jjMoveStringLiteralDfa0_0();
++       break;
++     case 1:
++       jjmatchedKind = 0x7fffffff;
++       jjmatchedPos = 0;
++       curPos = jjMoveStringLiteralDfa0_1();
++       break;
++   }
++     if (jjmatchedKind != 0x7fffffff)
++     {
++        if (jjmatchedPos + 1 < curPos)
++           input_stream.backup(curPos - jjmatchedPos - 1);
++           matchedToken = jjFillToken();
++       if (jjnewLexState[jjmatchedKind] != -1)
++         curLexState = jjnewLexState[jjmatchedKind];
++           return matchedToken;
++     }
++     int error_line = input_stream.getEndLine();
++     int error_column = input_stream.getEndColumn();
++     String error_after = null;
++     boolean EOFSeen = false;
++     try { input_stream.readChar(); input_stream.backup(1); }
++     catch (java.io.IOException e1) {
++        EOFSeen = true;
++        error_after = curPos <= 1 ? "" : input_stream.GetImage();
++        if (curChar == '\n' || curChar == '\r') {
++           error_line++;
++           error_column = 0;
++        }
++        else
++           error_column++;
++     }
++     if (!EOFSeen) {
++        input_stream.backup(1);
++        error_after = curPos <= 1 ? "" : input_stream.GetImage();
++     }
++     throw new TokenMgrError(EOFSeen, curLexState, error_line, error_column, error_after, curChar, TokenMgrError.LEXICAL_ERROR);
++  }
++}
++
++private void jjCheckNAdd(int state)
++{
++   if (jjrounds[state] != jjround)
++   {
++      jjstateSet[jjnewStateCnt++] = state;
++      jjrounds[state] = jjround;
++   }
++}
++private void jjAddStates(int start, int end)
++{
++   do {
++      jjstateSet[jjnewStateCnt++] = jjnextStates[start];
++   } while (start++ != end);
++}
++private void jjCheckNAddTwoStates(int state1, int state2)
++{
++   jjCheckNAdd(state1);
++   jjCheckNAdd(state2);
++}
++
++private void jjCheckNAddStates(int start, int end)
++{
++   do {
++      jjCheckNAdd(jjnextStates[start]);
++   } while (start++ != end);
++}
++
++}
+
+==================================================
+JJTHttpParserState.java
+new file mode 100644
+index 0000000000..615c56c654
+--- /dev/null
++++ b/java/org/apache/tomcat/util/http/parser/HttpParserTreeConstants.java
+@@ -0,0 +1,23 @@
++/* Generated By:JavaCC: Do not edit this line. HttpParserTreeConstants.java Version 5.0 */
++package org.apache.tomcat.util.http.parser;
++
++public interface HttpParserTreeConstants
++{
++  public int JJTMEDIATYPE = 0;
++  public int JJTTYPE = 1;
++  public int JJTSUBTYPE = 2;
++  public int JJTPARAMETER = 3;
++  public int JJTATTRIBUTE = 4;
++  public int JJTVALUE = 5;
++
++
++  public String[] jjtNodeName = {
++    "MediaType",
++    "Type",
++    "SubType",
++    "Parameter",
++    "Attribute",
++    "Value",
++  };
++}
++/* JavaCC - OriginalChecksum=f4745df783771bdbdddd3be661f1c089 (do not edit this line) */
+
+==================================================
+Node.java
+new file mode 100644
+index 0000000000..5b20ba3430
+--- /dev/null
++++ b/java/org/apache/tomcat/util/http/parser/JJTHttpParserState.java
+@@ -0,0 +1,124 @@
++/* Generated By:JavaCC: Do not edit this line. JJTHttpParserState.java Version 5.0 */
++package org.apache.tomcat.util.http.parser;
++
++@SuppressWarnings("all") // Ignore warnings in generated code
++public class JJTHttpParserState {
++  private java.util.List<Node> nodes;
++  private java.util.List<Integer> marks;
++
++  private int sp;        // number of nodes on stack
++  private int mk;        // current mark
++  private boolean node_created;
++
++  public JJTHttpParserState() {
++    nodes = new java.util.ArrayList<Node>();
++    marks = new java.util.ArrayList<Integer>();
++    sp = 0;
++    mk = 0;
++  }
++
++  /* Determines whether the current node was actually closed and
++     pushed.  This should only be called in the final user action of a
++     node scope.  */
++  public boolean nodeCreated() {
++    return node_created;
++  }
++
++  /* Call this to reinitialize the node stack.  It is called
++     automatically by the parser's ReInit() method. */
++  public void reset() {
++    nodes.clear();
++    marks.clear();
++    sp = 0;
++    mk = 0;
++  }
++
++  /* Returns the root node of the AST.  It only makes sense to call
++     this after a successful parse. */
++  public Node rootNode() {
++    return nodes.get(0);
++  }
++
++  /* Pushes a node on to the stack. */
++  public void pushNode(Node n) {
++    nodes.add(n);
++    ++sp;
++  }
++
++  /* Returns the node on the top of the stack, and remove it from the
++     stack.  */
++  public Node popNode() {
++    if (--sp < mk) {
++      mk = marks.remove(marks.size()-1);
++    }
++    return nodes.remove(nodes.size()-1);
++  }
++
++  /* Returns the node currently on the top of the stack. */
++  public Node peekNode() {
++    return nodes.get(nodes.size()-1);
++  }
++
++  /* Returns the number of children on the stack in the current node
++     scope. */
++  public int nodeArity() {
++    return sp - mk;
++  }
++
++
++  public void clearNodeScope(Node n) {
++    while (sp > mk) {
++      popNode();
++    }
++    mk = marks.remove(marks.size()-1);
++  }
++
++
++  public void openNodeScope(Node n) {
++    marks.add(mk);
++    mk = sp;
++    n.jjtOpen();
++  }
++
++
++  /* A definite node is constructed from a specified number of
++     children.  That number of nodes are popped from the stack and
++     made the children of the definite node.  Then the definite node
++     is pushed on to the stack. */
++  public void closeNodeScope(Node n, int num) {
++    mk = marks.remove(marks.size()-1);
++    while (num-- > 0) {
++      Node c = popNode();
++      c.jjtSetParent(n);
++      n.jjtAddChild(c, num);
++    }
++    n.jjtClose();
++    pushNode(n);
++    node_created = true;
++  }
++
++
++  /* A conditional node is constructed if its condition is true.  All
++     the nodes that have been pushed since the node was opened are
++     made children of the conditional node, which is then pushed
++     on to the stack.  If the condition is false the node is not
++     constructed and they are left on the stack. */
++  public void closeNodeScope(Node n, boolean condition) {
++    if (condition) {
++      int a = nodeArity();
++      mk = marks.remove(marks.size()-1);
++      while (a-- > 0) {
++        Node c = popNode();
++        c.jjtSetParent(n);
++        n.jjtAddChild(c, a);
++      }
++      n.jjtClose();
++      pushNode(n);
++      node_created = true;
++    } else {
++      mk = marks.remove(marks.size()-1);
++      node_created = false;
++    }
++  }
++}
++/* JavaCC - OriginalChecksum=ddd6baff0afccf0891566804931f534d (do not edit this line) */
+
+==================================================
+ParseException.java
+new file mode 100644
+index 0000000000..6aaaba4a3a
+--- /dev/null
++++ b/java/org/apache/tomcat/util/http/parser/Node.java
+@@ -0,0 +1,59 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.tomcat.util.http.parser;
++
++/* All AST nodes must implement this interface.  It provides basic
++ machinery for constructing the parent and child relationships
++ between nodes. */
++
++public interface Node {
++
++    /**
++     * This method is called after the node has been made the current node. It
++     * indicates that child nodes can now be added to it.
++     */
++    public void jjtOpen();
++
++    /**
++     * This method is called after all the child nodes have been added.
++     */
++    public void jjtClose();
++
++    /**
++     * This pair of methods are used to inform the node of its parent.
++     */
++    public void jjtSetParent(Node n);
++
++    public Node jjtGetParent();
++
++    /**
++     * This method tells the node to add its argument to the node's list of
++     * children.
++     */
++    public void jjtAddChild(Node n, int i);
++
++    /**
++     * This method returns a child node. The children are numbered from zero,
++     * left to right.
++     */
++    public Node jjtGetChild(int i);
++
++    /** Return the number of children the node has. */
++    public int jjtGetNumChildren();
++
++    public Object jjtGetValue();
++}
+
+==================================================
+SimpleCharStream.java
+new file mode 100644
+index 0000000000..4e0e2df8c5
+--- /dev/null
++++ b/java/org/apache/tomcat/util/http/parser/ParseException.java
+@@ -0,0 +1,187 @@
++/* Generated By:JavaCC: Do not edit this line. ParseException.java Version 5.0 */
++/* JavaCCOptions:KEEP_LINE_COL=null */
++package org.apache.tomcat.util.http.parser;
++
++/**
++ * This exception is thrown when parse errors are encountered.
++ * You can explicitly create objects of this exception type by
++ * calling the method generateParseException in the generated
++ * parser.
++ *
++ * You can modify this class to customize your error reporting
++ * mechanisms so long as you retain the public fields.
++ */
++public class ParseException extends Exception {
++
++  /**
++   * The version identifier for this Serializable class.
++   * Increment only if the <i>serialized</i> form of the
++   * class changes.
++   */
++  private static final long serialVersionUID = 1L;
++
++  /**
++   * This constructor is used by the method "generateParseException"
++   * in the generated parser.  Calling this constructor generates
++   * a new object of this type with the fields "currentToken",
++   * "expectedTokenSequences", and "tokenImage" set.
++   */
++  public ParseException(Token currentTokenVal,
++                        int[][] expectedTokenSequencesVal,
++                        String[] tokenImageVal
++                       )
++  {
++    super(initialise(currentTokenVal, expectedTokenSequencesVal, tokenImageVal));
++    currentToken = currentTokenVal;
++    expectedTokenSequences = expectedTokenSequencesVal;
++    tokenImage = tokenImageVal;
++  }
++
++  /**
++   * The following constructors are for use by you for whatever
++   * purpose you can think of.  Constructing the exception in this
++   * manner makes the exception behave in the normal way - i.e., as
++   * documented in the class "Throwable".  The fields "errorToken",
++   * "expectedTokenSequences", and "tokenImage" do not contain
++   * relevant information.  The JavaCC generated code does not use
++   * these constructors.
++   */
++
++  public ParseException() {
++    super();
++  }
++
++  /** Constructor with message. */
++  public ParseException(String message) {
++    super(message);
++  }
++
++
++  /**
++   * This is the last token that has been consumed successfully.  If
++   * this object has been created due to a parse error, the token
++   * followng this token will (therefore) be the first error token.
++   */
++  public Token currentToken;
++
++  /**
++   * Each entry in this array is an array of integers.  Each array
++   * of integers represents a sequence of tokens (by their ordinal
++   * values) that is expected at this point of the parse.
++   */
++  public int[][] expectedTokenSequences;
++
++  /**
++   * This is a reference to the "tokenImage" array of the generated
++   * parser within which the parse error occurred.  This array is
++   * defined in the generated ...Constants interface.
++   */
++  public String[] tokenImage;
++
++  /**
++   * It uses "currentToken" and "expectedTokenSequences" to generate a parse
++   * error message and returns it.  If this object has been created
++   * due to a parse error, and you do not catch it (it gets thrown
++   * from the parser) the correct error message
++   * gets displayed.
++   */
++  private static String initialise(Token currentToken,
++                           int[][] expectedTokenSequences,
++                           String[] tokenImage) {
++    String eol = System.getProperty("line.separator", "\n");
++    StringBuffer expected = new StringBuffer();
++    int maxSize = 0;
++    for (int i = 0; i < expectedTokenSequences.length; i++) {
++      if (maxSize < expectedTokenSequences[i].length) {
++        maxSize = expectedTokenSequences[i].length;
++      }
++      for (int j = 0; j < expectedTokenSequences[i].length; j++) {
++        expected.append(tokenImage[expectedTokenSequences[i][j]]).append(' ');
++      }
++      if (expectedTokenSequences[i][expectedTokenSequences[i].length - 1] != 0) {
++        expected.append("...");
++      }
++      expected.append(eol).append("    ");
++    }
++    String retval = "Encountered \"";
++    Token tok = currentToken.next;
++    for (int i = 0; i < maxSize; i++) {
++      if (i != 0) retval += " ";
++      if (tok.kind == 0) {
++        retval += tokenImage[0];
++        break;
++      }
++      retval += " " + tokenImage[tok.kind];
++      retval += " \"";
++      retval += add_escapes(tok.image);
++      retval += " \"";
++      tok = tok.next;
++    }
++    retval += "\" at line " + currentToken.next.beginLine + ", column " + currentToken.next.beginColumn;
++    retval += "." + eol;
++    if (expectedTokenSequences.length == 1) {
++      retval += "Was expecting:" + eol + "    ";
++    } else {
++      retval += "Was expecting one of:" + eol + "    ";
++    }
++    retval += expected.toString();
++    return retval;
++  }
++
++  /**
++   * The end of line string for this machine.
++   */
++  protected String eol = System.getProperty("line.separator", "\n");
++
++  /**
++   * Used to convert raw characters to their escaped version
++   * when these raw version cannot be used as part of an ASCII
++   * string literal.
++   */
++  static String add_escapes(String str) {
++      StringBuffer retval = new StringBuffer();
++      char ch;
++      for (int i = 0; i < str.length(); i++) {
++        switch (str.charAt(i))
++        {
++           case 0 :
++              continue;
++           case '\b':
++              retval.append("\\b");
++              continue;
++           case '\t':
++              retval.append("\\t");
++              continue;
++           case '\n':
++              retval.append("\\n");
++              continue;
++           case '\f':
++              retval.append("\\f");
++              continue;
++           case '\r':
++              retval.append("\\r");
++              continue;
++           case '\"':
++              retval.append("\\\"");
++              continue;
++           case '\'':
++              retval.append("\\\'");
++              continue;
++           case '\\':
++              retval.append("\\\\");
++              continue;
++           default:
++              if ((ch = str.charAt(i)) < 0x20 || ch > 0x7e) {
++                 String s = "0000" + Integer.toString(ch, 16);
++                 retval.append("\\u" + s.substring(s.length() - 4, s.length()));
++              } else {
++                 retval.append(ch);
++              }
++              continue;
++        }
++      }
++      return retval.toString();
++   }
++
++}
++/* JavaCC - OriginalChecksum=a5bfbb99e4df5e108e0f9a6351af5364 (do not edit this line) */
+
+==================================================
+SimpleNode.java
+new file mode 100644
+index 0000000000..2c7b69e160
+--- /dev/null
++++ b/java/org/apache/tomcat/util/http/parser/SimpleCharStream.java
+@@ -0,0 +1,471 @@
++/* Generated By:JavaCC: Do not edit this line. SimpleCharStream.java Version 5.0 */
++/* JavaCCOptions:STATIC=false,SUPPORT_CLASS_VISIBILITY_PUBLIC=true */
++package org.apache.tomcat.util.http.parser;
++
++/**
++ * An implementation of interface CharStream, where the stream is assumed to
++ * contain only ASCII characters (without unicode processing).
++ */
++@SuppressWarnings("all") // Ignore warnings in generated code
++public class SimpleCharStream
++{
++/** Whether parser is static. */
++  public static final boolean staticFlag = false;
++  int bufsize;
++  int available;
++  int tokenBegin;
++/** Position in buffer. */
++  public int bufpos = -1;
++  protected int bufline[];
++  protected int bufcolumn[];
++
++  protected int column = 0;
++  protected int line = 1;
++
++  protected boolean prevCharIsCR = false;
++  protected boolean prevCharIsLF = false;
++
++  protected java.io.Reader inputStream;
++
++  protected char[] buffer;
++  protected int maxNextCharInd = 0;
++  protected int inBuf = 0;
++  protected int tabSize = 8;
++
++  protected void setTabSize(int i) { tabSize = i; }
++  protected int getTabSize(int i) { return tabSize; }
++
++
++  protected void ExpandBuff(boolean wrapAround)
++  {
++    char[] newbuffer = new char[bufsize + 2048];
++    int newbufline[] = new int[bufsize + 2048];
++    int newbufcolumn[] = new int[bufsize + 2048];
++
++    try
++    {
++      if (wrapAround)
++      {
++        System.arraycopy(buffer, tokenBegin, newbuffer, 0, bufsize - tokenBegin);
++        System.arraycopy(buffer, 0, newbuffer, bufsize - tokenBegin, bufpos);
++        buffer = newbuffer;
++
++        System.arraycopy(bufline, tokenBegin, newbufline, 0, bufsize - tokenBegin);
++        System.arraycopy(bufline, 0, newbufline, bufsize - tokenBegin, bufpos);
++        bufline = newbufline;
++
++        System.arraycopy(bufcolumn, tokenBegin, newbufcolumn, 0, bufsize - tokenBegin);
++        System.arraycopy(bufcolumn, 0, newbufcolumn, bufsize - tokenBegin, bufpos);
++        bufcolumn = newbufcolumn;
++
++        maxNextCharInd = (bufpos += (bufsize - tokenBegin));
++      }
++      else
++      {
++        System.arraycopy(buffer, tokenBegin, newbuffer, 0, bufsize - tokenBegin);
++        buffer = newbuffer;
++
++        System.arraycopy(bufline, tokenBegin, newbufline, 0, bufsize - tokenBegin);
++        bufline = newbufline;
++
++        System.arraycopy(bufcolumn, tokenBegin, newbufcolumn, 0, bufsize - tokenBegin);
++        bufcolumn = newbufcolumn;
++
++        maxNextCharInd = (bufpos -= tokenBegin);
++      }
++    }
++    catch (Throwable t)
++    {
++      throw new Error(t.getMessage());
++    }
++
++
++    bufsize += 2048;
++    available = bufsize;
++    tokenBegin = 0;
++  }
++
++  protected void FillBuff() throws java.io.IOException
++  {
++    if (maxNextCharInd == available)
++    {
++      if (available == bufsize)
++      {
++        if (tokenBegin > 2048)
++        {
++          bufpos = maxNextCharInd = 0;
++          available = tokenBegin;
++        }
++        else if (tokenBegin < 0)
++          bufpos = maxNextCharInd = 0;
++        else
++          ExpandBuff(false);
++      }
++      else if (available > tokenBegin)
++        available = bufsize;
++      else if ((tokenBegin - available) < 2048)
++        ExpandBuff(true);
++      else
++        available = tokenBegin;
++    }
++
++    int i;
++    try {
++      if ((i = inputStream.read(buffer, maxNextCharInd, available - maxNextCharInd)) == -1)
++      {
++        inputStream.close();
++        throw new java.io.IOException();
++      }
++      else
++        maxNextCharInd += i;
++      return;
++    }
++    catch(java.io.IOException e) {
++      --bufpos;
++      backup(0);
++      if (tokenBegin == -1)
++        tokenBegin = bufpos;
++      throw e;
++    }
++  }
++
++/** Start. */
++  public char BeginToken() throws java.io.IOException
++  {
++    tokenBegin = -1;
++    char c = readChar();
++    tokenBegin = bufpos;
++
++    return c;
++  }
++
++  protected void UpdateLineColumn(char c)
++  {
++    column++;
++
++    if (prevCharIsLF)
++    {
++      prevCharIsLF = false;
++      line += (column = 1);
++    }
++    else if (prevCharIsCR)
++    {
++      prevCharIsCR = false;
++      if (c == '\n')
++      {
++        prevCharIsLF = true;
++      }
++      else
++        line += (column = 1);
++    }
++
++    switch (c)
++    {
++      case '\r' :
++        prevCharIsCR = true;
++        break;
++      case '\n' :
++        prevCharIsLF = true;
++        break;
++      case '\t' :
++        column--;
++        column += (tabSize - (column % tabSize));
++        break;
++      default :
++        break;
++    }
++
++    bufline[bufpos] = line;
++    bufcolumn[bufpos] = column;
++  }
++
++/** Read a character. */
++  public char readChar() throws java.io.IOException
++  {
++    if (inBuf > 0)
++    {
++      --inBuf;
++
++      if (++bufpos == bufsize)
++        bufpos = 0;
++
++      return buffer[bufpos];
++    }
++
++    if (++bufpos >= maxNextCharInd)
++      FillBuff();
++
++    char c = buffer[bufpos];
++
++    UpdateLineColumn(c);
++    return c;
++  }
++
++  @Deprecated
++  /**
++   * @deprecated
++   * @see #getEndColumn
++   */
++
++  public int getColumn() {
++    return bufcolumn[bufpos];
++  }
++
++  @Deprecated
++  /**
++   * @deprecated
++   * @see #getEndLine
++   */
++
++  public int getLine() {
++    return bufline[bufpos];
++  }
++
++  /** Get token end column number. */
++  public int getEndColumn() {
++    return bufcolumn[bufpos];
++  }
++
++  /** Get token end line number. */
++  public int getEndLine() {
++     return bufline[bufpos];
++  }
++
++  /** Get token beginning column number. */
++  public int getBeginColumn() {
++    return bufcolumn[tokenBegin];
++  }
++
++  /** Get token beginning line number. */
++  public int getBeginLine() {
++    return bufline[tokenBegin];
++  }
++
++/** Backup a number of characters. */
++  public void backup(int amount) {
++
++    inBuf += amount;
++    if ((bufpos -= amount) < 0)
++      bufpos += bufsize;
++  }
++
++  /** Constructor. */
++  public SimpleCharStream(java.io.Reader dstream, int startline,
++  int startcolumn, int buffersize)
++  {
++    inputStream = dstream;
++    line = startline;
++    column = startcolumn - 1;
++
++    available = bufsize = buffersize;
++    buffer = new char[buffersize];
++    bufline = new int[buffersize];
++    bufcolumn = new int[buffersize];
++  }
++
++  /** Constructor. */
++  public SimpleCharStream(java.io.Reader dstream, int startline,
++                          int startcolumn)
++  {
++    this(dstream, startline, startcolumn, 4096);
++  }
++
++  /** Constructor. */
++  public SimpleCharStream(java.io.Reader dstream)
++  {
++    this(dstream, 1, 1, 4096);
++  }
++
++  /** Reinitialise. */
++  public void ReInit(java.io.Reader dstream, int startline,
++  int startcolumn, int buffersize)
++  {
++    inputStream = dstream;
++    line = startline;
++    column = startcolumn - 1;
++
++    if (buffer == null || buffersize != buffer.length)
++    {
++      available = bufsize = buffersize;
++      buffer = new char[buffersize];
++      bufline = new int[buffersize];
++      bufcolumn = new int[buffersize];
++    }
++    prevCharIsLF = prevCharIsCR = false;
++    tokenBegin = inBuf = maxNextCharInd = 0;
++    bufpos = -1;
++  }
++
++  /** Reinitialise. */
++  public void ReInit(java.io.Reader dstream, int startline,
++                     int startcolumn)
++  {
++    ReInit(dstream, startline, startcolumn, 4096);
++  }
++
++  /** Reinitialise. */
++  public void ReInit(java.io.Reader dstream)
++  {
++    ReInit(dstream, 1, 1, 4096);
++  }
++  /** Constructor. */
++  public SimpleCharStream(java.io.InputStream dstream, String encoding, int startline,
++  int startcolumn, int buffersize) throws java.io.UnsupportedEncodingException
++  {
++    this(encoding == null ? new java.io.InputStreamReader(dstream) : new java.io.InputStreamReader(dstream, encoding), startline, startcolumn, buffersize);
++  }
++
++  /** Constructor. */
++  public SimpleCharStream(java.io.InputStream dstream, int startline,
++  int startcolumn, int buffersize)
++  {
++    this(new java.io.InputStreamReader(dstream), startline, startcolumn, buffersize);
++  }
++
++  /** Constructor. */
++  public SimpleCharStream(java.io.InputStream dstream, String encoding, int startline,
++                          int startcolumn) throws java.io.UnsupportedEncodingException
++  {
++    this(dstream, encoding, startline, startcolumn, 4096);
++  }
++
++  /** Constructor. */
++  public SimpleCharStream(java.io.InputStream dstream, int startline,
++                          int startcolumn)
++  {
++    this(dstream, startline, startcolumn, 4096);
++  }
++
++  /** Constructor. */
++  public SimpleCharStream(java.io.InputStream dstream, String encoding) throws java.io.UnsupportedEncodingException
++  {
++    this(dstream, encoding, 1, 1, 4096);
++  }
++
++  /** Constructor. */
++  public SimpleCharStream(java.io.InputStream dstream)
++  {
++    this(dstream, 1, 1, 4096);
++  }
++
++  /** Reinitialise. */
++  public void ReInit(java.io.InputStream dstream, String encoding, int startline,
++                          int startcolumn, int buffersize) throws java.io.UnsupportedEncodingException
++  {
++    ReInit(encoding == null ? new java.io.InputStreamReader(dstream) : new java.io.InputStreamReader(dstream, encoding), startline, startcolumn, buffersize);
++  }
++
++  /** Reinitialise. */
++  public void ReInit(java.io.InputStream dstream, int startline,
++                          int startcolumn, int buffersize)
++  {
++    ReInit(new java.io.InputStreamReader(dstream), startline, startcolumn, buffersize);
++  }
++
++  /** Reinitialise. */
++  public void ReInit(java.io.InputStream dstream, String encoding) throws java.io.UnsupportedEncodingException
++  {
++    ReInit(dstream, encoding, 1, 1, 4096);
++  }
++
++  /** Reinitialise. */
++  public void ReInit(java.io.InputStream dstream)
++  {
++    ReInit(dstream, 1, 1, 4096);
++  }
++  /** Reinitialise. */
++  public void ReInit(java.io.InputStream dstream, String encoding, int startline,
++                     int startcolumn) throws java.io.UnsupportedEncodingException
++  {
++    ReInit(dstream, encoding, startline, startcolumn, 4096);
++  }
++  /** Reinitialise. */
++  public void ReInit(java.io.InputStream dstream, int startline,
++                     int startcolumn)
++  {
++    ReInit(dstream, startline, startcolumn, 4096);
++  }
++  /** Get token literal value. */
++  public String GetImage()
++  {
++    if (bufpos >= tokenBegin)
++      return new String(buffer, tokenBegin, bufpos - tokenBegin + 1);
++    else
++      return new String(buffer, tokenBegin, bufsize - tokenBegin) +
++                            new String(buffer, 0, bufpos + 1);
++  }
++
++  /** Get the suffix. */
++  public char[] GetSuffix(int len)
++  {
++    char[] ret = new char[len];
++
++    if ((bufpos + 1) >= len)
++      System.arraycopy(buffer, bufpos - len + 1, ret, 0, len);
++    else
++    {
++      System.arraycopy(buffer, bufsize - (len - bufpos - 1), ret, 0,
++                                                        len - bufpos - 1);
++      System.arraycopy(buffer, 0, ret, len - bufpos - 1, bufpos + 1);
++    }
++
++    return ret;
++  }
++
++  /** Reset buffer when finished. */
++  public void Done()
++  {
++    buffer = null;
++    bufline = null;
++    bufcolumn = null;
++  }
++
++  /**
++   * Method to adjust line and column numbers for the start of a token.
++   */
++  public void adjustBeginLineColumn(int newLine, int newCol)
++  {
++    int start = tokenBegin;
++    int len;
++
++    if (bufpos >= tokenBegin)
++    {
++      len = bufpos - tokenBegin + inBuf + 1;
++    }
++    else
++    {
++      len = bufsize - tokenBegin + bufpos + 1 + inBuf;
++    }
++
++    int i = 0, j = 0, k = 0;
++    int nextColDiff = 0, columnDiff = 0;
++
++    while (i < len && bufline[j = start % bufsize] == bufline[k = ++start % bufsize])
++    {
++      bufline[j] = newLine;
++      nextColDiff = columnDiff + bufcolumn[k] - bufcolumn[j];
++      bufcolumn[j] = newCol + columnDiff;
++      columnDiff = nextColDiff;
++      i++;
++    }
++
++    if (i < len)
++    {
++      bufline[j] = newLine++;
++      bufcolumn[j] = newCol + columnDiff;
++
++      while (i++ < len)
++      {
++        if (bufline[j = start % bufsize] != bufline[++start % bufsize])
++          bufline[j] = newLine++;
++        else
++          bufline[j] = newLine;
++      }
++    }
++
++    line = bufline[j];
++    column = bufcolumn[j];
++  }
++
++}
++/* JavaCC - OriginalChecksum=d7e5626d3f8464d1815f1157b0223728 (do not edit this line) */
+
+==================================================
+Token.java
+new file mode 100644
+index 0000000000..c401bb01a7
+--- /dev/null
++++ b/java/org/apache/tomcat/util/http/parser/SimpleNode.java
+@@ -0,0 +1,118 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.tomcat.util.http.parser;
++
++public class SimpleNode implements Node {
++
++    protected Node parent;
++    protected Node[] children;
++    protected int id;
++    protected Object value;
++    protected HttpParser parser;
++
++    public SimpleNode(int i) {
++        id = i;
++    }
++
++    public SimpleNode(HttpParser p, int i) {
++        this(i);
++        parser = p;
++    }
++
++    @Override
++    public void jjtOpen() {
++        // NOOP
++    }
++
++    @Override
++    public void jjtClose() {
++        // NOOP
++    }
++
++    @Override
++    public void jjtSetParent(Node n) {
++        parent = n;
++    }
++
++    @Override
++    public Node jjtGetParent() {
++        return parent;
++    }
++
++    @Override
++    public void jjtAddChild(Node n, int i) {
++        if (children == null) {
++            children = new Node[i + 1];
++        } else if (i >= children.length) {
++            Node c[] = new Node[i + 1];
++            System.arraycopy(children, 0, c, 0, children.length);
++            children = c;
++        }
++        children[i] = n;
++    }
++
++    @Override
++    public Node jjtGetChild(int i) {
++        return children[i];
++    }
++
++    @Override
++    public int jjtGetNumChildren() {
++        return (children == null) ? 0 : children.length;
++    }
++
++    public void jjtSetValue(Object value) {
++        this.value = value;
++    }
++
++    @Override
++    public Object jjtGetValue() {
++        return value;
++    }
++
++    /*
++     * You can override these two methods in subclasses of SimpleNode to
++     * customize the way the node appears when the tree is dumped. If your
++     * output uses more than one line you should override toString(String),
++     * otherwise overriding toString() is probably all you need to do.
++     */
++    @Override
++    public String toString() {
++        return HttpParserTreeConstants.jjtNodeName[id];
++    }
++
++    public String toString(String prefix) {
++        return prefix + toString();
++    }
++
++    /*
++     * Override this method if you want to customize how the node dumps out its
++     * children.
++     */
++    public void dump(String prefix) {
++        System.out.println(toString(prefix));
++        if (children != null) {
++            for (int i = 0; i < children.length; ++i) {
++                SimpleNode n = (SimpleNode) children[i];
++                if (n != null) {
++                    n.dump(prefix + " ");
++                }
++            }
++        }
++    }
++}
++
+
+==================================================
+TokenMgrError.java
+new file mode 100644
+index 0000000000..43687b0c9c
+--- /dev/null
++++ b/java/org/apache/tomcat/util/http/parser/Token.java
+@@ -0,0 +1,131 @@
++/* Generated By:JavaCC: Do not edit this line. Token.java Version 5.0 */
++/* JavaCCOptions:TOKEN_EXTENDS=,KEEP_LINE_COL=null,SUPPORT_CLASS_VISIBILITY_PUBLIC=true */
++package org.apache.tomcat.util.http.parser;
++
++/**
++ * Describes the input token stream.
++ */
++@SuppressWarnings("all") // Ignore warnings in generated code
++public class Token implements java.io.Serializable {
++
++  /**
++   * The version identifier for this Serializable class.
++   * Increment only if the <i>serialized</i> form of the
++   * class changes.
++   */
++  private static final long serialVersionUID = 1L;
++
++  /**
++   * An integer that describes the kind of this token.  This numbering
++   * system is determined by JavaCCParser, and a table of these numbers is
++   * stored in the file ...Constants.java.
++   */
++  public int kind;
++
++  /** The line number of the first character of this Token. */
++  public int beginLine;
++  /** The column number of the first character of this Token. */
++  public int beginColumn;
++  /** The line number of the last character of this Token. */
++  public int endLine;
++  /** The column number of the last character of this Token. */
++  public int endColumn;
++
++  /**
++   * The string image of the token.
++   */
++  public String image;
++
++  /**
++   * A reference to the next regular (non-special) token from the input
++   * stream.  If this is the last token from the input stream, or if the
++   * token manager has not read tokens beyond this one, this field is
++   * set to null.  This is true only if this token is also a regular
++   * token.  Otherwise, see below for a description of the contents of
++   * this field.
++   */
++  public Token next;
++
++  /**
++   * This field is used to access special tokens that occur prior to this
++   * token, but after the immediately preceding regular (non-special) token.
++   * If there are no such special tokens, this field is set to null.
++   * When there are more than one such special token, this field refers
++   * to the last of these special tokens, which in turn refers to the next
++   * previous special token through its specialToken field, and so on
++   * until the first special token (whose specialToken field is null).
++   * The next fields of special tokens refer to other special tokens that
++   * immediately follow it (without an intervening regular token).  If there
++   * is no such token, this field is null.
++   */
++  public Token specialToken;
++
++  /**
++   * An optional attribute value of the Token.
++   * Tokens which are not used as syntactic sugar will often contain
++   * meaningful values that will be used later on by the compiler or
++   * interpreter. This attribute value is often different from the image.
++   * Any subclass of Token that actually wants to return a non-null value can
++   * override this method as appropriate.
++   */
++  public Object getValue() {
++    return null;
++  }
++
++  /**
++   * No-argument constructor
++   */
++  public Token() {}
++
++  /**
++   * Constructs a new token for the specified Image.
++   */
++  public Token(int kind)
++  {
++    this(kind, null);
++  }
++
++  /**
++   * Constructs a new token for the specified Image and Kind.
++   */
++  public Token(int kind, String image)
++  {
++    this.kind = kind;
++    this.image = image;
++  }
++
++  /**
++   * Returns the image.
++   */
++  public String toString()
++  {
++    return image;
++  }
++
++  /**
++   * Returns a new Token object, by default. However, if you want, you
++   * can create and return subclass objects based on the value of ofKind.
++   * Simply add the cases to the switch for all those special cases.
++   * For example, if you have a subclass of Token called IDToken that
++   * you want to create if ofKind is ID, simply add something like :
++   *
++   *    case MyParserConstants.ID : return new IDToken(ofKind, image);
++   *
++   * to the following switch statement. Then you can cast matchedToken
++   * variable to the appropriate type and use sit in your lexical actions.
++   */
++  public static Token newToken(int ofKind, String image)
++  {
++    switch(ofKind)
++    {
++      default : return new Token(ofKind, image);
++    }
++  }
++
++  public static Token newToken(int ofKind)
++  {
++    return newToken(ofKind, null);
++  }
++
++}
++/* JavaCC - OriginalChecksum=2104130aa3f9189e35a4571dc4c8f0c9 (do not edit this line) */
+
+==================================================
+TestMediaType.java
+new file mode 100644
+index 0000000000..b7244380ee
+--- /dev/null
++++ b/java/org/apache/tomcat/util/http/parser/TokenMgrError.java
+@@ -0,0 +1,148 @@
++/* Generated By:JavaCC: Do not edit this line. TokenMgrError.java Version 5.0 */
++/* JavaCCOptions: */
++package org.apache.tomcat.util.http.parser;
++
++/** Token Manager Error. */
++@SuppressWarnings("all") // Ignore warnings in generated code
++public class TokenMgrError extends Error
++{
++
++  /**
++   * The version identifier for this Serializable class.
++   * Increment only if the <i>serialized</i> form of the
++   * class changes.
++   */
++  private static final long serialVersionUID = 1L;
++
++  /*
++   * Ordinals for various reasons why an Error of this type can be thrown.
++   */
++
++  /**
++   * Lexical error occurred.
++   */
++  static final int LEXICAL_ERROR = 0;
++
++  /**
++   * An attempt was made to create a second instance of a static token manager.
++   */
++  static final int STATIC_LEXER_ERROR = 1;
++
++  /**
++   * Tried to change to an invalid lexical state.
++   */
++  static final int INVALID_LEXICAL_STATE = 2;
++
++  /**
++   * Detected (and bailed out of) an infinite loop in the token manager.
++   */
++  static final int LOOP_DETECTED = 3;
++
++  /**
++   * Indicates the reason why the exception is thrown. It will have
++   * one of the above 4 values.
++   */
++  int errorCode;
++
++  /**
++   * Replaces unprintable characters by their escaped (or unicode escaped)
++   * equivalents in the given string
++   */
++  protected static final String addEscapes(String str) {
++    StringBuffer retval = new StringBuffer();
++    char ch;
++    for (int i = 0; i < str.length(); i++) {
++      switch (str.charAt(i))
++      {
++        case 0 :
++          continue;
++        case '\b':
++          retval.append("\\b");
++          continue;
++        case '\t':
++          retval.append("\\t");
++          continue;
++        case '\n':
++          retval.append("\\n");
++          continue;
++        case '\f':
++          retval.append("\\f");
++          continue;
++        case '\r':
++          retval.append("\\r");
++          continue;
++        case '\"':
++          retval.append("\\\"");
++          continue;
++        case '\'':
++          retval.append("\\\'");
++          continue;
++        case '\\':
++          retval.append("\\\\");
++          continue;
++        default:
++          if ((ch = str.charAt(i)) < 0x20 || ch > 0x7e) {
++            String s = "0000" + Integer.toString(ch, 16);
++            retval.append("\\u" + s.substring(s.length() - 4, s.length()));
++          } else {
++            retval.append(ch);
++          }
++          continue;
++      }
++    }
++    return retval.toString();
++  }
++
++  /**
++   * Returns a detailed message for the Error when it is thrown by the
++   * token manager to indicate a lexical error.
++   * Parameters :
++   *    EOFSeen     : indicates if EOF caused the lexical error
++   *    curLexState : lexical state in which this error occurred
++   *    errorLine   : line number when the error occurred
++   *    errorColumn : column number when the error occurred
++   *    errorAfter  : prefix that was seen before this error occurred
++   *    curchar     : the offending character
++   * Note: You can customize the lexical error message by modifying this method.
++   */
++  protected static String LexicalError(boolean EOFSeen, int lexState, int errorLine, int errorColumn, String errorAfter, char curChar) {
++    return("Lexical error at line " +
++          errorLine + ", column " +
++          errorColumn + ".  Encountered: " +
++          (EOFSeen ? "<EOF> " : ("\"" + addEscapes(String.valueOf(curChar)) + "\"") + " (" + (int)curChar + "), ") +
++          "after : \"" + addEscapes(errorAfter) + "\"");
++  }
++
++  /**
++   * You can also modify the body of this method to customize your error messages.
++   * For example, cases like LOOP_DETECTED and INVALID_LEXICAL_STATE are not
++   * of end-users concern, so you can return something like :
++   *
++   *     "Internal Error : Please file a bug report .... "
++   *
++   * from this method for such cases in the release version of your parser.
++   */
++  public String getMessage() {
++    return super.getMessage();
++  }
++
++  /*
++   * Constructors of various flavors follow.
++   */
++
++  /** No arg constructor. */
++  public TokenMgrError() {
++  }
++
++  /** Constructor with message and reason. */
++  public TokenMgrError(String message, int reason) {
++    super(message);
++    errorCode = reason;
++  }
++
++  /** Full Constructor. */
++  public TokenMgrError(boolean EOFSeen, int lexState, int errorLine, int errorColumn, String errorAfter, char curChar, int reason) {
++    this(LexicalError(EOFSeen, lexState, errorLine, errorColumn, errorAfter, curChar), reason);
++  }
++}
++/* JavaCC - OriginalChecksum=c0e71cb84849413e4aa36c7471643b93 (do not edit this line) */
+
+==================================================

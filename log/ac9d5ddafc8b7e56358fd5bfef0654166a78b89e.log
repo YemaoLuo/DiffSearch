@@ -1,0 +1,290 @@
+ac9d5ddafc8b7e56358fd5bfef0654166a78b89e
+==================================================
+Fix a concurrency issue with connections being released and then trying to be reconnected
+==================================================
+Filip Hanik
+==================================================
+Fri Jul 10 21:02:43 2009 +0000
+==================================================
+ConnectionPool.java
+Fix a concurrency issue with connections being released and then trying to be reconnected
+
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@793108 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+PoolProperties.java
+index a1eed81807..b02b06c85a 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/ConnectionPool.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/ConnectionPool.java
+@@ -648,6 +648,11 @@ public class ConnectionPool {
+         boolean setToNull = false;
+         try {
+             con.lock();
++            
++            if (con.isReleased()) {
++                return null;
++            }
++            
+             if (!con.isDiscarded() && !con.isInitialized()) {
+                 //attempt to connect
+                 con.connect();
+
+==================================================
+PooledConnection.java
+index b28f411c30..9c7d29b5dd 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/PoolProperties.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/PoolProperties.java
+@@ -72,7 +72,7 @@ public class PoolProperties {
+     protected boolean useEquals = false;
+     protected int abandonWhenPercentageFull = 0;
+     protected long maxAge = 0;
+-
++    protected boolean useLock = true;
+     private InterceptorDefinition[] interceptors = null;
+     
+     public void setAbandonWhenPercentageFull(int percentage) {
+@@ -531,7 +531,15 @@ public class PoolProperties {
+     public void setMaxAge(long maxAge) {
+         this.maxAge = maxAge;
+     }
++
++    public boolean getUseLock() {
++        return useLock;
++    }
++
++    public void setUseLock(boolean useLock) {
++        this.useLock = useLock;
++    }
+     
+-    
++        
+ 
+ }
+
+==================================================
+ConnectCountTest.java
+index 24c33772b7..f01b2a03ae 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/PooledConnection.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/PooledConnection.java
+@@ -112,7 +112,6 @@ public class PooledConnection {
+     
+     private AtomicBoolean released = new AtomicBoolean(false);
+     
+-    
+     public PooledConnection(PoolProperties prop, ConnectionPool parent) {
+         instanceCount = counter.addAndGet(1);
+         poolProperties = prop;
+@@ -367,7 +366,7 @@ public class PooledConnection {
+      * Otherwise this is a noop for performance
+      */
+     public void lock() {
+-        if (this.poolProperties.isPoolSweeperEnabled()) {
++        if (poolProperties.getUseLock() || this.poolProperties.isPoolSweeperEnabled()) {
+             //optimized, only use a lock when there is concurrency
+             lock.writeLock().lock();
+         }
+@@ -378,7 +377,7 @@ public class PooledConnection {
+      * Otherwise this is a noop for performance
+      */
+     public void unlock() {
+-        if (this.poolProperties.isPoolSweeperEnabled()) {
++        if (poolProperties.getUseLock() || this.poolProperties.isPoolSweeperEnabled()) {
+           //optimized, only use a lock when there is concurrency
+             lock.writeLock().unlock();
+         }
+@@ -423,5 +422,9 @@ public class PooledConnection {
+     public String toString() {
+         return "PooledConnection["+(connection!=null?connection.toString():"null")+"]";
+     }
++    
++    public boolean isReleased() {
++        return released.get();
++    }
+ 
+ }
+
+==================================================
+TestConcurrency.java
+index 61183293b6..f0e8c103b1 100644
+--- a/modules/jdbc-pool/test/org/apache/tomcat/jdbc/test/ConnectCountTest.java
++++ b/modules/jdbc-pool/test/org/apache/tomcat/jdbc/test/ConnectCountTest.java
+@@ -62,7 +62,7 @@ public class ConnectCountTest extends DefaultTestCase {
+ 
+     @Override
+     protected void tearDown() throws Exception {
+-        Driver.connectCount.set(0);
++        Driver.reset();
+         super.tearDown();
+     }
+ 
+
+==================================================
+Connection.java
+new file mode 100644
+index 0000000000..23b4ef0276
+--- /dev/null
++++ b/modules/jdbc-pool/test/org/apache/tomcat/jdbc/test/TestConcurrency.java
+@@ -0,0 +1,144 @@
++package org.apache.tomcat.jdbc.test;
++
++import java.sql.Connection;
++import java.util.concurrent.atomic.AtomicInteger;
++
++import org.apache.tomcat.jdbc.pool.DataSource;
++import org.apache.tomcat.jdbc.test.driver.Driver;
++
++public class TestConcurrency extends DefaultTestCase {
++
++    public static final  boolean debug = Boolean.getBoolean("jdbc.debug");
++    
++    protected volatile DataSource ds = null;
++    
++    public TestConcurrency(String name) {
++        super(name);
++    }
++    
++    @Override
++    public void setUp() {
++        // TODO Auto-generated method stub
++        ds = createDefaultDataSource();
++        ds.getPoolProperties().setDriverClassName(Driver.class.getName());
++        ds.getPoolProperties().setUrl(Driver.url);
++        ds.getPoolProperties().setInitialSize(0);
++        ds.getPoolProperties().setMaxIdle(0);
++        ds.getPoolProperties().setMinIdle(0);
++        ds.getPoolProperties().setMaxActive(10);
++        ds.getPoolProperties().setRemoveAbandoned(true);
++        ds.getPoolProperties().setLogAbandoned(true);
++        ds.getPoolProperties().setTestWhileIdle(true);
++        ds.getPoolProperties().setMinEvictableIdleTimeMillis(750);
++        ds.getPoolProperties().setTimeBetweenEvictionRunsMillis(25);
++    }
++
++    @Override
++    protected void tearDown() throws Exception {
++        Driver.reset();
++        super.tearDown();
++    }
++    
++    public void testSimple() throws Exception {
++        ds.getConnection().close();
++        final int iter = 1000 * 10;
++        final AtomicInteger loopcount = new AtomicInteger(0);
++        final Runnable run = new Runnable() {
++            public void run() {
++                try {
++                    while (loopcount.incrementAndGet() < iter) {
++                        Connection con = ds.getConnection();
++                        Thread.sleep(10);
++                        con.close();
++                    }
++                }catch (Exception x) {
++                    loopcount.set(iter); //stops the test
++                    x.printStackTrace();
++                }
++            }
++        };
++        Thread[] threads = new Thread[20];
++        for (int i=0; i<threads.length; i++) {
++            threads[i] = new Thread(run);
++        }
++        for (int i=0; i<threads.length; i++) {
++            threads[i].start();
++        }
++        try {
++            while (loopcount.get()<iter) {
++                assertEquals("Size comparison:",10, ds.getPool().getSize());
++                if (debug) {
++                    System.out.println("Size: "+ds.getPool().getSize());
++                    System.out.println("Used: "+ds.getPool().getActive());
++                    System.out.println("Idle: "+ds.getPool().getIdle());
++                    System.out.println("Wait: "+ds.getPool().getWaitCount());
++                }
++                Thread.sleep(250);
++            }
++        }catch (Exception x) {
++            loopcount.set(iter); //stops the test
++            x.printStackTrace();
++        }
++        for (int i=0; i<threads.length; i++) {
++            threads[i].join();
++        }
++        assertEquals("Size comparison:",10, ds.getPool().getSize());
++        assertEquals("Idle comparison:",10, ds.getPool().getIdle());
++        assertEquals("Used comparison:",0, ds.getPool().getActive());
++        assertEquals("Connect count",10,Driver.connectCount.get());
++            
++    }
++    
++    public void testBrutal() throws Exception {
++        ds.getPoolProperties().setRemoveAbandoned(false);
++        ds.getPoolProperties().setMinEvictableIdleTimeMillis(-1);
++        ds.getPoolProperties().setTimeBetweenEvictionRunsMillis(-1);
++        ds.getConnection().close();
++        final int iter = 1000 * 10;
++        final AtomicInteger loopcount = new AtomicInteger(0);
++        final Runnable run = new Runnable() {
++            public void run() {
++                try {
++                    while (loopcount.incrementAndGet() < iter) {
++                        Connection con = ds.getConnection();
++                        Thread.sleep(10);
++                        con.close();
++                    }
++                }catch (Exception x) {
++                    loopcount.set(iter); //stops the test
++                    x.printStackTrace();
++                }
++            }
++        };
++        Thread[] threads = new Thread[20];
++        for (int i=0; i<threads.length; i++) {
++            threads[i] = new Thread(run);
++        }
++        for (int i=0; i<threads.length; i++) {
++            threads[i].start();
++        }
++        try {
++            while (loopcount.get()<iter) {
++                //assertEquals("Size comparison:",10, ds.getPool().getSize());
++                ds.getPool().testAllIdle();
++                ds.getPool().checkAbandoned();
++                ds.getPool().checkIdle();
++            }
++        }catch (Exception x) {
++            loopcount.set(iter); //stops the test
++            x.printStackTrace();
++        }
++        for (int i=0; i<threads.length; i++) {
++            threads[i].join();
++        }
++        System.out.println("Connect count:"+Driver.connectCount.get());
++        System.out.println("DisConnect count:"+Driver.disconnectCount.get());
++        assertEquals("Size comparison:",10, ds.getPool().getSize());
++        assertEquals("Idle comparison:",10, ds.getPool().getIdle());
++        assertEquals("Used comparison:",0, ds.getPool().getActive());
++        assertEquals("Connect count",10,Driver.connectCount.get());
++            
++    }
++
++    
++}
+
+==================================================
+Driver.java
+index d9d2b1fcac..b37d37d405 100644
+--- a/modules/jdbc-pool/test/org/apache/tomcat/jdbc/test/driver/Connection.java
++++ b/modules/jdbc-pool/test/org/apache/tomcat/jdbc/test/driver/Connection.java
+@@ -39,6 +39,7 @@ public class Connection implements java.sql.Connection {
+     }
+ 
+     public void close() throws SQLException {
++        Driver.disconnectCount.incrementAndGet();
+     }
+ 
+     public void commit() throws SQLException {
+
+==================================================

@@ -1,0 +1,354 @@
+bf3072b59db912e2d6fce538610961e84832fd7b
+==================================================
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=56521
+==================================================
+Mark Emlyn
+==================================================
+Tue May 20 14:46:48 2014 +0000
+==================================================
+AbstractHttp11Protocol.java
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=56521
+Implement a TODO
+Reuse the async write buffer between writes to reduce allocation and GC overhead. Based on a patch by leonzhx.
+Also:
+ - don't re-allocate the buffer / move the data in the buffer if the buffer is partially written on a subsequent write
+ - make the buffer size configurable, defaulting to 8k
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1596275 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Http11AprProtocol.java
+index d3aa6a0c78..a31091cd9f 100644
+--- a/java/org/apache/coyote/http11/AbstractHttp11Protocol.java
++++ b/java/org/apache/coyote/http11/AbstractHttp11Protocol.java
+@@ -166,6 +166,17 @@ public abstract class AbstractHttp11Protocol<S> extends AbstractProtocol<S> {
+     }
+ 
+ 
++    /**
++     * The size of the buffer used by the ServletOutputStream when performing
++     * delayed asynchronous writes using HTTP upgraded connections.
++     */
++    private int upgradeAsyncWriteBufferSize = 8192;
++    public int getUpgradeAsyncWriteBufferSize() { return upgradeAsyncWriteBufferSize; }
++    public void setUpgradeAsyncWriteBufferSize(int upgradeAsyncWriteBufferSize) {
++        this.upgradeAsyncWriteBufferSize = upgradeAsyncWriteBufferSize;
++    }
++
++
+     // ------------------------------------------------ HTTP specific properties
+     // ------------------------------------------ passed through to the EndPoint
+ 
+
+==================================================
+Http11Nio2Protocol.java
+index 49a5bc7fd0..024e93dbae 100644
+--- a/java/org/apache/coyote/http11/Http11AprProtocol.java
++++ b/java/org/apache/coyote/http11/Http11AprProtocol.java
+@@ -345,7 +345,8 @@ public class Http11AprProtocol extends AbstractHttp11Protocol<Long> {
+                 HttpUpgradeHandler httpUpgradeProcessor)
+                 throws IOException {
+             return new AprProcessor(socket, httpUpgradeProcessor,
+-                    (AprEndpoint) proto.endpoint);
++                    (AprEndpoint) proto.endpoint,
++                    proto.getUpgradeAsyncWriteBufferSize());
+         }
+     }
+ }
+
+==================================================
+Http11NioProtocol.java
+index 477a76fa2e..920b7d73ca 100644
+--- a/java/org/apache/coyote/http11/Http11Nio2Protocol.java
++++ b/java/org/apache/coyote/http11/Http11Nio2Protocol.java
+@@ -265,7 +265,8 @@ public class Http11Nio2Protocol extends AbstractHttp11JsseProtocol<Nio2Channel>
+                 SocketWrapper<Nio2Channel> socket,
+                 HttpUpgradeHandler httpUpgradeProcessor)
+                 throws IOException {
+-            return new Nio2Processor(proto.endpoint, socket, httpUpgradeProcessor);
++            return new Nio2Processor(proto.endpoint, socket, httpUpgradeProcessor,
++                    proto.getUpgradeAsyncWriteBufferSize());
+         }
+ 
+         @Override
+
+==================================================
+Http11Protocol.java
+index fb7149b992..77646d75ec 100644
+--- a/java/org/apache/coyote/http11/Http11NioProtocol.java
++++ b/java/org/apache/coyote/http11/Http11NioProtocol.java
+@@ -305,7 +305,8 @@ public class Http11NioProtocol extends AbstractHttp11JsseProtocol<NioChannel> {
+                 HttpUpgradeHandler httpUpgradeProcessor)
+                 throws IOException {
+             return new NioProcessor(socket, httpUpgradeProcessor,
+-                    ((Http11NioProtocol) getProtocol()).getEndpoint().getSelectorPool());
++                    proto.getEndpoint().getSelectorPool(),
++                    proto.getUpgradeAsyncWriteBufferSize());
+         }
+ 
+         @Override
+
+==================================================
+AbstractServletOutputStream.java
+index 162f3f7ea8..81e8fa3fab 100644
+--- a/java/org/apache/coyote/http11/Http11Protocol.java
++++ b/java/org/apache/coyote/http11/Http11Protocol.java
+@@ -212,7 +212,8 @@ public class Http11Protocol extends AbstractHttp11JsseProtocol<Socket> {
+                 SocketWrapper<Socket> socket,
+                 HttpUpgradeHandler httpUpgradeProcessor)
+                 throws IOException {
+-            return new BioProcessor(socket, httpUpgradeProcessor);
++            return new BioProcessor(socket, httpUpgradeProcessor,
++                    proto.getUpgradeAsyncWriteBufferSize());
+         }
+ 
+         @Override
+
+==================================================
+AprProcessor.java
+index f236a983cb..00e9ff14be 100644
+--- a/java/org/apache/coyote/http11/upgrade/AbstractServletOutputStream.java
++++ b/java/org/apache/coyote/http11/upgrade/AbstractServletOutputStream.java
+@@ -57,10 +57,16 @@ public abstract class AbstractServletOutputStream<S> extends ServletOutputStream
+ 
+     // Writes guarded by writeLock
+     private volatile byte[] buffer;
++    private volatile int bufferPos;
++    private volatile int bufferLimit;
++    private final int asyncWriteBufferSize;
+ 
+ 
+-    public AbstractServletOutputStream(SocketWrapper<S> socketWrapper) {
++    public AbstractServletOutputStream(SocketWrapper<S> socketWrapper,
++            int asyncWriteBufferSize) {
+         this.socketWrapper = socketWrapper;
++        this.asyncWriteBufferSize = asyncWriteBufferSize;
++        buffer = new byte[asyncWriteBufferSize];
+     }
+ 
+ 
+@@ -74,7 +80,7 @@ public abstract class AbstractServletOutputStream<S> extends ServletOutputStream
+         // Make sure isReady() and onWritePossible() have a consistent view of
+         // buffer and fireListener when determining if the listener should fire
+         synchronized (fireListenerLock) {
+-            boolean result = (buffer == null);
++            boolean result = (bufferLimit == 0);
+             fireListener = !result;
+             return result;
+         }
+@@ -134,9 +140,8 @@ public abstract class AbstractServletOutputStream<S> extends ServletOutputStream
+ 
+ 
+     private void preWriteChecks() {
+-        if (buffer != null) {
+-            throw new IllegalStateException(
+-                    sm.getString("upgrade.sis.write.ise"));
++        if (bufferLimit != 0) {
++            throw new IllegalStateException(sm.getString("upgrade.sis.write.ise"));
+         }
+     }
+ 
+@@ -157,12 +162,25 @@ public abstract class AbstractServletOutputStream<S> extends ServletOutputStream
+             // write executes.
+             int written = doWrite(false, b, off, len);
+             if (written < len) {
+-                // TODO: - Reuse the buffer
+-                //       - Only reallocate if it gets too big (>8k?)
+-                buffer = new byte[len - written];
+-                System.arraycopy(b, off + written, buffer, 0, len - written);
++                if (b == buffer) {
++                    // This is a partial write of the existing buffer. Just
++                    // increment the current position
++                    bufferPos += written;
++                } else {
++                    // This is a new partial write
++                    int bytesLeft = len - written;
++                    if (bytesLeft > buffer.length) {
++                        buffer = new byte[bytesLeft];
++                    } else if (bytesLeft < asyncWriteBufferSize &&
++                            buffer.length > asyncWriteBufferSize) {
++                        buffer = new byte[asyncWriteBufferSize];
++                    }
++                    bufferPos = 0;
++                    bufferLimit = bytesLeft;
++                    System.arraycopy(b, off + written, buffer, bufferPos, bufferLimit);
++                }
+             } else {
+-                buffer = null;
++                bufferLimit = 0;
+             }
+         }
+     }
+@@ -171,8 +189,8 @@ public abstract class AbstractServletOutputStream<S> extends ServletOutputStream
+     protected final void onWritePossible() throws IOException {
+         try {
+             synchronized (writeLock) {
+-                if (buffer != null) {
+-                    writeInternal(buffer, 0, buffer.length);
++                if (bufferLimit > 0) {
++                    writeInternal(buffer, bufferPos, bufferLimit - bufferPos);
+                 }
+             }
+         } catch (Throwable t) {
+@@ -190,7 +208,7 @@ public abstract class AbstractServletOutputStream<S> extends ServletOutputStream
+         // should fire
+         boolean fire = false;
+         synchronized (fireListenerLock) {
+-            if (buffer == null && fireListener) {
++            if (bufferLimit == 0 && fireListener) {
+                 fireListener = false;
+                 fire = true;
+             }
+
+==================================================
+AprServletOutputStream.java
+index 41f51301d4..df42d35d7e 100644
+--- a/java/org/apache/coyote/http11/upgrade/AprProcessor.java
++++ b/java/org/apache/coyote/http11/upgrade/AprProcessor.java
+@@ -33,10 +33,11 @@ public class AprProcessor extends AbstractProcessor<Long> {
+     private static final int INFINITE_TIMEOUT = -1;
+ 
+     public AprProcessor(SocketWrapper<Long> wrapper,
+-            HttpUpgradeHandler httpUpgradeProcessor, AprEndpoint endpoint) {
++            HttpUpgradeHandler httpUpgradeProcessor, AprEndpoint endpoint,
++            int asyncWriteBufferSize) {
+         super(httpUpgradeProcessor,
+                 new AprServletInputStream(wrapper),
+-                new AprServletOutputStream(wrapper, endpoint));
++                new AprServletOutputStream(wrapper, asyncWriteBufferSize, endpoint));
+ 
+         Socket.timeoutSet(wrapper.getSocket().longValue(), INFINITE_TIMEOUT);
+     }
+
+==================================================
+BioProcessor.java
+index d7f89d7d36..e4a66ea371 100644
+--- a/java/org/apache/coyote/http11/upgrade/AprServletOutputStream.java
++++ b/java/org/apache/coyote/http11/upgrade/AprServletOutputStream.java
+@@ -38,8 +38,8 @@ public class AprServletOutputStream extends AbstractServletOutputStream<Long> {
+     private final ByteBuffer sslOutputBuffer;
+ 
+     public AprServletOutputStream(SocketWrapper<Long> socketWrapper,
+-            AprEndpoint endpoint) {
+-        super(socketWrapper);
++            int asyncWriteBufferSize, AprEndpoint endpoint) {
++        super(socketWrapper, asyncWriteBufferSize);
+         this.endpoint = endpoint;
+         this.socket = socketWrapper.getSocket().longValue();
+         if (endpoint.isSSLEnabled()) {
+
+==================================================
+BioServletOutputStream.java
+index f71f957f48..3fda3332ad 100644
+--- a/java/org/apache/coyote/http11/upgrade/BioProcessor.java
++++ b/java/org/apache/coyote/http11/upgrade/BioProcessor.java
+@@ -34,9 +34,10 @@ public class BioProcessor extends AbstractProcessor<Socket> {
+     private static final int INFINITE_TIMEOUT = 0;
+ 
+     public BioProcessor(SocketWrapper<Socket> wrapper,
+-            HttpUpgradeHandler httpUpgradeProcessor) throws IOException {
++            HttpUpgradeHandler httpUpgradeProcessor,
++            int asyncWriteBufferSize) throws IOException {
+         super(httpUpgradeProcessor, new BioServletInputStream(wrapper),
+-                new BioServletOutputStream(wrapper));
++                new BioServletOutputStream(wrapper, asyncWriteBufferSize));
+ 
+         wrapper.getSocket().setSoTimeout(INFINITE_TIMEOUT);
+     }
+
+==================================================
+Nio2Processor.java
+index 51932f9e42..233f6364a6 100644
+--- a/java/org/apache/coyote/http11/upgrade/BioServletOutputStream.java
++++ b/java/org/apache/coyote/http11/upgrade/BioServletOutputStream.java
+@@ -26,9 +26,9 @@ public class BioServletOutputStream extends AbstractServletOutputStream<Socket>
+ 
+     private final OutputStream os;
+ 
+-    public BioServletOutputStream(SocketWrapper<Socket> socketWrapper)
+-            throws IOException {
+-        super(socketWrapper);
++    public BioServletOutputStream(SocketWrapper<Socket> socketWrapper,
++            int asyncWriteBufferSize) throws IOException {
++        super(socketWrapper, asyncWriteBufferSize);
+         os = socketWrapper.getSocket().getOutputStream();
+     }
+ 
+
+==================================================
+Nio2ServletInputStream.java
+index ceece5d02a..a8d02868d6 100644
+--- a/java/org/apache/coyote/http11/upgrade/Nio2Processor.java
++++ b/java/org/apache/coyote/http11/upgrade/Nio2Processor.java
+@@ -34,10 +34,11 @@ public class Nio2Processor extends AbstractProcessor<Nio2Channel> {
+ 
+     public Nio2Processor(AbstractEndpoint<Nio2Channel> endpoint,
+             SocketWrapper<Nio2Channel> wrapper,
+-            HttpUpgradeHandler httpUpgradeProcessor) {
++            HttpUpgradeHandler httpUpgradeProcessor,
++            int asyncWriteBufferSize) {
+         super(httpUpgradeProcessor,
+-                new Nio2ServletInputStream(endpoint, wrapper),
+-                new Nio2ServletOutputStream(endpoint, wrapper));
++                new Nio2ServletInputStream(wrapper, endpoint),
++                new Nio2ServletOutputStream(wrapper, asyncWriteBufferSize, endpoint));
+ 
+         wrapper.setTimeout(INFINITE_TIMEOUT);
+     }
+
+==================================================
+Nio2ServletOutputStream.java
+index e7a259e7bd..d85f243f6b 100644
+--- a/java/org/apache/coyote/http11/upgrade/Nio2ServletInputStream.java
++++ b/java/org/apache/coyote/http11/upgrade/Nio2ServletInputStream.java
+@@ -41,7 +41,7 @@ public class Nio2ServletInputStream extends AbstractServletInputStream {
+     private boolean flipped = false;
+     private volatile boolean readPending = false;
+ 
+-    public Nio2ServletInputStream(AbstractEndpoint<Nio2Channel> endpoint0, SocketWrapper<Nio2Channel> wrapper) {
++    public Nio2ServletInputStream(SocketWrapper<Nio2Channel> wrapper, AbstractEndpoint<Nio2Channel> endpoint0) {
+         this.endpoint = endpoint0;
+         this.wrapper = wrapper;
+         this.channel = wrapper.getSocket();
+
+==================================================
+NioProcessor.java
+index 46804e049d..7375f300a7 100644
+--- a/java/org/apache/coyote/http11/upgrade/Nio2ServletOutputStream.java
++++ b/java/org/apache/coyote/http11/upgrade/Nio2ServletOutputStream.java
+@@ -41,8 +41,9 @@ public class Nio2ServletOutputStream extends AbstractServletOutputStream<Nio2Cha
+     private final CompletionHandler<Integer, ByteBuffer> completionHandler;
+     private final Semaphore writePending = new Semaphore(1);
+ 
+-    public Nio2ServletOutputStream(AbstractEndpoint<Nio2Channel> endpoint0, SocketWrapper<Nio2Channel> socketWrapper0) {
+-        super(socketWrapper0);
++    public Nio2ServletOutputStream(SocketWrapper<Nio2Channel> socketWrapper0,
++            int asyncWriteBufferSize, AbstractEndpoint<Nio2Channel> endpoint0) {
++        super(socketWrapper0, asyncWriteBufferSize);
+         this.endpoint = endpoint0;
+         channel = socketWrapper0.getSocket();
+         maxWrite = channel.getBufHandler().getWriteBuffer().capacity();
+
+==================================================
+NioServletOutputStream.java
+index 948a240ecb..6d6c639ac1 100644
+--- a/java/org/apache/coyote/http11/upgrade/NioProcessor.java
++++ b/java/org/apache/coyote/http11/upgrade/NioProcessor.java
+@@ -33,10 +33,11 @@ public class NioProcessor extends AbstractProcessor<NioChannel> {
+     private static final int INFINITE_TIMEOUT = -1;
+ 
+     public NioProcessor(SocketWrapper<NioChannel> wrapper,
+-            HttpUpgradeHandler httpUpgradeProcessor, NioSelectorPool pool) {
++            HttpUpgradeHandler httpUpgradeProcessor, NioSelectorPool pool,
++            int asyncWriteBufferSize) {
+         super(httpUpgradeProcessor,
+                 new NioServletInputStream(wrapper, pool),
+-                new NioServletOutputStream(wrapper, pool));
++                new NioServletOutputStream(wrapper, asyncWriteBufferSize, pool));
+ 
+         wrapper.setTimeout(INFINITE_TIMEOUT);
+     }
+
+==================================================

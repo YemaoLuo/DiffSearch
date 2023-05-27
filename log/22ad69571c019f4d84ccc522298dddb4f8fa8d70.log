@@ -1,0 +1,266 @@
+22ad69571c019f4d84ccc522298dddb4f8fa8d70
+==================================================
+Update request start time using nanoTime
+==================================================
+remm remm@apache.org
+==================================================
+Thu Feb 27 16:49:04 2020 +0100
+==================================================
+CoyoteAdapter.java
+index ab47a46953..34e3adfc5e 100644
+--- a/TOMCAT-NEXT.txt
++++ b/TOMCAT-NEXT.txt
+@@ -41,11 +41,9 @@ New items for 10.0.x onwards:
+  4. RFC 3986 states (section 2.2) that a %nn encoded delimiter is NOT equivalent
+     to the decoded form. Provide an option not to decode delimiters in %nn form.
+ 
+- 5. BZ 56966. Refactor internal request timing to use System.nanoTime()
++ 5. BZ 63286. Make behaviour of %D and %T consistent with httpd.
+ 
+- 6. BZ 63286. Make behaviour of %D and %T consistent with httpd.
+-
+- 7. Refactor DefaultServlet to use Ranges in parseRanges().
++ 6. Refactor DefaultServlet to use Ranges in parseRanges().
+ 
+ Deferred until 10.1.x:
+ 
+
+==================================================
+AbstractAccessLogValve.java
+index 1a1430bca5..18b8025bb4 100644
+--- a/java/org/apache/catalina/connector/CoyoteAdapter.java
++++ b/java/org/apache/catalina/connector/CoyoteAdapter.java
+@@ -20,6 +20,7 @@ import java.io.IOException;
+ import java.nio.charset.Charset;
+ import java.nio.charset.StandardCharsets;
+ import java.util.EnumSet;
++import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ import jakarta.servlet.ReadListener;
+@@ -273,8 +274,8 @@ public class CoyoteAdapter implements Adapter {
+             // Access logging
+             if (!success || !request.isAsync()) {
+                 long time = 0;
+-                if (req.getStartTime() != -1) {
+-                    time = System.currentTimeMillis() - req.getStartTime();
++                if (req.getStartTimeNanos() != -1) {
++                    time = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - req.getStartTimeNanos());
+                 }
+                 Context context = request.getContext();
+                 if (context != null) {
+@@ -402,7 +403,7 @@ public class CoyoteAdapter implements Adapter {
+                 // The other possibility is that an error occurred early in
+                 // processing and the request could not be mapped to a Context.
+                 // Log via the host or engine in that case.
+-                long time = System.currentTimeMillis() - req.getStartTime();
++                long time = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - req.getStartTimeNanos());
+                 if (context != null) {
+                     context.logAccess(request, response, time, false);
+                 } else if (response.isError()) {
+
+==================================================
+AbstractProcessor.java
+index 47685eae8d..5cc1f031ca 100644
+--- a/java/org/apache/catalina/valves/AbstractAccessLogValve.java
++++ b/java/org/apache/catalina/valves/AbstractAccessLogValve.java
+@@ -30,6 +30,7 @@ import java.util.List;
+ import java.util.Locale;
+ import java.util.Map;
+ import java.util.TimeZone;
++import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ import jakarta.servlet.RequestDispatcher;
+@@ -699,14 +700,9 @@ public abstract class AbstractAccessLogValve extends ValveBase implements Access
+             return;
+         }
+ 
+-        /**
+-         * XXX This is a bit silly, but we want to have start and stop time and
+-         * duration consistent. It would be better to keep start and stop
+-         * simply in the request and/or response object and remove time
+-         * (duration) from the interface.
+-         */
+-        long start = request.getCoyoteRequest().getStartTime();
+-        Date date = getDate(start + time);
++        long elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - request.getCoyoteRequest().getStartTimeNanos());
++        // Date for access log should be the beginning of the request
++        Date date = getDate(System.currentTimeMillis() - elapsed);
+ 
+         CharArrayWriter result = charArrayWriters.pop();
+         if (result == null) {
+@@ -1372,8 +1368,8 @@ public abstract class AbstractAccessLogValve extends ValveBase implements Access
+             if (commitTime == -1) {
+                 buf.append('-');
+             } else {
+-                long delta = commitTime - request.getCoyoteRequest().getStartTime();
+-                buf.append(Long.toString(delta));
++                long delta = commitTime - request.getCoyoteRequest().getStartTimeNanos();
++                buf.append(Long.toString(TimeUnit.NANOSECONDS.toMillis(delta)));
+             }
+         }
+     }
+
+==================================================
+Request.java
+index 254950e26c..5af371083e 100644
+--- a/java/org/apache/coyote/AbstractProcessor.java
++++ b/java/org/apache/coyote/AbstractProcessor.java
+@@ -978,6 +978,7 @@ public abstract class AbstractProcessor extends AbstractProcessorLight implement
+         setSocketWrapper(socketWrapper);
+         // Setup the minimal request information
+         request.setStartTime(System.currentTimeMillis());
++        request.setStartTimeNanos(System.nanoTime());
+         // Setup the minimal response information
+         response.setStatus(400);
+         response.setError();
+
+==================================================
+RequestInfo.java
+index deff3f4fa7..3c095cb47e 100644
+--- a/java/org/apache/coyote/Request.java
++++ b/java/org/apache/coyote/Request.java
+@@ -154,6 +154,7 @@ public final class Request {
+     private long bytesRead=0;
+     // Time of the request - useful to avoid repeated calls to System.currentTime
+     private long startTime = -1;
++    private long startTimeNanos = -1;
+     private int available = 0;
+ 
+     private final RequestInfo reqProcessorMX=new RequestInfo(this);
+@@ -571,6 +572,14 @@ public final class Request {
+         this.startTime = startTime;
+     }
+ 
++    public long getStartTimeNanos() {
++        return startTimeNanos;
++    }
++
++    public void setStartTimeNanos(long startTimeNanos) {
++        this.startTimeNanos = startTimeNanos;
++    }
++
+     // -------------------- Per-Request "notes" --------------------
+ 
+ 
+@@ -647,6 +656,7 @@ public final class Request {
+         allDataReadEventSent.set(false);
+ 
+         startTime = -1;
++        startTimeNanos = -1;
+     }
+ 
+     // -------------------- Info  --------------------
+
+==================================================
+Response.java
+index 30216b7640..23cfb27756 100644
+--- a/java/org/apache/coyote/RequestInfo.java
++++ b/java/org/apache/coyote/RequestInfo.java
+@@ -17,6 +17,8 @@
+ 
+ package org.apache.coyote;
+ 
++import java.util.concurrent.TimeUnit;
++
+ import javax.management.ObjectName;
+ 
+ 
+@@ -125,11 +127,11 @@ public class RequestInfo  {
+     public long getRequestProcessingTime() {
+         // Not perfect, but good enough to avoid returning strange values due to
+         // concurrent updates.
+-        long startTime = req.getStartTime();
++        long startTime = req.getStartTimeNanos();
+         if (getStage() == org.apache.coyote.Constants.STAGE_ENDED || startTime < 0) {
+             return 0;
+         } else {
+-            return System.currentTimeMillis() - startTime;
++            return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startTime);
+         }
+     }
+ 
+@@ -153,24 +155,24 @@ public class RequestInfo  {
+     private long lastRequestProcessingTime = 0;
+ 
+ 
+-    /** Called by the processor before recycling the request. It'll collect
++    /**
++     * Called by the processor before recycling the request. It'll collect
+      * statistic information.
+      */
+     void updateCounters() {
+-        bytesReceived+=req.getBytesRead();
+-        bytesSent+=req.getResponse().getContentWritten();
++        bytesReceived += req.getBytesRead();
++        bytesSent += req.getResponse().getContentWritten();
+ 
+         requestCount++;
+-        if( req.getResponse().getStatus() >=400 )
++        if (req.getResponse().getStatus() >= 400) {
+             errorCount++;
+-        long t0=req.getStartTime();
+-        long t1=System.currentTimeMillis();
+-        long time=t1-t0;
++        }
++        long time = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - req.getStartTimeNanos());
+         this.lastRequestProcessingTime = time;
+-        processingTime+=time;
+-        if( maxTime < time ) {
+-            maxTime=time;
+-            maxRequestUri=req.requestURI().toString();
++        processingTime += time;
++        if (maxTime < time) {
++            maxTime = time;
++            maxRequestUri = req.requestURI().toString();
+         }
+     }
+ 
+
+==================================================
+AjpProcessor.java
+index 54a484407b..9555538165 100644
+--- a/java/org/apache/coyote/Response.java
++++ b/java/org/apache/coyote/Response.java
+@@ -258,7 +258,7 @@ public final class Response {
+ 
+     public void setCommitted(boolean v) {
+         if (v && !this.committed) {
+-            this.commitTime = System.currentTimeMillis();
++            this.commitTime = System.nanoTime();
+         }
+         this.committed = v;
+     }
+
+==================================================
+Http11InputBuffer.java
+index a333d045d8..562fc675e3 100644
+--- a/java/org/apache/coyote/ajp/AjpProcessor.java
++++ b/java/org/apache/coyote/ajp/AjpProcessor.java
+@@ -395,6 +395,7 @@ public class AjpProcessor extends AbstractProcessor {
+                     break;
+                 }
+                 request.setStartTime(System.currentTimeMillis());
++                request.setStartTimeNanos(System.nanoTime());
+             } catch (IOException e) {
+                 setErrorState(ErrorState.CLOSE_CONNECTION_NOW, e);
+                 break;
+
+==================================================
+Stream.java
+index 04543effcf..59a01f752d 100644
+--- a/java/org/apache/coyote/http11/Http11InputBuffer.java
++++ b/java/org/apache/coyote/http11/Http11InputBuffer.java
+@@ -378,6 +378,9 @@ public class Http11InputBuffer implements InputBuffer, ApplicationBufferHandler
+                 if (request.getStartTime() < 0) {
+                     request.setStartTime(System.currentTimeMillis());
+                 }
++                if (request.getStartTimeNanos() < 0) {
++                    request.setStartTimeNanos(System.nanoTime());
++                }
+                 chr = byteBuffer.get();
+             } while ((chr == Constants.CR) || (chr == Constants.LF));
+             byteBuffer.position(byteBuffer.position() - 1);
+
+==================================================

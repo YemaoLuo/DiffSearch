@@ -1,0 +1,364 @@
+592bc75020589df542320ae0a55cf7ff400bd45f
+==================================================
+Refactor JreCompat for minimum Java version of Java 21
+==================================================
+Mark Thomas
+==================================================
+Thu May 11 17:09:03 2023 +0100
+==================================================
+StandardContext.java
+Refactor JreCompat for minimum Java version of Java 21
+
+
+
+==================================================
+WebappClassLoaderBase.java
+index 888aa53e0e..5d1cc905ad 100644
+--- a/java/org/apache/catalina/core/StandardContext.java
++++ b/java/org/apache/catalina/core/StandardContext.java
+@@ -705,12 +705,6 @@ public class StandardContext extends ContainerBase implements Context, Notificat
+      */
+     private boolean renewThreadsWhenStoppingContext = true;
+ 
+-    /**
+-     * Should Tomcat attempt to clear references to classes loaded by the web application class loader from the
+-     * ObjectStreamClass caches?
+-     */
+-    private boolean clearReferencesObjectStreamClassCaches = true;
+-
+     /**
+      * Should Tomcat attempt to clear references to classes loaded by this class loader from ThreadLocals?
+      */
+@@ -2648,19 +2642,6 @@ public class StandardContext extends ContainerBase implements Context, Notificat
+     }
+ 
+ 
+-    public boolean getClearReferencesObjectStreamClassCaches() {
+-        return clearReferencesObjectStreamClassCaches;
+-    }
+-
+-
+-    public void setClearReferencesObjectStreamClassCaches(boolean clearReferencesObjectStreamClassCaches) {
+-        boolean oldClearReferencesObjectStreamClassCaches = this.clearReferencesObjectStreamClassCaches;
+-        this.clearReferencesObjectStreamClassCaches = clearReferencesObjectStreamClassCaches;
+-        support.firePropertyChange("clearReferencesObjectStreamClassCaches", oldClearReferencesObjectStreamClassCaches,
+-                this.clearReferencesObjectStreamClassCaches);
+-    }
+-
+-
+     public boolean getClearReferencesThreadLocals() {
+         return clearReferencesThreadLocals;
+     }
+@@ -4745,7 +4726,6 @@ public class StandardContext extends ContainerBase implements Context, Notificat
+                     cl.setClearReferencesStopThreads(getClearReferencesStopThreads());
+                     cl.setClearReferencesStopTimerThreads(getClearReferencesStopTimerThreads());
+                     cl.setClearReferencesHttpClientKeepAliveThread(getClearReferencesHttpClientKeepAliveThread());
+-                    cl.setClearReferencesObjectStreamClassCaches(getClearReferencesObjectStreamClassCaches());
+                     cl.setClearReferencesThreadLocals(getClearReferencesThreadLocals());
+                     cl.setSkipMemoryLeakChecksOnJvmShutdown(getSkipMemoryLeakChecksOnJvmShutdown());
+                 }
+
+==================================================
+Jre19Compat.java
+index b637fdd323..fede505739 100644
+--- a/java/org/apache/catalina/loader/WebappClassLoaderBase.java
++++ b/java/org/apache/catalina/loader/WebappClassLoaderBase.java
+@@ -352,12 +352,6 @@ public abstract class WebappClassLoaderBase extends URLClassLoader
+      */
+     private boolean clearReferencesHttpClientKeepAliveThread = true;
+ 
+-    /**
+-     * Should Tomcat attempt to clear references to classes loaded by this class
+-     * loader from the ObjectStreamClass caches?
+-     */
+-    private boolean clearReferencesObjectStreamClassCaches = true;
+-
+     /**
+      * Should Tomcat attempt to clear references to classes loaded by this class
+      * loader from ThreadLocals?
+@@ -539,17 +533,6 @@ public abstract class WebappClassLoaderBase extends URLClassLoader
+     }
+ 
+ 
+-    public boolean getClearReferencesObjectStreamClassCaches() {
+-        return clearReferencesObjectStreamClassCaches;
+-    }
+-
+-
+-    public void setClearReferencesObjectStreamClassCaches(
+-            boolean clearReferencesObjectStreamClassCaches) {
+-        this.clearReferencesObjectStreamClassCaches = clearReferencesObjectStreamClassCaches;
+-    }
+-
+-
+     public boolean getClearReferencesThreadLocals() {
+         return clearReferencesThreadLocals;
+     }
+@@ -1518,11 +1501,6 @@ public abstract class WebappClassLoaderBase extends URLClassLoader
+         // Stop any threads the web application started
+         clearReferencesThreads();
+ 
+-        // Clear any references retained in the serialization caches
+-        if (clearReferencesObjectStreamClassCaches && !JreCompat.isGraalAvailable()) {
+-            clearReferencesObjectStreamClassCaches();
+-        }
+-
+         // Check for leaks triggered by ThreadLocals loaded by this class loader
+         if (clearReferencesThreadLocals && !JreCompat.isGraalAvailable()) {
+             checkThreadLocalsForLeaks();
+@@ -1669,7 +1647,7 @@ public abstract class WebappClassLoaderBase extends URLClassLoader
+                     // shutting down the executor
+                     boolean usingExecutor = false;
+                     try {
+-                        Object executor = JreCompat.getInstance().getExecutor(thread);
++                        Object executor = getExecutor(thread);
+                         if (executor instanceof ThreadPoolExecutor) {
+                             ((ThreadPoolExecutor) executor).shutdownNow();
+                             usingExecutor = true;
+@@ -1726,6 +1704,70 @@ public abstract class WebappClassLoaderBase extends URLClassLoader
+     }
+ 
+ 
++    private Object getExecutor(Thread thread)
++            throws NoSuchFieldException, SecurityException, IllegalArgumentException, IllegalAccessException {
++
++        Object result = null;
++
++        // Runnable wrapped by Thread
++        // "target" in Sun/Oracle JDK
++        // "runnable" in IBM JDK
++        // "action" in Apache Harmony
++        Object target = null;
++        for (String fieldName : new String[] { "target", "runnable", "action" }) {
++            try {
++                Field targetField = thread.getClass().getDeclaredField(fieldName);
++                targetField.setAccessible(true);
++                target = targetField.get(thread);
++                break;
++            } catch (NoSuchFieldException nfe) {
++                continue;
++            }
++        }
++
++        // "java.util.concurrent" code is in public domain,
++        // so all implementations are similar including our
++        // internal fork.
++        if (target != null && target.getClass().getCanonicalName() != null &&
++                (target.getClass().getCanonicalName().equals(
++                        "org.apache.tomcat.util.threads.ThreadPoolExecutor.Worker") ||
++                        target.getClass().getCanonicalName().equals(
++                                "java.util.concurrent.ThreadPoolExecutor.Worker"))) {
++            Field executorField = target.getClass().getDeclaredField("this$0");
++            executorField.setAccessible(true);
++            result = executorField.get(target);
++        }
++
++        if (result == null) {
++            Object holder = null;
++            Object task = null;
++            try {
++                Field holderField = thread.getClass().getDeclaredField("holder");
++                holderField.setAccessible(true);
++                holder = holderField.get(thread);
++
++                Field taskField = holder.getClass().getDeclaredField("task");
++                taskField.setAccessible(true);
++                task = taskField.get(holder);
++            } catch (NoSuchFieldException nfe) {
++                return null;
++            }
++
++            if (task!= null && task.getClass().getCanonicalName() != null &&
++                    (task.getClass().getCanonicalName().equals(
++                            "org.apache.tomcat.util.threads.ThreadPoolExecutor.Worker") ||
++                            task.getClass().getCanonicalName().equals(
++                                    "java.util.concurrent.ThreadPoolExecutor.Worker"))) {
++                Field executorField = task.getClass().getDeclaredField("this$0");
++                executorField.setAccessible(true);
++                result = executorField.get(task);
++            }
++        }
++
++        return result;
++    }
++
++
+     /*
+      * Look at a threads stack trace to see if it is a request thread or not. It
+      * isn't perfect, but it should be good-enough for most cases.
+@@ -2110,27 +2152,6 @@ public abstract class WebappClassLoaderBase extends URLClassLoader
+     }
+ 
+ 
+-    private void clearReferencesObjectStreamClassCaches() {
+-        if (JreCompat.isJre19Available()) {
+-            // The memory leak this fixes has been fixed in Java 19 onwards,
+-            // 17.0.4 onwards and 11.0.16 onwards
+-            // See https://bugs.openjdk.java.net/browse/JDK-8277072
+-            return;
+-        }
+-        try {
+-            Class<?> clazz = Class.forName("java.io.ObjectStreamClass$Caches");
+-            clearCache(clazz, "localDescs");
+-            clearCache(clazz, "reflectors");
+-        } catch (ReflectiveOperationException | SecurityException | ClassCastException e) {
+-            log.warn(sm.getString(
+-                    "webappClassLoader.clearObjectStreamClassCachesFail", getContextName()), e);
+-        } catch (InaccessibleObjectException e) {
+-            // Must be running on without the necessary command line options.
+-            log.warn(sm.getString("webappClassLoader.addExportsJavaIo", getCurrentModuleName()));
+-        }
+-    }
+-
+-
+     private String getCurrentModuleName() {
+         String moduleName = this.getClass().getModule().getName();
+         if (moduleName == null) {
+@@ -2140,29 +2161,6 @@ public abstract class WebappClassLoaderBase extends URLClassLoader
+     }
+ 
+ 
+-    private void clearCache(Class<?> target, String mapName)
+-            throws ReflectiveOperationException, SecurityException, ClassCastException {
+-        Field f = target.getDeclaredField(mapName);
+-        f.setAccessible(true);
+-        Object map = f.get(null);
+-        // Avoid trying to clear references if Tomcat is running on a JRE that
+-        // includes the fix for this memory leak
+-        // See https://bugs.openjdk.java.net/browse/JDK-8277072
+-        if (map instanceof Map<?,?>) {
+-            Iterator<?> keys = ((Map<?,?>) map).keySet().iterator();
+-            while (keys.hasNext()) {
+-                Object key = keys.next();
+-                if (key instanceof Reference) {
+-                    Object clazz = ((Reference<?>) key).get();
+-                    if (loadedByThisOrChild(clazz)) {
+-                        keys.remove();
+-                    }
+-                }
+-            }
+-        }
+-    }
+-
+-
+     /**
+      * Find specified class in local repositories.
+      *
+
+==================================================
+JreCompat.java
+deleted file mode 100644
+index 60ee0c2dc1..0000000000
+--- a/java/org/apache/tomcat/util/compat/Jre19Compat.java
++++ /dev/null
+@@ -1,84 +0,0 @@
+-/*
+- *  Licensed to the Apache Software Foundation (ASF) under one or more
+- *  contributor license agreements.  See the NOTICE file distributed with
+- *  this work for additional information regarding copyright ownership.
+- *  The ASF licenses this file to You under the Apache License, Version 2.0
+- *  (the "License"); you may not use this file except in compliance with
+- *  the License.  You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- *  Unless required by applicable law or agreed to in writing, software
+- *  distributed under the License is distributed on an "AS IS" BASIS,
+- *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- *  See the License for the specific language governing permissions and
+- *  limitations under the License.
+- */
+-package org.apache.tomcat.util.compat;
+-
+-import java.lang.reflect.Field;
+-
+-import org.apache.juli.logging.Log;
+-import org.apache.juli.logging.LogFactory;
+-import org.apache.tomcat.util.res.StringManager;
+-
+-public class Jre19Compat extends JreCompat {
+-
+-    private static final Log log = LogFactory.getLog(Jre19Compat.class);
+-    private static final StringManager sm = StringManager.getManager(Jre19Compat.class);
+-
+-    private static final boolean supported;
+-
+-    static {
+-        // Don't need any Java 19 specific classes (yet) so just test for one of
+-        // the new ones for now.
+-        Class<?> c1 = null;
+-        try {
+-            c1 = Class.forName("java.lang.WrongThreadException");
+-        } catch (ClassNotFoundException cnfe) {
+-            // Must be pre-Java 19
+-            log.debug(sm.getString("jre19Compat.javaPre19"), cnfe);
+-        }
+-
+-        supported = (c1 != null);
+-    }
+-
+-    static boolean isSupported() {
+-        return supported;
+-    }
+-
+-    @Override
+-    public Object getExecutor(Thread thread)
+-            throws NoSuchFieldException, SecurityException, IllegalArgumentException, IllegalAccessException {
+-
+-        Object result = super.getExecutor(thread);
+-
+-        if (result == null) {
+-            Object holder = null;
+-            Object task = null;
+-            try {
+-                Field holderField = thread.getClass().getDeclaredField("holder");
+-                holderField.setAccessible(true);
+-                holder = holderField.get(thread);
+-
+-                Field taskField = holder.getClass().getDeclaredField("task");
+-                taskField.setAccessible(true);
+-                task = taskField.get(holder);
+-            } catch (NoSuchFieldException nfe) {
+-                return null;
+-            }
+-
+-            if (task!= null && task.getClass().getCanonicalName() != null &&
+-                    (task.getClass().getCanonicalName().equals(
+-                            "org.apache.tomcat.util.threads.ThreadPoolExecutor.Worker") ||
+-                            task.getClass().getCanonicalName().equals(
+-                                    "java.util.concurrent.ThreadPoolExecutor.Worker"))) {
+-                Field executorField = task.getClass().getDeclaredField("this$0");
+-                executorField.setAccessible(true);
+-                result = executorField.get(task);
+-            }
+-        }
+-
+-        return result;
+-    }
+-}
+
+==================================================
+HttpServletDoHeadBaseTest.java
+deleted file mode 100644
+index 571a2bffd2..0000000000
+--- a/java/org/apache/tomcat/util/compat/LocalStrings_zh_CN.properties
++++ /dev/null
+@@ -1,16 +0,0 @@
+-# Licensed to the Apache Software Foundation (ASF) under one or more
+-# contributor license agreements.  See the NOTICE file distributed with
+-# this work for additional information regarding copyright ownership.
+-# The ASF licenses this file to You under the Apache License, Version 2.0
+-# (the "License"); you may not use this file except in compliance with
+-# the License.  You may obtain a copy of the License at
+-#
+-#     http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing, software
+-# distributed under the License is distributed on an "AS IS" BASIS,
+-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-# See the License for the specific language governing permissions and
+-# limitations under the License.
+-
+-jre19Compat.javaPre19=该类未找到，因此推测当前代码运行在Java 19版本之前的虚拟机上
+
+==================================================

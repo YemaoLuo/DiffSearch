@@ -1,0 +1,523 @@
+6f9ec67e00b407ac2139e90061204c55a518edee
+==================================================
+Introduce a new method org.apache.coyote.OutputBuffer.doWrite(ByteBuffer)
+==================================================
+Violeta Georgieva
+==================================================
+Mon Aug 29 16:31:46 2016 +0000
+==================================================
+OutputBuffer.java
+Introduce a new method org.apache.coyote.OutputBuffer.doWrite(ByteBuffer)
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1758257 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AjpMessage.java
+index e77c08b2fa..ac40d8d9f8 100644
+--- a/java/org/apache/coyote/OutputBuffer.java
++++ b/java/org/apache/coyote/OutputBuffer.java
+@@ -17,6 +17,7 @@
+ package org.apache.coyote;
+ 
+ import java.io.IOException;
++import java.nio.ByteBuffer;
+ 
+ import org.apache.tomcat.util.buf.ByteChunk;
+ 
+@@ -24,7 +25,7 @@ import org.apache.tomcat.util.buf.ByteChunk;
+  * Output buffer.
+  *
+  * This class is used internally by the protocol implementation. All writes from
+- * higher level code should happen via Resonse.doWrite().
++ * higher level code should happen via Response.doWrite().
+  *
+  * @author Remy Maucherat
+  */
+@@ -43,6 +44,19 @@ public interface OutputBuffer {
+     public int doWrite(ByteChunk chunk) throws IOException;
+ 
+ 
++    /**
++     * Write the given data to the response. The caller owns the chunks.
++     *
++     * @param chunk data to write
++     *
++     * @return The number of bytes written which may be less than available in
++     *         the input chunk
++     *
++     * @throws IOException an underlying I/O error occurred
++     */
++    public int doWrite(ByteBuffer chunk) throws IOException;
++
++
+     /**
+      * Bytes written to the underlying socket. This includes the effects of
+      * chunking, compression, etc.
+
+==================================================
+AjpProcessor.java
+index 8418bc6351..dc6a6f4055 100644
+--- a/java/org/apache/coyote/ajp/AjpMessage.java
++++ b/java/org/apache/coyote/ajp/AjpMessage.java
+@@ -17,6 +17,8 @@
+ 
+ package org.apache.coyote.ajp;
+ 
++import java.nio.ByteBuffer;
++
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.buf.ByteChunk;
+@@ -220,18 +222,47 @@ public class AjpMessage {
+      * @param numBytes The number of bytes to copy.
+      */
+     public void appendBytes(byte[] b, int off, int numBytes) {
++        if (checkOverflow(numBytes)) {
++            return;
++        }
++        appendInt(numBytes);
++        System.arraycopy(b, off, buf, pos, numBytes);
++        pos += numBytes;
++        appendByte(0);
++    }
++
++
++    /**
++     * Copy a chunk of bytes into the packet, starting at the current
++     * write position.  The chunk of bytes is encoded with the length
++     * in two bytes first, then the data itself, and finally a
++     * terminating \0 (which is <B>not</B> included in the encoded
++     * length).
++     *
++     * @param b The ByteBuffer from which to copy bytes.
++     */
++    public void appendBytes(ByteBuffer b) {
++        int numBytes = b.remaining();
++        if (checkOverflow(numBytes)) {
++            return;
++        }
++        appendInt(numBytes);
++        b.get(buf, pos, numBytes);
++        pos += numBytes;
++        appendByte(0);
++    }
++
++
++    private boolean checkOverflow(int numBytes) {
+         if (pos + numBytes + 3 > buf.length) {
+             log.error(sm.getString("ajpmessage.overflow", "" + numBytes, "" + pos),
+                     new ArrayIndexOutOfBoundsException());
+             if (log.isDebugEnabled()) {
+                 dump("Overflow/coBytes");
+             }
+-            return;
++            return true;
+         }
+-        appendInt(numBytes);
+-        System.arraycopy(b, off, buf, pos, numBytes);
+-        pos += numBytes;
+-        appendByte(0);
++        return false;
+     }
+ 
+ 
+
+==================================================
+Http11OutputBuffer.java
+index 8c96c7536f..1573fdf1b1 100644
+--- a/java/org/apache/coyote/ajp/AjpProcessor.java
++++ b/java/org/apache/coyote/ajp/AjpProcessor.java
+@@ -21,6 +21,7 @@ import java.io.EOFException;
+ import java.io.IOException;
+ import java.io.InterruptedIOException;
+ import java.net.InetAddress;
++import java.nio.ByteBuffer;
+ import java.security.NoSuchProviderException;
+ import java.security.cert.CertificateFactory;
+ import java.security.cert.X509Certificate;
+@@ -1313,10 +1314,8 @@ public class AjpProcessor extends AbstractProcessor {
+ 
+         // Write this chunk
+         while (len > 0) {
+-            int thisTime = len;
+-            if (thisTime > outputMaxChunkSize) {
+-                thisTime = outputMaxChunkSize;
+-            }
++            int thisTime = Math.min(len, outputMaxChunkSize);
++
+             responseMessage.reset();
+             responseMessage.appendByte(Constants.JK_AJP13_SEND_BODY_CHUNK);
+             responseMessage.appendBytes(chunk.getBytes(), chunk.getOffset() + off, thisTime);
+@@ -1332,6 +1331,32 @@ public class AjpProcessor extends AbstractProcessor {
+     }
+ 
+ 
++    private void writeData(ByteBuffer chunk) throws IOException {
++        boolean blocking = (response.getWriteListener() == null);
++
++        int len = chunk.remaining();
++        int off = 0;
++
++        // Write this chunk
++        while (len > 0) {
++            int thisTime = Math.min(len, outputMaxChunkSize);
++
++            responseMessage.reset();
++            responseMessage.appendByte(Constants.JK_AJP13_SEND_BODY_CHUNK);
++            chunk.limit(chunk.position() + thisTime);
++            responseMessage.appendBytes(chunk);
++            responseMessage.end();
++            socketWrapper.write(blocking, responseMessage.getBuffer(), 0, responseMessage.getLen());
++            socketWrapper.flush(blocking);
++
++            len -= thisTime;
++            off += thisTime;
++        }
++
++        bytesWritten += off;
++    }
++
++
+     private boolean hasDataToWrite() {
+         return responseMsgPos != -1 || socketWrapper.hasDataToWrite();
+     }
+@@ -1396,6 +1421,27 @@ public class AjpProcessor extends AbstractProcessor {
+             return chunk.getLength();
+         }
+ 
++        @Override
++        public int doWrite(ByteBuffer chunk) throws IOException {
++
++            if (!response.isCommitted()) {
++                // Validate and write response headers
++                try {
++                    prepareResponse();
++                } catch (IOException e) {
++                    setErrorState(ErrorState.CLOSE_CONNECTION_NOW, e);
++                }
++            }
++
++            int len = 0;
++            if (!swallowResponse) {
++                len = chunk.remaining();
++                writeData(chunk);
++                len -= chunk.remaining();
++            }
++            return len;
++        }
++
+         @Override
+         public long getBytesWritten() {
+             return bytesWritten;
+
+==================================================
+ChunkedOutputFilter.java
+index d710447d59..09099ef114 100644
+--- a/java/org/apache/coyote/http11/Http11OutputBuffer.java
++++ b/java/org/apache/coyote/http11/Http11OutputBuffer.java
+@@ -17,6 +17,7 @@
+ package org.apache.coyote.http11;
+ 
+ import java.io.IOException;
++import java.nio.ByteBuffer;
+ 
+ import org.apache.coyote.ActionCode;
+ import org.apache.coyote.OutputBuffer;
+@@ -208,6 +209,24 @@ public class Http11OutputBuffer implements OutputBuffer {
+     }
+ 
+ 
++    @Override
++    public int doWrite(ByteBuffer chunk) throws IOException {
++
++        if (!response.isCommitted()) {
++            // Send the connector a request for commit. The connector should
++            // then validate the headers, send them (using sendHeaders) and
++            // set the filters accordingly.
++            response.action(ActionCode.COMMIT, null);
++        }
++
++        if (lastActiveFilter == -1) {
++            return outputStreamOutputBuffer.doWrite(chunk);
++        } else {
++            return activeFilters[lastActiveFilter].doWrite(chunk);
++        }
++    }
++
++
+     @Override
+     public long getBytesWritten() {
+         if (lastActiveFilter == -1) {
+@@ -563,6 +582,18 @@ public class Http11OutputBuffer implements OutputBuffer {
+             return len;
+         }
+ 
++        /**
++         * Write chunk.
++         */
++        @Override
++        public int doWrite(ByteBuffer chunk) throws IOException {
++            int len = chunk.remaining();
++            socketWrapper.write(isBlocking(), chunk);
++            len -= chunk.remaining();
++            byteCount += len;
++            return len;
++        }
++
+         @Override
+         public long getBytesWritten() {
+             return byteCount;
+
+==================================================
+GzipOutputFilter.java
+index 45a1d08c25..ff37d6ded6 100644
+--- a/java/org/apache/coyote/http11/filters/ChunkedOutputFilter.java
++++ b/java/org/apache/coyote/http11/filters/ChunkedOutputFilter.java
+@@ -18,6 +18,7 @@
+ package org.apache.coyote.http11.filters;
+ 
+ import java.io.IOException;
++import java.nio.ByteBuffer;
+ 
+ import org.apache.coyote.OutputBuffer;
+ import org.apache.coyote.Response;
+@@ -89,8 +90,7 @@ public class ChunkedOutputFilter implements OutputFilter {
+     // --------------------------------------------------- OutputBuffer Methods
+ 
+     @Override
+-    public int doWrite(ByteChunk chunk)
+-        throws IOException {
++    public int doWrite(ByteChunk chunk) throws IOException {
+ 
+         int result = chunk.getLength();
+ 
+@@ -98,14 +98,32 @@ public class ChunkedOutputFilter implements OutputFilter {
+             return 0;
+         }
+ 
+-        // Calculate chunk header
+-        int pos = 7;
+-        int current = result;
+-        while (current > 0) {
+-            int digit = current % 16;
+-            current = current / 16;
+-            chunkLength[pos--] = HexUtils.getHex(digit);
++        int pos = calculateChunkHeader(result);
++
++        chunkHeader.setBytes(chunkLength, pos + 1, 9 - pos);
++        buffer.doWrite(chunkHeader);
++
++        buffer.doWrite(chunk);
++
++        chunkHeader.setBytes(chunkLength, 8, 2);
++        buffer.doWrite(chunkHeader);
++
++        return result;
++
++    }
++
++
++    @Override
++    public int doWrite(ByteBuffer chunk) throws IOException {
++
++        int result = chunk.remaining();
++
++        if (result <= 0) {
++            return 0;
+         }
++
++        int pos = calculateChunkHeader(result);
++
+         chunkHeader.setBytes(chunkLength, pos + 1, 9 - pos);
+         buffer.doWrite(chunkHeader);
+ 
+@@ -119,6 +137,19 @@ public class ChunkedOutputFilter implements OutputFilter {
+     }
+ 
+ 
++    private int calculateChunkHeader(int len) {
++        // Calculate chunk header
++        int pos = 7;
++        int current = len;
++        while (current > 0) {
++            int digit = current % 16;
++            current = current / 16;
++            chunkLength[pos--] = HexUtils.getHex(digit);
++        }
++        return pos;
++    }
++
++
+     @Override
+     public long getBytesWritten() {
+         return buffer.getBytesWritten();
+
+==================================================
+IdentityOutputFilter.java
+index 6523f016f0..fe3ae859a4 100644
+--- a/java/org/apache/coyote/http11/filters/GzipOutputFilter.java
++++ b/java/org/apache/coyote/http11/filters/GzipOutputFilter.java
+@@ -19,6 +19,7 @@ package org.apache.coyote.http11.filters;
+ 
+ import java.io.IOException;
+ import java.io.OutputStream;
++import java.nio.ByteBuffer;
+ import java.util.zip.GZIPOutputStream;
+ 
+ import org.apache.coyote.OutputBuffer;
+@@ -73,6 +74,23 @@ public class GzipOutputFilter implements OutputFilter {
+     }
+ 
+ 
++    @Override
++    public int doWrite(ByteBuffer chunk) throws IOException {
++        if (compressionStream == null) {
++            compressionStream = new GZIPOutputStream(fakeOutputStream, true);
++        }
++        int len = chunk.remaining();
++        if (chunk.hasArray()) {
++            compressionStream.write(chunk.array(), chunk.arrayOffset() + chunk.position(), len);
++        } else {
++            byte[] bytes = new byte[len];
++            chunk.put(bytes);
++            compressionStream.write(bytes, 0, len);
++        }
++        return len;
++    }
++
++
+     @Override
+     public long getBytesWritten() {
+         return buffer.getBytesWritten();
+
+==================================================
+VoidOutputFilter.java
+index 3a7dbf95ab..1949137acf 100644
+--- a/java/org/apache/coyote/http11/filters/IdentityOutputFilter.java
++++ b/java/org/apache/coyote/http11/filters/IdentityOutputFilter.java
+@@ -18,6 +18,7 @@
+ package org.apache.coyote.http11.filters;
+ 
+ import java.io.IOException;
++import java.nio.ByteBuffer;
+ 
+ import org.apache.coyote.OutputBuffer;
+ import org.apache.coyote.Response;
+@@ -92,6 +93,44 @@ public class IdentityOutputFilter implements OutputFilter {
+     }
+ 
+ 
++    @Override
++    public int doWrite(ByteBuffer chunk) throws IOException {
++
++        int result = -1;
++
++        if (contentLength >= 0) {
++            if (remaining > 0) {
++                result = chunk.remaining();
++                if (result > remaining) {
++                    // The chunk is longer than the number of bytes remaining
++                    // in the body; changing the chunk length to the number
++                    // of bytes remaining
++                    chunk.limit(chunk.position() + (int) remaining);
++                    result = (int) remaining;
++                    remaining = 0;
++                } else {
++                    remaining = remaining - result;
++                }
++                buffer.doWrite(chunk);
++            } else {
++                // No more bytes left to be written : return -1 and clear the
++                // buffer
++                chunk.position(0);
++                chunk.limit(0);
++                result = -1;
++            }
++        } else {
++            // If no content length was set, just write the bytes
++            result = chunk.remaining();
++            buffer.doWrite(chunk);
++            result -= chunk.remaining();
++        }
++
++        return result;
++
++    }
++
++
+     @Override
+     public long getBytesWritten() {
+         return buffer.getBytesWritten();
+
+==================================================
+Stream.java
+index 6b0a624fc3..19426fa3de 100644
+--- a/java/org/apache/coyote/http11/filters/VoidOutputFilter.java
++++ b/java/org/apache/coyote/http11/filters/VoidOutputFilter.java
+@@ -18,6 +18,7 @@
+ package org.apache.coyote.http11.filters;
+ 
+ import java.io.IOException;
++import java.nio.ByteBuffer;
+ 
+ import org.apache.coyote.OutputBuffer;
+ import org.apache.coyote.Response;
+@@ -41,6 +42,12 @@ public class VoidOutputFilter implements OutputFilter {
+     }
+ 
+ 
++    @Override
++    public int doWrite(ByteBuffer chunk) throws IOException {
++        return chunk.remaining();
++    }
++
++
+     @Override
+     public long getBytesWritten() {
+         return 0;
+
+==================================================
+TesterOutputBuffer.java
+index 7b4c187c3f..735e15669d 100644
+--- a/java/org/apache/coyote/http2/Stream.java
++++ b/java/org/apache/coyote/http2/Stream.java
+@@ -489,6 +489,35 @@ public class Stream extends AbstractStream implements HeaderEmitter {
+             return offset;
+         }
+ 
++        @Override
++        public synchronized int doWrite(ByteBuffer chunk) throws IOException {
++            if (closed) {
++                throw new IllegalStateException(
++                        sm.getString("stream.closed", getConnectionId(), getIdentifier()));
++            }
++            if (!coyoteResponse.isCommitted()) {
++                coyoteResponse.sendHeaders();
++            }
++            int chunkLimit = chunk.limit();
++            int offset = 0;
++            while (chunk.remaining() > 0) {
++                int thisTime = Math.min(buffer.remaining(), chunk.remaining());
++                chunk.limit(chunk.position() + thisTime);
++                buffer.put(chunk);
++                chunk.limit(chunkLimit);
++                offset += thisTime;
++                if (chunk.remaining() > 0 && !buffer.hasRemaining()) {
++                    // Only flush if we have more data to write and the buffer
++                    // is full
++                    if (flush(true, coyoteResponse.getWriteListener() == null)) {
++                        break;
++                    }
++                }
++            }
++            written += offset;
++            return offset;
++        }
++
+         public synchronized boolean flush(boolean block) throws IOException {
+             return flush(false, block);
+         }
+
+==================================================

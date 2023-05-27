@@ -1,0 +1,293 @@
+88a5fa13dc3bfc89ae576447d287ef61d0e164ce
+==================================================
+Connector re-factoring
+==================================================
+Mark Emlyn
+==================================================
+Sat Jun 18 13:41:17 2011 +0000
+==================================================
+AjpAprProtocol.java
+Connector re-factoring
+Align APR with BIO/NIO
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1137184 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Http11AprProtocol.java
+index f67fb6148b..676f43aa69 100644
+--- a/java/org/apache/coyote/ajp/AjpAprProtocol.java
++++ b/java/org/apache/coyote/ajp/AjpAprProtocol.java
+@@ -129,31 +129,46 @@ public class AjpAprProtocol extends AbstractAjpProtocol {
+             recycledProcessors.clear();
+         }
+         
+-        // FIXME: Support for this could be added in AJP as well
+-        @Override
+-        public SocketState event(SocketWrapper<Long> socket, SocketStatus status) {
+-            return SocketState.CLOSED;
+-        }
+-        
+         @Override
+         public SocketState process(SocketWrapper<Long> socket,
+                 SocketStatus status) {
+-            AjpAprProcessor processor = recycledProcessors.poll();
++            AjpAprProcessor processor = connections.remove(socket);
++
++            socket.setAsync(false);
++
+             try {
++                if (processor == null) {
++                    processor = recycledProcessors.poll();
++                }
+                 if (processor == null) {
+                     processor = createProcessor();
+                 }
+ 
+-                SocketState state = processor.process(socket);
++                SocketState state = SocketState.CLOSED;
++                do {
++                    if (processor.isAsync() || state == SocketState.ASYNC_END) {
++                        state = processor.asyncDispatch(status);
++                    } else {
++                        state = processor.process(socket);
++                    }
++
++                    if (processor.isAsync()) {
++                        state = processor.asyncPostProcess();
++                    }
++                } while (state == SocketState.ASYNC_END);
++                
+                 if (state == SocketState.LONG) {
+-                    // Check if the post processing is going to change the state
+-                    state = processor.asyncPostProcess();
+-                }
+-                if (state == SocketState.LONG || state == SocketState.ASYNC_END) {
+                     // Need to make socket available for next processing cycle
+                     // but no need for the poller
+                     connections.put(socket, processor);
+                     socket.setAsync(true);
++                } else if (state == SocketState.OPEN){
++                    // In keep-alive but between requests. OK to recycle
++                    // processor. Continue to poll for the next request.
++                    processor.recycle();
++                    recycledProcessors.offer(processor);
++                    ((AprEndpoint)proto.endpoint).getPoller().add(
++                            socket.getSocket().longValue());
+                 } else {
+                     processor.recycle();
+                     recycledProcessors.offer(processor);
+@@ -184,44 +199,6 @@ public class AjpAprProtocol extends AbstractAjpProtocol {
+             return SocketState.CLOSED;
+         }
+ 
+-        @Override
+-        public SocketState asyncDispatch(SocketWrapper<Long> socket, SocketStatus status) {
+-
+-            AjpAprProcessor processor = connections.get(socket);
+-            
+-            SocketState state = SocketState.CLOSED; 
+-            if (processor != null) {
+-                // Call the appropriate event
+-                try {
+-                    state = processor.asyncDispatch(status);
+-                }
+-                // Future developers: if you discover any other
+-                // rare-but-nonfatal exceptions, catch them here, and log as
+-                // debug.
+-                catch (Throwable e) {
+-                    ExceptionUtils.handleThrowable(e);
+-                    // any other exception or error is odd. Here we log it
+-                    // with "ERROR" level, so it will show up even on
+-                    // less-than-verbose logs.
+-                    AjpAprProtocol.log.error
+-                        (sm.getString("ajpprotocol.proto.error"), e);
+-                } finally {
+-                    if (state == SocketState.LONG && processor.isAsync()) {
+-                        state = processor.asyncPostProcess();
+-                    }
+-                    if (state != SocketState.LONG && state != SocketState.ASYNC_END) {
+-                        connections.remove(socket);
+-                        processor.recycle();
+-                        recycledProcessors.offer(processor);
+-                        if (state == SocketState.OPEN) {
+-                            ((AprEndpoint)proto.endpoint).getPoller().add(socket.getSocket().longValue());
+-                        }
+-                    }
+-                }
+-            }
+-            return state;
+-        }
+-        
+         protected AjpAprProcessor createProcessor() {
+             AjpAprProcessor processor = new AjpAprProcessor(proto.packetSize, (AprEndpoint)proto.endpoint);
+             processor.setAdapter(proto.adapter);
+
+==================================================
+AprEndpoint.java
+index f7815a43da..c403978334 100644
+--- a/java/org/apache/coyote/http11/Http11AprProtocol.java
++++ b/java/org/apache/coyote/http11/Http11AprProtocol.java
+@@ -211,83 +211,57 @@ public class Http11AprProtocol extends AbstractHttp11Protocol {
+             recycledProcessors.clear();
+         }
+         
+-        @Override
+-        public SocketState event(SocketWrapper<Long> socket, SocketStatus status) {
+-            Http11AprProcessor processor = connections.get(socket.getSocket());
+-            
+-            SocketState state = SocketState.CLOSED; 
+-            if (processor != null) {
+-                if (processor.comet) {
+-                    // Call the appropriate event
+-                    try {
+-                        state = processor.event(status);
+-                    } catch (java.net.SocketException e) {
+-                        // SocketExceptions are normal
+-                        Http11AprProtocol.log.debug(sm.getString(
+-                                "http11protocol.proto.socketexception.debug"),
+-                                e);
+-                    } catch (java.io.IOException e) {
+-                        // IOExceptions are normal
+-                        Http11AprProtocol.log.debug(sm.getString(
+-                                "http11protocol.proto.ioexception.debug"), e);
+-                    }
+-                    // Future developers: if you discover any other
+-                    // rare-but-nonfatal exceptions, catch them here, and log as
+-                    // above.
+-                    catch (Throwable e) {
+-                        ExceptionUtils.handleThrowable(e);
+-                        // any other exception or error is odd. Here we log it
+-                        // with "ERROR" level, so it will show up even on
+-                        // less-than-verbose logs.
+-                        Http11AprProtocol.log.error(sm.getString(
+-                                "http11protocol.proto.error"), e);
+-                    } finally {
+-                        if (state != SocketState.LONG) {
+-                            connections.remove(socket.getSocket());
+-                            socket.setAsync(false);
+-                            processor.recycle();
+-                            recycledProcessors.offer(processor);
+-                            if (state == SocketState.OPEN) {
+-                                ((AprEndpoint)proto.endpoint).getPoller().add(socket.getSocket().longValue());
+-                            }
+-                        } else {
+-                            ((AprEndpoint)proto.endpoint).getCometPoller().add(socket.getSocket().longValue());
+-                        }
+-                    }
+-                } else if (processor.isAsync()) {
+-                    state = asyncDispatch(socket, status);
+-                }
+-            }
+-            return state;
+-        }
+-        
+         @Override
+         public SocketState process(SocketWrapper<Long> socket,
+                 SocketStatus status) {
+-            Http11AprProcessor processor = recycledProcessors.poll();
++            Http11AprProcessor processor =
++                connections.remove(socket.getSocket());
++            
++            socket.setAsync(false);
++
+             try {
++                if (processor == null) {
++                    processor = recycledProcessors.poll();
++                }
+                 if (processor == null) {
+                     processor = createProcessor();
+                 }
+ 
+-                SocketState state = processor.process(socket);
+-                if (state == SocketState.LONG) {
++                SocketState state = SocketState.CLOSED;
++                do {
++                    if (processor.isAsync() || state == SocketState.ASYNC_END) {
++                        state = processor.asyncDispatch(socket, status);
++                    } else if (processor.comet) {
++                        state = processor.event(status);
++                    } else {
++                        state = processor.process(socket);
++                    }
++
+                     if (processor.isAsync()) {
+-                        // Check if the post processing is going to change the state
+                         state = processor.asyncPostProcess();
+                     }
+-                }
+-                if (state == SocketState.LONG || state == SocketState.ASYNC_END) {
+-                    // Need to make socket available for next processing cycle
+-                    // but no need for the poller
++                } while (state == SocketState.ASYNC_END);
++
++                if (state == SocketState.LONG) {
++                    // In the middle of processing a request/response. Keep the
++                    // socket associated with the processor.
+                     connections.put(socket.getSocket(), processor);
++
+                     if (processor.isAsync()) {
+                         socket.setAsync(true);
+                     } else if (processor.comet) {
+                         ((AprEndpoint) proto.endpoint).getCometPoller().add(
+                                 socket.getSocket().longValue());
+                     }
++                } else if (state == SocketState.OPEN){
++                    // In keep-alive but between requests. OK to recycle
++                    // processor. Continue to poll for the next request.
++                    processor.recycle();
++                    recycledProcessors.offer(processor);
++                    ((AprEndpoint)proto.endpoint).getPoller().add(
++                            socket.getSocket().longValue());
+                 } else {
++                    // Connection closed. OK to recycle the processor.
+                     processor.recycle();
+                     recycledProcessors.offer(processor);
+                 }
+@@ -318,43 +292,6 @@ public class Http11AprProtocol extends AbstractHttp11Protocol {
+             return SocketState.CLOSED;
+         }
+ 
+-        @Override
+-        public SocketState asyncDispatch(SocketWrapper<Long> socket, SocketStatus status) {
+-            Http11AprProcessor processor = connections.get(socket.getSocket());
+-            
+-            SocketState state = SocketState.CLOSED; 
+-            if (processor != null) {
+-                // Call the appropriate event
+-                try {
+-                    state = processor.asyncDispatch(socket, status);
+-                // Future developers: if you discover any rare-but-nonfatal
+-                // exceptions, catch them here, and log as per {@link #event()}
+-                // above.
+-                } catch (Throwable e) {
+-                    ExceptionUtils.handleThrowable(e);
+-                    // any other exception or error is odd. Here we log it
+-                    // with "ERROR" level, so it will show up even on
+-                    // less-than-verbose logs.
+-                    Http11AprProtocol.log.error
+-                        (sm.getString("http11protocol.proto.error"), e);
+-                } finally {
+-                    if (state == SocketState.LONG && processor.isAsync()) {
+-                        state = processor.asyncPostProcess();
+-                    }
+-                    if (state != SocketState.LONG && state != SocketState.ASYNC_END) {
+-                        connections.remove(socket.getSocket());
+-                        socket.setAsync(false);
+-                        processor.recycle();
+-                        recycledProcessors.offer(processor);
+-                        if (state == SocketState.OPEN) {
+-                            ((AprEndpoint)proto.endpoint).getPoller().add(socket.getSocket().longValue());
+-                        }
+-                    }
+-                }
+-            }
+-            return state;
+-        }
+-
+         protected Http11AprProcessor createProcessor() {
+             Http11AprProcessor processor = new Http11AprProcessor(
+                     proto.getMaxHttpHeaderSize(), (AprEndpoint)proto.endpoint,
+
+==================================================

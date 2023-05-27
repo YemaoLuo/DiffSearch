@@ -1,0 +1,264 @@
+34bd7ef64c1a15df45f14afc90e61f67e469c819
+==================================================
+Fixed deadlock issue with thread pool
+==================================================
+Filip Hanik
+==================================================
+Wed Aug 9 14:44:50 2006 +0000
+==================================================
+Http11NioProcessor.java
+Fixed deadlock issue with thread pool
+Fixed error catches for a known JDK bug on windows #5076772 
+Added in the ability to have more than one poller, although performance actually gets worse
+Next steps: hand off setting socket options etc to the worker thread for faster acceptance of new socket
+
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/tc6.0.x/trunk@430064 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Http11NioProtocol.java
+index 61482b997e..96d94a2269 100644
+--- a/java/org/apache/coyote/http11/Http11NioProcessor.java
++++ b/java/org/apache/coyote/http11/Http11NioProcessor.java
+@@ -95,7 +95,6 @@ public class Http11NioProcessor implements ActionHook {
+             //readTimeout = -1;
+         }
+         inputBuffer = new InternalNioInputBuffer(request, headerBufferSize,readTimeout);
+-        inputBuffer.setPoller(endpoint.getPoller());
+         request.setInputBuffer(inputBuffer);
+ 
+         response = new Response();
+@@ -752,7 +751,7 @@ public class Http11NioProcessor implements ActionHook {
+             if (request.getAttribute("org.apache.tomcat.comet") == null) {
+                 comet = false;
+             }
+-            SelectionKey key = socket.getIOChannel().keyFor(endpoint.getPoller().getSelector());
++            SelectionKey key = socket.getIOChannel().keyFor(socket.getPoller().getSelector());
+             if ( key != null ) {
+                 NioEndpoint.KeyAttachment attach = (NioEndpoint.KeyAttachment) key.attachment();
+                 if ( attach!=null ) {
+@@ -778,10 +777,10 @@ public class Http11NioProcessor implements ActionHook {
+             return SocketState.CLOSED;
+         } else if (!comet) {
+             recycle();
+-            endpoint.getPoller().add(socket);
++            socket.getPoller().add(socket);
+             return SocketState.OPEN;
+         } else {
+-            endpoint.getCometPoller().add(socket);
++            socket.getPoller().add(socket);
+             return SocketState.LONG;
+         }
+     }
+@@ -809,7 +808,6 @@ public class Http11NioProcessor implements ActionHook {
+         this.socket = socket;
+         inputBuffer.setSocket(socket);
+         outputBuffer.setSocket(socket);
+-        outputBuffer.setSelector(endpoint.getPoller().getSelector());
+ 
+         // Error flag
+         error = false;
+@@ -841,7 +839,7 @@ public class Http11NioProcessor implements ActionHook {
+                     // and the method should return true
+                     openSocket = true;
+                     // Add the socket to the poller
+-                    endpoint.getPoller().add(socket);
++                    socket.getPoller().add(socket);
+                     break;
+                 }
+                 request.setStartTime(System.currentTimeMillis());
+@@ -897,7 +895,7 @@ public class Http11NioProcessor implements ActionHook {
+                     if (request.getAttribute("org.apache.tomcat.comet") != null) {
+                         comet = true;
+                     }
+-                    SelectionKey key = socket.getIOChannel().keyFor(endpoint.getPoller().getSelector());
++                    SelectionKey key = socket.getIOChannel().keyFor(socket.getPoller().getSelector());
+                     if (key != null) {
+                         NioEndpoint.KeyAttachment attach = (NioEndpoint.KeyAttachment) key.attachment();
+                         if (attach != null)  {
+@@ -1049,7 +1047,7 @@ public class Http11NioProcessor implements ActionHook {
+ 
+             comet = false;
+             cometClose = true;
+-            SelectionKey key = socket.getIOChannel().keyFor(endpoint.getPoller().getSelector());
++            SelectionKey key = socket.getIOChannel().keyFor(socket.getPoller().getSelector());
+             if ( key != null ) {
+                 NioEndpoint.KeyAttachment attach = (NioEndpoint.KeyAttachment) key.attachment();
+                 if ( attach!=null && attach.getComet()) {
+
+==================================================
+InternalNioInputBuffer.java
+index e5792b8e98..f485bbec80 100644
+--- a/java/org/apache/coyote/http11/Http11NioProtocol.java
++++ b/java/org/apache/coyote/http11/Http11NioProtocol.java
+@@ -223,6 +223,21 @@ public class Http11NioProtocol implements ProtocolHandler, MBeanRegistration
+ 
+     // -------------------- Pool setup --------------------
+ 
++    public void setPollerThreadCount(int count) {
++        ep.setPollerThreadCount(count);
++    }
++    
++    public int getPollerThreadCount() {
++        return ep.getPollerThreadCount();
++    }
++    
++    public void setSelectorTimeout(long timeout) {
++        ep.setSelectorTimeout(timeout);
++    }
++    
++    public long getSelectorTimeout() {
++        return ep.getSelectorTimeout();
++    }
+     // *
+     public Executor getExecutor() {
+         return ep.getExecutor();
+@@ -616,7 +631,7 @@ public class Http11NioProtocol implements ProtocolHandler, MBeanRegistration
+                     // processor.
+                     connections.put(socket, processor);
+                     localProcessor.set(null);
+-                    proto.ep.getCometPoller().add(socket);
++                    socket.getPoller().add(socket);
+                 }
+                 return state;
+ 
+
+==================================================
+InternalNioOutputBuffer.java
+index ada5fd11dd..4698b4b3b0 100644
+--- a/java/org/apache/coyote/http11/InternalNioInputBuffer.java
++++ b/java/org/apache/coyote/http11/InternalNioInputBuffer.java
+@@ -182,7 +182,6 @@ public class InternalNioInputBuffer implements InputBuffer {
+      * header.
+      */
+     protected long readTimeout;
+-    private Poller poller;
+ 
+     // ------------------------------------------------------------- Properties
+ 
+@@ -202,10 +201,6 @@ public class InternalNioInputBuffer implements InputBuffer {
+         return socket;
+     }
+ 
+-    public Poller getPoller() {
+-        return poller;
+-    }
+-
+     /**
+      * Add an input filter to the filter library.
+      */
+@@ -274,10 +269,6 @@ public class InternalNioInputBuffer implements InputBuffer {
+         this.swallowInput = swallowInput;
+     }
+ 
+-    public void setPoller(Poller poller) {
+-        this.poller = poller;
+-    }
+-
+     // --------------------------------------------------------- Public Methods
+ 
+ 
+@@ -564,7 +555,7 @@ public class InternalNioInputBuffer implements InputBuffer {
+                 timedOut = (readTimeout != -1) && ((System.currentTimeMillis()-start)>readTimeout);
+                 if ( !timedOut && nRead == 0 )  {
+                     try {
+-                        final SelectionKey key = socket.getIOChannel().keyFor(poller.getSelector());
++                        final SelectionKey key = socket.getIOChannel().keyFor(socket.getPoller().getSelector());
+                         final KeyAttachment att = (KeyAttachment)key.attachment();
+                         //to do, add in a check, we might have just timed out on the wait,
+                         //so there is no need to register us again.
+@@ -587,7 +578,7 @@ public class InternalNioInputBuffer implements InputBuffer {
+ 
+     private void addToReadQueue(final SelectionKey key, final KeyAttachment att) {
+         att.setWakeUp(true);
+-        poller.addEvent(
++        att.getPoller().addEvent(
+             new Runnable() {
+             public void run() {
+                 try {
+
+==================================================
+NioChannel.java
+index e6d50f1774..cbafdc16be 100644
+--- a/java/org/apache/coyote/http11/InternalNioOutputBuffer.java
++++ b/java/org/apache/coyote/http11/InternalNioOutputBuffer.java
+@@ -49,8 +49,7 @@ public class InternalNioOutputBuffer
+     // ----------------------------------------------------------- Constructors
+     int bbufLimit = 0;
+     
+-    Selector selector;
+-
++    
+     /**
+      * Default constructor.
+      */
+@@ -182,10 +181,6 @@ public class InternalNioOutputBuffer
+         this.socket = socket;
+     }
+ 
+-    public void setSelector(Selector selector) {
+-        this.selector = selector;
+-    }
+-
+     /**
+      * Get the underlying socket input stream.
+      */
+@@ -715,7 +710,7 @@ public class InternalNioOutputBuffer
+         throws IOException {
+ 
+         //prevent timeout for async,
+-        SelectionKey key = socket.getIOChannel().keyFor(selector);
++        SelectionKey key = socket.getIOChannel().keyFor(socket.getPoller().getSelector());
+         if (key != null) {
+             NioEndpoint.KeyAttachment attach = (NioEndpoint.KeyAttachment) key.attachment();
+             attach.access();
+
+==================================================
+NioEndpoint.java
+index 14ab5a60a7..93a9e649fc 100644
+--- a/java/org/apache/tomcat/util/net/NioChannel.java
++++ b/java/org/apache/tomcat/util/net/NioChannel.java
+@@ -20,7 +20,9 @@ import java.nio.ByteBuffer;
+ import java.nio.channels.ByteChannel;
+ import java.nio.channels.SocketChannel;
+ 
++import org.apache.tomcat.util.net.NioEndpoint.Poller;
+ import org.apache.tomcat.util.net.SecureNioChannel.ApplicationBufferHandler;
++
+ /**
+  * 
+  * Base class for a SocketChannel wrapper used by the endpoint.
+@@ -37,6 +39,8 @@ public class NioChannel implements ByteChannel{
+     protected SocketChannel sc = null;
+ 
+     protected ApplicationBufferHandler bufHandler;
++    
++    protected Poller poller;
+ 
+     public NioChannel(SocketChannel channel, ApplicationBufferHandler bufHandler) throws IOException {
+         this.sc = channel;
+@@ -112,6 +116,10 @@ public class NioChannel implements ByteChannel{
+         return bufHandler;
+     }
+ 
++    public Poller getPoller() {
++        return poller;
++    }
++
+     /**
+      * getIOChannel
+      *
+@@ -146,5 +154,8 @@ public class NioChannel implements ByteChannel{
+         return 0;
+     }
+ 
++    public void setPoller(Poller poller) {
++        this.poller = poller;
++    }
+ 
+ }
+\ No newline at end of file
+
+==================================================

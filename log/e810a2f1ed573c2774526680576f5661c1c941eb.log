@@ -1,0 +1,260 @@
+e810a2f1ed573c2774526680576f5661c1c941eb
+==================================================
+Complete the fix for https://bz.apache.org/bugzilla/show_bug.cgi?id=61601
+==================================================
+Mark Thomas
+==================================================
+Mon Oct 16 19:29:37 2017 +0000
+==================================================
+JarWarResourceSet.java
+Complete the fix for https://bz.apache.org/bugzilla/show_bug.cgi?id=61601
+Handle multi-release JARs for packed web applications
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1812315 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Jre9Compat.java
+index f21fe7509c..a0a426ce04 100644
+--- a/java/org/apache/catalina/webresources/JarWarResourceSet.java
++++ b/java/org/apache/catalina/webresources/JarWarResourceSet.java
+@@ -21,7 +21,9 @@ import java.io.IOException;
+ import java.io.InputStream;
+ import java.net.MalformedURLException;
+ import java.util.HashMap;
++import java.util.Iterator;
+ import java.util.Map;
++import java.util.Map.Entry;
+ import java.util.jar.JarEntry;
+ import java.util.jar.JarFile;
+ import java.util.jar.JarInputStream;
+@@ -31,6 +33,7 @@ import org.apache.catalina.LifecycleException;
+ import org.apache.catalina.WebResource;
+ import org.apache.catalina.WebResourceRoot;
+ import org.apache.tomcat.util.buf.UriUtil;
++import org.apache.tomcat.util.compat.JreCompat;
+ 
+ /**
+  * Represents a {@link org.apache.catalina.WebResourceSet} based on a JAR file
+@@ -101,6 +104,7 @@ public class JarWarResourceSet extends AbstractArchiveResourceSet {
+                 JarFile warFile = null;
+                 InputStream jarFileIs = null;
+                 archiveEntries = new HashMap<>();
++                boolean multiRelease = false;
+                 try {
+                     warFile = openJarFile();
+                     JarEntry jarFileInWar = warFile.getJarEntry(archivePath);
+@@ -112,7 +116,14 @@ public class JarWarResourceSet extends AbstractArchiveResourceSet {
+                             archiveEntries.put(entry.getName(), entry);
+                             entry = jarIs.getNextJarEntry();
+                         }
+-                        setManifest(jarIs.getManifest());
++                        Manifest m = jarIs.getManifest();
++                        setManifest(m);
++                        if (m != null && JreCompat.isJre9Available()) {
++                            String value = m.getMainAttributes().getValue("Multi-Release");
++                            if (value != null) {
++                                multiRelease = Boolean.parseBoolean(value);
++                            }
++                        }
+                         // Hack to work-around JarInputStream swallowing these
+                         // entries. TomcatJarInputStream is used above which
+                         // extends JarInputStream and the method that creates
+@@ -128,6 +139,9 @@ public class JarWarResourceSet extends AbstractArchiveResourceSet {
+                             archiveEntries.put(entry.getName(), entry);
+                         }
+                     }
++                    if (multiRelease) {
++                        processArchivesEntriesForMultiRelease();
++                    }
+                 } catch (IOException ioe) {
+                     // Should never happen
+                     archiveEntries = null;
+@@ -150,6 +164,56 @@ public class JarWarResourceSet extends AbstractArchiveResourceSet {
+     }
+ 
+ 
++    protected void processArchivesEntriesForMultiRelease() {
++
++        int targetVersion = JreCompat.getInstance().jarFileRuntimeMajorVersion();
++
++        Map<String,VersionedJarEntry> versionedEntries = new HashMap<>();
++        Iterator<Entry<String,JarEntry>> iter = archiveEntries.entrySet().iterator();
++        while (iter.hasNext()) {
++            Entry<String,JarEntry> entry = iter.next();
++            String name = entry.getKey();
++            if (name.startsWith("META-INF/versions/")) {
++                // Remove the multi-release version
++                iter.remove();
++
++                // Get the base name and version for this versioned entry
++                int i = name.indexOf('/', 18);
++                if (i > 0) {
++                    String baseName = name.substring(i + 1);
++                    int version = Integer.parseInt(name.substring(18, i));
++
++                    // Ignore any entries targeting for a later version than
++                    // the target for this runtime
++                    if (version <= targetVersion) {
++                        VersionedJarEntry versionedJarEntry = versionedEntries.get(baseName);
++                        if (versionedJarEntry == null) {
++                            // No versioned entry found for this name. Create
++                            // one.
++                            versionedEntries.put(baseName,
++                                    new VersionedJarEntry(version, entry.getValue()));
++                        } else {
++                            // Ignore any entry for which we have already found
++                            // a later version
++                            if (version > versionedJarEntry.getVersion()) {
++                                // Replace the entry targeted at an earlier
++                                // version
++                                versionedEntries.put(baseName,
++                                        new VersionedJarEntry(version, entry.getValue()));
++                            }
++                        }
++                    }
++                }
++            }
++        }
++
++        for (Entry<String,VersionedJarEntry> versionedJarEntry : versionedEntries.entrySet()) {
++            archiveEntries.put(versionedJarEntry.getKey(),
++                    versionedJarEntry.getValue().getJarEntry());
++        }
++    }
++
++
+     /**
+      * {@inheritDoc}
+      * <p>
+@@ -164,7 +228,8 @@ public class JarWarResourceSet extends AbstractArchiveResourceSet {
+ 
+     @Override
+     protected boolean isMultiRelease() {
+-        // TODO: multi-release support for packed WAR files
++        // This always returns false otherwise the superclass will call
++        // #getArchiveEntry(String)
+         return false;
+     }
+ 
+@@ -190,4 +255,25 @@ public class JarWarResourceSet extends AbstractArchiveResourceSet {
+             throw new IllegalArgumentException(e);
+         }
+     }
++
++
++    private static final class VersionedJarEntry {
++        private final int version;
++        private final JarEntry jarEntry;
++
++        public VersionedJarEntry(int version, JarEntry jarEntry) {
++            this.version = version;
++            this.jarEntry = jarEntry;
++        }
++
++
++        public int getVersion() {
++            return version;
++        }
++
++
++        public JarEntry getJarEntry() {
++            return jarEntry;
++        }
++    }
+ }
+
+==================================================
+JreCompat.java
+index 8c713e9a01..193ea5bf4d 100644
+--- a/java/org/apache/tomcat/util/compat/Jre9Compat.java
++++ b/java/org/apache/tomcat/util/compat/Jre9Compat.java
+@@ -57,6 +57,7 @@ class Jre9Compat extends JreCompat {
+     private static final Method isMultiReleaseMethod;
+ 
+     private static final Object RUNTIME_VERSION;
++    private static final int RUNTIME_MAJOR_VERSION;
+ 
+     static {
+         Class<?> c1 = null;
+@@ -73,6 +74,7 @@ class Jre9Compat extends JreCompat {
+         Constructor<JarFile> c12 = null;
+         Method m13 = null;
+         Object o14 = null;
++        Object o15 = null;
+ 
+         try {
+             Class<?> moduleLayerClazz = Class.forName("java.lang.ModuleLayer");
+@@ -81,7 +83,8 @@ class Jre9Compat extends JreCompat {
+             Class<?> moduleReferenceClazz = Class.forName("java.lang.module.ModuleReference");
+             Class<?> optionalClazz = Class.forName("java.util.Optional");
+             Class<?> versionClazz = Class.forName("java.lang.Runtime$Version");
+-            Method versionMethod = JarFile.class.getMethod("runtimeVersion");
++            Method runtimeVersionMethod = JarFile.class.getMethod("runtimeVersion");
++            Method majorMethod = versionClazz.getMethod("major");
+ 
+             c1 = Class.forName("java.lang.reflect.InaccessibleObjectException");
+             m2 = SSLParameters.class.getMethod("setApplicationProtocols", String[].class);
+@@ -96,7 +99,9 @@ class Jre9Compat extends JreCompat {
+             m11 = optionalClazz.getMethod("get");
+             c12 = JarFile.class.getConstructor(File.class, boolean.class, int.class, versionClazz);
+             m13 = JarFile.class.getMethod("isMultiRelease");
+-            o14 = versionMethod.invoke(null);
++            o14 = runtimeVersionMethod.invoke(null);
++            o15 = majorMethod.invoke(o14);
++
+         } catch (ClassNotFoundException e) {
+             // Must be Java 8
+         } catch (ReflectiveOperationException | IllegalArgumentException e) {
+@@ -118,6 +123,12 @@ class Jre9Compat extends JreCompat {
+         isMultiReleaseMethod = m13;
+ 
+         RUNTIME_VERSION = o14;
++        if (o15 != null) {
++            RUNTIME_MAJOR_VERSION = ((Integer) o15).intValue();
++        } else {
++            // Must be Java 8
++            RUNTIME_MAJOR_VERSION = 8;
++        }
+     }
+ 
+ 
+@@ -211,4 +222,10 @@ class Jre9Compat extends JreCompat {
+             return false;
+         }
+     }
++
++
++    @Override
++    public int jarFileRuntimeMajorVersion() {
++        return RUNTIME_MAJOR_VERSION;
++    }
+ }
+
+==================================================
+AbstractInputStreamJar.java
+index 97baa985a8..5e7fc68d3c 100644
+--- a/java/org/apache/tomcat/util/compat/JreCompat.java
++++ b/java/org/apache/tomcat/util/compat/JreCompat.java
+@@ -35,6 +35,8 @@ import org.apache.tomcat.util.res.StringManager;
+  */
+ public class JreCompat {
+ 
++    private static final int RUNTIME_MAJOR_VERSION = 8;
++
+     private static final JreCompat instance;
+     private static final boolean jre9Available;
+     private static final StringManager sm = StringManager.getManager(JreCompat.class);
+@@ -175,4 +177,9 @@ public class JreCompat {
+         // Java 8 doesn't support multi-release so default to false
+         return false;
+     }
++
++
++    public int jarFileRuntimeMajorVersion() {
++        return RUNTIME_MAJOR_VERSION;
++    }
+ }
+
+==================================================

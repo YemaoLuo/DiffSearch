@@ -1,0 +1,867 @@
+63f708ac1243fb91867da7345f73359cda742541
+==================================================
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=52028
+==================================================
+Mark Emlyn
+==================================================
+Mon Nov 28 23:16:42 2011 +0000
+==================================================
+Connector.java
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=52028
+Add support for automatic selection of a free port for a connector when the special value of zero is used
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1207692 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AbstractProtocol.java
+index 1581d15e9d..c9a0e367de 100644
+--- a/java/org/apache/catalina/connector/mbeans-descriptors.xml
++++ b/java/org/apache/catalina/connector/mbeans-descriptors.xml
+@@ -77,6 +77,10 @@
+           description="The number of seconds Tomcat will wait for a subsequent request before closing the connection"
+                  type="int"/>
+ 
++    <attribute   name="localPort"
++          description="The port number on which this connector is listening to requests. If the special value for port of zero is used then this method will report the actual port bound."
++                type="int"/>
++
+     <attribute   name="maxKeepAliveRequests"
+           description="Maximum number of Keep-Alive requests to honor per connection"
+                  type="int"/>
+@@ -108,7 +112,7 @@
+                  type="int"/>
+ 
+     <attribute   name="port"
+-          description="The port number on which we listen for requests"
++          description="The port number on which this connector is configured to listen for requests. The special value of 0 means select a random free port when the socket is bound."
+                 type="int"/>
+ 
+     <!-- Common -->
+
+==================================================
+AbstractEndpoint.java
+index 532cb08fae..97b133e3ec 100644
+--- a/java/org/apache/coyote/AbstractProtocol.java
++++ b/java/org/apache/coyote/AbstractProtocol.java
+@@ -47,6 +47,13 @@ public abstract class AbstractProtocol implements ProtocolHandler,
+         StringManager.getManager(Constants.Package);
+ 
+ 
++    /**
++     * Counter used to generate unique JMX names for connectors using automatic
++     * port binding.
++     */
++    private static final AtomicInteger nameCounter = new AtomicInteger(0);
++
++
+     /**
+      * Name of MBean for the Global Request Processor.
+      */
+@@ -59,6 +66,14 @@ public abstract class AbstractProtocol implements ProtocolHandler,
+     protected ObjectName tpOname = null;
+ 
+ 
++    /**
++     * Unique ID for this connector. Only used if the connector is configured
++     * to use a random port as the port will change if stop(), start() is
++     * called.
++     */
++    private int nameIndex = 0;
++
++
+     /**
+      * Endpoint that provides low-level network I/O - must be matched to the
+      * ProtocolHandler implementation (ProtocolHandler using BIO, requires BIO
+@@ -194,6 +209,8 @@ public abstract class AbstractProtocol implements ProtocolHandler,
+     }
+ 
+ 
++    public int getLocalPort() { return endpoint.getLocalPort(); }
++
+     /*
+      * When Tomcat expects data from the client, this is the time Tomcat will
+      * wait for that data to arrive before closing the connection.
+@@ -220,6 +237,15 @@ public abstract class AbstractProtocol implements ProtocolHandler,
+ 
+     // ---------------------------------------------------------- Public methods
+ 
++    public synchronized int getNameIndex() {
++        if (nameIndex == 0) {
++            nameIndex = nameCounter.incrementAndGet();
++        }
++
++        return nameIndex;
++    }
++
++
+     /**
+      * The name will be prefix-address-port if address is non-null and
+      * prefix-port if the address is null. The name will be appropriately quoted
+@@ -232,7 +258,13 @@ public abstract class AbstractProtocol implements ProtocolHandler,
+             name.append(getAddress());
+             name.append('-');
+         }
+-        name.append(endpoint.getPort());
++        int port = getLocalPort();
++        if (port > 0) {
++            name.append(port);
++        } else {
++            name.append("auto-");
++            name.append(getNameIndex());
++        }
+         return ObjectName.quote(name.toString());
+     }
+ 
+@@ -313,7 +345,13 @@ public abstract class AbstractProtocol implements ProtocolHandler,
+ 
+         StringBuilder name = new StringBuilder(getDomain());
+         name.append(":type=ProtocolHandler,port=");
+-        name.append(getPort());
++        int port = getPort();
++        if (port > 0) {
++            name.append(getPort());
++        } else {
++            name.append("auto-");
++            name.append(getNameIndex());
++        }
+         InetAddress address = getAddress();
+         if (address != null) {
+             name.append(",address=");
+@@ -322,6 +360,7 @@ public abstract class AbstractProtocol implements ProtocolHandler,
+         return new ObjectName(name.toString());
+     }
+ 
++
+     // ------------------------------------------------------- Lifecycle methods
+ 
+     /*
+
+==================================================
+AprEndpoint.java
+index 308202d2af..7c7a73be9f 100644
+--- a/java/org/apache/tomcat/util/net/AbstractEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AbstractEndpoint.java
+@@ -186,6 +186,7 @@ public abstract class AbstractEndpoint {
+     public int getPort() { return port; }
+     public void setPort(int port ) { this.port=port; }
+ 
++    public abstract int getLocalPort();
+ 
+     /**
+      * Address for the server socket.
+
+==================================================
+JIoEndpoint.java
+index 76cf4830f8..55ce515bda 100644
+--- a/java/org/apache/tomcat/util/net/AprEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AprEndpoint.java
+@@ -37,6 +37,7 @@ import org.apache.tomcat.jni.Pool;
+ import org.apache.tomcat.jni.SSL;
+ import org.apache.tomcat.jni.SSLContext;
+ import org.apache.tomcat.jni.SSLSocket;
++import org.apache.tomcat.jni.Sockaddr;
+ import org.apache.tomcat.jni.Socket;
+ import org.apache.tomcat.jni.Status;
+ import org.apache.tomcat.util.ExceptionUtils;
+@@ -316,8 +317,29 @@ public class AprEndpoint extends AbstractEndpoint {
+     public void setSSLInsecureRenegotiation(boolean SSLInsecureRenegotiation) { this.SSLInsecureRenegotiation = SSLInsecureRenegotiation; }
+     public boolean getSSLInsecureRenegotiation() { return SSLInsecureRenegotiation; }
+ 
+-    // --------------------------------------------------------- Public Methods
+ 
++    /**
++     * Port in use.
++     */
++    @Override
++    public int getLocalPort() {
++        long s = serverSock;
++        if (s == 0) {
++            return -1;
++        } else {
++            long sa;
++            try {
++                sa = Address.get(Socket.APR_LOCAL, s);
++                Sockaddr addr = Address.getInfo(sa);
++                return addr.port;
++            } catch (Exception e) {
++                return -1;
++            }
++        }
++    }
++
++
++    // --------------------------------------------------------- Public Methods
+ 
+     /**
+      * Number of keepalive sockets.
+
+==================================================
+NioEndpoint.java
+index 4d4e06b6d8..dd19919102 100644
+--- a/java/org/apache/tomcat/util/net/JIoEndpoint.java
++++ b/java/org/apache/tomcat/util/net/JIoEndpoint.java
+@@ -89,6 +89,18 @@ public class JIoEndpoint extends AbstractEndpoint {
+     public void setServerSocketFactory(ServerSocketFactory factory) { this.serverSocketFactory = factory; }
+     public ServerSocketFactory getServerSocketFactory() { return serverSocketFactory; }
+ 
++    /**
++     * Port in use.
++     */
++    @Override
++    public int getLocalPort() {
++        ServerSocket s = serverSocket;
++        if (s == null) {
++            return -1;
++        } else {
++            return s.getLocalPort();
++        }
++    }
+ 
+     /*
+      * Optional feature support.
+
+==================================================
+TestFormAuthenticator.java
+index 175813ff0a..b8537006d9 100644
+--- a/java/org/apache/tomcat/util/net/NioEndpoint.java
++++ b/java/org/apache/tomcat/util/net/NioEndpoint.java
+@@ -21,6 +21,7 @@ import java.io.File;
+ import java.io.FileInputStream;
+ import java.io.IOException;
+ import java.net.InetSocketAddress;
++import java.net.ServerSocket;
+ import java.net.Socket;
+ import java.net.SocketTimeoutException;
+ import java.nio.ByteBuffer;
+@@ -387,6 +388,26 @@ public class NioEndpoint extends AbstractEndpoint {
+     public SSLContext getSSLContext() { return sslContext;}
+     public void setSSLContext(SSLContext c) { sslContext = c;}
+ 
++
++    /**
++     * Port in use.
++     */
++    @Override
++    public int getLocalPort() {
++        ServerSocketChannel ssc = serverSock;
++        if (ssc == null) {
++            return -1;
++        } else {
++            ServerSocket s = ssc.socket();
++            if (s == null) {
++                return -1;
++            } else {
++                return s.getLocalPort();
++            }
++        }
++    }
++
++
+     // --------------------------------------------------------- OOM Parachute Methods
+ 
+     protected void checkParachute() {
+
+==================================================
+TestConnector.java
+index 12c220c16a..3f45623427 100644
+--- a/test/org/apache/catalina/authenticator/TestFormAuthenticator.java
++++ b/test/org/apache/catalina/authenticator/TestFormAuthenticator.java
+@@ -115,9 +115,10 @@ public class TestFormAuthenticator extends TomcatBaseTest {
+             realm.addUserRole("tomcat", "tomcat");
+             ctx.setRealm(realm);
+ 
+-            setPort(getPort());
+-
+             tomcat.start();
++
++            // Port only known after Tomcat starts
++            setPort(getPort());
+         }
+ 
+         private void doResourceRequest(String method) throws Exception {
+
+==================================================
+TestRequest.java
+index 87835fa448..0006ce3224 100644
+--- a/test/org/apache/catalina/connector/TestConnector.java
++++ b/test/org/apache/catalina/connector/TestConnector.java
+@@ -19,6 +19,7 @@ package org.apache.catalina.connector;
+ import java.net.SocketTimeoutException;
+ 
+ import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
+ 
+ import org.junit.Test;
+ 
+@@ -69,4 +70,26 @@ public class TestConnector extends TomcatBaseTest {
+         }
+         assertEquals(503, rc);
+     }
++
++
++    @Test
++    public void testPort() throws Exception {
++        Tomcat tomcat = getTomcatInstance();
++
++        Connector connector1 = tomcat.getConnector();
++        connector1.setPort(0);
++
++        Connector connector2 = new Connector();
++        connector2.setPort(0);
++
++        tomcat.getService().addConnector(connector2);
++
++        tomcat.start();
++
++        int localPort1 = connector1.getLocalPort();
++        int localPort2 = connector2.getLocalPort();
++
++        assertTrue(localPort1 > 0);
++        assertTrue(localPort2 > 0);
++    }
+ }
+
+==================================================
+TestStandardContext.java
+index 8326bd53af..d999b04d58 100644
+--- a/test/org/apache/catalina/connector/TestRequest.java
++++ b/test/org/apache/catalina/connector/TestRequest.java
+@@ -62,7 +62,6 @@ public class TestRequest extends TomcatBaseTest {
+     @Test
+     public void testBug37794() {
+         Bug37794Client client = new Bug37794Client(true);
+-        client.setPort(getPort());
+ 
+         // Edge cases around zero
+         client.doRequest(-1, false); // Unlimited
+@@ -111,7 +110,6 @@ public class TestRequest extends TomcatBaseTest {
+     @Test
+     public void testBug37794withoutFilter() {
+         Bug37794Client client = new Bug37794Client(false);
+-        client.setPort(getPort());
+ 
+         // Edge cases around actual content length
+         client.reset();
+@@ -180,6 +178,8 @@ public class TestRequest extends TomcatBaseTest {
+ 
+             tomcat.start();
+ 
++            setPort(tomcat.getConnector().getLocalPort());
++
+             init = true;
+         }
+ 
+@@ -391,7 +391,6 @@ public class TestRequest extends TomcatBaseTest {
+     @Test
+     public void testBug48692() {
+         Bug48692Client client = new Bug48692Client();
+-        client.setPort(getPort());
+ 
+         // Make sure GET works properly
+         client.doRequest("GET", "foo=bar", null, null, false);
+@@ -518,6 +517,8 @@ public class TestRequest extends TomcatBaseTest {
+             root.addServletMapping("/echo", "EchoParameters");
+             tomcat.start();
+ 
++            setPort(tomcat.getConnector().getLocalPort());
++
+             init = true;
+         }
+ 
+
+==================================================
+TestSwallowAbortedUploads.java
+index 4775f72de7..d2bcbd3dea 100644
+--- a/test/org/apache/catalina/core/TestStandardContext.java
++++ b/test/org/apache/catalina/core/TestStandardContext.java
+@@ -97,11 +97,12 @@ public class TestStandardContext extends TomcatBaseTest {
+         Tomcat.addServlet(root, "Bug46243", new HelloWorldServlet());
+         root.addServletMapping("/", "Bug46243");
+ 
++
+         tomcat.start();
+ 
+         // Configure the client
+-        Bug46243Client client = new Bug46243Client();
+-        client.setPort(getPort());
++        Bug46243Client client =
++                new Bug46243Client(tomcat.getConnector().getLocalPort());
+         client.setRequest(new String[] { REQUEST });
+ 
+         client.connect();
+@@ -110,6 +111,11 @@ public class TestStandardContext extends TomcatBaseTest {
+     }
+ 
+     private static final class Bug46243Client extends SimpleHttpClient {
++
++        public Bug46243Client(int port) {
++            setPort(port);
++        }
++
+         @Override
+         public boolean isResponseBodyOK() {
+             // Don't care about the body in this test
+@@ -442,7 +448,6 @@ public class TestStandardContext extends TomcatBaseTest {
+     @Test
+     public void testBug49711() {
+         Bug49711Client client = new Bug49711Client();
+-        client.setPort(getPort());
+ 
+         // Make sure non-multipart works properly
+         client.doRequest("/regular", false, false);
+@@ -531,6 +536,8 @@ public class TestStandardContext extends TomcatBaseTest {
+             context.addServletMapping("/multipart", "multipart");
+             tomcat.start();
+ 
++            setPort(tomcat.getConnector().getLocalPort());
++
+             init = true;
+         }
+ 
+
+==================================================
+TestExpiresFilter.java
+index 6a323ad1a5..de83c83930 100644
+--- a/test/org/apache/catalina/core/TestSwallowAbortedUploads.java
++++ b/test/org/apache/catalina/core/TestSwallowAbortedUploads.java
+@@ -51,7 +51,6 @@ public class TestSwallowAbortedUploads extends TomcatBaseTest {
+      */
+     public Exception doAbortedUploadTest(AbortedUploadClient client, boolean limited,
+                             boolean swallow) {
+-        client.setPort(getPort());
+         Exception ex = client.doRequest(limited, swallow);
+         if (log.isDebugEnabled()) {
+             log.debug("Response line: " + client.getResponseLine());
+@@ -70,7 +69,6 @@ public class TestSwallowAbortedUploads extends TomcatBaseTest {
+      */
+     public Exception doAbortedPOSTTest(AbortedPOSTClient client, int status,
+                             boolean swallow) {
+-        client.setPort(getPort());
+         Exception ex = client.doRequest(status, swallow);
+         if (log.isDebugEnabled()) {
+             log.debug("Response line: " + client.getResponseLine());
+@@ -254,6 +252,7 @@ public class TestSwallowAbortedUploads extends TomcatBaseTest {
+             context.setSwallowAbortedUploads(swallow);
+ 
+             tomcat.start();
++            setPort(tomcat.getConnector().getLocalPort());
+ 
+             init = true;
+         }
+@@ -367,6 +366,8 @@ public class TestSwallowAbortedUploads extends TomcatBaseTest {
+ 
+             tomcat.start();
+ 
++            setPort(tomcat.getConnector().getLocalPort());
++
+             init = true;
+         }
+ 
+
+==================================================
+TestRemoteIpFilter.java
+index 38f3e45774..b26065bbb4 100644
+--- a/test/org/apache/catalina/filters/TestExpiresFilter.java
++++ b/test/org/apache/catalina/filters/TestExpiresFilter.java
+@@ -432,7 +432,7 @@ public class TestExpiresFilter extends TomcatBaseTest {
+ 
+             // TEST
+             HttpURLConnection httpURLConnection = (HttpURLConnection) new URL(
+-                    "http://localhost:" + tomcat.getConnector().getPort() +
++                    "http://localhost:" + tomcat.getConnector().getLocalPort() +
+                             "/test").openConnection();
+ 
+             // VALIDATE
+
+==================================================
+TestRegistration.java
+index c8e95d13a6..2853fab6bb 100644
+--- a/test/org/apache/catalina/filters/TestRemoteIpFilter.java
++++ b/test/org/apache/catalina/filters/TestRemoteIpFilter.java
+@@ -537,8 +537,9 @@ public class TestRemoteIpFilter extends TomcatBaseTest {
+         getTomcatInstance().start();
+ 
+         // TEST
+-        HttpURLConnection httpURLConnection = (HttpURLConnection) new URL("http://localhost:" + tomcat.getConnector().getPort() + "/test")
+-                .openConnection();
++        HttpURLConnection httpURLConnection = (HttpURLConnection) new URL(
++                "http://localhost:" + tomcat.getConnector().getLocalPort() +
++                "/test").openConnection();
+         String expectedRemoteAddr = "my-remote-addr";
+         httpURLConnection.addRequestProperty("x-forwarded-for", expectedRemoteAddr);
+         httpURLConnection.addRequestProperty("x-forwarded-proto", "https");
+
+==================================================
+TestDefaultServlet.java
+index 394b7f56e9..f5ddaa47ef 100644
+--- a/test/org/apache/catalina/mbeans/TestRegistration.java
++++ b/test/org/apache/catalina/mbeans/TestRegistration.java
+@@ -147,7 +147,7 @@ public class TestRegistration extends TomcatBaseTest {
+         ArrayList<String> expected = new ArrayList<String>(Arrays.asList(basicMBeanNames()));
+         expected.addAll(Arrays.asList(hostMBeanNames("localhost")));
+         expected.addAll(Arrays.asList(contextMBeanNames("localhost", contextName)));
+-        expected.addAll(Arrays.asList(connectorMBeanNames(Integer.toString(getPort()), protocol)));
++        expected.addAll(Arrays.asList(connectorMBeanNames("auto-1", protocol)));
+         expected.addAll(Arrays.asList(optionalMBeanNames("localhost")));
+ 
+         // Did we find all expected MBeans?
+
+==================================================
+SimpleHttpClient.java
+index 8548ae7872..225100c6f4 100644
+--- a/test/org/apache/catalina/servlets/TestDefaultServlet.java
++++ b/test/org/apache/catalina/servlets/TestDefaultServlet.java
+@@ -198,8 +198,8 @@ public class TestDefaultServlet extends TomcatBaseTest {
+         tomcat.addWebapp(null, contextPath, appDir.getAbsolutePath());
+         tomcat.start();
+ 
+-        TestCustomErrorClient client = new TestCustomErrorClient();
+-        client.setPort(getPort());
++        TestCustomErrorClient client =
++                new TestCustomErrorClient(tomcat.getConnector().getLocalPort());
+ 
+         client.reset();
+         client.setRequest(new String[] {
+@@ -276,8 +276,8 @@ public class TestDefaultServlet extends TomcatBaseTest {
+         tomcat.addWebapp(null, contextPath, appDir.getAbsolutePath());
+         tomcat.start();
+ 
+-        TestCustomErrorClient client = new TestCustomErrorClient();
+-        client.setPort(getPort());
++        TestCustomErrorClient client =
++                new TestCustomErrorClient(tomcat.getConnector().getLocalPort());
+ 
+         client.reset();
+         client.setRequest(new String[] {
+@@ -294,6 +294,11 @@ public class TestDefaultServlet extends TomcatBaseTest {
+     }
+ 
+     private static class TestCustomErrorClient extends SimpleHttpClient {
++
++        public TestCustomErrorClient(int port) {
++            setPort(port);
++        }
++
+         @Override
+         public boolean isResponseBodyOK() {
+             return true;
+
+==================================================
+TomcatBaseTest.java
+index 765e9e32c0..5a48b7ee43 100644
+--- a/test/org/apache/catalina/startup/SimpleHttpClient.java
++++ b/test/org/apache/catalina/startup/SimpleHttpClient.java
+@@ -70,7 +70,7 @@ public abstract class SimpleHttpClient {
+     private String responseBody;
+     private boolean useContentLength;
+ 
+-    public void setPort(int thePort) {
++    protected void setPort(int thePort) {
+         port = thePort;
+     }
+ 
+
+==================================================
+TestAbstractHttp11Processor.java
+index 780455c892..e9d209f013 100644
+--- a/test/org/apache/catalina/startup/TomcatBaseTest.java
++++ b/test/org/apache/catalina/startup/TomcatBaseTest.java
+@@ -56,7 +56,6 @@ import org.apache.tomcat.util.buf.ByteChunk;
+ public abstract class TomcatBaseTest extends LoggingBaseTest {
+     private Tomcat tomcat;
+     private boolean accessLogEnabled = false;
+-    private static int port = 8000;
+ 
+     public static final String TEMP_DIR = System.getProperty("java.io.tmpdir");
+ 
+@@ -71,15 +70,7 @@ public abstract class TomcatBaseTest extends LoggingBaseTest {
+      * Sub-classes need to know port so they can connect
+      */
+     public int getPort() {
+-        return port;
+-    }
+-
+-    /**
+-     * Sub-classes may want to add connectors on a new port
+-     */
+-    public int getNextPort() {
+-        port++;
+-        return getPort();
++        return tomcat.getConnector().getLocalPort();
+     }
+ 
+     /**
+@@ -106,9 +97,8 @@ public abstract class TomcatBaseTest extends LoggingBaseTest {
+ 
+         String protocol = getProtocol();
+         Connector connector = new Connector(protocol);
+-        // If each test is running on same port - they
+-        // may interfere with each other
+-        connector.setPort(getNextPort());
++        // Use random free port
++        connector.setPort(0);
+         // Mainly set to reduce timeouts during async tests
+         connector.setAttribute("connectionTimeout", "3000");
+         tomcat.getService().addConnector(connector);
+
+==================================================
+TestInternalInputBuffer.java
+index 4b2adb4ef8..6b5495c162 100644
+--- a/test/org/apache/coyote/http11/TestAbstractHttp11Processor.java
++++ b/test/org/apache/coyote/http11/TestAbstractHttp11Processor.java
+@@ -53,8 +53,7 @@ public class TestAbstractHttp11Processor extends TomcatBaseTest {
+             SimpleHttpClient.CRLF +
+             "test=data";
+ 
+-        Client client = new Client();
+-        client.setPort(getPort());
++        Client client = new Client(tomcat.getConnector().getLocalPort());
+         client.setRequest(new String[] {request});
+ 
+         client.connect();
+@@ -82,8 +81,7 @@ public class TestAbstractHttp11Processor extends TomcatBaseTest {
+             SimpleHttpClient.CRLF +
+             "test=data";
+ 
+-        Client client = new Client();
+-        client.setPort(getPort());
++        Client client = new Client(tomcat.getConnector().getLocalPort());
+         client.setRequest(new String[] {request});
+ 
+         client.connect();
+@@ -113,8 +111,7 @@ public class TestAbstractHttp11Processor extends TomcatBaseTest {
+             SimpleHttpClient.CRLF +
+             "test=data";
+ 
+-        Client client = new Client();
+-        client.setPort(getPort());
++        Client client = new Client(tomcat.getConnector().getLocalPort());
+         client.setRequest(new String[] {request});
+ 
+         client.connect();
+@@ -144,8 +141,7 @@ public class TestAbstractHttp11Processor extends TomcatBaseTest {
+             SimpleHttpClient.CRLF +
+             "test=data";
+ 
+-        Client client = new Client();
+-        client.setPort(getPort());
++        Client client = new Client(tomcat.getConnector().getLocalPort());
+         client.setRequest(new String[] {request});
+ 
+         client.connect();
+@@ -174,8 +170,7 @@ public class TestAbstractHttp11Processor extends TomcatBaseTest {
+             SimpleHttpClient.CRLF +
+             "test=data";
+ 
+-        Client client = new Client();
+-        client.setPort(getPort());
++        Client client = new Client(tomcat.getConnector().getLocalPort());
+         client.setRequest(new String[] {request});
+ 
+         client.connect();
+@@ -204,8 +199,7 @@ public class TestAbstractHttp11Processor extends TomcatBaseTest {
+             "Host: any" + SimpleHttpClient.CRLF +
+             SimpleHttpClient.CRLF;
+ 
+-        final Client client = new Client();
+-        client.setPort(getPort());
++        final Client client = new Client(tomcat.getConnector().getLocalPort());
+         client.setRequest(new String[] {requestPart1, requestPart2});
+         client.setRequestPause(1000);
+         client.setUseContentLength(true);
+@@ -246,6 +240,11 @@ public class TestAbstractHttp11Processor extends TomcatBaseTest {
+     }
+ 
+     private static final class Client extends SimpleHttpClient {
++
++        public Client(int port) {
++            setPort(port);
++        }
++
+         @Override
+         public boolean isResponseBodyOK() {
+             return getResponseBody().contains("test - data");
+
+==================================================
+TestChunkedInputFilter.java
+index bddb98e942..b3d4766fd0 100644
+--- a/test/org/apache/coyote/http11/TestInternalInputBuffer.java
++++ b/test/org/apache/coyote/http11/TestInternalInputBuffer.java
+@@ -45,7 +45,6 @@ public class TestInternalInputBuffer extends TomcatBaseTest {
+     public void testBug48839() {
+ 
+         Bug48839Client client = new Bug48839Client();
+-        client.setPort(getPort());
+ 
+         client.doRequest();
+         assertTrue(client.isResponse200());
+@@ -68,6 +67,7 @@ public class TestInternalInputBuffer extends TomcatBaseTest {
+ 
+             try {
+                 tomcat.start();
++                setPort(tomcat.getConnector().getLocalPort());
+ 
+                 // Open connection
+                 connect();
+@@ -131,7 +131,6 @@ public class TestInternalInputBuffer extends TomcatBaseTest {
+     public void testBug51557NoColon() {
+ 
+         Bug51557Client client = new Bug51557Client("X-Bug51557NoColon");
+-        client.setPort(getPort());
+ 
+         client.doRequest();
+         assertTrue(client.isResponse200());
+@@ -170,7 +169,6 @@ public class TestInternalInputBuffer extends TomcatBaseTest {
+ 
+         Bug51557Client client = new Bug51557Client("X-Bug=51557NoColon",
+                 "foo" + SimpleHttpClient.CRLF + " bar");
+-        client.setPort(getPort());
+ 
+         client.doRequest();
+         assertTrue(client.isResponse200());
+@@ -184,7 +182,6 @@ public class TestInternalInputBuffer extends TomcatBaseTest {
+ 
+         Bug51557Client client = new Bug51557Client("=X-Bug51557",
+                 "invalid");
+-        client.setPort(getPort());
+ 
+         client.doRequest();
+         assertTrue(client.isResponse200());
+@@ -198,7 +195,6 @@ public class TestInternalInputBuffer extends TomcatBaseTest {
+ 
+         Bug51557Client client = new Bug51557Client("X-Bug51557=",
+                 "invalid");
+-        client.setPort(getPort());
+ 
+         client.doRequest();
+         assertTrue(client.isResponse200());
+@@ -211,7 +207,6 @@ public class TestInternalInputBuffer extends TomcatBaseTest {
+         Bug51557Client client =
+             new Bug51557Client("X-Bug" + s + "51557", "invalid");
+ 
+-        client.setPort(getPort());
+         client.doRequest();
+         assertTrue(client.isResponse200());
+         assertEquals("abcd", client.getResponseBody());
+@@ -247,6 +242,7 @@ public class TestInternalInputBuffer extends TomcatBaseTest {
+ 
+             try {
+                 tomcat.start();
++                setPort(tomcat.getConnector().getLocalPort());
+ 
+                 // Open connection
+                 connect();
+
+==================================================
+TestCookiesAllowEquals.java
+index f58f05dce9..a57182ed30 100644
+--- a/test/org/apache/coyote/http11/filters/TestChunkedInputFilter.java
++++ b/test/org/apache/coyote/http11/filters/TestChunkedInputFilter.java
+@@ -68,8 +68,8 @@ public class TestChunkedInputFilter extends TomcatBaseTest {
+             "x-trailer: Test", "TestTest0123456789abcdefghijABCDEFGHIJopqrstuvwxyz" + SimpleHttpClient.CRLF +
+             SimpleHttpClient.CRLF };
+ 
+-        TrailerClient client = new TrailerClient();
+-        client.setPort(getPort());
++        TrailerClient client =
++                new TrailerClient(tomcat.getConnector().getLocalPort());
+         client.setRequest(request);
+ 
+         client.connect();
+@@ -109,8 +109,8 @@ public class TestChunkedInputFilter extends TomcatBaseTest {
+             "x-trailer: Test" + SimpleHttpClient.CRLF +
+             SimpleHttpClient.CRLF };
+ 
+-        TrailerClient client = new TrailerClient();
+-        client.setPort(getPort());
++        TrailerClient client =
++                new TrailerClient(tomcat.getConnector().getLocalPort());
+         client.setRequest(request);
+ 
+         client.connect();
+@@ -149,8 +149,8 @@ public class TestChunkedInputFilter extends TomcatBaseTest {
+             "0" + SimpleHttpClient.CRLF +
+             SimpleHttpClient.CRLF;
+ 
+-        TrailerClient client = new TrailerClient();
+-        client.setPort(getPort());
++        TrailerClient client =
++                new TrailerClient(tomcat.getConnector().getLocalPort());
+         client.setRequest(new String[] {request});
+ 
+         client.connect();
+@@ -193,6 +193,10 @@ public class TestChunkedInputFilter extends TomcatBaseTest {
+ 
+     private static class TrailerClient extends SimpleHttpClient {
+ 
++        public TrailerClient(int port) {
++            setPort(port);
++        }
++
+         @Override
+         public boolean isResponseBodyOK() {
+             return getResponseBody().contains("TestTestTest");
+
+==================================================
+TestCookiesAllowHttpSeps.java
+index 494585f883..af11e04210 100644
+--- a/test/org/apache/tomcat/util/http/TestCookiesAllowEquals.java
++++ b/test/org/apache/tomcat/util/http/TestCookiesAllowEquals.java
+@@ -60,7 +60,7 @@ public class TestCookiesAllowEquals extends TomcatBaseTest {
+ 
+             tomcat.start();
+             // Open connection
+-            setPort(tomcat.getConnector().getPort());
++            setPort(tomcat.getConnector().getLocalPort());
+             connect();
+ 
+             String[] request = new String[1];
+
+==================================================
+TestCookiesAllowNameOnly.java
+index 00b5133f5a..6543e6a531 100644
+--- a/test/org/apache/tomcat/util/http/TestCookiesAllowHttpSeps.java
++++ b/test/org/apache/tomcat/util/http/TestCookiesAllowHttpSeps.java
+@@ -58,7 +58,7 @@ public class TestCookiesAllowHttpSeps extends TomcatBaseTest {
+ 
+             tomcat.start();
+             // Open connection
+-            setPort(tomcat.getConnector().getPort());
++            setPort(tomcat.getConnector().getLocalPort());
+             connect();
+ 
+             String[] request = new String[1];
+
+==================================================
+TestCookiesDisallowEquals.java
+index ebc6477c31..079a643811 100644
+--- a/test/org/apache/tomcat/util/http/TestCookiesAllowNameOnly.java
++++ b/test/org/apache/tomcat/util/http/TestCookiesAllowNameOnly.java
+@@ -59,7 +59,7 @@ public class TestCookiesAllowNameOnly extends TomcatBaseTest {
+ 
+             tomcat.start();
+             // Open connection
+-            setPort(tomcat.getConnector().getPort());
++            setPort(tomcat.getConnector().getLocalPort());
+             connect();
+ 
+             String[] request = new String[1];
+
+==================================================
+TestXxxEndpoint.java
+index d11b128da1..7e26aa9b40 100644
+--- a/test/org/apache/tomcat/util/http/TestCookiesDisallowEquals.java
++++ b/test/org/apache/tomcat/util/http/TestCookiesDisallowEquals.java
+@@ -55,7 +55,7 @@ public class TestCookiesDisallowEquals extends TomcatBaseTest {
+ 
+             tomcat.start();
+             // Open connection
+-            setPort(tomcat.getConnector().getPort());
++            setPort(tomcat.getConnector().getLocalPort());
+             connect();
+ 
+             String[] request = new String[1];
+
+==================================================

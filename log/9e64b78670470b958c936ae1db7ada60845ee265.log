@@ -1,0 +1,238 @@
+9e64b78670470b958c936ae1db7ada60845ee265
+==================================================
+Additional fixes for output corruption of response bodies when writing large bodies using asynchronous processing over HTTP/2.
+==================================================
+Mark Thomas
+==================================================
+Fri Aug 17 19:16:56 2018 +0000
+==================================================
+Http2AsyncUpgradeHandler.java
+Additional fixes for output corruption of response bodies when writing large bodies using asynchronous processing over HTTP/2.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1838275 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Http2UpgradeHandler.java
+index ba49986b5b..2ab57910a7 100644
+--- a/java/org/apache/coyote/http2/Http2AsyncUpgradeHandler.java
++++ b/java/org/apache/coyote/http2/Http2AsyncUpgradeHandler.java
+@@ -280,7 +280,7 @@ public class Http2AsyncUpgradeHandler extends Http2UpgradeHandler {
+                 // Reserve as much as possible right away
+                 int reservation = (sendfile.end - sendfile.pos > Integer.MAX_VALUE) ? Integer.MAX_VALUE : (int) (sendfile.end - sendfile.pos);
+                 sendfile.streamReservation  = sendfile.stream.reserveWindowSize(reservation, true);
+-                sendfile.connectionReservation = reserveWindowSize(sendfile.stream, sendfile.streamReservation);
++                sendfile.connectionReservation = reserveWindowSize(sendfile.stream, sendfile.streamReservation, true);
+             } catch (IOException e) {
+                 return SendfileState.ERROR;
+             }
+@@ -340,7 +340,7 @@ public class Http2AsyncUpgradeHandler extends Http2UpgradeHandler {
+                         int reservation = (sendfile.end - sendfile.pos > Integer.MAX_VALUE) ? Integer.MAX_VALUE : (int) (sendfile.end - sendfile.pos);
+                         sendfile.streamReservation = sendfile.stream.reserveWindowSize(reservation, true);
+                     }
+-                    sendfile.connectionReservation = reserveWindowSize(sendfile.stream, sendfile.streamReservation);
++                    sendfile.connectionReservation = reserveWindowSize(sendfile.stream, sendfile.streamReservation, true);
+                 }
+             } catch (IOException e) {
+                 failed (e, sendfile);
+
+==================================================
+Stream.java
+index a7b507899e..0041fbc1c7 100644
+--- a/java/org/apache/coyote/http2/Http2UpgradeHandler.java
++++ b/java/org/apache/coyote/http2/Http2UpgradeHandler.java
+@@ -723,7 +723,7 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
+     }
+ 
+ 
+-    int reserveWindowSize(Stream stream, int reservation) throws IOException {
++    int reserveWindowSize(Stream stream, int reservation, boolean block) throws IOException {
+         // Need to be holding the stream lock so releaseBacklog() can't notify
+         // this thread until after this thread enters wait()
+         int allocation = 0;
+@@ -775,12 +775,16 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
+                     }
+                 }
+                 if (allocation == 0) {
+-                    try {
+-                        stream.wait();
+-                    } catch (InterruptedException e) {
+-                        throw new IOException(sm.getString(
+-                                "upgradeHandler.windowSizeReservationInterrupted", connectionId,
+-                                stream.getIdentifier(), Integer.toString(reservation)), e);
++                    if (block) {
++                        try {
++                            stream.wait();
++                        } catch (InterruptedException e) {
++                            throw new IOException(sm.getString(
++                                    "upgradeHandler.windowSizeReservationInterrupted", connectionId,
++                                    stream.getIdentifier(), Integer.toString(reservation)), e);
++                        }
++                    } else {
++                        return 0;
+                     }
+                 }
+             } while (allocation == 0);
+
+==================================================
+Http2TestBase.java
+index de5c46580b..86d49f2543 100644
+--- a/java/org/apache/coyote/http2/Stream.java
++++ b/java/org/apache/coyote/http2/Stream.java
+@@ -718,6 +718,7 @@ class Stream extends AbstractStream implements HeaderEmitter {
+         private final ByteBuffer buffer = ByteBuffer.allocate(8 * 1024);
+         private final WriteBuffer writeBuffer = new WriteBuffer(32 * 1024);
+         private volatile long written = 0;
++        private volatile int streamReservation = 0;
+         private volatile boolean closed = false;
+         private volatile boolean endOfStreamSent = false;
+ 
+@@ -732,25 +733,31 @@ class Stream extends AbstractStream implements HeaderEmitter {
+                 throw new IllegalStateException(
+                         sm.getString("stream.closed", getConnectionId(), getIdentifier()));
+             }
+-            int chunkLimit = chunk.limit();
+-            int offset = 0;
+-            while (chunk.remaining() > 0) {
+-                int thisTime = Math.min(buffer.remaining(), chunk.remaining());
+-                chunk.limit(chunk.position() + thisTime);
+-                buffer.put(chunk);
+-                chunk.limit(chunkLimit);
+-                offset += thisTime;
+-                if (chunk.remaining() > 0 && !buffer.hasRemaining()) {
+-                    // Only flush if we have more data to write and the buffer
+-                    // is full
+-                    if (flush(true, coyoteResponse.getWriteListener() == null)) {
+-                        writeBuffer.add(chunk);
+-                        break;
++            int totalThisTime = 0;
++            if (writeBuffer.isEmpty()) {
++                int chunkLimit = chunk.limit();
++                while (chunk.remaining() > 0) {
++                    int thisTime = Math.min(buffer.remaining(), chunk.remaining());
++                    chunk.limit(chunk.position() + thisTime);
++                    buffer.put(chunk);
++                    chunk.limit(chunkLimit);
++                    totalThisTime += thisTime;
++                    if (chunk.remaining() > 0 && !buffer.hasRemaining()) {
++                        // Only flush if we have more data to write and the buffer
++                        // is full
++                        if (flush(true, coyoteResponse.getWriteListener() == null)) {
++                            totalThisTime += chunk.remaining();
++                            writeBuffer.add(chunk);
++                            break;
++                        }
+                     }
+                 }
++            } else {
++                totalThisTime = chunk.remaining();
++                writeBuffer.add(chunk);
+             }
+-            written += offset;
+-            return offset;
++            written += totalThisTime;
++            return totalThisTime;
+         }
+ 
+         final synchronized boolean flush(boolean block) throws IOException {
+@@ -803,15 +810,22 @@ class Stream extends AbstractStream implements HeaderEmitter {
+             buffer.flip();
+             int left = buffer.remaining();
+             while (left > 0) {
+-                int streamReservation  = reserveWindowSize(left, block);
+                 if (streamReservation == 0) {
+-                    // Must be non-blocking
+-                    buffer.compact();
+-                    return true;
++                    streamReservation  = reserveWindowSize(left, block);
++                    if (streamReservation == 0) {
++                        // Must be non-blocking
++                        buffer.compact();
++                        return true;
++                    }
+                 }
+                 while (streamReservation > 0) {
+                     int connectionReservation =
+-                                handler.reserveWindowSize(Stream.this, streamReservation);
++                                handler.reserveWindowSize(Stream.this, streamReservation, block);
++                    if (connectionReservation == 0) {
++                        // Must be non-blocking
++                        buffer.compact();
++                        return true;
++                    }
+                     // Do the write
+                     handler.writeBody(Stream.this, buffer, connectionReservation,
+                             !writeInProgress && closed && left == connectionReservation &&
+@@ -858,16 +872,14 @@ class Stream extends AbstractStream implements HeaderEmitter {
+         }
+ 
+         @Override
+-        public boolean writeFromBuffer(ByteBuffer src, boolean blocking) throws IOException {
++        public synchronized boolean writeFromBuffer(ByteBuffer src, boolean blocking) throws IOException {
+             int chunkLimit = src.limit();
+-            int offset = 0;
+             while (src.remaining() > 0) {
+                 int thisTime = Math.min(buffer.remaining(), src.remaining());
+                 src.limit(src.position() + thisTime);
+                 buffer.put(src);
+                 src.limit(chunkLimit);
+-                written += offset;
+-                if (flush(true, blocking)) {
++                if (flush(false, blocking)) {
+                     return true;
+                 }
+             }
+
+==================================================
+TestAsync.java
+index 3fc3db9658..93ec070bb7 100644
+--- a/test/org/apache/coyote/http2/Http2TestBase.java
++++ b/test/org/apache/coyote/http2/Http2TestBase.java
+@@ -890,6 +890,7 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+         private ConnectionSettingsRemote remoteSettings = new ConnectionSettingsRemote("-1");
+         private boolean traceBody = false;
+         private ByteBuffer bodyBuffer = null;
++        private long bytesRead;
+ 
+         public void setTraceBody(boolean traceBody) {
+             this.traceBody = traceBody;
+@@ -905,6 +906,7 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+         @Override
+         public ByteBuffer startRequestBodyFrame(int streamId, int payloadSize) {
+             lastStreamId = Integer.toString(streamId);
++            bytesRead += payloadSize;
+             if (traceBody) {
+                 bodyBuffer = ByteBuffer.allocate(payloadSize);
+                 return bodyBuffer;
+@@ -1068,6 +1070,7 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+ 
+         public void clearTrace() {
+             trace = new StringBuffer();
++            bytesRead = 0;
+         }
+ 
+ 
+@@ -1079,6 +1082,11 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+         public int getMaxFrameSize() {
+             return remoteSettings.getMaxFrameSize();
+         }
++
++
++        public long getBytesRead() {
++            return bytesRead;
++        }
+     }
+ 
+ 
+@@ -1101,6 +1109,8 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+ 
+         private static final long serialVersionUID = 1L;
+ 
++        public static final int CONTENT_LENGTH = 8192;
++
+         @Override
+         protected void doGet(HttpServletRequest req, HttpServletResponse resp)
+                 throws ServletException, IOException {
+
+==================================================

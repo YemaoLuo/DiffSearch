@@ -1,0 +1,585 @@
+18ad6f3460677ce07f5ba2a8d14f13fbe2ee6865
+==================================================
+Modify the Default and WebDAV Servlets so that a 405 status code is returned for PUT and DELETE requests when disabled via the readonly initialisation parameter.
+==================================================
+Mark Thomas
+==================================================
+Tue Jan 9 13:50:52 2018 +0000
+==================================================
+DefaultServlet.java
+Modify the Default and WebDAV Servlets so that a 405 status code is returned for PUT and DELETE requests when disabled via the readonly initialisation parameter.
+
+Align the contents of the <code>Allow</code> header with the response code for the Default and WebDAV Servlets. For any given resource a method that returns a 405 status code will not be listed in the Allow header and a method listed in the Allow header will not return a 405 status code.
+
+Based on a patch suggested by Ken Dombeck.
+
+This closes #96
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1820663 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+WebdavServlet.java
+index ab7e4ee433..a5da7abd57 100644
+--- a/java/org/apache/catalina/servlets/DefaultServlet.java
++++ b/java/org/apache/catalina/servlets/DefaultServlet.java
+@@ -499,24 +499,35 @@ public class DefaultServlet extends HttpServlet {
+     protected void doOptions(HttpServletRequest req, HttpServletResponse resp)
+         throws ServletException, IOException {
+ 
++        resp.setHeader("Allow", determineMethodsAllowed(req));
++    }
++
++
++    protected String determineMethodsAllowed(HttpServletRequest req) {
+         StringBuilder allow = new StringBuilder();
+-        // There is a doGet method
+-        allow.append("GET, HEAD");
+-        // There is a doPost
+-        allow.append(", POST");
+-        // There is a doPut
+-        allow.append(", PUT");
+-        // There is a doDelete
+-        allow.append(", DELETE");
++
++        // Start with methods that are always allowed
++        allow.append("OPTIONS, GET, HEAD, POST");
++
++        // PUT and DELETE depend on readonly
++        if (!readOnly) {
++            allow.append(", PUT, DELETE");
++        }
++
+         // Trace - assume disabled unless we can prove otherwise
+         if (req instanceof RequestFacade &&
+                 ((RequestFacade) req).getAllowTrace()) {
+             allow.append(", TRACE");
+         }
+-        // Always allow options
+-        allow.append(", OPTIONS");
+ 
+-        resp.setHeader("Allow", allow.toString());
++        return allow.toString();
++    }
++
++
++    protected void sendNotAllowed(HttpServletRequest req, HttpServletResponse resp)
++            throws IOException {
++        resp.addHeader("Allow", determineMethodsAllowed(req));
++        resp.sendError(WebdavStatus.SC_METHOD_NOT_ALLOWED);
+     }
+ 
+ 
+@@ -551,7 +562,7 @@ public class DefaultServlet extends HttpServlet {
+         throws ServletException, IOException {
+ 
+         if (readOnly) {
+-            resp.sendError(HttpServletResponse.SC_FORBIDDEN);
++            sendNotAllowed(req, resp);
+             return;
+         }
+ 
+@@ -675,7 +686,7 @@ public class DefaultServlet extends HttpServlet {
+         throws ServletException, IOException {
+ 
+         if (readOnly) {
+-            resp.sendError(HttpServletResponse.SC_FORBIDDEN);
++            sendNotAllowed(req, resp);
+             return;
+         }
+ 
+
+==================================================
+ServletOptionsBaseTest.java
+index 596759e330..a1b8ad1bdd 100644
+--- a/java/org/apache/catalina/servlets/WebdavServlet.java
++++ b/java/org/apache/catalina/servlets/WebdavServlet.java
+@@ -464,10 +464,7 @@ public class WebdavServlet extends DefaultServlet {
+         throws ServletException, IOException {
+ 
+         resp.addHeader("DAV", "1,2");
+-
+-        StringBuilder methodsAllowed = determineMethodsAllowed(req);
+-
+-        resp.addHeader("Allow", methodsAllowed.toString());
++        resp.addHeader("Allow", determineMethodsAllowed(req));
+         resp.addHeader("MS-Author-Via", "DAV");
+     }
+ 
+@@ -483,11 +480,7 @@ public class WebdavServlet extends DefaultServlet {
+         throws ServletException, IOException {
+ 
+         if (!listings) {
+-            // Get allowed methods
+-            StringBuilder methodsAllowed = determineMethodsAllowed(req);
+-
+-            resp.addHeader("Allow", methodsAllowed.toString());
+-            resp.sendError(WebdavStatus.SC_METHOD_NOT_ALLOWED);
++            sendNotAllowed(req, resp);
+             return;
+         }
+ 
+@@ -743,16 +736,6 @@ public class WebdavServlet extends DefaultServlet {
+     protected void doMkcol(HttpServletRequest req, HttpServletResponse resp)
+         throws ServletException, IOException {
+ 
+-        if (readOnly) {
+-            resp.sendError(WebdavStatus.SC_FORBIDDEN);
+-            return;
+-        }
+-
+-        if (isLocked(req)) {
+-            resp.sendError(WebdavStatus.SC_LOCKED);
+-            return;
+-        }
+-
+         String path = getRelativePath(req);
+ 
+         WebResource resource = resources.getResource(path);
+@@ -760,12 +743,17 @@ public class WebdavServlet extends DefaultServlet {
+         // Can't create a collection if a resource already exists at the given
+         // path
+         if (resource.exists()) {
+-            // Get allowed methods
+-            StringBuilder methodsAllowed = determineMethodsAllowed(req);
++            sendNotAllowed(req, resp);
++            return;
++        }
+ 
+-            resp.addHeader("Allow", methodsAllowed.toString());
++        if (readOnly) {
++            resp.sendError(WebdavStatus.SC_FORBIDDEN);
++            return;
++        }
+ 
+-            resp.sendError(WebdavStatus.SC_METHOD_NOT_ALLOWED);
++        if (isLocked(req)) {
++            resp.sendError(WebdavStatus.SC_LOCKED);
+             return;
+         }
+ 
+@@ -809,7 +797,7 @@ public class WebdavServlet extends DefaultServlet {
+         throws ServletException, IOException {
+ 
+         if (readOnly) {
+-            resp.sendError(WebdavStatus.SC_FORBIDDEN);
++            sendNotAllowed(req, resp);
+             return;
+         }
+ 
+@@ -841,9 +829,14 @@ public class WebdavServlet extends DefaultServlet {
+             return;
+         }
+ 
+-        super.doPut(req, resp);
+-
+         String path = getRelativePath(req);
++        WebResource resource = resources.getResource(path);
++        if (resource.isDirectory()) {
++            sendNotAllowed(req, resp);
++            return;
++        }
++
++        super.doPut(req, resp);
+ 
+         // Removing any lock-null resource which would be present
+         lockNullResources.remove(path);
+@@ -2325,41 +2318,50 @@ public class WebdavServlet extends DefaultServlet {
+ 
+     /**
+      * Determines the methods normally allowed for the resource.
++     *
+      * @param req The Servlet request
+-     * @return a string builder with the allowed HTTP methods
++     *
++     * @return The allowed HTTP methods
+      */
+-    private StringBuilder determineMethodsAllowed(HttpServletRequest req) {
++    @Override
++    protected String determineMethodsAllowed(HttpServletRequest req) {
+ 
+-        StringBuilder methodsAllowed = new StringBuilder();
+ 
+         WebResource resource = resources.getResource(getRelativePath(req));
+ 
+-        if (!resource.exists()) {
+-            methodsAllowed.append("OPTIONS, MKCOL, PUT, LOCK");
+-            return methodsAllowed;
++        // These methods are always allowed. They may return a 404 (not a 405)
++        // if the resource does not exist.
++        StringBuilder methodsAllowed = new StringBuilder(
++                "OPTIONS, GET, POST, HEAD");
++
++        if (!readOnly) {
++            methodsAllowed.append(", DELETE");
++            if (!resource.isDirectory()) {
++                methodsAllowed.append(", PUT");
++            }
+         }
+ 
+-        methodsAllowed.append("OPTIONS, GET, HEAD, POST, DELETE");
+         // Trace - assume disabled unless we can prove otherwise
+         if (req instanceof RequestFacade &&
+                 ((RequestFacade) req).getAllowTrace()) {
+             methodsAllowed.append(", TRACE");
+         }
+-        methodsAllowed.append(", PROPPATCH, COPY, MOVE, LOCK, UNLOCK");
++
++        methodsAllowed.append(", LOCK, UNLOCK, PROPPATCH, COPY, MOVE");
+ 
+         if (listings) {
+             methodsAllowed.append(", PROPFIND");
+         }
+ 
+-        if (resource.isFile()) {
+-            methodsAllowed.append(", PUT");
++        if (!resource.exists()) {
++            methodsAllowed.append(", MKCOL");
+         }
+ 
+-        return methodsAllowed;
++        return methodsAllowed.toString();
+     }
+ 
+-    // --------------------------------------------------  LockInfo Inner Class
+ 
++    // --------------------------------------------------  LockInfo Inner Class
+ 
+     /**
+      * Holds a lock information.
+
+==================================================
+TestDefaultServletOptions.java
+new file mode 100644
+index 0000000000..4777185a1e
+--- /dev/null
++++ b/test/org/apache/catalina/servlets/ServletOptionsBaseTest.java
+@@ -0,0 +1,161 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.catalina.servlets;
++
++
++import java.io.File;
++import java.util.Arrays;
++import java.util.HashSet;
++import java.util.Set;
++
++import javax.servlet.Servlet;
++
++import org.junit.Assert;
++import org.junit.Test;
++import org.junit.runners.Parameterized.Parameter;
++
++import static org.apache.catalina.startup.SimpleHttpClient.CRLF;
++import org.apache.catalina.Wrapper;
++import org.apache.catalina.startup.SimpleHttpClient;
++import org.apache.catalina.startup.Tomcat;
++import org.apache.catalina.startup.TomcatBaseTest;
++
++public abstract class ServletOptionsBaseTest extends TomcatBaseTest {
++
++    protected static final String COLLECTION_NAME = "collection";
++    protected static final String FILE_NAME = "file";
++    protected static final String UNKNOWN_NAME = "unknown";
++
++    @Parameter(0)
++    public boolean listings;
++
++    @Parameter(1)
++    public boolean readonly;
++
++    @Parameter(2)
++    public boolean trace;
++
++    @Parameter(3)
++    public String url;
++
++    @Parameter(4)
++    public String method;
++
++
++    /*
++     * Check that methods returned by OPTIONS are consistent with the return
++     * http status code.
++     * Method not present in options response -> 405 expected
++     * Method present in options response     -> anything other than 405 expected
++     */
++    @Test
++    public void testOptions() throws Exception {
++        Tomcat tomcat = getTomcatInstance();
++
++        tomcat.getConnector().setAllowTrace(trace);
++
++        File docBase = new File(getTemporaryDirectory(), "webdav");
++        File collection = new File(docBase, COLLECTION_NAME);
++        Assert.assertTrue(collection.mkdirs());
++        File file = new File(docBase, FILE_NAME);
++        Assert.assertTrue(file.createNewFile());
++
++        addDeleteOnTearDown(docBase);
++
++        // app dir is relative to server home
++        org.apache.catalina.Context ctx =
++            tomcat.addWebapp(null, "/servlet", docBase.getAbsolutePath());
++
++        Wrapper w = Tomcat.addServlet(ctx, "servlet", createServlet());
++        w.addInitParameter("listings", Boolean.toString(listings));
++        w.addInitParameter("readonly", Boolean.toString(readonly));
++
++        ctx.addServletMappingDecoded("/*", "servlet");
++
++        tomcat.start();
++
++        OptionsHttpClient client = new OptionsHttpClient();
++        client.setPort(getPort());
++        client.setRequest(new String[] {
++                "OPTIONS /servlet/" + url + " HTTP/1.1" + CRLF +
++                "Host: localhost:" + getPort() + CRLF +
++                "Connection: close" + CRLF +
++                CRLF });
++
++        client.connect();
++        client.processRequest();
++
++        Assert.assertTrue(client.isResponse200());
++        Set<String> allowed = client.getAllowedMethods();
++
++        client.disconnect();
++        client.reset();
++
++        client.setRequest(new String[] {
++                method + " /servlet/" + url + " HTTP/1.1" + CRLF +
++                "Host: localhost:" + getPort() + CRLF +
++                "Connection: close" + CRLF +
++                CRLF });
++
++        client.connect();
++        client.processRequest();
++
++        String msg = "Listings[" + listings + "], readonly [" + readonly +
++                "], trace[ " + trace + "], url[" + url + "], method[" + method + "]";
++
++        Assert.assertNotNull(client.getResponseLine());
++
++        if (allowed.contains(method)) {
++            Assert.assertFalse(msg, client.isResponse405());
++        } else {
++            Assert.assertTrue(msg, client.isResponse405());
++            allowed = client.getAllowedMethods();
++            Assert.assertFalse(msg, allowed.contains(method));
++        }
++    }
++
++
++    protected abstract Servlet createServlet();
++
++
++    private static class OptionsHttpClient extends SimpleHttpClient {
++
++        @Override
++        public boolean isResponseBodyOK() {
++            return true;
++        }
++
++        public Set<String> getAllowedMethods() {
++            String valueList = null;
++            for (String header : getResponseHeaders()) {
++                if (header.startsWith("Allow:")) {
++                    valueList = header.substring(6).trim();
++                    break;
++                }
++            }
++            Assert.assertNotNull(valueList);
++            String[] values = valueList.split(",");
++            for (int i = 0; i < values.length; i++) {
++                values[i] = values[i].trim();
++            }
++            Set<String> allowed = new HashSet<>();
++            allowed.addAll(Arrays.asList(values));
++
++            return allowed;
++        }
++    }
++}
+
+==================================================
+TestWebdavServletOptions.java
+new file mode 100644
+index 0000000000..98e0829502
+--- /dev/null
++++ b/test/org/apache/catalina/servlets/TestDefaultServletOptions.java
+@@ -0,0 +1,61 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.catalina.servlets;
++
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.List;
++
++import javax.servlet.Servlet;
++
++import org.junit.runner.RunWith;
++import org.junit.runners.Parameterized;
++import org.junit.runners.Parameterized.Parameters;
++
++@RunWith(Parameterized.class)
++public class TestDefaultServletOptions extends ServletOptionsBaseTest {
++
++    @Parameters
++    public static Collection<Object[]> inputs() {
++        Boolean[] booleans = new Boolean[] { Boolean.FALSE, Boolean.TRUE };
++        String[] urls = new String[] { COLLECTION_NAME, FILE_NAME, UNKNOWN_NAME };
++        String[] methods = new String[] { "GET", "POST", "HEAD", "TRACE", "PUT", "DELETE" };
++
++        List<Object[]> result = new ArrayList<>();
++
++        for (Boolean listingsValue : booleans) {
++            for (Boolean readOnlyValue : booleans) {
++                for (Boolean traceValue : booleans) {
++                    for (String url : urls) {
++                        for (String method : methods) {
++                            result.add(new Object[] {
++                                    listingsValue, readOnlyValue, traceValue, url, method } );
++                        }
++                    }
++                }
++            }
++
++        }
++        return result;
++    }
++
++
++    @Override
++    protected Servlet createServlet() {
++        return new DefaultServlet();
++    }
++}
+
+==================================================
+SimpleHttpClient.java
+new file mode 100644
+index 0000000000..ed8b776174
+--- /dev/null
++++ b/test/org/apache/catalina/servlets/TestWebdavServletOptions.java
+@@ -0,0 +1,62 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.catalina.servlets;
++
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.List;
++
++import javax.servlet.Servlet;
++
++import org.junit.runner.RunWith;
++import org.junit.runners.Parameterized;
++import org.junit.runners.Parameterized.Parameters;
++
++@RunWith(Parameterized.class)
++public class TestWebdavServletOptions extends ServletOptionsBaseTest {
++
++    @Parameters
++    public static Collection<Object[]> inputs() {
++        Boolean[] booleans = new Boolean[] { Boolean.FALSE, Boolean.TRUE };
++        String[] urls = new String[] { COLLECTION_NAME, FILE_NAME, UNKNOWN_NAME };
++        String[] methods = new String[] { "GET", "POST", "HEAD", "TRACE", "PUT", "DELETE",
++                "MKCOL", "LOCK", "UNLOCK", "COPY", "MOVE", "PROPFIND", "PROPPATCH" };
++
++        List<Object[]> result = new ArrayList<>();
++
++        for (Boolean listingsValue : booleans) {
++            for (Boolean readOnlyValue : booleans) {
++                for (Boolean traceValue : booleans) {
++                    for (String url : urls) {
++                        for (String method : methods) {
++                            result.add(new Object[] {
++                                    listingsValue, readOnlyValue, traceValue, url, method } );
++                        }
++                    }
++                }
++            }
++
++        }
++        return result;
++    }
++
++
++    @Override
++    protected Servlet createServlet() {
++        return new WebdavServlet();
++    }
++}
+
+==================================================
+TomcatBaseTest.java
+index 0cf14ee8f8..af2c69d5e6 100644
+--- a/test/org/apache/catalina/startup/SimpleHttpClient.java
++++ b/test/org/apache/catalina/startup/SimpleHttpClient.java
+@@ -54,6 +54,7 @@ public abstract class SimpleHttpClient {
+     public static final String REDIRECT_303 = "HTTP/1.1 303 ";
+     public static final String FAIL_400 = "HTTP/1.1 400 ";
+     public static final String FAIL_404 = "HTTP/1.1 404 ";
++    public static final String FAIL_405 = "HTTP/1.1 405 ";
+     public static final String TIMEOUT_408 = "HTTP/1.1 408 ";
+     public static final String FAIL_413 = "HTTP/1.1 413 ";
+     public static final String FAIL_417 = "HTTP/1.1 417 ";
+@@ -429,6 +430,10 @@ public abstract class SimpleHttpClient {
+         return responseLineStartsWith(FAIL_404);
+     }
+ 
++    public boolean isResponse405() {
++        return responseLineStartsWith(FAIL_405);
++    }
++
+     public boolean isResponse408() {
+         return responseLineStartsWith(TIMEOUT_408);
+     }
+
+==================================================

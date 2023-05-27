@@ -1,0 +1,497 @@
+41c69693309cdfeba07e20b6bb4568df94e072d8
+==================================================
+Fix failing NIO2 unit tests with a largish plaster until the writes are
+==================================================
+Mark Thomas
+==================================================
+Thu Jan 8 13:10:34 2015 +0000
+==================================================
+AbstractOutputBuffer.java
+Fix failing NIO2 unit tests with a largish plaster until the writes are
+fully moved to the NIO2 SocketWrapper.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1650276 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+InternalAprOutputBuffer.java
+index 2c50b3cdb5..25cbd7adc0 100644
+--- a/java/org/apache/coyote/http11/AbstractOutputBuffer.java
++++ b/java/org/apache/coyote/http11/AbstractOutputBuffer.java
+@@ -20,7 +20,6 @@ import java.io.IOException;
+ import java.nio.ByteBuffer;
+ import java.security.AccessController;
+ import java.security.PrivilegedAction;
+-import java.util.concurrent.LinkedBlockingDeque;
+ 
+ import org.apache.coyote.ActionCode;
+ import org.apache.coyote.OutputBuffer;
+@@ -28,7 +27,6 @@ import org.apache.coyote.Response;
+ import org.apache.coyote.http11.filters.GzipOutputFilter;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+-import org.apache.tomcat.util.buf.ByteBufferHolder;
+ import org.apache.tomcat.util.buf.ByteChunk;
+ import org.apache.tomcat.util.buf.MessageBytes;
+ import org.apache.tomcat.util.http.HttpMessages;
+@@ -104,23 +102,6 @@ public abstract class AbstractOutputBuffer<S> implements OutputBuffer {
+      */
+     protected long byteCount = 0;
+ 
+-    protected ByteBuffer socketWriteBuffer;
+-    protected volatile boolean writeBufferFlipped;
+-
+-    /**
+-     * For "non-blocking" writes use an external set of buffers. Although the
+-     * API only allows one non-blocking write at a time, due to buffering and
+-     * the possible need to write HTTP headers, there may be more than one write
+-     * to the OutputBuffer.
+-     */
+-    protected final LinkedBlockingDeque<ByteBufferHolder> bufferedWrites =
+-            new LinkedBlockingDeque<>();
+-
+-    /**
+-     * The max size of the buffered write buffer
+-     */
+-    protected int bufferedWriteSize = 64*1024; //64k default write buffer
+-
+ 
+     protected AbstractOutputBuffer(Response response, int headerBufferSize) {
+ 
+@@ -208,16 +189,6 @@ public abstract class AbstractOutputBuffer<S> implements OutputBuffer {
+     }
+ 
+ 
+-    public void setBufferedWriteSize(int bufferedWriteSize) {
+-        this.bufferedWriteSize = bufferedWriteSize;
+-    }
+-
+-
+-    public int getBufferedWriteSize() {
+-        return bufferedWriteSize;
+-    }
+-
+-
+     // --------------------------------------------------- OutputBuffer Methods
+ 
+     /**
+@@ -321,8 +292,6 @@ public abstract class AbstractOutputBuffer<S> implements OutputBuffer {
+         // Sub-classes may wish to do more than this.
+         nextRequest();
+         socketWrapper = null;
+-        bufferedWrites.clear();
+-        writeBufferFlipped = false;
+     }
+ 
+     /**
+@@ -625,12 +594,6 @@ public abstract class AbstractOutputBuffer<S> implements OutputBuffer {
+     protected abstract void registerWriteInterest() throws IOException;
+ 
+ 
+-    protected boolean hasMoreDataToFlush() {
+-        return (writeBufferFlipped && socketWriteBuffer.remaining() > 0) ||
+-        (!writeBufferFlipped && socketWriteBuffer.position() > 0);
+-    }
+-
+-
+     /**
+      * Writes any remaining buffered data.
+      *
+
+==================================================
+InternalNio2OutputBuffer.java
+index 688fdd8f90..1d20d03c97 100644
+--- a/java/org/apache/coyote/http11/InternalAprOutputBuffer.java
++++ b/java/org/apache/coyote/http11/InternalAprOutputBuffer.java
+@@ -17,10 +17,8 @@
+ package org.apache.coyote.http11;
+ 
+ import java.io.IOException;
+-import java.nio.ByteBuffer;
+ 
+ import org.apache.coyote.Response;
+-import org.apache.tomcat.util.net.SocketWrapperBase;
+ 
+ /**
+  * Output buffer.
+@@ -35,34 +33,7 @@ public class InternalAprOutputBuffer extends AbstractOutputBuffer<Long> {
+      * Default constructor.
+      */
+     public InternalAprOutputBuffer(Response response, int headerBufferSize) {
+-
+         super(response, headerBufferSize);
+-
+-        if (headerBufferSize < (8 * 1024)) {
+-            socketWriteBuffer = ByteBuffer.allocateDirect(6 * 1500);
+-        } else {
+-            socketWriteBuffer = ByteBuffer.allocateDirect((headerBufferSize / 1500 + 1) * 1500);
+-        }
+-    }
+-
+-
+-    // --------------------------------------------------------- Public Methods
+-
+-    @Override
+-    public void init(SocketWrapperBase<Long> socketWrapper) {
+-        super.init(socketWrapper);
+-        socketWrapper.socketWriteBuffer = socketWriteBuffer;
+-    }
+-
+-
+-    /**
+-     * Recycle the output buffer. This should be called when closing the
+-     * connection.
+-     */
+-    @Override
+-    public void recycle() {
+-        super.recycle();
+-        socketWriteBuffer.clear();
+     }
+ 
+ 
+
+==================================================
+InternalNioOutputBuffer.java
+index dc25e76665..a8e66d16a1 100644
+--- a/java/org/apache/coyote/http11/InternalNio2OutputBuffer.java
++++ b/java/org/apache/coyote/http11/InternalNio2OutputBuffer.java
+@@ -90,7 +90,6 @@ public class InternalNio2OutputBuffer extends AbstractOutputBuffer<Nio2Channel>
+     public void init(SocketWrapperBase<Nio2Channel> socketWrapper) {
+         super.init(socketWrapper);
+         this.endpoint = socketWrapper.getEndpoint();
+-        this.socketWriteBuffer = socketWrapper.getSocket().getBufHandler().getWriteBuffer();
+ 
+         this.completionHandler = new CompletionHandler<Integer, ByteBuffer>() {
+             @Override
+@@ -99,17 +98,17 @@ public class InternalNio2OutputBuffer extends AbstractOutputBuffer<Nio2Channel>
+                 synchronized (completionHandler) {
+                     if (nBytes.intValue() < 0) {
+                         failed(new EOFException(sm.getString("iob.failedwrite")), attachment);
+-                    } else if (bufferedWrites.size() > 0) {
++                    } else if (socketWrapper.bufferedWrites.size() > 0) {
+                         // Continue writing data using a gathering write
+                         ArrayList<ByteBuffer> arrayList = new ArrayList<>();
+                         if (attachment.hasRemaining()) {
+                             arrayList.add(attachment);
+                         }
+-                        for (ByteBufferHolder buffer : bufferedWrites) {
++                        for (ByteBufferHolder buffer : socketWrapper.bufferedWrites) {
+                             buffer.flip();
+                             arrayList.add(buffer.getBuf());
+                         }
+-                        bufferedWrites.clear();
++                        socketWrapper.bufferedWrites.clear();
+                         ByteBuffer[] array = arrayList.toArray(EMPTY_BUF_ARRAY);
+                         socketWrapper.getSocket().write(array, 0, array.length,
+                                 socketWrapper.getTimeout(), TimeUnit.MILLISECONDS,
+@@ -152,7 +151,7 @@ public class InternalNio2OutputBuffer extends AbstractOutputBuffer<Nio2Channel>
+                 synchronized (completionHandler) {
+                     if (nBytes.longValue() < 0) {
+                         failed(new EOFException(sm.getString("iob.failedwrite")), attachment);
+-                    } else if (bufferedWrites.size() > 0 || arrayHasData(attachment)) {
++                    } else if (socketWrapper.bufferedWrites.size() > 0 || arrayHasData(attachment)) {
+                         // Continue writing data
+                         ArrayList<ByteBuffer> arrayList = new ArrayList<>();
+                         for (ByteBuffer buffer : attachment) {
+@@ -160,11 +159,11 @@ public class InternalNio2OutputBuffer extends AbstractOutputBuffer<Nio2Channel>
+                                 arrayList.add(buffer);
+                             }
+                         }
+-                        for (ByteBufferHolder buffer : bufferedWrites) {
++                        for (ByteBufferHolder buffer : socketWrapper.bufferedWrites) {
+                             buffer.flip();
+                             arrayList.add(buffer.getBuf());
+                         }
+-                        bufferedWrites.clear();
++                        socketWrapper.bufferedWrites.clear();
+                         ByteBuffer[] array = arrayList.toArray(EMPTY_BUF_ARRAY);
+                         socketWrapper.getSocket().write(array, 0, array.length,
+                                 socketWrapper.getTimeout(), TimeUnit.MILLISECONDS,
+@@ -212,7 +211,6 @@ public class InternalNio2OutputBuffer extends AbstractOutputBuffer<Nio2Channel>
+             writePending.drainPermits();
+             writePending.release();
+         }
+-        bufferedWrites.clear();
+     }
+ 
+ 
+@@ -220,7 +218,6 @@ public class InternalNio2OutputBuffer extends AbstractOutputBuffer<Nio2Channel>
+     public void nextRequest() {
+         super.nextRequest();
+         interest = false;
+-        writeBufferFlipped = false;
+     }
+ 
+ 
+@@ -246,10 +243,10 @@ public class InternalNio2OutputBuffer extends AbstractOutputBuffer<Nio2Channel>
+ 
+         if (isBlocking()) {
+             while (length > 0) {
+-                int thisTime = transfer(buf, offset, length, socketWriteBuffer);
++                int thisTime = transfer(buf, offset, length, socketWrapper.socketWriteBuffer);
+                 length = length - thisTime;
+                 offset = offset + thisTime;
+-                if (socketWriteBuffer.remaining() == 0) {
++                if (socketWrapper.socketWriteBuffer.remaining() == 0) {
+                     flushBuffer(true);
+                 }
+             }
+@@ -266,7 +263,7 @@ public class InternalNio2OutputBuffer extends AbstractOutputBuffer<Nio2Channel>
+                 synchronized (completionHandler) {
+                     // No pending completion handler, so writing to the main buffer
+                     // is possible
+-                    int thisTime = transfer(buf, offset, length, socketWriteBuffer);
++                    int thisTime = transfer(buf, offset, length, socketWrapper.socketWriteBuffer);
+                     length = length - thisTime;
+                     offset = offset + thisTime;
+                     if (length > 0) {
+@@ -287,7 +284,7 @@ public class InternalNio2OutputBuffer extends AbstractOutputBuffer<Nio2Channel>
+     private void addToBuffers(byte[] buf, int offset, int length) {
+         ByteBuffer buffer = ByteBuffer.allocate(length);
+         buffer.put(buf, offset, length);
+-        bufferedWrites.add(new ByteBufferHolder(buffer, false));
++        socketWrapper.bufferedWrites.add(new ByteBufferHolder(buffer, false));
+     }
+ 
+ 
+@@ -319,8 +316,8 @@ public class InternalNio2OutputBuffer extends AbstractOutputBuffer<Nio2Channel>
+                 }
+             }
+             try {
+-                if (bufferedWrites.size() > 0) {
+-                    for (ByteBufferHolder holder : bufferedWrites) {
++                if (socketWrapper.bufferedWrites.size() > 0) {
++                    for (ByteBufferHolder holder : socketWrapper.bufferedWrites) {
+                         holder.flip();
+                         ByteBuffer buffer = holder.getBuf();
+                         while (buffer.hasRemaining()) {
+@@ -329,14 +326,14 @@ public class InternalNio2OutputBuffer extends AbstractOutputBuffer<Nio2Channel>
+                             }
+                         }
+                     }
+-                    bufferedWrites.clear();
++                    socketWrapper.bufferedWrites.clear();
+                 }
+-                if (!writeBufferFlipped) {
+-                    socketWriteBuffer.flip();
+-                    writeBufferFlipped = true;
++                if (!socketWrapper.writeBufferFlipped) {
++                    socketWrapper.socketWriteBuffer.flip();
++                    socketWrapper.writeBufferFlipped = true;
+                 }
+-                while (socketWriteBuffer.hasRemaining()) {
+-                    if (socketWrapper.getSocket().write(socketWriteBuffer).get(socketWrapper.getTimeout(), TimeUnit.MILLISECONDS).intValue() < 0) {
++                while (socketWrapper.socketWriteBuffer.hasRemaining()) {
++                    if (socketWrapper.getSocket().write(socketWrapper.socketWriteBuffer).get(socketWrapper.getTimeout(), TimeUnit.MILLISECONDS).intValue() < 0) {
+                         throw new EOFException(sm.getString("iob.failedwrite"));
+                     }
+                 }
+@@ -351,48 +348,48 @@ public class InternalNio2OutputBuffer extends AbstractOutputBuffer<Nio2Channel>
+             } catch (TimeoutException e) {
+                 throw new SocketTimeoutException();
+             }
+-            socketWriteBuffer.clear();
+-            writeBufferFlipped = false;
++            socketWrapper.socketWriteBuffer.clear();
++            socketWrapper.writeBufferFlipped = false;
+             return false;
+         } else {
+             synchronized (completionHandler) {
+                 if (hasPermit || writePending.tryAcquire()) {
+-                    if (!writeBufferFlipped) {
+-                        socketWriteBuffer.flip();
+-                        writeBufferFlipped = true;
++                    if (!socketWrapper.writeBufferFlipped) {
++                        socketWrapper.socketWriteBuffer.flip();
++                        socketWrapper.writeBufferFlipped = true;
+                     }
+                     Nio2Endpoint.startInline();
+-                    if (bufferedWrites.size() > 0) {
++                    if (socketWrapper.bufferedWrites.size() > 0) {
+                         // Gathering write of the main buffer plus all leftovers
+                         ArrayList<ByteBuffer> arrayList = new ArrayList<>();
+-                        if (socketWriteBuffer.hasRemaining()) {
+-                            arrayList.add(socketWriteBuffer);
++                        if (socketWrapper.socketWriteBuffer.hasRemaining()) {
++                            arrayList.add(socketWrapper.socketWriteBuffer);
+                         }
+-                        for (ByteBufferHolder buffer : bufferedWrites) {
++                        for (ByteBufferHolder buffer : socketWrapper.bufferedWrites) {
+                             buffer.flip();
+                             arrayList.add(buffer.getBuf());
+                         }
+-                        bufferedWrites.clear();
++                        socketWrapper.bufferedWrites.clear();
+                         ByteBuffer[] array = arrayList.toArray(EMPTY_BUF_ARRAY);
+                         socketWrapper.getSocket().write(array, 0, array.length, socketWrapper.getTimeout(),
+                                 TimeUnit.MILLISECONDS, array, gatherCompletionHandler);
+-                    } else if (socketWriteBuffer.hasRemaining()) {
++                    } else if (socketWrapper.socketWriteBuffer.hasRemaining()) {
+                         // Regular write
+-                        socketWrapper.getSocket().write(socketWriteBuffer, socketWrapper.getTimeout(),
+-                                TimeUnit.MILLISECONDS, socketWriteBuffer, completionHandler);
++                        socketWrapper.getSocket().write(socketWrapper.socketWriteBuffer, socketWrapper.getTimeout(),
++                                TimeUnit.MILLISECONDS, socketWrapper.socketWriteBuffer, completionHandler);
+                     } else {
+                         // Nothing was written
+                         writePending.release();
+                     }
+                     Nio2Endpoint.endInline();
+                     if (writePending.availablePermits() > 0) {
+-                        if (socketWriteBuffer.remaining() == 0) {
+-                            socketWriteBuffer.clear();
+-                            writeBufferFlipped = false;
++                        if (socketWrapper.socketWriteBuffer.remaining() == 0) {
++                            socketWrapper.socketWriteBuffer.clear();
++                            socketWrapper.writeBufferFlipped = false;
+                         }
+                     }
+                 }
+-                return hasMoreDataToFlush() || hasBufferedData() || e != null;
++                return socketWrapper.hasMoreDataToFlush() || hasBufferedData() || e != null;
+             }
+         }
+     }
+@@ -401,12 +398,12 @@ public class InternalNio2OutputBuffer extends AbstractOutputBuffer<Nio2Channel>
+     @Override
+     public boolean hasDataToWrite() {
+         synchronized (completionHandler) {
+-            return hasMoreDataToFlush() || hasBufferedData() || e != null;
++            return socketWrapper.hasMoreDataToFlush() || hasBufferedData() || e != null;
+         }
+     }
+ 
+     protected boolean hasBufferedData() {
+-        return bufferedWrites.size() > 0;
++        return socketWrapper.bufferedWrites.size() > 0;
+     }
+ 
+     @Override
+
+==================================================
+AprEndpoint.java
+index 0a57e72bcc..709011bf5d 100644
+--- a/java/org/apache/coyote/http11/InternalNioOutputBuffer.java
++++ b/java/org/apache/coyote/http11/InternalNioOutputBuffer.java
+@@ -20,7 +20,6 @@ import java.io.IOException;
+ 
+ import org.apache.coyote.Response;
+ import org.apache.tomcat.util.net.NioChannel;
+-import org.apache.tomcat.util.net.SocketWrapperBase;
+ 
+ /**
+  * Output buffer.
+@@ -39,26 +38,6 @@ public class InternalNioOutputBuffer extends AbstractOutputBuffer<NioChannel> {
+     }
+ 
+ 
+-    // --------------------------------------------------------- Public Methods
+-
+-    @Override
+-    public void init(SocketWrapperBase<NioChannel> socketWrapper) {
+-        super.init(socketWrapper);
+-        socketWriteBuffer = socketWrapper.getSocket().getBufHandler().getWriteBuffer();
+-    }
+-
+-
+-    /**
+-     * Recycle the output buffer. This should be called when closing the
+-     * connection.
+-     */
+-    @Override
+-    public void recycle() {
+-        super.recycle();
+-        socketWriteBuffer.clear();
+-    }
+-
+-
+     // ------------------------------------------------------ Protected Methods
+ 
+     @Override
+
+==================================================
+Nio2Endpoint.java
+index af0fec2810..d1f20cb977 100644
+--- a/java/org/apache/tomcat/util/net/AprEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AprEndpoint.java
+@@ -2383,6 +2383,9 @@ public class AprEndpoint extends AbstractEndpoint<Long> {
+             } else {
+                 sslOutputBuffer = null;
+             }
++
++            // TODO: This needs to be expandable to the header buffer size
++            socketWriteBuffer = ByteBuffer.allocateDirect(6 * 1500);
+         }
+ 
+ 
+
+==================================================
+SocketWrapperBase.java
+index 030a5d1974..337f406041 100644
+--- a/java/org/apache/tomcat/util/net/Nio2Endpoint.java
++++ b/java/org/apache/tomcat/util/net/Nio2Endpoint.java
+@@ -797,6 +797,7 @@ public class Nio2Endpoint extends AbstractEndpoint<Nio2Channel> {
+             super.reset(channel, soTimeout);
+             upgradeInit = false;
+             sendfileData = null;
++            socketWriteBuffer = channel.getBufHandler().getWriteBuffer();
+         }
+ 
+         @Override
+@@ -1040,6 +1041,7 @@ public class Nio2Endpoint extends AbstractEndpoint<Nio2Channel> {
+                 writeBuffer.clear();
+                 writeBuffer.put(b, off, len);
+                 writeBuffer.flip();
++                writeBufferFlipped = true;
+                 try {
+                     written = getSocket().write(writeBuffer).get(getTimeout(), TimeUnit.MILLISECONDS).intValue();
+                 } catch (ExecutionException e) {
+@@ -1059,6 +1061,7 @@ public class Nio2Endpoint extends AbstractEndpoint<Nio2Channel> {
+                     writeBuffer.clear();
+                     writeBuffer.put(b, off, len);
+                     writeBuffer.flip();
++                    writeBufferFlipped = true;
+                     Nio2Endpoint.startInline();
+                     getSocket().write(writeBuffer, getTimeout(), TimeUnit.MILLISECONDS, writeBuffer, writeCompletionHandler);
+                     Nio2Endpoint.endInline();
+
+==================================================
+TesterOutputBuffer.java
+index 83999b101b..cc0da73c67 100644
+--- a/java/org/apache/tomcat/util/net/SocketWrapperBase.java
++++ b/java/org/apache/tomcat/util/net/SocketWrapperBase.java
+@@ -70,9 +70,9 @@ public abstract class SocketWrapperBase<E> {
+      */
+     private final Object writeThreadLock = new Object();
+ 
+-    // TODO This being public is a temporary hack to simplify refactoring
++    // TODO These being public is a temporary hack to simplify refactoring
+     public volatile ByteBuffer socketWriteBuffer;
+-    protected volatile boolean writeBufferFlipped;
++    public volatile boolean writeBufferFlipped;
+ 
+     /**
+      * For "non-blocking" writes use an external set of buffers. Although the
+@@ -80,7 +80,8 @@ public abstract class SocketWrapperBase<E> {
+      * the possible need to write HTTP headers, there may be more than one write
+      * to the OutputBuffer.
+      */
+-    protected final LinkedBlockingDeque<ByteBufferHolder> bufferedWrites =
++    // TODO This being public is a temporary hack to simplify refactoring
++    public final LinkedBlockingDeque<ByteBufferHolder> bufferedWrites =
+             new LinkedBlockingDeque<>();
+ 
+     /**
+@@ -179,7 +180,8 @@ public abstract class SocketWrapperBase<E> {
+     }
+     public Object getWriteThreadLock() { return writeThreadLock; }
+ 
+-    protected boolean hasMoreDataToFlush() {
++    // TODO This being public is a temporary hack to simplify refactoring
++    public boolean hasMoreDataToFlush() {
+         return (writeBufferFlipped && socketWriteBuffer.remaining() > 0) ||
+         (!writeBufferFlipped && socketWriteBuffer.position() > 0);
+     }
+
+==================================================

@@ -1,0 +1,332 @@
+594aa5869c9724d69ed2af91d4470ee3bda92bdf
+==================================================
+Improve close behaviour - fixes various issues highlighted by the Autobahn WebSocket test suite
+==================================================
+Mark Emlyn
+==================================================
+Fri Dec 21 21:04:07 2012 +0000
+==================================================
+Session.java
+Improve close behaviour - fixes various issues highlighted by the Autobahn WebSocket test suite
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1425145 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+WsEndpointPojo.java
+index 9275b6cb3e..a981601160 100644
+--- a/java/javax/websocket/Session.java
++++ b/java/javax/websocket/Session.java
+@@ -54,8 +54,22 @@ public interface Session {
+ 
+     RemoteEndpoint getRemote();
+ 
++    /**
++     * Close the connection to the remote end point using the code
++     * {@link javax.websocket.CloseReason.CloseCodes#NORMAL_CLOSURE} and an
++     * empty reason phrase.
++     *
++     * @throws IOException
++     */
+     void close() throws IOException;
+ 
++
++    /**
++     * Close the connection to the remote end point using the specified code
++     * and reason phrase.
++     *
++     * @throws IOException
++     */
+     void close(CloseReason closeStatus) throws IOException;
+ 
+     URI getRequestURI();
+
+==================================================
+WsFrame.java
+index cc0fc09ea8..f6a1a96f14 100644
+--- a/java/org/apache/tomcat/websocket/WsEndpointPojo.java
++++ b/java/org/apache/tomcat/websocket/WsEndpointPojo.java
+@@ -16,6 +16,7 @@
+  */
+ package org.apache.tomcat.websocket;
+ 
++import java.io.IOException;
+ import java.lang.reflect.InvocationTargetException;
+ 
+ import javax.websocket.CloseReason;
+@@ -68,7 +69,15 @@ public class WsEndpointPojo extends Endpoint {
+ 
+     @Override
+     public void onClose(CloseReason closeReason) {
+-        if (methodMapping.getOnClose() != null) {
++        if (methodMapping.getOnClose() == null) {
++            // If the POJO doesn't handle the close, close the connection
++            try {
++                session.close(closeReason);
++            } catch (IOException e) {
++                // TODO Auto-generated catch block
++                e.printStackTrace();
++            }
++        } else {
+             try {
+                 methodMapping.getOnClose().invoke(pojo,
+                         methodMapping.getOnCloseArgs(pathInfo, session));
+
+==================================================
+WsProtocolHandler.java
+index 0968590c58..ea924190f0 100644
+--- a/java/org/apache/tomcat/websocket/WsFrame.java
++++ b/java/org/apache/tomcat/websocket/WsFrame.java
+@@ -21,6 +21,8 @@ import java.io.IOException;
+ import java.nio.ByteBuffer;
+ 
+ import javax.servlet.ServletInputStream;
++import javax.websocket.CloseReason;
++import javax.websocket.CloseReason.CloseCodes;
+ import javax.websocket.MessageHandler;
+ import javax.websocket.PongMessage;
+ 
+@@ -194,7 +196,19 @@ public class WsFrame {
+                 return false;
+             }
+             if (opCode == Constants.OPCODE_CLOSE) {
+-                wsSession.close();
++                messageBuffer.flip();
++                String reason = null;
++                int code = CloseCodes.NO_STATUS_CODE.getCode();
++                if (messageBuffer.remaining() > 1) {
++                    code = messageBuffer.getShort();
++                    if (messageBuffer.remaining() > 0) {
++                         reason = new String(messageBuffer.array(),
++                                messageBuffer.arrayOffset() + messageBuffer.position(),
++                                messageBuffer.remaining(), "UTF8");
++                    }
++                }
++                wsSession.onClose(
++                        new CloseReason(Util.getCloseCode(code), reason));
+             } else if (opCode == Constants.OPCODE_PING) {
+                 messageBuffer.flip();
+                 wsSession.getRemote().sendPong(messageBuffer);
+
+==================================================
+WsRemoteEndpoint.java
+index d0ededdaa3..518df9bf72 100644
+--- a/java/org/apache/tomcat/websocket/WsProtocolHandler.java
++++ b/java/org/apache/tomcat/websocket/WsProtocolHandler.java
+@@ -58,7 +58,8 @@ public class WsProtocolHandler implements ProtocolHandler {
+         }
+         WsFrame wsFrame = new WsFrame(sis, wsSession);
+         sis.setReadListener(new WsReadListener(this, wsFrame, wsSession));
+-        WsRemoteEndpoint wsRemoteEndpoint = new WsRemoteEndpoint(sos);
++        WsRemoteEndpoint wsRemoteEndpoint =
++                new WsRemoteEndpoint(wsSession, sos);
+         wsSession.setRemote(wsRemoteEndpoint);
+         sos.setWriteListener(new WsWriteListener(this, wsRemoteEndpoint));
+ 
+@@ -108,8 +109,10 @@ public class WsProtocolHandler implements ProtocolHandler {
+             } catch (IOException e) {
+                 if (e instanceof EOFException){
+                     try {
+-                        wsSession.close(new CloseReason(
+-                                CloseCodes.CLOSED_ABNORMALLY, e.getMessage()));
++                        CloseReason cr = new CloseReason(
++                                CloseCodes.CLOSED_ABNORMALLY, e.getMessage());
++                        wsSession.onClose(cr);
++                        wsSession.close(cr);
+                     } catch (IOException e1) {
+                         // TODO
+                     }
+
+==================================================
+WsSession.java
+index de2116d703..4e3c182e7f 100644
+--- a/java/org/apache/tomcat/websocket/WsRemoteEndpoint.java
++++ b/java/org/apache/tomcat/websocket/WsRemoteEndpoint.java
+@@ -37,6 +37,7 @@ import javax.websocket.SendResult;
+ public class WsRemoteEndpoint implements RemoteEndpoint {
+ 
+     private final ServletOutputStream sos;
++    private final WsSession wsSession;
+     // Max length for outgoing WebSocket frame header is 10 bytes
+     private final ByteBuffer header = ByteBuffer.allocate(10);
+ 
+@@ -46,7 +47,8 @@ public class WsRemoteEndpoint implements RemoteEndpoint {
+     private volatile CyclicBarrier writeBarrier = new CyclicBarrier(2);
+ 
+ 
+-    public WsRemoteEndpoint(ServletOutputStream sos) {
++    public WsRemoteEndpoint(WsSession wsSession, ServletOutputStream sos) {
++        this.wsSession = wsSession;
+         this.sos = sos;
+     }
+ 
+@@ -198,7 +200,7 @@ public class WsRemoteEndpoint implements RemoteEndpoint {
+     }
+ 
+ 
+-    private void sendMessage(byte opCode, ByteBuffer message,
++    protected void sendMessage(byte opCode, ByteBuffer message,
+             boolean isFirstFragment, boolean isLastFragment) {
+         // Clear header, ready for new message
+         header.clear();
+@@ -247,6 +249,15 @@ public class WsRemoteEndpoint implements RemoteEndpoint {
+             // TODO Auto-generated catch block
+             e.printStackTrace();
+         }
++
++        if (Constants.OPCODE_CLOSE == opCode) {
++            try {
++                sos.close();
++            } catch (IOException e) {
++                // TODO Auto-generated catch block
++                e.printStackTrace();
++            }
++        }
+     }
+ 
+ 
+@@ -255,15 +266,13 @@ public class WsRemoteEndpoint implements RemoteEndpoint {
+             try {
+                 writeBarrier.await();
+             } catch (InterruptedException | BrokenBarrierException e) {
+-                // TODO Auto-generated catch block
+-                e.printStackTrace();
++                wsSession.getLocalEndpoint().onError(e);
+             }
+         }
+         try {
+             sos.write(data.array(), data.arrayOffset(), data.limit());
+         } catch (IOException e) {
+-            // TODO Auto-generated catch block
+-            e.printStackTrace();
++            wsSession.getLocalEndpoint().onError(e);
+         }
+     }
+ }
+
+==================================================
+ChatAnnotation.java
+index ed6de46a99..ab32d720a0 100644
+--- a/java/org/apache/tomcat/websocket/WsSession.java
++++ b/java/org/apache/tomcat/websocket/WsSession.java
+@@ -22,6 +22,7 @@ import java.lang.reflect.Type;
+ import java.lang.reflect.TypeVariable;
+ import java.net.URI;
+ import java.nio.ByteBuffer;
++import java.nio.charset.Charset;
+ import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
+@@ -38,14 +39,16 @@ import javax.websocket.Session;
+ 
+ public class WsSession implements Session {
+ 
++    private static final Charset UTF8 = Charset.forName("UTF8");
++
+     private final Endpoint localEndpoint;
+-    private RemoteEndpoint remoteEndpoint;
++    private WsRemoteEndpoint wsRemoteEndpoint;
+     private MessageHandler textMessageHandler = null;
+     private MessageHandler binaryMessageHandler = null;
+     private MessageHandler.Basic<PongMessage> pongMessageHandler =
+             new DefaultPingMessageHandler(this);
+ 
+-    public WsSession(Endpoint localEndpoint) {
++    protected WsSession(Endpoint localEndpoint) {
+         this.localEndpoint = localEndpoint;
+     }
+ 
+@@ -194,20 +197,28 @@ public class WsSession implements Session {
+ 
+     @Override
+     public RemoteEndpoint getRemote() {
+-        return remoteEndpoint;
++        return wsRemoteEndpoint;
+     }
+ 
+ 
+     @Override
+     public void close() throws IOException {
+-        close(new CloseReason(CloseCodes.GOING_AWAY, ""));
++        close(new CloseReason(CloseCodes.NORMAL_CLOSURE, ""));
+     }
+ 
+ 
+     @Override
+     public void close(CloseReason closeStatus) throws IOException {
+         // TODO Send the close message to the remote endpoint
+-        localEndpoint.onClose(closeStatus);
++        // 125 is maximum size for the payload of a control message
++        ByteBuffer msg = ByteBuffer.allocate(125);
++        msg.putShort((short) closeStatus.getCloseCode().getCode());
++        String reason = closeStatus.getReasonPhrase();
++        if (reason != null && reason.length() > 0) {
++            msg.put(reason.getBytes(UTF8));
++        }
++        msg.flip();
++        wsRemoteEndpoint.sendMessage(Constants.OPCODE_CLOSE, msg, true, true);
+     }
+ 
+ 
+@@ -246,25 +257,34 @@ public class WsSession implements Session {
+     }
+ 
+ 
+-    public void setRemote(WsRemoteEndpoint remoteEndpoint) {
+-        this.remoteEndpoint = remoteEndpoint;
++    protected void setRemote(WsRemoteEndpoint wsRemoteEndpoint) {
++        this.wsRemoteEndpoint = wsRemoteEndpoint;
+     }
+ 
+ 
+-    public MessageHandler getTextMessageHandler() {
++    protected MessageHandler getTextMessageHandler() {
+         return textMessageHandler;
+     }
+ 
+ 
+-    public MessageHandler getBinaryMessageHandler() {
++    protected MessageHandler getBinaryMessageHandler() {
+         return binaryMessageHandler;
+     }
+ 
+ 
+-    public MessageHandler.Basic<PongMessage> getPongMessageHandler() {
++    protected MessageHandler.Basic<PongMessage> getPongMessageHandler() {
+         return pongMessageHandler;
+     }
+ 
++    protected void onClose(CloseReason closeReason) {
++        localEndpoint.onClose(closeReason);
++    }
++
++
++    protected Endpoint getLocalEndpoint() {
++        return localEndpoint;
++    }
++
+ 
+     // Protected so unit tests can use it
+     protected static Class<?> getMessageType(MessageHandler listener) {
+
+==================================================
+EchoEndpoint.java
+index 45c716ddea..6d308129bd 100644
+--- a/webapps/examples/WEB-INF/classes/websocket/chat/ChatAnnotation.java
++++ b/webapps/examples/WEB-INF/classes/websocket/chat/ChatAnnotation.java
+@@ -56,6 +56,12 @@ public class ChatAnnotation {
+ 
+     @WebSocketClose
+     public void end() {
++        try {
++            session.close();
++        } catch (IOException e) {
++            // TODO Auto-generated catch block
++            e.printStackTrace();
++        }
+         connections.remove(this);
+         String message = String.format("* %s %s",
+                 nickname, "has disconnected.");
+
+==================================================

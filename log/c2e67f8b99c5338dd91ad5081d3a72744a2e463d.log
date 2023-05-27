@@ -1,0 +1,160 @@
+c2e67f8b99c5338dd91ad5081d3a72744a2e463d
+==================================================
+Enable non-blocking reads to take place on non-container threads.
+==================================================
+Mark Emlyn
+==================================================
+Fri Jan 31 18:34:18 2014 +0000
+==================================================
+CoyoteAdapter.java
+Enable non-blocking reads to take place on non-container threads.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1563206 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+InputBuffer.java
+index f0eded7dd8..3de464d8f9 100644
+--- a/java/org/apache/catalina/connector/CoyoteAdapter.java
++++ b/java/org/apache/catalina/connector/CoyoteAdapter.java
+@@ -373,7 +373,14 @@ public class CoyoteAdapter implements Adapter {
+                     ClassLoader oldCL = null;
+                     try {
+                         oldCL = request.getContext().bind(false, null);
+-                        readListener.onDataAvailable();
++                        // If data is being read on a non-container thread a
++                        // dispatch with status OPEN_READ will be used to get
++                        // execution back on a container thread for the
++                        // onAllDataRead() event. Therefore, make sure
++                        // onDataAvailable() is not called in this case.
++                        if (!request.isFinished()) {
++                            readListener.onDataAvailable();
++                        }
+                         if (request.isFinished() && req.sendAllDataReadEvent()) {
+                             readListener.onAllDataRead();
+                         }
+
+==================================================
+AbstractProtocol.java
+index ba5d794338..15b793253a 100644
+--- a/java/org/apache/catalina/connector/InputBuffer.java
++++ b/java/org/apache/catalina/connector/InputBuffer.java
+@@ -27,6 +27,7 @@ import javax.servlet.ReadListener;
+ 
+ import org.apache.catalina.security.SecurityUtil;
+ import org.apache.coyote.ActionCode;
++import org.apache.coyote.ContainerThreadMarker;
+ import org.apache.coyote.Request;
+ import org.apache.tomcat.util.buf.B2CConverter;
+ import org.apache.tomcat.util.buf.ByteChunk;
+@@ -273,8 +274,19 @@ public class InputBuffer extends Reader
+         if (coyoteRequest.getReadListener() == null) {
+             throw new IllegalStateException("not in non blocking mode.");
+         }
+-        int available = available();
+-        boolean result = available > 0;
++        // Need to check is finished before we check available() as BIO always
++        // returns 1 for isAvailable()
++        if (isFinished()) {
++            // If this is a non-container thread, need to trigger a read
++            // which will eventually lead to a call to onAllDataRead() via a
++            // container thread.
++            if (!ContainerThreadMarker.isContainerThread()) {
++                coyoteRequest.action(ActionCode.DISPATCH_READ, null);
++                coyoteRequest.action(ActionCode.DISPATCH_EXECUTE, null);
++            }
++            return false;
++        }
++        boolean result = available() > 0;
+         if (!result) {
+             coyoteRequest.action(ActionCode.NB_READ_INTEREST, null);
+         }
+
+==================================================
+ContainerThreadMarker.java
+index 3a5c258d38..74acfc67ea 100644
+--- a/java/org/apache/coyote/AbstractProtocol.java
++++ b/java/org/apache/coyote/AbstractProtocol.java
+@@ -609,6 +609,7 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+             }
+ 
+             wrapper.setAsync(false);
++            ContainerThreadMarker.markAsContainerThread();
+ 
+             try {
+                 if (processor == null) {
+
+==================================================
+AjpNioProcessor.java
+new file mode 100644
+index 0000000000..5b8e146b9b
+--- /dev/null
++++ b/java/org/apache/coyote/ContainerThreadMarker.java
+@@ -0,0 +1,35 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.coyote;
++
++public class ContainerThreadMarker {
++
++    private static final ThreadLocal<Boolean> marker = new ThreadLocal<>();
++
++    public static boolean isContainerThread() {
++        Boolean flag = marker.get();
++        if (flag == null) {
++            return false;
++        } else {
++            return flag.booleanValue();
++        }
++    }
++
++    public static void markAsContainerThread() {
++        marker.set(Boolean.TRUE);
++    }
++}
+
+==================================================
+Http11NioProcessor.java
+index 1d7c1059b6..6368710789 100644
+--- a/java/org/apache/coyote/ajp/AjpNioProcessor.java
++++ b/java/org/apache/coyote/ajp/AjpNioProcessor.java
+@@ -59,17 +59,20 @@ public class AjpNioProcessor extends AbstractAjpProcessor<NioChannel> {
+ 
+     @Override
+     protected void registerForEvent(boolean read, boolean write) {
++        final NioChannel socket = socketWrapper.getSocket();
+         final NioEndpoint.KeyAttachment attach =
+-                (NioEndpoint.KeyAttachment)socketWrapper.getSocket().getAttachment(
+-                        false);
++                (NioEndpoint.KeyAttachment) socket.getAttachment(false);
+         if (attach == null) {
+             return;
+         }
++        SelectionKey key = socket.getIOChannel().keyFor(socket.getPoller().getSelector());
+         if (read) {
+             attach.interestOps(attach.interestOps() | SelectionKey.OP_READ);
++            key.interestOps(key.interestOps() | SelectionKey.OP_READ);
+         }
+         if (write) {
+             attach.interestOps(attach.interestOps() | SelectionKey.OP_WRITE);
++            key.interestOps(key.interestOps() | SelectionKey.OP_READ);
+         }
+     }
+ 
+
+==================================================

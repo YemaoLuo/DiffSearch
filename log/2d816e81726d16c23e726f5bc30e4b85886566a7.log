@@ -1,0 +1,3212 @@
+2d816e81726d16c23e726f5bc30e4b85886566a7
+==================================================
+Update Panama module to OpenSSL 3.0
+==================================================
+remm remm@apache.org
+==================================================
+Fri Jun 17 15:19:29 2022 +0200
+==================================================
+OpenSSLContext.java
+index 3f7368b94e..e31fad9e1b 100644
+--- a/modules/openssl-foreign/openssl.h
++++ b/modules/openssl-foreign/openssl.h
+@@ -28,4 +28,4 @@
+ #include <openssl/bn.h>
+ #include <openssl/engine.h>
+ #include <openssl/ocsp.h>
+-
++#include <openssl/provider.h>
+
+==================================================
+OpenSSLEngine.java
+index 9657f33945..5f85266d2c 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/net/openssl/panama/OpenSSLContext.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/net/openssl/panama/OpenSSLContext.java
+@@ -760,7 +760,7 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
+     // DH *(*tmp_dh_callback)(SSL *ssl, int is_export, int keylength)
+     public static Addressable openSSLCallbackTmpDH(MemoryAddress ssl, int isExport, int keylength) {
+         var pkey = SSL_get_privatekey(ssl);
+-        int type = (MemoryAddress.NULL.equals(pkey)) ? EVP_PKEY_NONE() : EVP_PKEY_base_id(pkey);
++        int type = (MemoryAddress.NULL.equals(pkey)) ? EVP_PKEY_NONE() : EVP_PKEY_get_base_id(pkey);
+         /*
+          * OpenSSL will call us with either keylen == 512 or keylen == 1024
+          * (see the definition of SSL_EXPORT_PKEYLENGTH in ssl_locl.h).
+@@ -775,7 +775,7 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
+          */
+         int keylen = 0;
+         if ((type == EVP_PKEY_RSA()) || (type == EVP_PKEY_DSA())) {
+-            keylen = EVP_PKEY_bits(pkey);
++            keylen = EVP_PKEY_get_bits(pkey);
+         }
+         for (int i = 0; i < OpenSSLLifecycleListener.dhParameters.length; i++) {
+             if (keylen >= OpenSSLLifecycleListener.dhParameters[i].min) {
+
+==================================================
+OpenSSLLifecycleListener.java
+index 3d355d5393..c64e8e19c1 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/net/openssl/panama/OpenSSLEngine.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/net/openssl/panama/OpenSSLEngine.java
+@@ -966,7 +966,7 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
+ 
+     private byte[] getPeerCertificate() {
+         var allocator = SegmentAllocator.newNativeArena(engineMemorySession);
+-        MemoryAddress/*(X509*)*/ x509 = SSL_get_peer_certificate(state.ssl);
++        MemoryAddress/*(X509*)*/ x509 = SSL_get1_peer_certificate(state.ssl);
+         MemorySegment bufPointer = allocator.allocate(ValueLayout.ADDRESS, MemoryAddress.NULL);
+         int length = i2d_X509(x509, bufPointer);
+         if (length <= 0) {
+
+==================================================
+Constants$root.java
+index 426c9a5873..5f0359d26d 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/net/openssl/panama/OpenSSLLifecycleListener.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/net/openssl/panama/OpenSSLLifecycleListener.java
+@@ -17,6 +17,8 @@
+ package org.apache.tomcat.util.net.openssl.panama;
+ 
+ 
++import static org.apache.tomcat.util.openssl.openssl_compat_h.FIPS_mode;
++import static org.apache.tomcat.util.openssl.openssl_compat_h.FIPS_mode_set;
+ import static org.apache.tomcat.util.openssl.openssl_h.*;
+ 
+ import java.lang.foreign.MemoryAddress;
+@@ -282,41 +284,74 @@ public class OpenSSLLifecycleListener implements LifecycleListener {
+ 
+             initDHParameters();
+ 
+-            if (!(null == FIPSMode || "off".equalsIgnoreCase(FIPSMode))) {
++            // OpenSSL 3 onwards uses providers
++            boolean usingProviders = (OpenSSL_version_num() & 0xF0000000L) > 2;
+ 
++            if (usingProviders || !(null == FIPSMode || "off".equalsIgnoreCase(FIPSMode))) {
+                 fipsModeActive = false;
+-
+                 final boolean enterFipsMode;
+-                int fipsModeState = FIPS_mode();
++                int fipsModeState = FIPS_OFF;
++                if (usingProviders) {
++                    var md = EVP_MD_fetch(MemoryAddress.NULL, allocator.allocateUtf8String("SHA-512"), MemoryAddress.NULL);
++                    var provider = EVP_MD_get0_provider(md);
++                    String name = OSSL_PROVIDER_get0_name(provider).getUtf8String(0);
++                    EVP_MD_free(md);
++                    if ("fips".equals(name)) {
++                        fipsModeState = FIPS_ON;
++                    }
++                } else {
++                    fipsModeState = FIPS_mode();
++                }
+ 
+                 if(log.isDebugEnabled()) {
+-                    log.debug(sm.getString("listener.currentFIPSMode",
+-                            Integer.valueOf(fipsModeState)));
++                    log.debug(sm.getString("listener.currentFIPSMode", Integer.valueOf(fipsModeState)));
+                 }
+ 
+-                if ("on".equalsIgnoreCase(FIPSMode)) {
++                if (null == FIPSMode || "off".equalsIgnoreCase(FIPSMode)) {
++                    if (fipsModeState == FIPS_ON) {
++                        fipsModeActive = true;
++                    }
++                    enterFipsMode = false;
++                } else if ("on".equalsIgnoreCase(FIPSMode)) {
+                     if (fipsModeState == FIPS_ON) {
+-                        log.info(sm.getString("listener.skipFIPSInitialization"));
++                        if (!usingProviders) {
++                            log.info(sm.getString("listener.skipFIPSInitialization"));
++                        }
+                         fipsModeActive = true;
+                         enterFipsMode = false;
+                     } else {
+-                        enterFipsMode = true;
++                        if (usingProviders) {
++                            throw new IllegalStateException(sm.getString("listener.FIPSProviderNotDefault", FIPSMode));
++                        } else {
++                            enterFipsMode = true;
++                        }
+                     }
+                 } else if ("require".equalsIgnoreCase(FIPSMode)) {
+                     if (fipsModeState == FIPS_ON) {
+                         fipsModeActive = true;
+                         enterFipsMode = false;
+                     } else {
+-                        throw new IllegalStateException(
+-                                sm.getString("listener.requireNotInFIPSMode"));
++                        if (usingProviders) {
++                            throw new IllegalStateException(sm.getString("listener.FIPSProviderNotDefault", FIPSMode));
++                        } else {
++                            throw new IllegalStateException(sm.getString("listener.requireNotInFIPSMode"));
++                        }
+                     }
+                 } else if ("enter".equalsIgnoreCase(FIPSMode)) {
+                     if (fipsModeState == FIPS_OFF) {
+-                        enterFipsMode = true;
++                        if (usingProviders) {
++                            throw new IllegalStateException(sm.getString("listener.FIPSProviderNotDefault", FIPSMode));
++                        } else {
++                            enterFipsMode = true;
++                        }
+                     } else {
+-                        throw new IllegalStateException(sm.getString(
+-                                "listener.enterAlreadyInFIPSMode",
+-                                Integer.valueOf(fipsModeState)));
++                        if (usingProviders) {
++                            fipsModeActive = true;
++                            enterFipsMode = false;
++                        } else {
++                            throw new IllegalStateException(sm.getString(
++                                    "listener.enterAlreadyInFIPSMode", Integer.valueOf(fipsModeState)));
++                        }
+                     }
+                 } else {
+                     throw new IllegalArgumentException(sm.getString(
+@@ -338,6 +373,10 @@ public class OpenSSLLifecycleListener implements LifecycleListener {
+                     fipsModeActive = true;
+                     log.info(sm.getString("listener.initializeFIPSSuccess"));
+                 }
++
++                if (usingProviders && fipsModeActive) {
++                    log.info(sm.getString("aprListener.usingFIPSProvider"));
++                }
+             }
+ 
+             log.info(sm.getString("listener.initializedOpenSSL", OpenSSL_version(0).getUtf8String(0)));
+
+==================================================
+RuntimeHelper.java
+new file mode 100644
+index 0000000000..54a6564276
+--- /dev/null
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/Constants$root.java
+@@ -0,0 +1,40 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++// Generated by jextract
++
++package org.apache.tomcat.util.openssl;
++
++import java.lang.invoke.MethodHandle;
++import java.lang.invoke.VarHandle;
++import java.nio.ByteOrder;
++import java.lang.foreign.*;
++import static java.lang.foreign.ValueLayout.*;
++public class Constants$root {
++
++    static final  OfBoolean C_BOOL$LAYOUT = JAVA_BOOLEAN;
++    static final  OfByte C_CHAR$LAYOUT = JAVA_BYTE;
++    static final  OfShort C_SHORT$LAYOUT = JAVA_SHORT.withBitAlignment(16);
++    static final  OfInt C_INT$LAYOUT = JAVA_INT.withBitAlignment(32);
++    static final  OfLong C_LONG$LAYOUT = JAVA_LONG.withBitAlignment(64);
++    static final  OfLong C_LONG_LONG$LAYOUT = JAVA_LONG.withBitAlignment(64);
++    static final  OfFloat C_FLOAT$LAYOUT = JAVA_FLOAT.withBitAlignment(32);
++    static final  OfDouble C_DOUBLE$LAYOUT = JAVA_DOUBLE.withBitAlignment(64);
++    static final  OfAddress C_POINTER$LAYOUT = ADDRESS.withBitAlignment(64);
++}
++
++
+
+==================================================
+SSL_CTX_set_cert_verify_callback$cb.java
+index 74e85d1820..1e251b1129 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/RuntimeHelper.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/RuntimeHelper.java
+@@ -19,15 +19,15 @@ package org.apache.tomcat.util.openssl;
+ // Generated by jextract
+ 
+ import java.lang.foreign.Addressable;
++import java.lang.foreign.Linker;
+ import java.lang.foreign.FunctionDescriptor;
+ import java.lang.foreign.GroupLayout;
+-import java.lang.foreign.Linker;
++import java.lang.foreign.SymbolLookup;
+ import java.lang.foreign.MemoryAddress;
+ import java.lang.foreign.MemoryLayout;
+ import java.lang.foreign.MemorySegment;
+ import java.lang.foreign.MemorySession;
+ import java.lang.foreign.SegmentAllocator;
+-import java.lang.foreign.SymbolLookup;
+ import java.lang.foreign.ValueLayout;
+ import java.lang.invoke.MethodHandle;
+ import java.lang.invoke.MethodHandles;
+@@ -48,12 +48,15 @@ final class RuntimeHelper {
+     private final static Linker LINKER = Linker.nativeLinker();
+     private final static ClassLoader LOADER = RuntimeHelper.class.getClassLoader();
+     private final static MethodHandles.Lookup MH_LOOKUP = MethodHandles.lookup();
++    private final static SymbolLookup SYMBOL_LOOKUP;
+ 
+     final static SegmentAllocator CONSTANT_ALLOCATOR =
+             (size, align) -> MemorySegment.allocateNative(size, align, MemorySession.openImplicit());
+ 
+     static {
+         System.loadLibrary("ssl");
++        SymbolLookup loaderLookup = SymbolLookup.loaderLookup();
++        SYMBOL_LOOKUP = name -> loaderLookup.lookup(name).or(() -> LINKER.defaultLookup().lookup(name));
+     }
+ 
+     static <T> T requireNonNull(T obj, String symbolName) {
+@@ -66,38 +69,37 @@ final class RuntimeHelper {
+     private final static SegmentAllocator THROWING_ALLOCATOR = (x, y) -> { throw new AssertionError("should not reach here"); };
+ 
+     static final MemorySegment lookupGlobalVariable(String name, MemoryLayout layout) {
+-        return SymbolLookup.loaderLookup().lookup(name).map(symbol -> MemorySegment.ofAddress(symbol.address(), layout.byteSize(), MemorySession.openShared())).orElse(null);
++        return SYMBOL_LOOKUP.lookup(name).map(symbol -> MemorySegment.ofAddress(symbol.address(), layout.byteSize(), MemorySession.openShared())).orElse(null);
+     }
+ 
+-    static final MethodHandle downcallHandle(String name, FunctionDescriptor fdesc, boolean variadic) {
+-        return SymbolLookup.loaderLookup().lookup(name).map(
+-                addr -> {
+-                    return variadic ?
+-                        VarargsInvoker.make(addr, fdesc) :
+-                        LINKER.downcallHandle(addr, fdesc);
+-                }).orElse(null);
++    static final MethodHandle downcallHandle(String name, FunctionDescriptor fdesc) {
++        return SYMBOL_LOOKUP.lookup(name).
++                map(addr -> LINKER.downcallHandle(addr, fdesc)).
++                orElse(null);
+     }
+ 
+-    static final MethodHandle downcallHandle(FunctionDescriptor fdesc, boolean variadic) {
+-        if (variadic) {
+-            throw new AssertionError("Cannot get here!");
+-        }
++    static final MethodHandle downcallHandle(FunctionDescriptor fdesc) {
+         return LINKER.downcallHandle(fdesc);
+     }
+ 
+-    static final <Z> MemorySegment upcallStub(Class<Z> fi, Z z, FunctionDescriptor fdesc, String mtypeDesc, MemorySession scope) {
++    static final MethodHandle downcallHandleVariadic(String name, FunctionDescriptor fdesc) {
++        return SYMBOL_LOOKUP.lookup(name).
++                map(addr -> VarargsInvoker.make(addr, fdesc)).
++                orElse(null);
++    }
++
++    static final <Z> MemorySegment upcallStub(Class<Z> fi, Z z, FunctionDescriptor fdesc, MemorySession session) {
+         try {
+-            MethodHandle handle = MH_LOOKUP.findVirtual(fi, "apply",
+-                    MethodType.fromMethodDescriptorString(mtypeDesc, LOADER));
++            MethodHandle handle = MH_LOOKUP.findVirtual(fi, "apply", Linker.upcallType(fdesc));
+             handle = handle.bindTo(z);
+-            return LINKER.upcallStub(handle, fdesc, scope);
++            return LINKER.upcallStub(handle, fdesc, session);
+         } catch (Throwable ex) {
+             throw new AssertionError(ex);
+         }
+     }
+ 
+-    static MemorySegment asArray(MemoryAddress addr, MemoryLayout layout, int numElements, MemorySession scope) {
+-         return MemorySegment.ofAddress(addr, numElements * layout.byteSize(), scope);
++    static MemorySegment asArray(MemoryAddress addr, MemoryLayout layout, int numElements, MemorySession session) {
++         return MemorySegment.ofAddress(addr, numElements * layout.byteSize(), session);
+     }
+ 
+     // Internals only below this point
+
+==================================================
+SSL_CTX_set_tmp_dh_callback$dh.java
+new file mode 100644
+index 0000000000..43210cfc8b
+--- /dev/null
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/SSL_CTX_set_cert_verify_callback$cb.java
+@@ -0,0 +1,45 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++// Generated by jextract
++
++package org.apache.tomcat.util.openssl;
++
++import java.lang.invoke.MethodHandle;
++import java.lang.invoke.VarHandle;
++import java.nio.ByteOrder;
++import java.lang.foreign.*;
++import static java.lang.foreign.ValueLayout.*;
++public interface SSL_CTX_set_cert_verify_callback$cb {
++
++    int apply(java.lang.foreign.MemoryAddress _x0, java.lang.foreign.MemoryAddress _x1);
++    static MemorySegment allocate(SSL_CTX_set_cert_verify_callback$cb fi, MemorySession session) {
++        return RuntimeHelper.upcallStub(SSL_CTX_set_cert_verify_callback$cb.class, fi, constants$15.SSL_CTX_set_cert_verify_callback$cb$FUNC, session);
++    }
++    static SSL_CTX_set_cert_verify_callback$cb ofAddress(MemoryAddress addr, MemorySession session) {
++        MemorySegment symbol = MemorySegment.ofAddress(addr, 0, session);
++        return (java.lang.foreign.MemoryAddress __x0, java.lang.foreign.MemoryAddress __x1) -> {
++            try {
++                return (int)constants$15.SSL_CTX_set_cert_verify_callback$cb$MH.invokeExact((Addressable)symbol, (java.lang.foreign.Addressable)__x0, (java.lang.foreign.Addressable)__x1);
++            } catch (Throwable ex$) {
++                throw new AssertionError("should not reach here", ex$);
++            }
++        };
++    }
++}
++
++
+
+==================================================
+SSL_set_info_callback$cb.java
+new file mode 100644
+index 0000000000..cb91c18667
+--- /dev/null
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/SSL_CTX_set_tmp_dh_callback$dh.java
+@@ -0,0 +1,45 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++// Generated by jextract
++
++package org.apache.tomcat.util.openssl;
++
++import java.lang.invoke.MethodHandle;
++import java.lang.invoke.VarHandle;
++import java.nio.ByteOrder;
++import java.lang.foreign.*;
++import static java.lang.foreign.ValueLayout.*;
++public interface SSL_CTX_set_tmp_dh_callback$dh {
++
++    java.lang.foreign.Addressable apply(java.lang.foreign.MemoryAddress _x0, int _x1, int _x2);
++    static MemorySegment allocate(SSL_CTX_set_tmp_dh_callback$dh fi, MemorySession session) {
++        return RuntimeHelper.upcallStub(SSL_CTX_set_tmp_dh_callback$dh.class, fi, constants$21.SSL_CTX_set_tmp_dh_callback$dh$FUNC, session);
++    }
++    static SSL_CTX_set_tmp_dh_callback$dh ofAddress(MemoryAddress addr, MemorySession session) {
++        MemorySegment symbol = MemorySegment.ofAddress(addr, 0, session);
++        return (java.lang.foreign.MemoryAddress __x0, int __x1, int __x2) -> {
++            try {
++                return (java.lang.foreign.Addressable)(java.lang.foreign.MemoryAddress)constants$22.SSL_CTX_set_tmp_dh_callback$dh$MH.invokeExact((Addressable)symbol, (java.lang.foreign.Addressable)__x0, __x1, __x2);
++            } catch (Throwable ex$) {
++                throw new AssertionError("should not reach here", ex$);
++            }
++        };
++    }
++}
++
++
+
+==================================================
+constants$0.java
+new file mode 100644
+index 0000000000..7e472ef297
+--- /dev/null
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/SSL_set_info_callback$cb.java
+@@ -0,0 +1,45 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++// Generated by jextract
++
++package org.apache.tomcat.util.openssl;
++
++import java.lang.invoke.MethodHandle;
++import java.lang.invoke.VarHandle;
++import java.nio.ByteOrder;
++import java.lang.foreign.*;
++import static java.lang.foreign.ValueLayout.*;
++public interface SSL_set_info_callback$cb {
++
++    void apply(java.lang.foreign.MemoryAddress _x0, int _x1, int _x2);
++    static MemorySegment allocate(SSL_set_info_callback$cb fi, MemorySession session) {
++        return RuntimeHelper.upcallStub(SSL_set_info_callback$cb.class, fi, constants$21.SSL_set_info_callback$cb$FUNC, session);
++    }
++    static SSL_set_info_callback$cb ofAddress(MemoryAddress addr, MemorySession session) {
++        MemorySegment symbol = MemorySegment.ofAddress(addr, 0, session);
++        return (java.lang.foreign.MemoryAddress __x0, int __x1, int __x2) -> {
++            try {
++                constants$21.SSL_set_info_callback$cb$MH.invokeExact((Addressable)symbol, (java.lang.foreign.Addressable)__x0, __x1, __x2);
++            } catch (Throwable ex$) {
++                throw new AssertionError("should not reach here", ex$);
++            }
++        };
++    }
++}
++
++
+
+==================================================
+constants$1.java
+index 264553e0be..5812df1472 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$0.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$0.java
+@@ -26,40 +26,48 @@ import java.lang.foreign.*;
+ import static java.lang.foreign.ValueLayout.*;
+ class constants$0 {
+ 
+-    static final FunctionDescriptor OPENSSL_sk_num$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS
++    static final FunctionDescriptor OPENSSL_sk_num$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+     static final MethodHandle OPENSSL_sk_num$MH = RuntimeHelper.downcallHandle(
+         "OPENSSL_sk_num",
+-        constants$0.OPENSSL_sk_num$FUNC, false
++        constants$0.OPENSSL_sk_num$FUNC
+     );
+-    static final FunctionDescriptor OPENSSL_sk_value$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS,
+-        JAVA_INT
++    static final FunctionDescriptor OPENSSL_sk_value$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_INT$LAYOUT
+     );
+     static final MethodHandle OPENSSL_sk_value$MH = RuntimeHelper.downcallHandle(
+         "OPENSSL_sk_value",
+-        constants$0.OPENSSL_sk_value$FUNC, false
++        constants$0.OPENSSL_sk_value$FUNC
+     );
+-    static final FunctionDescriptor OpenSSL_version_num$FUNC = FunctionDescriptor.of(JAVA_LONG);
++    static final FunctionDescriptor OpenSSL_version_num$FUNC = FunctionDescriptor.of(Constants$root.C_LONG_LONG$LAYOUT);
+     static final MethodHandle OpenSSL_version_num$MH = RuntimeHelper.downcallHandle(
+         "OpenSSL_version_num",
+-        constants$0.OpenSSL_version_num$FUNC, false
++        constants$0.OpenSSL_version_num$FUNC
+     );
+-    static final FunctionDescriptor OpenSSL_version$FUNC = FunctionDescriptor.of(ADDRESS,
+-        JAVA_INT
++    static final FunctionDescriptor OpenSSL_version$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_INT$LAYOUT
+     );
+     static final MethodHandle OpenSSL_version$MH = RuntimeHelper.downcallHandle(
+         "OpenSSL_version",
+-        constants$0.OpenSSL_version$FUNC, false
++        constants$0.OpenSSL_version$FUNC
+     );
+-    static final FunctionDescriptor CRYPTO_set_mem_functions$m$FUNC = FunctionDescriptor.of(ADDRESS,
+-        JAVA_LONG,
+-        ADDRESS,
+-        JAVA_INT
++    static final FunctionDescriptor CRYPTO_free$FUNC = FunctionDescriptor.ofVoid(
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_INT$LAYOUT
+     );
+-    static final MethodHandle CRYPTO_set_mem_functions$m$MH = RuntimeHelper.downcallHandle(
+-        constants$0.CRYPTO_set_mem_functions$m$FUNC, false
++    static final MethodHandle CRYPTO_free$MH = RuntimeHelper.downcallHandle(
++        "CRYPTO_free",
++        constants$0.CRYPTO_free$FUNC
++    );
++    static final FunctionDescriptor BIO_ctrl_pending$FUNC = FunctionDescriptor.of(Constants$root.C_LONG_LONG$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
++    );
++    static final MethodHandle BIO_ctrl_pending$MH = RuntimeHelper.downcallHandle(
++        "BIO_ctrl_pending",
++        constants$0.BIO_ctrl_pending$FUNC
+     );
+ }
+ 
+
+==================================================
+constants$10.java
+index 986b10a55f..674de51409 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$1.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$1.java
+@@ -26,40 +26,50 @@ import java.lang.foreign.*;
+ import static java.lang.foreign.ValueLayout.*;
+ class constants$1 {
+ 
+-    static final FunctionDescriptor CRYPTO_set_mem_functions$r$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS,
+-        JAVA_LONG,
+-        ADDRESS,
+-        JAVA_INT
++    static final FunctionDescriptor BIO_s_file$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT);
++    static final MethodHandle BIO_s_file$MH = RuntimeHelper.downcallHandle(
++        "BIO_s_file",
++        constants$1.BIO_s_file$FUNC
+     );
+-    static final MethodHandle CRYPTO_set_mem_functions$r$MH = RuntimeHelper.downcallHandle(
+-        constants$1.CRYPTO_set_mem_functions$r$FUNC, false
++    static final FunctionDescriptor BIO_new_file$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor CRYPTO_set_mem_functions$f$FUNC = FunctionDescriptor.ofVoid(
+-        ADDRESS,
+-        ADDRESS,
+-        JAVA_INT
++    static final MethodHandle BIO_new_file$MH = RuntimeHelper.downcallHandle(
++        "BIO_new_file",
++        constants$1.BIO_new_file$FUNC
+     );
+-    static final MethodHandle CRYPTO_set_mem_functions$f$MH = RuntimeHelper.downcallHandle(
+-        constants$1.CRYPTO_set_mem_functions$f$FUNC, false
++    static final FunctionDescriptor BIO_new$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor CRYPTO_set_mem_functions$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        ADDRESS,
+-        ADDRESS
++    static final MethodHandle BIO_new$MH = RuntimeHelper.downcallHandle(
++        "BIO_new",
++        constants$1.BIO_new$FUNC
+     );
+-    static final MethodHandle CRYPTO_set_mem_functions$MH = RuntimeHelper.downcallHandle(
+-        "CRYPTO_set_mem_functions",
+-        constants$1.CRYPTO_set_mem_functions$FUNC, false
++    static final FunctionDescriptor BIO_free$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor CRYPTO_free$FUNC = FunctionDescriptor.ofVoid(
+-        ADDRESS,
+-        ADDRESS,
+-        JAVA_INT
++    static final MethodHandle BIO_free$MH = RuntimeHelper.downcallHandle(
++        "BIO_free",
++        constants$1.BIO_free$FUNC
+     );
+-    static final MethodHandle CRYPTO_free$MH = RuntimeHelper.downcallHandle(
+-        "CRYPTO_free",
+-        constants$1.CRYPTO_free$FUNC, false
++    static final FunctionDescriptor BIO_read$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_INT$LAYOUT
++    );
++    static final MethodHandle BIO_read$MH = RuntimeHelper.downcallHandle(
++        "BIO_read",
++        constants$1.BIO_read$FUNC
++    );
++    static final FunctionDescriptor BIO_write$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_INT$LAYOUT
++    );
++    static final MethodHandle BIO_write$MH = RuntimeHelper.downcallHandle(
++        "BIO_write",
++        constants$1.BIO_write$FUNC
+     );
+ }
+ 
+
+==================================================
+constants$11.java
+index dc282042f7..24301868e0 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$10.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$10.java
+@@ -26,56 +26,57 @@ import java.lang.foreign.*;
+ import static java.lang.foreign.ValueLayout.*;
+ class constants$10 {
+ 
+-    static final FunctionDescriptor d2i_X509$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS,
+-        ADDRESS,
+-        JAVA_LONG
++    static final FunctionDescriptor PEM_read_bio_ECPKParameters$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle d2i_X509$MH = RuntimeHelper.downcallHandle(
+-        "d2i_X509",
+-        constants$10.d2i_X509$FUNC, false
++    static final MethodHandle PEM_read_bio_ECPKParameters$MH = RuntimeHelper.downcallHandle(
++        "PEM_read_bio_ECPKParameters",
++        constants$10.PEM_read_bio_ECPKParameters$FUNC
+     );
+-    static final FunctionDescriptor i2d_X509$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor PEM_read_bio_DHparams$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle i2d_X509$MH = RuntimeHelper.downcallHandle(
+-        "i2d_X509",
+-        constants$10.i2d_X509$FUNC, false
++    static final MethodHandle PEM_read_bio_DHparams$MH = RuntimeHelper.downcallHandle(
++        "PEM_read_bio_DHparams",
++        constants$10.PEM_read_bio_DHparams$FUNC
+     );
+-    static final FunctionDescriptor X509_get_ext_by_NID$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        JAVA_INT,
+-        JAVA_INT
++    static final FunctionDescriptor PEM_read_bio_PrivateKey$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle X509_get_ext_by_NID$MH = RuntimeHelper.downcallHandle(
+-        "X509_get_ext_by_NID",
+-        constants$10.X509_get_ext_by_NID$FUNC, false
++    static final MethodHandle PEM_read_bio_PrivateKey$MH = RuntimeHelper.downcallHandle(
++        "PEM_read_bio_PrivateKey",
++        constants$10.PEM_read_bio_PrivateKey$FUNC
+     );
+-    static final FunctionDescriptor X509_get_ext$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS,
+-        JAVA_INT
++    static final FunctionDescriptor SSL_CTX_get_options$FUNC = FunctionDescriptor.of(Constants$root.C_LONG_LONG$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle X509_get_ext$MH = RuntimeHelper.downcallHandle(
+-        "X509_get_ext",
+-        constants$10.X509_get_ext$FUNC, false
++    static final MethodHandle SSL_CTX_get_options$MH = RuntimeHelper.downcallHandle(
++        "SSL_CTX_get_options",
++        constants$10.SSL_CTX_get_options$FUNC
+     );
+-    static final FunctionDescriptor X509_EXTENSION_get_data$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor SSL_get_options$FUNC = FunctionDescriptor.of(Constants$root.C_LONG_LONG$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle X509_EXTENSION_get_data$MH = RuntimeHelper.downcallHandle(
+-        "X509_EXTENSION_get_data",
+-        constants$10.X509_EXTENSION_get_data$FUNC, false
++    static final MethodHandle SSL_get_options$MH = RuntimeHelper.downcallHandle(
++        "SSL_get_options",
++        constants$10.SSL_get_options$FUNC
+     );
+-    static final FunctionDescriptor PEM_read_bio_X509_AUX$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS,
+-        ADDRESS,
+-        ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor SSL_CTX_clear_options$FUNC = FunctionDescriptor.of(Constants$root.C_LONG_LONG$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_LONG_LONG$LAYOUT
+     );
+-    static final MethodHandle PEM_read_bio_X509_AUX$MH = RuntimeHelper.downcallHandle(
+-        "PEM_read_bio_X509_AUX",
+-        constants$10.PEM_read_bio_X509_AUX$FUNC, false
++    static final MethodHandle SSL_CTX_clear_options$MH = RuntimeHelper.downcallHandle(
++        "SSL_CTX_clear_options",
++        constants$10.SSL_CTX_clear_options$FUNC
+     );
+ }
+ 
+
+==================================================
+constants$12.java
+index 981de46964..312a845a8f 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$11.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$11.java
+@@ -26,57 +26,54 @@ import java.lang.foreign.*;
+ import static java.lang.foreign.ValueLayout.*;
+ class constants$11 {
+ 
+-    static final FunctionDescriptor PEM_read_bio_ECPKParameters$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS,
+-        ADDRESS,
+-        ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor SSL_CTX_set_options$FUNC = FunctionDescriptor.of(Constants$root.C_LONG_LONG$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_LONG_LONG$LAYOUT
+     );
+-    static final MethodHandle PEM_read_bio_ECPKParameters$MH = RuntimeHelper.downcallHandle(
+-        "PEM_read_bio_ECPKParameters",
+-        constants$11.PEM_read_bio_ECPKParameters$FUNC, false
++    static final MethodHandle SSL_CTX_set_options$MH = RuntimeHelper.downcallHandle(
++        "SSL_CTX_set_options",
++        constants$11.SSL_CTX_set_options$FUNC
+     );
+-    static final FunctionDescriptor PEM_read_bio_DHparams$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS,
+-        ADDRESS,
+-        ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor SSL_set_options$FUNC = FunctionDescriptor.of(Constants$root.C_LONG_LONG$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_LONG_LONG$LAYOUT
+     );
+-    static final MethodHandle PEM_read_bio_DHparams$MH = RuntimeHelper.downcallHandle(
+-        "PEM_read_bio_DHparams",
+-        constants$11.PEM_read_bio_DHparams$FUNC, false
++    static final MethodHandle SSL_set_options$MH = RuntimeHelper.downcallHandle(
++        "SSL_set_options",
++        constants$11.SSL_set_options$FUNC
+     );
+-    static final FunctionDescriptor PEM_read_bio_PrivateKey$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS,
+-        ADDRESS,
+-        ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor SSL_CTX_set_alpn_select_cb$FUNC = FunctionDescriptor.ofVoid(
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle PEM_read_bio_PrivateKey$MH = RuntimeHelper.downcallHandle(
+-        "PEM_read_bio_PrivateKey",
+-        constants$11.PEM_read_bio_PrivateKey$FUNC, false
++    static final MethodHandle SSL_CTX_set_alpn_select_cb$MH = RuntimeHelper.downcallHandle(
++        "SSL_CTX_set_alpn_select_cb",
++        constants$11.SSL_CTX_set_alpn_select_cb$FUNC
+     );
+-    static final FunctionDescriptor SSL_CTX_get_options$FUNC = FunctionDescriptor.of(JAVA_LONG,
+-        ADDRESS
++    static final FunctionDescriptor SSL_get0_alpn_selected$FUNC = FunctionDescriptor.ofVoid(
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_CTX_get_options$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CTX_get_options",
+-        constants$11.SSL_CTX_get_options$FUNC, false
++    static final MethodHandle SSL_get0_alpn_selected$MH = RuntimeHelper.downcallHandle(
++        "SSL_get0_alpn_selected",
++        constants$11.SSL_get0_alpn_selected$FUNC
+     );
+-    static final FunctionDescriptor SSL_get_options$FUNC = FunctionDescriptor.of(JAVA_LONG,
+-        ADDRESS
++    static final FunctionDescriptor SSL_in_init$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_get_options$MH = RuntimeHelper.downcallHandle(
+-        "SSL_get_options",
+-        constants$11.SSL_get_options$FUNC, false
++    static final MethodHandle SSL_in_init$MH = RuntimeHelper.downcallHandle(
++        "SSL_in_init",
++        constants$11.SSL_in_init$FUNC
+     );
+-    static final FunctionDescriptor SSL_CTX_clear_options$FUNC = FunctionDescriptor.of(JAVA_LONG,
+-        ADDRESS,
+-        JAVA_LONG
++    static final FunctionDescriptor SSL_CTX_set_cipher_list$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_CTX_clear_options$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CTX_clear_options",
+-        constants$11.SSL_CTX_clear_options$FUNC, false
++    static final MethodHandle SSL_CTX_set_cipher_list$MH = RuntimeHelper.downcallHandle(
++        "SSL_CTX_set_cipher_list",
++        constants$11.SSL_CTX_set_cipher_list$FUNC
+     );
+ }
+ 
+
+==================================================
+constants$13.java
+index df4926405e..2f5ed0b29c 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$12.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$12.java
+@@ -26,46 +26,48 @@ import java.lang.foreign.*;
+ import static java.lang.foreign.ValueLayout.*;
+ class constants$12 {
+ 
+-    static final FunctionDescriptor SSL_CTX_set_options$FUNC = FunctionDescriptor.of(JAVA_LONG,
+-        ADDRESS,
+-        JAVA_LONG
++    static final FunctionDescriptor SSL_CTX_new$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_CTX_set_options$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CTX_set_options",
+-        constants$12.SSL_CTX_set_options$FUNC, false
++    static final MethodHandle SSL_CTX_new$MH = RuntimeHelper.downcallHandle(
++        "SSL_CTX_new",
++        constants$12.SSL_CTX_new$FUNC
+     );
+-    static final FunctionDescriptor SSL_set_options$FUNC = FunctionDescriptor.of(JAVA_LONG,
+-        ADDRESS,
+-        JAVA_LONG
++    static final FunctionDescriptor SSL_CTX_free$FUNC = FunctionDescriptor.ofVoid(
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_set_options$MH = RuntimeHelper.downcallHandle(
+-        "SSL_set_options",
+-        constants$12.SSL_set_options$FUNC, false
++    static final MethodHandle SSL_CTX_free$MH = RuntimeHelper.downcallHandle(
++        "SSL_CTX_free",
++        constants$12.SSL_CTX_free$FUNC
+     );
+-    static final FunctionDescriptor SSL_CTX_set_alpn_select_cb$FUNC = FunctionDescriptor.ofVoid(
+-        ADDRESS,
+-        ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor SSL_CTX_set_timeout$FUNC = FunctionDescriptor.of(Constants$root.C_LONG_LONG$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_LONG_LONG$LAYOUT
+     );
+-    static final MethodHandle SSL_CTX_set_alpn_select_cb$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CTX_set_alpn_select_cb",
+-        constants$12.SSL_CTX_set_alpn_select_cb$FUNC, false
++    static final MethodHandle SSL_CTX_set_timeout$MH = RuntimeHelper.downcallHandle(
++        "SSL_CTX_set_timeout",
++        constants$12.SSL_CTX_set_timeout$FUNC
+     );
+-    static final FunctionDescriptor SSL_get0_alpn_selected$FUNC = FunctionDescriptor.ofVoid(
+-        ADDRESS,
+-        ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor SSL_CTX_get_timeout$FUNC = FunctionDescriptor.of(Constants$root.C_LONG_LONG$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_get0_alpn_selected$MH = RuntimeHelper.downcallHandle(
+-        "SSL_get0_alpn_selected",
+-        constants$12.SSL_get0_alpn_selected$FUNC, false
++    static final MethodHandle SSL_CTX_get_timeout$MH = RuntimeHelper.downcallHandle(
++        "SSL_CTX_get_timeout",
++        constants$12.SSL_CTX_get_timeout$FUNC
+     );
+-    static final FunctionDescriptor SSL_in_init$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS
++    static final FunctionDescriptor SSL_CTX_get_cert_store$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_in_init$MH = RuntimeHelper.downcallHandle(
+-        "SSL_in_init",
+-        constants$12.SSL_in_init$FUNC, false
++    static final MethodHandle SSL_CTX_get_cert_store$MH = RuntimeHelper.downcallHandle(
++        "SSL_CTX_get_cert_store",
++        constants$12.SSL_CTX_get_cert_store$FUNC
++    );
++    static final FunctionDescriptor SSL_get_current_cipher$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
++    );
++    static final MethodHandle SSL_get_current_cipher$MH = RuntimeHelper.downcallHandle(
++        "SSL_get_current_cipher",
++        constants$12.SSL_get_current_cipher$FUNC
+     );
+ }
+ 
+
+==================================================
+constants$14.java
+index 2c35a0861f..8a526af710 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$13.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$13.java
+@@ -26,57 +26,50 @@ import java.lang.foreign.*;
+ import static java.lang.foreign.ValueLayout.*;
+ class constants$13 {
+ 
+-    static final FunctionDescriptor SSL_CTX_set_cipher_list$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor SSL_CIPHER_get_name$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_CTX_set_cipher_list$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CTX_set_cipher_list",
+-        constants$13.SSL_CTX_set_cipher_list$FUNC, false
++    static final MethodHandle SSL_CIPHER_get_name$MH = RuntimeHelper.downcallHandle(
++        "SSL_CIPHER_get_name",
++        constants$13.SSL_CIPHER_get_name$FUNC
+     );
+-    static final FunctionDescriptor SSL_CTX_set_ciphersuites$FUNC = FunctionDescriptor.of(JAVA_INT,
+-            ADDRESS,
+-            ADDRESS
+-        );
+-    static final MethodHandle SSL_CTX_set_ciphersuites$MH = RuntimeHelper.downcallHandle(
+-            "SSL_CTX_set_ciphersuites",
+-            constants$13.SSL_CTX_set_ciphersuites$FUNC, false
+-        );
+-    static final FunctionDescriptor SSL_CTX_new$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor SSL_CIPHER_get_kx_nid$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_CTX_new$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CTX_new",
+-        constants$13.SSL_CTX_new$FUNC, false
++    static final MethodHandle SSL_CIPHER_get_kx_nid$MH = RuntimeHelper.downcallHandle(
++        "SSL_CIPHER_get_kx_nid",
++        constants$13.SSL_CIPHER_get_kx_nid$FUNC
+     );
+-    static final FunctionDescriptor SSL_CTX_free$FUNC = FunctionDescriptor.ofVoid(
+-        ADDRESS
++    static final FunctionDescriptor SSL_CIPHER_get_auth_nid$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_CTX_free$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CTX_free",
+-        constants$13.SSL_CTX_free$FUNC, false
++    static final MethodHandle SSL_CIPHER_get_auth_nid$MH = RuntimeHelper.downcallHandle(
++        "SSL_CIPHER_get_auth_nid",
++        constants$13.SSL_CIPHER_get_auth_nid$FUNC
+     );
+-    static final FunctionDescriptor SSL_CTX_set_timeout$FUNC = FunctionDescriptor.of(JAVA_LONG,
+-        ADDRESS,
+-        JAVA_LONG
++    static final FunctionDescriptor SSL_pending$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_CTX_set_timeout$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CTX_set_timeout",
+-        constants$13.SSL_CTX_set_timeout$FUNC, false
++    static final MethodHandle SSL_pending$MH = RuntimeHelper.downcallHandle(
++        "SSL_pending",
++        constants$13.SSL_pending$FUNC
+     );
+-    static final FunctionDescriptor SSL_CTX_get_timeout$FUNC = FunctionDescriptor.of(JAVA_LONG,
+-        ADDRESS
++    static final FunctionDescriptor SSL_set_bio$FUNC = FunctionDescriptor.ofVoid(
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_CTX_get_timeout$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CTX_get_timeout",
+-        constants$13.SSL_CTX_get_timeout$FUNC, false
++    static final MethodHandle SSL_set_bio$MH = RuntimeHelper.downcallHandle(
++        "SSL_set_bio",
++        constants$13.SSL_set_bio$FUNC
+     );
+-    static final FunctionDescriptor SSL_CTX_get_cert_store$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor SSL_set_cipher_list$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_CTX_get_cert_store$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CTX_get_cert_store",
+-        constants$13.SSL_CTX_get_cert_store$FUNC, false
++    static final MethodHandle SSL_set_cipher_list$MH = RuntimeHelper.downcallHandle(
++        "SSL_set_cipher_list",
++        constants$13.SSL_set_cipher_list$FUNC
+     );
+ }
+ 
+
+==================================================
+constants$15.java
+index 698c479087..18f386d913 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$14.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$14.java
+@@ -26,49 +26,52 @@ import java.lang.foreign.*;
+ import static java.lang.foreign.ValueLayout.*;
+ class constants$14 {
+ 
+-    static final FunctionDescriptor SSL_get_current_cipher$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor SSL_CTX_set_ciphersuites$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_get_current_cipher$MH = RuntimeHelper.downcallHandle(
+-        "SSL_get_current_cipher",
+-        constants$14.SSL_get_current_cipher$FUNC, false
++    static final MethodHandle SSL_CTX_set_ciphersuites$MH = RuntimeHelper.downcallHandle(
++        "SSL_CTX_set_ciphersuites",
++        constants$14.SSL_CTX_set_ciphersuites$FUNC
+     );
+-    static final FunctionDescriptor SSL_CIPHER_get_name$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor SSL_set_verify$FUNC = FunctionDescriptor.ofVoid(
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_CIPHER_get_name$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CIPHER_get_name",
+-        constants$14.SSL_CIPHER_get_name$FUNC, false
++    static final MethodHandle SSL_set_verify$MH = RuntimeHelper.downcallHandle(
++        "SSL_set_verify",
++        constants$14.SSL_set_verify$FUNC
+     );
+-    static final FunctionDescriptor SSL_CIPHER_get_kx_nid$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS
++    static final FunctionDescriptor SSL_CTX_use_certificate_chain_file$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_CIPHER_get_kx_nid$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CIPHER_get_kx_nid",
+-        constants$14.SSL_CIPHER_get_kx_nid$FUNC, false
++    static final MethodHandle SSL_CTX_use_certificate_chain_file$MH = RuntimeHelper.downcallHandle(
++        "SSL_CTX_use_certificate_chain_file",
++        constants$14.SSL_CTX_use_certificate_chain_file$FUNC
+     );
+-    static final FunctionDescriptor SSL_CIPHER_get_auth_nid$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS
++    static final FunctionDescriptor SSL_load_client_CA_file$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_CIPHER_get_auth_nid$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CIPHER_get_auth_nid",
+-        constants$14.SSL_CIPHER_get_auth_nid$FUNC, false
++    static final MethodHandle SSL_load_client_CA_file$MH = RuntimeHelper.downcallHandle(
++        "SSL_load_client_CA_file",
++        constants$14.SSL_load_client_CA_file$FUNC
+     );
+-    static final FunctionDescriptor SSL_pending$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS
++    static final FunctionDescriptor SSL_add_file_cert_subjects_to_stack$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_pending$MH = RuntimeHelper.downcallHandle(
+-        "SSL_pending",
+-        constants$14.SSL_pending$FUNC, false
++    static final MethodHandle SSL_add_file_cert_subjects_to_stack$MH = RuntimeHelper.downcallHandle(
++        "SSL_add_file_cert_subjects_to_stack",
++        constants$14.SSL_add_file_cert_subjects_to_stack$FUNC
+     );
+-    static final FunctionDescriptor SSL_set_bio$FUNC = FunctionDescriptor.ofVoid(
+-        ADDRESS,
+-        ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor SSL_SESSION_get_time$FUNC = FunctionDescriptor.of(Constants$root.C_LONG_LONG$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_set_bio$MH = RuntimeHelper.downcallHandle(
+-        "SSL_set_bio",
+-        constants$14.SSL_set_bio$FUNC, false
++    static final MethodHandle SSL_SESSION_get_time$MH = RuntimeHelper.downcallHandle(
++        "SSL_SESSION_get_time",
++        constants$14.SSL_SESSION_get_time$FUNC
+     );
+ }
+ 
+
+==================================================
+constants$16.java
+index 31aa20f732..8e092c940e 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$15.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$15.java
+@@ -26,52 +26,43 @@ import java.lang.foreign.*;
+ import static java.lang.foreign.ValueLayout.*;
+ class constants$15 {
+ 
+-    static final FunctionDescriptor SSL_set_cipher_list$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor SSL_SESSION_get_id$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_set_cipher_list$MH = RuntimeHelper.downcallHandle(
+-        "SSL_set_cipher_list",
+-        constants$15.SSL_set_cipher_list$FUNC, false
++    static final MethodHandle SSL_SESSION_get_id$MH = RuntimeHelper.downcallHandle(
++        "SSL_SESSION_get_id",
++        constants$15.SSL_SESSION_get_id$FUNC
+     );
+-    static final FunctionDescriptor SSL_set_verify$FUNC = FunctionDescriptor.ofVoid(
+-        ADDRESS,
+-        JAVA_INT,
+-        ADDRESS
++    static final FunctionDescriptor SSL_get1_peer_certificate$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_set_verify$MH = RuntimeHelper.downcallHandle(
+-        "SSL_set_verify",
+-        constants$15.SSL_set_verify$FUNC, false
++    static final MethodHandle SSL_get1_peer_certificate$MH = RuntimeHelper.downcallHandle(
++        "SSL_get1_peer_certificate",
++        constants$15.SSL_get1_peer_certificate$FUNC
+     );
+-    static final FunctionDescriptor SSL_CTX_use_certificate_chain_file$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor SSL_get_peer_cert_chain$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_CTX_use_certificate_chain_file$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CTX_use_certificate_chain_file",
+-        constants$15.SSL_CTX_use_certificate_chain_file$FUNC, false
++    static final MethodHandle SSL_get_peer_cert_chain$MH = RuntimeHelper.downcallHandle(
++        "SSL_get_peer_cert_chain",
++        constants$15.SSL_get_peer_cert_chain$FUNC
+     );
+-    static final FunctionDescriptor SSL_load_client_CA_file$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor SSL_CTX_set_verify$FUNC = FunctionDescriptor.ofVoid(
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_load_client_CA_file$MH = RuntimeHelper.downcallHandle(
+-        "SSL_load_client_CA_file",
+-        constants$15.SSL_load_client_CA_file$FUNC, false
++    static final MethodHandle SSL_CTX_set_verify$MH = RuntimeHelper.downcallHandle(
++        "SSL_CTX_set_verify",
++        constants$15.SSL_CTX_set_verify$FUNC
+     );
+-    static final FunctionDescriptor SSL_add_file_cert_subjects_to_stack$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor SSL_CTX_set_cert_verify_callback$cb$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_add_file_cert_subjects_to_stack$MH = RuntimeHelper.downcallHandle(
+-        "SSL_add_file_cert_subjects_to_stack",
+-        constants$15.SSL_add_file_cert_subjects_to_stack$FUNC, false
+-    );
+-    static final FunctionDescriptor SSL_SESSION_get_time$FUNC = FunctionDescriptor.of(JAVA_LONG,
+-        ADDRESS
+-    );
+-    static final MethodHandle SSL_SESSION_get_time$MH = RuntimeHelper.downcallHandle(
+-        "SSL_SESSION_get_time",
+-        constants$15.SSL_SESSION_get_time$FUNC, false
++    static final MethodHandle SSL_CTX_set_cert_verify_callback$cb$MH = RuntimeHelper.downcallHandle(
++        constants$15.SSL_CTX_set_cert_verify_callback$cb$FUNC
+     );
+ }
+ 
+
+==================================================
+constants$17.java
+index c4529d5247..602efd7b79 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$16.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$16.java
+@@ -26,43 +26,54 @@ import java.lang.foreign.*;
+ import static java.lang.foreign.ValueLayout.*;
+ class constants$16 {
+ 
+-    static final FunctionDescriptor SSL_SESSION_get_id$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor SSL_CTX_set_cert_verify_callback$FUNC = FunctionDescriptor.ofVoid(
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_SESSION_get_id$MH = RuntimeHelper.downcallHandle(
+-        "SSL_SESSION_get_id",
+-        constants$16.SSL_SESSION_get_id$FUNC, false
++    static final MethodHandle SSL_CTX_set_cert_verify_callback$MH = RuntimeHelper.downcallHandle(
++        "SSL_CTX_set_cert_verify_callback",
++        constants$16.SSL_CTX_set_cert_verify_callback$FUNC
+     );
+-    static final FunctionDescriptor SSL_get_peer_certificate$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor SSL_CTX_use_PrivateKey$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_get_peer_certificate$MH = RuntimeHelper.downcallHandle(
+-        "SSL_get_peer_certificate",
+-        constants$16.SSL_get_peer_certificate$FUNC, false
++    static final MethodHandle SSL_CTX_use_PrivateKey$MH = RuntimeHelper.downcallHandle(
++        "SSL_CTX_use_PrivateKey",
++        constants$16.SSL_CTX_use_PrivateKey$FUNC
+     );
+-    static final FunctionDescriptor SSL_get_peer_cert_chain$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor SSL_CTX_use_certificate$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_get_peer_cert_chain$MH = RuntimeHelper.downcallHandle(
+-        "SSL_get_peer_cert_chain",
+-        constants$16.SSL_get_peer_cert_chain$FUNC, false
++    static final MethodHandle SSL_CTX_use_certificate$MH = RuntimeHelper.downcallHandle(
++        "SSL_CTX_use_certificate",
++        constants$16.SSL_CTX_use_certificate$FUNC
+     );
+-    static final FunctionDescriptor SSL_CTX_set_verify$FUNC = FunctionDescriptor.ofVoid(
+-        ADDRESS,
+-        JAVA_INT,
+-        ADDRESS
++    static final FunctionDescriptor SSL_CTX_set_default_passwd_cb$FUNC = FunctionDescriptor.ofVoid(
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_CTX_set_verify$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CTX_set_verify",
+-        constants$16.SSL_CTX_set_verify$FUNC, false
++    static final MethodHandle SSL_CTX_set_default_passwd_cb$MH = RuntimeHelper.downcallHandle(
++        "SSL_CTX_set_default_passwd_cb",
++        constants$16.SSL_CTX_set_default_passwd_cb$FUNC
+     );
+-    static final FunctionDescriptor SSL_CTX_set_cert_verify_callback$cb$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor SSL_CTX_check_private_key$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_CTX_set_cert_verify_callback$cb$MH = RuntimeHelper.downcallHandle(
+-        constants$16.SSL_CTX_set_cert_verify_callback$cb$FUNC, false
++    static final MethodHandle SSL_CTX_check_private_key$MH = RuntimeHelper.downcallHandle(
++        "SSL_CTX_check_private_key",
++        constants$16.SSL_CTX_check_private_key$FUNC
++    );
++    static final FunctionDescriptor SSL_CTX_set_session_id_context$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_INT$LAYOUT
++    );
++    static final MethodHandle SSL_CTX_set_session_id_context$MH = RuntimeHelper.downcallHandle(
++        "SSL_CTX_set_session_id_context",
++        constants$16.SSL_CTX_set_session_id_context$FUNC
+     );
+ }
+ 
+
+==================================================
+constants$18.java
+index 81d397403a..bab5081b38 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$17.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$17.java
+@@ -26,54 +26,54 @@ import java.lang.foreign.*;
+ import static java.lang.foreign.ValueLayout.*;
+ class constants$17 {
+ 
+-    static final FunctionDescriptor SSL_CTX_set_cert_verify_callback$FUNC = FunctionDescriptor.ofVoid(
+-        ADDRESS,
+-        ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor SSL_new$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_CTX_set_cert_verify_callback$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CTX_set_cert_verify_callback",
+-        constants$17.SSL_CTX_set_cert_verify_callback$FUNC, false
++    static final MethodHandle SSL_new$MH = RuntimeHelper.downcallHandle(
++        "SSL_new",
++        constants$17.SSL_new$FUNC
+     );
+-    static final FunctionDescriptor SSL_CTX_use_PrivateKey$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor SSL_free$FUNC = FunctionDescriptor.ofVoid(
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_CTX_use_PrivateKey$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CTX_use_PrivateKey",
+-        constants$17.SSL_CTX_use_PrivateKey$FUNC, false
++    static final MethodHandle SSL_free$MH = RuntimeHelper.downcallHandle(
++        "SSL_free",
++        constants$17.SSL_free$FUNC
+     );
+-    static final FunctionDescriptor SSL_CTX_use_certificate$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor SSL_read$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_INT$LAYOUT
+     );
+-    static final MethodHandle SSL_CTX_use_certificate$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CTX_use_certificate",
+-        constants$17.SSL_CTX_use_certificate$FUNC, false
++    static final MethodHandle SSL_read$MH = RuntimeHelper.downcallHandle(
++        "SSL_read",
++        constants$17.SSL_read$FUNC
+     );
+-    static final FunctionDescriptor SSL_CTX_set_default_passwd_cb$FUNC = FunctionDescriptor.ofVoid(
+-        ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor SSL_write$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_INT$LAYOUT
+     );
+-    static final MethodHandle SSL_CTX_set_default_passwd_cb$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CTX_set_default_passwd_cb",
+-        constants$17.SSL_CTX_set_default_passwd_cb$FUNC, false
++    static final MethodHandle SSL_write$MH = RuntimeHelper.downcallHandle(
++        "SSL_write",
++        constants$17.SSL_write$FUNC
+     );
+-    static final FunctionDescriptor SSL_CTX_check_private_key$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS
++    static final FunctionDescriptor SSL_CTX_ctrl$FUNC = FunctionDescriptor.of(Constants$root.C_LONG_LONG$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_INT$LAYOUT,
++        Constants$root.C_LONG_LONG$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_CTX_check_private_key$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CTX_check_private_key",
+-        constants$17.SSL_CTX_check_private_key$FUNC, false
++    static final MethodHandle SSL_CTX_ctrl$MH = RuntimeHelper.downcallHandle(
++        "SSL_CTX_ctrl",
++        constants$17.SSL_CTX_ctrl$FUNC
+     );
+-    static final FunctionDescriptor SSL_CTX_set_session_id_context$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        ADDRESS,
+-        JAVA_INT
++    static final FunctionDescriptor SSL_get_version$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_CTX_set_session_id_context$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CTX_set_session_id_context",
+-        constants$17.SSL_CTX_set_session_id_context$FUNC, false
++    static final MethodHandle SSL_get_version$MH = RuntimeHelper.downcallHandle(
++        "SSL_get_version",
++        constants$17.SSL_get_version$FUNC
+     );
+ }
+ 
+
+==================================================
+constants$19.java
+index 8c060c0718..7112db0e02 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$18.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$18.java
+@@ -26,54 +26,45 @@ import java.lang.foreign.*;
+ import static java.lang.foreign.ValueLayout.*;
+ class constants$18 {
+ 
+-    static final FunctionDescriptor SSL_new$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor TLS_server_method$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT);
++    static final MethodHandle TLS_server_method$MH = RuntimeHelper.downcallHandle(
++        "TLS_server_method",
++        constants$18.TLS_server_method$FUNC
+     );
+-    static final MethodHandle SSL_new$MH = RuntimeHelper.downcallHandle(
+-        "SSL_new",
+-        constants$18.SSL_new$FUNC, false
++    static final FunctionDescriptor SSL_get_ciphers$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor SSL_free$FUNC = FunctionDescriptor.ofVoid(
+-        ADDRESS
++    static final MethodHandle SSL_get_ciphers$MH = RuntimeHelper.downcallHandle(
++        "SSL_get_ciphers",
++        constants$18.SSL_get_ciphers$FUNC
+     );
+-    static final MethodHandle SSL_free$MH = RuntimeHelper.downcallHandle(
+-        "SSL_free",
+-        constants$18.SSL_free$FUNC, false
++    static final FunctionDescriptor SSL_CTX_get_ciphers$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor SSL_read$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        ADDRESS,
+-        JAVA_INT
++    static final MethodHandle SSL_CTX_get_ciphers$MH = RuntimeHelper.downcallHandle(
++        "SSL_CTX_get_ciphers",
++        constants$18.SSL_CTX_get_ciphers$FUNC
+     );
+-    static final MethodHandle SSL_read$MH = RuntimeHelper.downcallHandle(
+-        "SSL_read",
+-        constants$18.SSL_read$FUNC, false
++    static final FunctionDescriptor SSL_do_handshake$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor SSL_write$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        ADDRESS,
+-        JAVA_INT
++    static final MethodHandle SSL_do_handshake$MH = RuntimeHelper.downcallHandle(
++        "SSL_do_handshake",
++        constants$18.SSL_do_handshake$FUNC
+     );
+-    static final MethodHandle SSL_write$MH = RuntimeHelper.downcallHandle(
+-        "SSL_write",
+-        constants$18.SSL_write$FUNC, false
++    static final FunctionDescriptor SSL_renegotiate$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor SSL_CTX_ctrl$FUNC = FunctionDescriptor.of(JAVA_LONG,
+-        ADDRESS,
+-        JAVA_INT,
+-        JAVA_LONG,
+-        ADDRESS
++    static final MethodHandle SSL_renegotiate$MH = RuntimeHelper.downcallHandle(
++        "SSL_renegotiate",
++        constants$18.SSL_renegotiate$FUNC
+     );
+-    static final MethodHandle SSL_CTX_ctrl$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CTX_ctrl",
+-        constants$18.SSL_CTX_ctrl$FUNC, false
++    static final FunctionDescriptor SSL_renegotiate_pending$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor SSL_get_version$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS
+-    );
+-    static final MethodHandle SSL_get_version$MH = RuntimeHelper.downcallHandle(
+-        "SSL_get_version",
+-        constants$18.SSL_get_version$FUNC, false
++    static final MethodHandle SSL_renegotiate_pending$MH = RuntimeHelper.downcallHandle(
++        "SSL_renegotiate_pending",
++        constants$18.SSL_renegotiate_pending$FUNC
+     );
+ }
+ 
+
+==================================================
+constants$2.java
+index 0b4a602bd7..723ab4f361 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$19.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$19.java
+@@ -26,45 +26,49 @@ import java.lang.foreign.*;
+ import static java.lang.foreign.ValueLayout.*;
+ class constants$19 {
+ 
+-    static final FunctionDescriptor TLS_server_method$FUNC = FunctionDescriptor.of(ADDRESS);
+-    static final MethodHandle TLS_server_method$MH = RuntimeHelper.downcallHandle(
+-        "TLS_server_method",
+-        constants$19.TLS_server_method$FUNC, false
++    static final FunctionDescriptor SSL_shutdown$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor SSL_get_ciphers$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS
++    static final MethodHandle SSL_shutdown$MH = RuntimeHelper.downcallHandle(
++        "SSL_shutdown",
++        constants$19.SSL_shutdown$FUNC
+     );
+-    static final MethodHandle SSL_get_ciphers$MH = RuntimeHelper.downcallHandle(
+-        "SSL_get_ciphers",
+-        constants$19.SSL_get_ciphers$FUNC, false
++    static final FunctionDescriptor SSL_verify_client_post_handshake$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor SSL_CTX_get_ciphers$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS
++    static final MethodHandle SSL_verify_client_post_handshake$MH = RuntimeHelper.downcallHandle(
++        "SSL_verify_client_post_handshake",
++        constants$19.SSL_verify_client_post_handshake$FUNC
+     );
+-    static final MethodHandle SSL_CTX_get_ciphers$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CTX_get_ciphers",
+-        constants$19.SSL_CTX_get_ciphers$FUNC, false
++    static final FunctionDescriptor SSL_CTX_set_client_CA_list$FUNC = FunctionDescriptor.ofVoid(
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor SSL_do_handshake$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS
++    static final MethodHandle SSL_CTX_set_client_CA_list$MH = RuntimeHelper.downcallHandle(
++        "SSL_CTX_set_client_CA_list",
++        constants$19.SSL_CTX_set_client_CA_list$FUNC
+     );
+-    static final MethodHandle SSL_do_handshake$MH = RuntimeHelper.downcallHandle(
+-        "SSL_do_handshake",
+-        constants$19.SSL_do_handshake$FUNC, false
++    static final FunctionDescriptor SSL_CTX_get_client_CA_list$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor SSL_renegotiate$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS
++    static final MethodHandle SSL_CTX_get_client_CA_list$MH = RuntimeHelper.downcallHandle(
++        "SSL_CTX_get_client_CA_list",
++        constants$19.SSL_CTX_get_client_CA_list$FUNC
+     );
+-    static final MethodHandle SSL_renegotiate$MH = RuntimeHelper.downcallHandle(
+-        "SSL_renegotiate",
+-        constants$19.SSL_renegotiate$FUNC, false
++    static final FunctionDescriptor SSL_CTX_add_client_CA$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor SSL_renegotiate_pending$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS
++    static final MethodHandle SSL_CTX_add_client_CA$MH = RuntimeHelper.downcallHandle(
++        "SSL_CTX_add_client_CA",
++        constants$19.SSL_CTX_add_client_CA$FUNC
+     );
+-    static final MethodHandle SSL_renegotiate_pending$MH = RuntimeHelper.downcallHandle(
+-        "SSL_renegotiate_pending",
+-        constants$19.SSL_renegotiate_pending$FUNC, false
++    static final FunctionDescriptor SSL_set_connect_state$FUNC = FunctionDescriptor.ofVoid(
++        Constants$root.C_POINTER$LAYOUT
++    );
++    static final MethodHandle SSL_set_connect_state$MH = RuntimeHelper.downcallHandle(
++        "SSL_set_connect_state",
++        constants$19.SSL_set_connect_state$FUNC
+     );
+ }
+ 
+
+==================================================
+constants$20.java
+index c7532094ef..aad34760e5 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$2.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$2.java
+@@ -26,44 +26,48 @@ import java.lang.foreign.*;
+ import static java.lang.foreign.ValueLayout.*;
+ class constants$2 {
+ 
+-    static final FunctionDescriptor FIPS_mode$FUNC = FunctionDescriptor.of(JAVA_INT);
+-    static final MethodHandle FIPS_mode$MH = RuntimeHelper.downcallHandle(
+-        "FIPS_mode",
+-        constants$2.FIPS_mode$FUNC, false
++    static final FunctionDescriptor BIO_ctrl$FUNC = FunctionDescriptor.of(Constants$root.C_LONG_LONG$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_INT$LAYOUT,
++        Constants$root.C_LONG_LONG$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor FIPS_mode_set$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        JAVA_INT
++    static final MethodHandle BIO_ctrl$MH = RuntimeHelper.downcallHandle(
++        "BIO_ctrl",
++        constants$2.BIO_ctrl$FUNC
+     );
+-    static final MethodHandle FIPS_mode_set$MH = RuntimeHelper.downcallHandle(
+-        "FIPS_mode_set",
+-        constants$2.FIPS_mode_set$FUNC, false
++    static final FunctionDescriptor BIO_s_mem$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT);
++    static final MethodHandle BIO_s_mem$MH = RuntimeHelper.downcallHandle(
++        "BIO_s_mem",
++        constants$2.BIO_s_mem$FUNC
+     );
+-    static final FunctionDescriptor BIO_ctrl_pending$FUNC = FunctionDescriptor.of(JAVA_LONG,
+-        ADDRESS
++    static final FunctionDescriptor BIO_s_bio$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT);
++    static final MethodHandle BIO_s_bio$MH = RuntimeHelper.downcallHandle(
++        "BIO_s_bio",
++        constants$2.BIO_s_bio$FUNC
+     );
+-    static final MethodHandle BIO_ctrl_pending$MH = RuntimeHelper.downcallHandle(
+-        "BIO_ctrl_pending",
+-        constants$2.BIO_ctrl_pending$FUNC, false
++    static final FunctionDescriptor BIO_new_bio_pair$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_LONG_LONG$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_LONG_LONG$LAYOUT
+     );
+-    static final FunctionDescriptor BIO_s_file$FUNC = FunctionDescriptor.of(ADDRESS);
+-    static final MethodHandle BIO_s_file$MH = RuntimeHelper.downcallHandle(
+-        "BIO_s_file",
+-        constants$2.BIO_s_file$FUNC, false
++    static final MethodHandle BIO_new_bio_pair$MH = RuntimeHelper.downcallHandle(
++        "BIO_new_bio_pair",
++        constants$2.BIO_new_bio_pair$FUNC
+     );
+-    static final FunctionDescriptor BIO_new_file$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor BN_new$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT);
++    static final MethodHandle BN_new$MH = RuntimeHelper.downcallHandle(
++        "BN_new",
++        constants$2.BN_new$FUNC
+     );
+-    static final MethodHandle BIO_new_file$MH = RuntimeHelper.downcallHandle(
+-        "BIO_new_file",
+-        constants$2.BIO_new_file$FUNC, false
++    static final FunctionDescriptor BN_set_word$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_LONG_LONG$LAYOUT
+     );
+-    static final FunctionDescriptor BIO_new$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS
+-    );
+-    static final MethodHandle BIO_new$MH = RuntimeHelper.downcallHandle(
+-        "BIO_new",
+-        constants$2.BIO_new$FUNC, false
++    static final MethodHandle BN_set_word$MH = RuntimeHelper.downcallHandle(
++        "BN_set_word",
++        constants$2.BN_set_word$FUNC
+     );
+ }
+ 
+
+==================================================
+constants$21.java
+index 016030bbb2..f037a6c9c3 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$20.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$20.java
+@@ -26,49 +26,49 @@ import java.lang.foreign.*;
+ import static java.lang.foreign.ValueLayout.*;
+ class constants$20 {
+ 
+-    static final FunctionDescriptor SSL_shutdown$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS
++    static final FunctionDescriptor SSL_set_accept_state$FUNC = FunctionDescriptor.ofVoid(
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_shutdown$MH = RuntimeHelper.downcallHandle(
+-        "SSL_shutdown",
+-        constants$20.SSL_shutdown$FUNC, false
++    static final MethodHandle SSL_set_accept_state$MH = RuntimeHelper.downcallHandle(
++        "SSL_set_accept_state",
++        constants$20.SSL_set_accept_state$FUNC
+     );
+-    static final FunctionDescriptor SSL_verify_client_post_handshake$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS
++    static final FunctionDescriptor SSL_get_privatekey$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_verify_client_post_handshake$MH = RuntimeHelper.downcallHandle(
+-        "SSL_verify_client_post_handshake",
+-        constants$20.SSL_verify_client_post_handshake$FUNC, false
++    static final MethodHandle SSL_get_privatekey$MH = RuntimeHelper.downcallHandle(
++        "SSL_get_privatekey",
++        constants$20.SSL_get_privatekey$FUNC
+     );
+-    static final FunctionDescriptor SSL_CTX_set_client_CA_list$FUNC = FunctionDescriptor.ofVoid(
+-        ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor SSL_get_shutdown$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_CTX_set_client_CA_list$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CTX_set_client_CA_list",
+-        constants$20.SSL_CTX_set_client_CA_list$FUNC, false
++    static final MethodHandle SSL_get_shutdown$MH = RuntimeHelper.downcallHandle(
++        "SSL_get_shutdown",
++        constants$20.SSL_get_shutdown$FUNC
+     );
+-    static final FunctionDescriptor SSL_CTX_get_client_CA_list$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor SSL_CTX_set_default_verify_paths$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_CTX_get_client_CA_list$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CTX_get_client_CA_list",
+-        constants$20.SSL_CTX_get_client_CA_list$FUNC, false
++    static final MethodHandle SSL_CTX_set_default_verify_paths$MH = RuntimeHelper.downcallHandle(
++        "SSL_CTX_set_default_verify_paths",
++        constants$20.SSL_CTX_set_default_verify_paths$FUNC
+     );
+-    static final FunctionDescriptor SSL_CTX_add_client_CA$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor SSL_CTX_load_verify_locations$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_CTX_add_client_CA$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CTX_add_client_CA",
+-        constants$20.SSL_CTX_add_client_CA$FUNC, false
++    static final MethodHandle SSL_CTX_load_verify_locations$MH = RuntimeHelper.downcallHandle(
++        "SSL_CTX_load_verify_locations",
++        constants$20.SSL_CTX_load_verify_locations$FUNC
+     );
+-    static final FunctionDescriptor SSL_set_connect_state$FUNC = FunctionDescriptor.ofVoid(
+-        ADDRESS
++    static final FunctionDescriptor SSL_get_session$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_set_connect_state$MH = RuntimeHelper.downcallHandle(
+-        "SSL_set_connect_state",
+-        constants$20.SSL_set_connect_state$FUNC, false
++    static final MethodHandle SSL_get_session$MH = RuntimeHelper.downcallHandle(
++        "SSL_get_session",
++        constants$20.SSL_get_session$FUNC
+     );
+ }
+ 
+
+==================================================
+constants$22.java
+index 702a53949e..4215d5c1d2 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$21.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$21.java
+@@ -26,49 +26,39 @@ import java.lang.foreign.*;
+ import static java.lang.foreign.ValueLayout.*;
+ class constants$21 {
+ 
+-    static final FunctionDescriptor SSL_set_accept_state$FUNC = FunctionDescriptor.ofVoid(
+-        ADDRESS
++    static final FunctionDescriptor SSL_set_info_callback$cb$FUNC = FunctionDescriptor.ofVoid(
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_INT$LAYOUT,
++        Constants$root.C_INT$LAYOUT
+     );
+-    static final MethodHandle SSL_set_accept_state$MH = RuntimeHelper.downcallHandle(
+-        "SSL_set_accept_state",
+-        constants$21.SSL_set_accept_state$FUNC, false
++    static final MethodHandle SSL_set_info_callback$cb$MH = RuntimeHelper.downcallHandle(
++        constants$21.SSL_set_info_callback$cb$FUNC
+     );
+-    static final FunctionDescriptor SSL_get_privatekey$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor SSL_set_info_callback$FUNC = FunctionDescriptor.ofVoid(
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_get_privatekey$MH = RuntimeHelper.downcallHandle(
+-        "SSL_get_privatekey",
+-        constants$21.SSL_get_privatekey$FUNC, false
++    static final MethodHandle SSL_set_info_callback$MH = RuntimeHelper.downcallHandle(
++        "SSL_set_info_callback",
++        constants$21.SSL_set_info_callback$FUNC
+     );
+-    static final FunctionDescriptor SSL_get_shutdown$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS
++    static final FunctionDescriptor SSL_set_verify_result$FUNC = FunctionDescriptor.ofVoid(
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_LONG_LONG$LAYOUT
+     );
+-    static final MethodHandle SSL_get_shutdown$MH = RuntimeHelper.downcallHandle(
+-        "SSL_get_shutdown",
+-        constants$21.SSL_get_shutdown$FUNC, false
++    static final MethodHandle SSL_set_verify_result$MH = RuntimeHelper.downcallHandle(
++        "SSL_set_verify_result",
++        constants$21.SSL_set_verify_result$FUNC
+     );
+-    static final FunctionDescriptor SSL_CTX_set_default_verify_paths$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS
++    static final FunctionDescriptor SSL_get_ex_data_X509_STORE_CTX_idx$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT);
++    static final MethodHandle SSL_get_ex_data_X509_STORE_CTX_idx$MH = RuntimeHelper.downcallHandle(
++        "SSL_get_ex_data_X509_STORE_CTX_idx",
++        constants$21.SSL_get_ex_data_X509_STORE_CTX_idx$FUNC
+     );
+-    static final MethodHandle SSL_CTX_set_default_verify_paths$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CTX_set_default_verify_paths",
+-        constants$21.SSL_CTX_set_default_verify_paths$FUNC, false
+-    );
+-    static final FunctionDescriptor SSL_CTX_load_verify_locations$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        ADDRESS,
+-        ADDRESS
+-    );
+-    static final MethodHandle SSL_CTX_load_verify_locations$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CTX_load_verify_locations",
+-        constants$21.SSL_CTX_load_verify_locations$FUNC, false
+-    );
+-    static final FunctionDescriptor SSL_get_session$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS
+-    );
+-    static final MethodHandle SSL_get_session$MH = RuntimeHelper.downcallHandle(
+-        "SSL_get_session",
+-        constants$21.SSL_get_session$FUNC, false
++    static final FunctionDescriptor SSL_CTX_set_tmp_dh_callback$dh$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_INT$LAYOUT,
++        Constants$root.C_INT$LAYOUT
+     );
+ }
+ 
+
+==================================================
+constants$23.java
+index 8336d37b8c..0e2e8f5899 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$22.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$22.java
+@@ -26,39 +26,48 @@ import java.lang.foreign.*;
+ import static java.lang.foreign.ValueLayout.*;
+ class constants$22 {
+ 
+-    static final FunctionDescriptor SSL_set_info_callback$cb$FUNC = FunctionDescriptor.ofVoid(
+-        ADDRESS,
+-        JAVA_INT,
+-        JAVA_INT
++    static final FunctionDescriptor SSL_CTX_set_tmp_dh_callback$dh$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_INT$LAYOUT,
++        Constants$root.C_INT$LAYOUT
+     );
+-    static final MethodHandle SSL_set_info_callback$cb$MH = RuntimeHelper.downcallHandle(
+-        constants$22.SSL_set_info_callback$cb$FUNC, false
++    static final MethodHandle SSL_CTX_set_tmp_dh_callback$dh$MH = RuntimeHelper.downcallHandle(
++        constants$22.SSL_CTX_set_tmp_dh_callback$dh$FUNC
+     );
+-    static final FunctionDescriptor SSL_set_info_callback$FUNC = FunctionDescriptor.ofVoid(
+-        ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor SSL_CTX_set_tmp_dh_callback$FUNC = FunctionDescriptor.ofVoid(
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_set_info_callback$MH = RuntimeHelper.downcallHandle(
+-        "SSL_set_info_callback",
+-        constants$22.SSL_set_info_callback$FUNC, false
++    static final MethodHandle SSL_CTX_set_tmp_dh_callback$MH = RuntimeHelper.downcallHandle(
++        "SSL_CTX_set_tmp_dh_callback",
++        constants$22.SSL_CTX_set_tmp_dh_callback$FUNC
+     );
+-    static final FunctionDescriptor SSL_set_verify_result$FUNC = FunctionDescriptor.ofVoid(
+-        ADDRESS,
+-        JAVA_LONG
++    static final FunctionDescriptor SSL_CONF_CTX_new$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT);
++    static final MethodHandle SSL_CONF_CTX_new$MH = RuntimeHelper.downcallHandle(
++        "SSL_CONF_CTX_new",
++        constants$22.SSL_CONF_CTX_new$FUNC
+     );
+-    static final MethodHandle SSL_set_verify_result$MH = RuntimeHelper.downcallHandle(
+-        "SSL_set_verify_result",
+-        constants$22.SSL_set_verify_result$FUNC, false
++    static final FunctionDescriptor SSL_CONF_CTX_finish$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor SSL_get_ex_data_X509_STORE_CTX_idx$FUNC = FunctionDescriptor.of(JAVA_INT);
+-    static final MethodHandle SSL_get_ex_data_X509_STORE_CTX_idx$MH = RuntimeHelper.downcallHandle(
+-        "SSL_get_ex_data_X509_STORE_CTX_idx",
+-        constants$22.SSL_get_ex_data_X509_STORE_CTX_idx$FUNC, false
++    static final MethodHandle SSL_CONF_CTX_finish$MH = RuntimeHelper.downcallHandle(
++        "SSL_CONF_CTX_finish",
++        constants$22.SSL_CONF_CTX_finish$FUNC
+     );
+-    static final FunctionDescriptor SSL_CTX_set_tmp_dh_callback$dh$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS,
+-        JAVA_INT,
+-        JAVA_INT
++    static final FunctionDescriptor SSL_CONF_CTX_free$FUNC = FunctionDescriptor.ofVoid(
++        Constants$root.C_POINTER$LAYOUT
++    );
++    static final MethodHandle SSL_CONF_CTX_free$MH = RuntimeHelper.downcallHandle(
++        "SSL_CONF_CTX_free",
++        constants$22.SSL_CONF_CTX_free$FUNC
++    );
++    static final FunctionDescriptor SSL_CONF_CTX_set_flags$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_INT$LAYOUT
++    );
++    static final MethodHandle SSL_CONF_CTX_set_flags$MH = RuntimeHelper.downcallHandle(
++        "SSL_CONF_CTX_set_flags",
++        constants$22.SSL_CONF_CTX_set_flags$FUNC
+     );
+ }
+ 
+
+==================================================
+constants$24.java
+index 7a2c21a271..b8ccff0855 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$23.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$23.java
+@@ -26,48 +26,48 @@ import java.lang.foreign.*;
+ import static java.lang.foreign.ValueLayout.*;
+ class constants$23 {
+ 
+-    static final FunctionDescriptor SSL_CTX_set_tmp_dh_callback$dh$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS,
+-        JAVA_INT,
+-        JAVA_INT
++    static final FunctionDescriptor SSL_CONF_CTX_set_ssl_ctx$FUNC = FunctionDescriptor.ofVoid(
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_CTX_set_tmp_dh_callback$dh$MH = RuntimeHelper.downcallHandle(
+-        constants$23.SSL_CTX_set_tmp_dh_callback$dh$FUNC, false
++    static final MethodHandle SSL_CONF_CTX_set_ssl_ctx$MH = RuntimeHelper.downcallHandle(
++        "SSL_CONF_CTX_set_ssl_ctx",
++        constants$23.SSL_CONF_CTX_set_ssl_ctx$FUNC
+     );
+-    static final FunctionDescriptor SSL_CTX_set_tmp_dh_callback$FUNC = FunctionDescriptor.ofVoid(
+-        ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor SSL_CONF_cmd$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle SSL_CTX_set_tmp_dh_callback$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CTX_set_tmp_dh_callback",
+-        constants$23.SSL_CTX_set_tmp_dh_callback$FUNC, false
++    static final MethodHandle SSL_CONF_cmd$MH = RuntimeHelper.downcallHandle(
++        "SSL_CONF_cmd",
++        constants$23.SSL_CONF_cmd$FUNC
+     );
+-    static final FunctionDescriptor SSL_CONF_CTX_new$FUNC = FunctionDescriptor.of(ADDRESS);
+-    static final MethodHandle SSL_CONF_CTX_new$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CONF_CTX_new",
+-        constants$23.SSL_CONF_CTX_new$FUNC, false
++    static final FunctionDescriptor SSL_CONF_cmd_value_type$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor SSL_CONF_CTX_finish$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS
++    static final MethodHandle SSL_CONF_cmd_value_type$MH = RuntimeHelper.downcallHandle(
++        "SSL_CONF_cmd_value_type",
++        constants$23.SSL_CONF_cmd_value_type$FUNC
+     );
+-    static final MethodHandle SSL_CONF_CTX_finish$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CONF_CTX_finish",
+-        constants$23.SSL_CONF_CTX_finish$FUNC, false
++    static final FunctionDescriptor OPENSSL_init_ssl$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_LONG_LONG$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor SSL_CONF_CTX_free$FUNC = FunctionDescriptor.ofVoid(
+-        ADDRESS
++    static final MethodHandle OPENSSL_init_ssl$MH = RuntimeHelper.downcallHandle(
++        "OPENSSL_init_ssl",
++        constants$23.OPENSSL_init_ssl$FUNC
+     );
+-    static final MethodHandle SSL_CONF_CTX_free$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CONF_CTX_free",
+-        constants$23.SSL_CONF_CTX_free$FUNC, false
++    static final FunctionDescriptor ERR_get_error$FUNC = FunctionDescriptor.of(Constants$root.C_LONG_LONG$LAYOUT);
++    static final MethodHandle ERR_get_error$MH = RuntimeHelper.downcallHandle(
++        "ERR_get_error",
++        constants$23.ERR_get_error$FUNC
+     );
+-    static final FunctionDescriptor SSL_CONF_CTX_set_flags$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        JAVA_INT
+-    );
+-    static final MethodHandle SSL_CONF_CTX_set_flags$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CONF_CTX_set_flags",
+-        constants$23.SSL_CONF_CTX_set_flags$FUNC, false
++    static final FunctionDescriptor ERR_peek_last_error$FUNC = FunctionDescriptor.of(Constants$root.C_LONG_LONG$LAYOUT);
++    static final MethodHandle ERR_peek_last_error$MH = RuntimeHelper.downcallHandle(
++        "ERR_peek_last_error",
++        constants$23.ERR_peek_last_error$FUNC
+     );
+ }
+ 
+
+==================================================
+constants$25.java
+index cc22bf1e2f..f94cf4fb0e 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$24.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$24.java
+@@ -26,48 +26,53 @@ import java.lang.foreign.*;
+ import static java.lang.foreign.ValueLayout.*;
+ class constants$24 {
+ 
+-    static final FunctionDescriptor SSL_CONF_CTX_set_ssl_ctx$FUNC = FunctionDescriptor.ofVoid(
+-        ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor ERR_clear_error$FUNC = FunctionDescriptor.ofVoid();
++    static final MethodHandle ERR_clear_error$MH = RuntimeHelper.downcallHandle(
++        "ERR_clear_error",
++        constants$24.ERR_clear_error$FUNC
+     );
+-    static final MethodHandle SSL_CONF_CTX_set_ssl_ctx$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CONF_CTX_set_ssl_ctx",
+-        constants$24.SSL_CONF_CTX_set_ssl_ctx$FUNC, false
++    static final FunctionDescriptor ERR_error_string$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_LONG_LONG$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor SSL_CONF_cmd$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        ADDRESS,
+-        ADDRESS
++    static final MethodHandle ERR_error_string$MH = RuntimeHelper.downcallHandle(
++        "ERR_error_string",
++        constants$24.ERR_error_string$FUNC
+     );
+-    static final MethodHandle SSL_CONF_cmd$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CONF_cmd",
+-        constants$24.SSL_CONF_cmd$FUNC, false
++    static final FunctionDescriptor PKCS12_verify_mac$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_INT$LAYOUT
+     );
+-    static final FunctionDescriptor SSL_CONF_cmd_value_type$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        ADDRESS
++    static final MethodHandle PKCS12_verify_mac$MH = RuntimeHelper.downcallHandle(
++        "PKCS12_verify_mac",
++        constants$24.PKCS12_verify_mac$FUNC
+     );
+-    static final MethodHandle SSL_CONF_cmd_value_type$MH = RuntimeHelper.downcallHandle(
+-        "SSL_CONF_cmd_value_type",
+-        constants$24.SSL_CONF_cmd_value_type$FUNC, false
++    static final FunctionDescriptor PKCS12_free$FUNC = FunctionDescriptor.ofVoid(
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor OPENSSL_init_ssl$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        JAVA_LONG,
+-        ADDRESS
++    static final MethodHandle PKCS12_free$MH = RuntimeHelper.downcallHandle(
++        "PKCS12_free",
++        constants$24.PKCS12_free$FUNC
+     );
+-    static final MethodHandle OPENSSL_init_ssl$MH = RuntimeHelper.downcallHandle(
+-        "OPENSSL_init_ssl",
+-        constants$24.OPENSSL_init_ssl$FUNC, false
++    static final FunctionDescriptor PKCS12_parse$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor ERR_get_error$FUNC = FunctionDescriptor.of(JAVA_LONG);
+-    static final MethodHandle ERR_get_error$MH = RuntimeHelper.downcallHandle(
+-        "ERR_get_error",
+-        constants$24.ERR_get_error$FUNC, false
++    static final MethodHandle PKCS12_parse$MH = RuntimeHelper.downcallHandle(
++        "PKCS12_parse",
++        constants$24.PKCS12_parse$FUNC
+     );
+-    static final FunctionDescriptor ERR_peek_last_error$FUNC = FunctionDescriptor.of(JAVA_LONG);
+-    static final MethodHandle ERR_peek_last_error$MH = RuntimeHelper.downcallHandle(
+-        "ERR_peek_last_error",
+-        constants$24.ERR_peek_last_error$FUNC, false
++    static final FunctionDescriptor d2i_PKCS12_bio$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
++    );
++    static final MethodHandle d2i_PKCS12_bio$MH = RuntimeHelper.downcallHandle(
++        "d2i_PKCS12_bio",
++        constants$24.d2i_PKCS12_bio$FUNC
+     );
+ }
+ 
+
+==================================================
+constants$26.java
+index 22d9b3dd65..b844e43196 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$25.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$25.java
+@@ -26,53 +26,51 @@ import java.lang.foreign.*;
+ import static java.lang.foreign.ValueLayout.*;
+ class constants$25 {
+ 
+-    static final FunctionDescriptor ERR_clear_error$FUNC = FunctionDescriptor.ofVoid();
+-    static final MethodHandle ERR_clear_error$MH = RuntimeHelper.downcallHandle(
+-        "ERR_clear_error",
+-        constants$25.ERR_clear_error$FUNC, false
++    static final FunctionDescriptor RAND_seed$FUNC = FunctionDescriptor.ofVoid(
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_INT$LAYOUT
+     );
+-    static final FunctionDescriptor ERR_error_string$FUNC = FunctionDescriptor.of(ADDRESS,
+-        JAVA_LONG,
+-        ADDRESS
++    static final MethodHandle RAND_seed$MH = RuntimeHelper.downcallHandle(
++        "RAND_seed",
++        constants$25.RAND_seed$FUNC
+     );
+-    static final MethodHandle ERR_error_string$MH = RuntimeHelper.downcallHandle(
+-        "ERR_error_string",
+-        constants$25.ERR_error_string$FUNC, false
++    static final FunctionDescriptor RAND_load_file$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_LONG_LONG$LAYOUT
+     );
+-    static final FunctionDescriptor PKCS12_verify_mac$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        ADDRESS,
+-        JAVA_INT
++    static final MethodHandle RAND_load_file$MH = RuntimeHelper.downcallHandle(
++        "RAND_load_file",
++        constants$25.RAND_load_file$FUNC
+     );
+-    static final MethodHandle PKCS12_verify_mac$MH = RuntimeHelper.downcallHandle(
+-        "PKCS12_verify_mac",
+-        constants$25.PKCS12_verify_mac$FUNC, false
++    static final FunctionDescriptor X509_check_issued$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor PKCS12_free$FUNC = FunctionDescriptor.ofVoid(
+-        ADDRESS
++    static final MethodHandle X509_check_issued$MH = RuntimeHelper.downcallHandle(
++        "X509_check_issued",
++        constants$25.X509_check_issued$FUNC
+     );
+-    static final MethodHandle PKCS12_free$MH = RuntimeHelper.downcallHandle(
+-        "PKCS12_free",
+-        constants$25.PKCS12_free$FUNC, false
++    static final FunctionDescriptor ENGINE_by_id$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor PKCS12_parse$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        ADDRESS,
+-        ADDRESS,
+-        ADDRESS,
+-        ADDRESS
++    static final MethodHandle ENGINE_by_id$MH = RuntimeHelper.downcallHandle(
++        "ENGINE_by_id",
++        constants$25.ENGINE_by_id$FUNC
+     );
+-    static final MethodHandle PKCS12_parse$MH = RuntimeHelper.downcallHandle(
+-        "PKCS12_parse",
+-        constants$25.PKCS12_parse$FUNC, false
++    static final FunctionDescriptor ENGINE_register_all_complete$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT);
++    static final MethodHandle ENGINE_register_all_complete$MH = RuntimeHelper.downcallHandle(
++        "ENGINE_register_all_complete",
++        constants$25.ENGINE_register_all_complete$FUNC
+     );
+-    static final FunctionDescriptor d2i_PKCS12_bio$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor ENGINE_ctrl_cmd_string$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_INT$LAYOUT
+     );
+-    static final MethodHandle d2i_PKCS12_bio$MH = RuntimeHelper.downcallHandle(
+-        "d2i_PKCS12_bio",
+-        constants$25.d2i_PKCS12_bio$FUNC, false
++    static final MethodHandle ENGINE_ctrl_cmd_string$MH = RuntimeHelper.downcallHandle(
++        "ENGINE_ctrl_cmd_string",
++        constants$25.ENGINE_ctrl_cmd_string$FUNC
+     );
+ }
+ 
+
+==================================================
+constants$27.java
+index 6ea09de487..691d00546b 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$26.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$26.java
+@@ -26,51 +26,54 @@ import java.lang.foreign.*;
+ import static java.lang.foreign.ValueLayout.*;
+ class constants$26 {
+ 
+-    static final FunctionDescriptor RAND_seed$FUNC = FunctionDescriptor.ofVoid(
+-        ADDRESS,
+-        JAVA_INT
++    static final FunctionDescriptor ENGINE_free$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle RAND_seed$MH = RuntimeHelper.downcallHandle(
+-        "RAND_seed",
+-        constants$26.RAND_seed$FUNC, false
++    static final MethodHandle ENGINE_free$MH = RuntimeHelper.downcallHandle(
++        "ENGINE_free",
++        constants$26.ENGINE_free$FUNC
+     );
+-    static final FunctionDescriptor RAND_load_file$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        JAVA_LONG
++    static final FunctionDescriptor ENGINE_load_private_key$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle RAND_load_file$MH = RuntimeHelper.downcallHandle(
+-        "RAND_load_file",
+-        constants$26.RAND_load_file$FUNC, false
++    static final MethodHandle ENGINE_load_private_key$MH = RuntimeHelper.downcallHandle(
++        "ENGINE_load_private_key",
++        constants$26.ENGINE_load_private_key$FUNC
+     );
+-    static final FunctionDescriptor X509_check_issued$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor ENGINE_set_default$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_INT$LAYOUT
+     );
+-    static final MethodHandle X509_check_issued$MH = RuntimeHelper.downcallHandle(
+-        "X509_check_issued",
+-        constants$26.X509_check_issued$FUNC, false
++    static final MethodHandle ENGINE_set_default$MH = RuntimeHelper.downcallHandle(
++        "ENGINE_set_default",
++        constants$26.ENGINE_set_default$FUNC
+     );
+-    static final FunctionDescriptor ENGINE_by_id$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor OCSP_cert_to_id$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle ENGINE_by_id$MH = RuntimeHelper.downcallHandle(
+-        "ENGINE_by_id",
+-        constants$26.ENGINE_by_id$FUNC, false
++    static final MethodHandle OCSP_cert_to_id$MH = RuntimeHelper.downcallHandle(
++        "OCSP_cert_to_id",
++        constants$26.OCSP_cert_to_id$FUNC
+     );
+-    static final FunctionDescriptor ENGINE_register_all_complete$FUNC = FunctionDescriptor.of(JAVA_INT);
+-    static final MethodHandle ENGINE_register_all_complete$MH = RuntimeHelper.downcallHandle(
+-        "ENGINE_register_all_complete",
+-        constants$26.ENGINE_register_all_complete$FUNC, false
++    static final FunctionDescriptor OCSP_request_add0_id$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor ENGINE_ctrl_cmd_string$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        ADDRESS,
+-        ADDRESS,
+-        JAVA_INT
++    static final MethodHandle OCSP_request_add0_id$MH = RuntimeHelper.downcallHandle(
++        "OCSP_request_add0_id",
++        constants$26.OCSP_request_add0_id$FUNC
+     );
+-    static final MethodHandle ENGINE_ctrl_cmd_string$MH = RuntimeHelper.downcallHandle(
+-        "ENGINE_ctrl_cmd_string",
+-        constants$26.ENGINE_ctrl_cmd_string$FUNC, false
++    static final FunctionDescriptor OCSP_response_status$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
++    );
++    static final MethodHandle OCSP_response_status$MH = RuntimeHelper.downcallHandle(
++        "OCSP_response_status",
++        constants$26.OCSP_response_status$FUNC
+     );
+ }
+ 
+
+==================================================
+constants$28.java
+index d9236ba3ff..d4d7cfc7be 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$27.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$27.java
+@@ -26,54 +26,54 @@ import java.lang.foreign.*;
+ import static java.lang.foreign.ValueLayout.*;
+ class constants$27 {
+ 
+-    static final FunctionDescriptor ENGINE_free$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS
++    static final FunctionDescriptor OCSP_response_get1_basic$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle ENGINE_free$MH = RuntimeHelper.downcallHandle(
+-        "ENGINE_free",
+-        constants$27.ENGINE_free$FUNC, false
++    static final MethodHandle OCSP_response_get1_basic$MH = RuntimeHelper.downcallHandle(
++        "OCSP_response_get1_basic",
++        constants$27.OCSP_response_get1_basic$FUNC
+     );
+-    static final FunctionDescriptor ENGINE_load_private_key$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS,
+-        ADDRESS,
+-        ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor OCSP_resp_get0$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_INT$LAYOUT
+     );
+-    static final MethodHandle ENGINE_load_private_key$MH = RuntimeHelper.downcallHandle(
+-        "ENGINE_load_private_key",
+-        constants$27.ENGINE_load_private_key$FUNC, false
++    static final MethodHandle OCSP_resp_get0$MH = RuntimeHelper.downcallHandle(
++        "OCSP_resp_get0",
++        constants$27.OCSP_resp_get0$FUNC
+     );
+-    static final FunctionDescriptor ENGINE_set_default$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        JAVA_INT
++    static final FunctionDescriptor OCSP_resp_find$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_INT$LAYOUT
+     );
+-    static final MethodHandle ENGINE_set_default$MH = RuntimeHelper.downcallHandle(
+-        "ENGINE_set_default",
+-        constants$27.ENGINE_set_default$FUNC, false
++    static final MethodHandle OCSP_resp_find$MH = RuntimeHelper.downcallHandle(
++        "OCSP_resp_find",
++        constants$27.OCSP_resp_find$FUNC
+     );
+-    static final FunctionDescriptor OCSP_cert_to_id$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS,
+-        ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor OCSP_single_get0_status$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle OCSP_cert_to_id$MH = RuntimeHelper.downcallHandle(
+-        "OCSP_cert_to_id",
+-        constants$27.OCSP_cert_to_id$FUNC, false
++    static final MethodHandle OCSP_single_get0_status$MH = RuntimeHelper.downcallHandle(
++        "OCSP_single_get0_status",
++        constants$27.OCSP_single_get0_status$FUNC
+     );
+-    static final FunctionDescriptor OCSP_request_add0_id$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor OCSP_BASICRESP_free$FUNC = FunctionDescriptor.ofVoid(
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle OCSP_request_add0_id$MH = RuntimeHelper.downcallHandle(
+-        "OCSP_request_add0_id",
+-        constants$27.OCSP_request_add0_id$FUNC, false
++    static final MethodHandle OCSP_BASICRESP_free$MH = RuntimeHelper.downcallHandle(
++        "OCSP_BASICRESP_free",
++        constants$27.OCSP_BASICRESP_free$FUNC
+     );
+-    static final FunctionDescriptor OCSP_response_status$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS
++    static final FunctionDescriptor OCSP_RESPONSE_free$FUNC = FunctionDescriptor.ofVoid(
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle OCSP_response_status$MH = RuntimeHelper.downcallHandle(
+-        "OCSP_response_status",
+-        constants$27.OCSP_response_status$FUNC, false
++    static final MethodHandle OCSP_RESPONSE_free$MH = RuntimeHelper.downcallHandle(
++        "OCSP_RESPONSE_free",
++        constants$27.OCSP_RESPONSE_free$FUNC
+     );
+ }
+ 
+
+==================================================
+constants$29.java
+index 729a875ca6..768dafad97 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$28.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$28.java
+@@ -26,54 +26,48 @@ import java.lang.foreign.*;
+ import static java.lang.foreign.ValueLayout.*;
+ class constants$28 {
+ 
+-    static final FunctionDescriptor OCSP_response_get1_basic$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor d2i_OCSP_RESPONSE$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_LONG_LONG$LAYOUT
+     );
+-    static final MethodHandle OCSP_response_get1_basic$MH = RuntimeHelper.downcallHandle(
+-        "OCSP_response_get1_basic",
+-        constants$28.OCSP_response_get1_basic$FUNC, false
++    static final MethodHandle d2i_OCSP_RESPONSE$MH = RuntimeHelper.downcallHandle(
++        "d2i_OCSP_RESPONSE",
++        constants$28.d2i_OCSP_RESPONSE$FUNC
+     );
+-    static final FunctionDescriptor OCSP_resp_get0$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS,
+-        JAVA_INT
++    static final FunctionDescriptor OCSP_CERTID_free$FUNC = FunctionDescriptor.ofVoid(
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle OCSP_resp_get0$MH = RuntimeHelper.downcallHandle(
+-        "OCSP_resp_get0",
+-        constants$28.OCSP_resp_get0$FUNC, false
++    static final MethodHandle OCSP_CERTID_free$MH = RuntimeHelper.downcallHandle(
++        "OCSP_CERTID_free",
++        constants$28.OCSP_CERTID_free$FUNC
+     );
+-    static final FunctionDescriptor OCSP_resp_find$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        ADDRESS,
+-        JAVA_INT
++    static final FunctionDescriptor OCSP_REQUEST_new$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT);
++    static final MethodHandle OCSP_REQUEST_new$MH = RuntimeHelper.downcallHandle(
++        "OCSP_REQUEST_new",
++        constants$28.OCSP_REQUEST_new$FUNC
+     );
+-    static final MethodHandle OCSP_resp_find$MH = RuntimeHelper.downcallHandle(
+-        "OCSP_resp_find",
+-        constants$28.OCSP_resp_find$FUNC, false
++    static final FunctionDescriptor OCSP_REQUEST_free$FUNC = FunctionDescriptor.ofVoid(
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor OCSP_single_get0_status$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        ADDRESS,
+-        ADDRESS,
+-        ADDRESS,
+-        ADDRESS
++    static final MethodHandle OCSP_REQUEST_free$MH = RuntimeHelper.downcallHandle(
++        "OCSP_REQUEST_free",
++        constants$28.OCSP_REQUEST_free$FUNC
+     );
+-    static final MethodHandle OCSP_single_get0_status$MH = RuntimeHelper.downcallHandle(
+-        "OCSP_single_get0_status",
+-        constants$28.OCSP_single_get0_status$FUNC, false
++    static final FunctionDescriptor i2d_OCSP_REQUEST$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor OCSP_BASICRESP_free$FUNC = FunctionDescriptor.ofVoid(
+-        ADDRESS
++    static final MethodHandle i2d_OCSP_REQUEST$MH = RuntimeHelper.downcallHandle(
++        "i2d_OCSP_REQUEST",
++        constants$28.i2d_OCSP_REQUEST$FUNC
+     );
+-    static final MethodHandle OCSP_BASICRESP_free$MH = RuntimeHelper.downcallHandle(
+-        "OCSP_BASICRESP_free",
+-        constants$28.OCSP_BASICRESP_free$FUNC, false
++    static final FunctionDescriptor OSSL_PROVIDER_get0_name$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor OCSP_RESPONSE_free$FUNC = FunctionDescriptor.ofVoid(
+-        ADDRESS
+-    );
+-    static final MethodHandle OCSP_RESPONSE_free$MH = RuntimeHelper.downcallHandle(
+-        "OCSP_RESPONSE_free",
+-        constants$28.OCSP_RESPONSE_free$FUNC, false
++    static final MethodHandle OSSL_PROVIDER_get0_name$MH = RuntimeHelper.downcallHandle(
++        "OSSL_PROVIDER_get0_name",
++        constants$28.OSSL_PROVIDER_get0_name$FUNC
+     );
+ }
+ 
+
+==================================================
+constants$3.java
+index ad2c41d86d..0484c297ec 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$29.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$29.java
+@@ -26,43 +26,7 @@ import java.lang.foreign.*;
+ import static java.lang.foreign.ValueLayout.*;
+ class constants$29 {
+ 
+-    static final FunctionDescriptor d2i_OCSP_RESPONSE$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS,
+-        ADDRESS,
+-        JAVA_LONG
+-    );
+-    static final MethodHandle d2i_OCSP_RESPONSE$MH = RuntimeHelper.downcallHandle(
+-        "d2i_OCSP_RESPONSE",
+-        constants$29.d2i_OCSP_RESPONSE$FUNC, false
+-    );
+-    static final FunctionDescriptor OCSP_CERTID_free$FUNC = FunctionDescriptor.ofVoid(
+-        ADDRESS
+-    );
+-    static final MethodHandle OCSP_CERTID_free$MH = RuntimeHelper.downcallHandle(
+-        "OCSP_CERTID_free",
+-        constants$29.OCSP_CERTID_free$FUNC, false
+-    );
+-    static final FunctionDescriptor OCSP_REQUEST_new$FUNC = FunctionDescriptor.of(ADDRESS);
+-    static final MethodHandle OCSP_REQUEST_new$MH = RuntimeHelper.downcallHandle(
+-        "OCSP_REQUEST_new",
+-        constants$29.OCSP_REQUEST_new$FUNC, false
+-    );
+-    static final FunctionDescriptor OCSP_REQUEST_free$FUNC = FunctionDescriptor.ofVoid(
+-        ADDRESS
+-    );
+-    static final MethodHandle OCSP_REQUEST_free$MH = RuntimeHelper.downcallHandle(
+-        "OCSP_REQUEST_free",
+-        constants$29.OCSP_REQUEST_free$FUNC, false
+-    );
+-    static final FunctionDescriptor i2d_OCSP_REQUEST$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        ADDRESS
+-    );
+-    static final MethodHandle i2d_OCSP_REQUEST$MH = RuntimeHelper.downcallHandle(
+-        "i2d_OCSP_REQUEST",
+-        constants$29.i2d_OCSP_REQUEST$FUNC, false
+-    );
+-    static final MemorySegment OPENSSL_FILE$SEGMENT = RuntimeHelper.CONSTANT_ALLOCATOR.allocateUtf8String("/tmp/jextract$7507082841068085766.h");
++    static final MemorySegment OPENSSL_FILE$SEGMENT = RuntimeHelper.CONSTANT_ALLOCATOR.allocateUtf8String("/tmp/jextract$17092896582695808251.h");
+ }
+ 
+ 
+
+==================================================
+constants$4.java
+index 6061e7aa01..dc54b44a45 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$3.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$3.java
+@@ -26,50 +26,47 @@ import java.lang.foreign.*;
+ import static java.lang.foreign.ValueLayout.*;
+ class constants$3 {
+ 
+-    static final FunctionDescriptor BIO_free$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS
++    static final FunctionDescriptor BN_get_rfc2409_prime_768$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle BIO_free$MH = RuntimeHelper.downcallHandle(
+-        "BIO_free",
+-        constants$3.BIO_free$FUNC, false
++    static final MethodHandle BN_get_rfc2409_prime_768$MH = RuntimeHelper.downcallHandle(
++        "BN_get_rfc2409_prime_768",
++        constants$3.BN_get_rfc2409_prime_768$FUNC
+     );
+-    static final FunctionDescriptor BIO_read$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        ADDRESS,
+-        JAVA_INT
++    static final FunctionDescriptor BN_get_rfc2409_prime_1024$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle BIO_read$MH = RuntimeHelper.downcallHandle(
+-        "BIO_read",
+-        constants$3.BIO_read$FUNC, false
++    static final MethodHandle BN_get_rfc2409_prime_1024$MH = RuntimeHelper.downcallHandle(
++        "BN_get_rfc2409_prime_1024",
++        constants$3.BN_get_rfc2409_prime_1024$FUNC
+     );
+-    static final FunctionDescriptor BIO_write$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        ADDRESS,
+-        JAVA_INT
++    static final FunctionDescriptor BN_get_rfc3526_prime_1536$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle BIO_write$MH = RuntimeHelper.downcallHandle(
+-        "BIO_write",
+-        constants$3.BIO_write$FUNC, false
++    static final MethodHandle BN_get_rfc3526_prime_1536$MH = RuntimeHelper.downcallHandle(
++        "BN_get_rfc3526_prime_1536",
++        constants$3.BN_get_rfc3526_prime_1536$FUNC
+     );
+-    static final FunctionDescriptor BIO_ctrl$FUNC = FunctionDescriptor.of(JAVA_LONG,
+-        ADDRESS,
+-        JAVA_INT,
+-        JAVA_LONG,
+-        ADDRESS
++    static final FunctionDescriptor BN_get_rfc3526_prime_2048$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle BIO_ctrl$MH = RuntimeHelper.downcallHandle(
+-        "BIO_ctrl",
+-        constants$3.BIO_ctrl$FUNC, false
++    static final MethodHandle BN_get_rfc3526_prime_2048$MH = RuntimeHelper.downcallHandle(
++        "BN_get_rfc3526_prime_2048",
++        constants$3.BN_get_rfc3526_prime_2048$FUNC
+     );
+-    static final FunctionDescriptor BIO_s_mem$FUNC = FunctionDescriptor.of(ADDRESS);
+-    static final MethodHandle BIO_s_mem$MH = RuntimeHelper.downcallHandle(
+-        "BIO_s_mem",
+-        constants$3.BIO_s_mem$FUNC, false
++    static final FunctionDescriptor BN_get_rfc3526_prime_3072$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor BIO_s_bio$FUNC = FunctionDescriptor.of(ADDRESS);
+-    static final MethodHandle BIO_s_bio$MH = RuntimeHelper.downcallHandle(
+-        "BIO_s_bio",
+-        constants$3.BIO_s_bio$FUNC, false
++    static final MethodHandle BN_get_rfc3526_prime_3072$MH = RuntimeHelper.downcallHandle(
++        "BN_get_rfc3526_prime_3072",
++        constants$3.BN_get_rfc3526_prime_3072$FUNC
++    );
++    static final FunctionDescriptor BN_get_rfc3526_prime_4096$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
++    );
++    static final MethodHandle BN_get_rfc3526_prime_4096$MH = RuntimeHelper.downcallHandle(
++        "BN_get_rfc3526_prime_4096",
++        constants$3.BN_get_rfc3526_prime_4096$FUNC
+     );
+ }
+ 
+
+==================================================
+constants$5.java
+index d7b39bd55c..46d0a201ef 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$4.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$4.java
+@@ -26,49 +26,49 @@ import java.lang.foreign.*;
+ import static java.lang.foreign.ValueLayout.*;
+ class constants$4 {
+ 
+-    static final FunctionDescriptor BIO_new_bio_pair$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        JAVA_LONG,
+-        ADDRESS,
+-        JAVA_LONG
++    static final FunctionDescriptor BN_get_rfc3526_prime_6144$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle BIO_new_bio_pair$MH = RuntimeHelper.downcallHandle(
+-        "BIO_new_bio_pair",
+-        constants$4.BIO_new_bio_pair$FUNC, false
++    static final MethodHandle BN_get_rfc3526_prime_6144$MH = RuntimeHelper.downcallHandle(
++        "BN_get_rfc3526_prime_6144",
++        constants$4.BN_get_rfc3526_prime_6144$FUNC
+     );
+-    static final FunctionDescriptor BN_new$FUNC = FunctionDescriptor.of(ADDRESS);
+-    static final MethodHandle BN_new$MH = RuntimeHelper.downcallHandle(
+-        "BN_new",
+-        constants$4.BN_new$FUNC, false
++    static final FunctionDescriptor BN_get_rfc3526_prime_8192$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor BN_set_word$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        JAVA_LONG
++    static final MethodHandle BN_get_rfc3526_prime_8192$MH = RuntimeHelper.downcallHandle(
++        "BN_get_rfc3526_prime_8192",
++        constants$4.BN_get_rfc3526_prime_8192$FUNC
+     );
+-    static final MethodHandle BN_set_word$MH = RuntimeHelper.downcallHandle(
+-        "BN_set_word",
+-        constants$4.BN_set_word$FUNC, false
++    static final FunctionDescriptor ASN1_STRING_length$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor BN_get_rfc2409_prime_768$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS
++    static final MethodHandle ASN1_STRING_length$MH = RuntimeHelper.downcallHandle(
++        "ASN1_STRING_length",
++        constants$4.ASN1_STRING_length$FUNC
+     );
+-    static final MethodHandle BN_get_rfc2409_prime_768$MH = RuntimeHelper.downcallHandle(
+-        "BN_get_rfc2409_prime_768",
+-        constants$4.BN_get_rfc2409_prime_768$FUNC, false
++    static final FunctionDescriptor ASN1_STRING_get0_data$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor BN_get_rfc2409_prime_1024$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS
++    static final MethodHandle ASN1_STRING_get0_data$MH = RuntimeHelper.downcallHandle(
++        "ASN1_STRING_get0_data",
++        constants$4.ASN1_STRING_get0_data$FUNC
+     );
+-    static final MethodHandle BN_get_rfc2409_prime_1024$MH = RuntimeHelper.downcallHandle(
+-        "BN_get_rfc2409_prime_1024",
+-        constants$4.BN_get_rfc2409_prime_1024$FUNC, false
++    static final FunctionDescriptor EVP_MD_get0_provider$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor BN_get_rfc3526_prime_1536$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS
++    static final MethodHandle EVP_MD_get0_provider$MH = RuntimeHelper.downcallHandle(
++        "EVP_MD_get0_provider",
++        constants$4.EVP_MD_get0_provider$FUNC
+     );
+-    static final MethodHandle BN_get_rfc3526_prime_1536$MH = RuntimeHelper.downcallHandle(
+-        "BN_get_rfc3526_prime_1536",
+-        constants$4.BN_get_rfc3526_prime_1536$FUNC, false
++    static final FunctionDescriptor EVP_MD_fetch$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
++    );
++    static final MethodHandle EVP_MD_fetch$MH = RuntimeHelper.downcallHandle(
++        "EVP_MD_fetch",
++        constants$4.EVP_MD_fetch$FUNC
+     );
+ }
+ 
+
+==================================================
+constants$6.java
+index 086e5b7db5..7efcd1bb60 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$5.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$5.java
+@@ -26,47 +26,47 @@ import java.lang.foreign.*;
+ import static java.lang.foreign.ValueLayout.*;
+ class constants$5 {
+ 
+-    static final FunctionDescriptor BN_get_rfc3526_prime_2048$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor EVP_MD_free$FUNC = FunctionDescriptor.ofVoid(
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle BN_get_rfc3526_prime_2048$MH = RuntimeHelper.downcallHandle(
+-        "BN_get_rfc3526_prime_2048",
+-        constants$5.BN_get_rfc3526_prime_2048$FUNC, false
++    static final MethodHandle EVP_MD_free$MH = RuntimeHelper.downcallHandle(
++        "EVP_MD_free",
++        constants$5.EVP_MD_free$FUNC
+     );
+-    static final FunctionDescriptor BN_get_rfc3526_prime_3072$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor EVP_PKEY_get_base_id$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle BN_get_rfc3526_prime_3072$MH = RuntimeHelper.downcallHandle(
+-        "BN_get_rfc3526_prime_3072",
+-        constants$5.BN_get_rfc3526_prime_3072$FUNC, false
++    static final MethodHandle EVP_PKEY_get_base_id$MH = RuntimeHelper.downcallHandle(
++        "EVP_PKEY_get_base_id",
++        constants$5.EVP_PKEY_get_base_id$FUNC
+     );
+-    static final FunctionDescriptor BN_get_rfc3526_prime_4096$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor EVP_PKEY_get_bits$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle BN_get_rfc3526_prime_4096$MH = RuntimeHelper.downcallHandle(
+-        "BN_get_rfc3526_prime_4096",
+-        constants$5.BN_get_rfc3526_prime_4096$FUNC, false
++    static final MethodHandle EVP_PKEY_get_bits$MH = RuntimeHelper.downcallHandle(
++        "EVP_PKEY_get_bits",
++        constants$5.EVP_PKEY_get_bits$FUNC
+     );
+-    static final FunctionDescriptor BN_get_rfc3526_prime_6144$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor EC_GROUP_free$FUNC = FunctionDescriptor.ofVoid(
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle BN_get_rfc3526_prime_6144$MH = RuntimeHelper.downcallHandle(
+-        "BN_get_rfc3526_prime_6144",
+-        constants$5.BN_get_rfc3526_prime_6144$FUNC, false
++    static final MethodHandle EC_GROUP_free$MH = RuntimeHelper.downcallHandle(
++        "EC_GROUP_free",
++        constants$5.EC_GROUP_free$FUNC
+     );
+-    static final FunctionDescriptor BN_get_rfc3526_prime_8192$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor EC_GROUP_get_curve_name$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle BN_get_rfc3526_prime_8192$MH = RuntimeHelper.downcallHandle(
+-        "BN_get_rfc3526_prime_8192",
+-        constants$5.BN_get_rfc3526_prime_8192$FUNC, false
++    static final MethodHandle EC_GROUP_get_curve_name$MH = RuntimeHelper.downcallHandle(
++        "EC_GROUP_get_curve_name",
++        constants$5.EC_GROUP_get_curve_name$FUNC
+     );
+-    static final FunctionDescriptor ASN1_STRING_length$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS
++    static final FunctionDescriptor EC_KEY_new_by_curve_name$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_INT$LAYOUT
+     );
+-    static final MethodHandle ASN1_STRING_length$MH = RuntimeHelper.downcallHandle(
+-        "ASN1_STRING_length",
+-        constants$5.ASN1_STRING_length$FUNC, false
++    static final MethodHandle EC_KEY_new_by_curve_name$MH = RuntimeHelper.downcallHandle(
++        "EC_KEY_new_by_curve_name",
++        constants$5.EC_KEY_new_by_curve_name$FUNC
+     );
+ }
+ 
+
+==================================================
+constants$7.java
+index ed2494b275..4761995db8 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$6.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$6.java
+@@ -26,47 +26,49 @@ import java.lang.foreign.*;
+ import static java.lang.foreign.ValueLayout.*;
+ class constants$6 {
+ 
+-    static final FunctionDescriptor ASN1_STRING_get0_data$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor EC_KEY_free$FUNC = FunctionDescriptor.ofVoid(
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle ASN1_STRING_get0_data$MH = RuntimeHelper.downcallHandle(
+-        "ASN1_STRING_get0_data",
+-        constants$6.ASN1_STRING_get0_data$FUNC, false
++    static final MethodHandle EC_KEY_free$MH = RuntimeHelper.downcallHandle(
++        "EC_KEY_free",
++        constants$6.EC_KEY_free$FUNC
+     );
+-    static final FunctionDescriptor EVP_PKEY_base_id$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS
++    static final FunctionDescriptor DH_new$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT);
++    static final MethodHandle DH_new$MH = RuntimeHelper.downcallHandle(
++        "DH_new",
++        constants$6.DH_new$FUNC
+     );
+-    static final MethodHandle EVP_PKEY_base_id$MH = RuntimeHelper.downcallHandle(
+-        "EVP_PKEY_base_id",
+-        constants$6.EVP_PKEY_base_id$FUNC, false
++    static final FunctionDescriptor DH_free$FUNC = FunctionDescriptor.ofVoid(
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor EVP_PKEY_bits$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS
++    static final MethodHandle DH_free$MH = RuntimeHelper.downcallHandle(
++        "DH_free",
++        constants$6.DH_free$FUNC
+     );
+-    static final MethodHandle EVP_PKEY_bits$MH = RuntimeHelper.downcallHandle(
+-        "EVP_PKEY_bits",
+-        constants$6.EVP_PKEY_bits$FUNC, false
++    static final FunctionDescriptor DH_set0_pqg$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor EC_GROUP_free$FUNC = FunctionDescriptor.ofVoid(
+-        ADDRESS
++    static final MethodHandle DH_set0_pqg$MH = RuntimeHelper.downcallHandle(
++        "DH_set0_pqg",
++        constants$6.DH_set0_pqg$FUNC
+     );
+-    static final MethodHandle EC_GROUP_free$MH = RuntimeHelper.downcallHandle(
+-        "EC_GROUP_free",
+-        constants$6.EC_GROUP_free$FUNC, false
++    static final FunctionDescriptor X509_STORE_set_flags$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_LONG_LONG$LAYOUT
+     );
+-    static final FunctionDescriptor EC_GROUP_get_curve_name$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS
++    static final MethodHandle X509_STORE_set_flags$MH = RuntimeHelper.downcallHandle(
++        "X509_STORE_set_flags",
++        constants$6.X509_STORE_set_flags$FUNC
+     );
+-    static final MethodHandle EC_GROUP_get_curve_name$MH = RuntimeHelper.downcallHandle(
+-        "EC_GROUP_get_curve_name",
+-        constants$6.EC_GROUP_get_curve_name$FUNC, false
++    static final FunctionDescriptor X509_STORE_CTX_get0_untrusted$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor EC_KEY_new_by_curve_name$FUNC = FunctionDescriptor.of(ADDRESS,
+-        JAVA_INT
+-    );
+-    static final MethodHandle EC_KEY_new_by_curve_name$MH = RuntimeHelper.downcallHandle(
+-        "EC_KEY_new_by_curve_name",
+-        constants$6.EC_KEY_new_by_curve_name$FUNC, false
++    static final MethodHandle X509_STORE_CTX_get0_untrusted$MH = RuntimeHelper.downcallHandle(
++        "X509_STORE_CTX_get0_untrusted",
++        constants$6.X509_STORE_CTX_get0_untrusted$FUNC
+     );
+ }
+ 
+
+==================================================
+constants$8.java
+index 343f45915d..03b0ebe143 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$7.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$7.java
+@@ -26,49 +26,49 @@ import java.lang.foreign.*;
+ import static java.lang.foreign.ValueLayout.*;
+ class constants$7 {
+ 
+-    static final FunctionDescriptor EC_KEY_free$FUNC = FunctionDescriptor.ofVoid(
+-        ADDRESS
++    static final FunctionDescriptor X509_STORE_add_lookup$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle EC_KEY_free$MH = RuntimeHelper.downcallHandle(
+-        "EC_KEY_free",
+-        constants$7.EC_KEY_free$FUNC, false
++    static final MethodHandle X509_STORE_add_lookup$MH = RuntimeHelper.downcallHandle(
++        "X509_STORE_add_lookup",
++        constants$7.X509_STORE_add_lookup$FUNC
+     );
+-    static final FunctionDescriptor DH_new$FUNC = FunctionDescriptor.of(ADDRESS);
+-    static final MethodHandle DH_new$MH = RuntimeHelper.downcallHandle(
+-        "DH_new",
+-        constants$7.DH_new$FUNC, false
++    static final FunctionDescriptor X509_LOOKUP_hash_dir$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT);
++    static final MethodHandle X509_LOOKUP_hash_dir$MH = RuntimeHelper.downcallHandle(
++        "X509_LOOKUP_hash_dir",
++        constants$7.X509_LOOKUP_hash_dir$FUNC
+     );
+-    static final FunctionDescriptor DH_free$FUNC = FunctionDescriptor.ofVoid(
+-        ADDRESS
++    static final FunctionDescriptor X509_LOOKUP_file$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT);
++    static final MethodHandle X509_LOOKUP_file$MH = RuntimeHelper.downcallHandle(
++        "X509_LOOKUP_file",
++        constants$7.X509_LOOKUP_file$FUNC
+     );
+-    static final MethodHandle DH_free$MH = RuntimeHelper.downcallHandle(
+-        "DH_free",
+-        constants$7.DH_free$FUNC, false
++    static final FunctionDescriptor X509_LOOKUP_ctrl$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_LONG_LONG$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor DH_set0_pqg$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        ADDRESS,
+-        ADDRESS,
+-        ADDRESS
++    static final MethodHandle X509_LOOKUP_ctrl$MH = RuntimeHelper.downcallHandle(
++        "X509_LOOKUP_ctrl",
++        constants$7.X509_LOOKUP_ctrl$FUNC
+     );
+-    static final MethodHandle DH_set0_pqg$MH = RuntimeHelper.downcallHandle(
+-        "DH_set0_pqg",
+-        constants$7.DH_set0_pqg$FUNC, false
++    static final FunctionDescriptor X509_STORE_CTX_get_ex_data$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_INT$LAYOUT
+     );
+-    static final FunctionDescriptor X509_STORE_set_flags$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        JAVA_LONG
++    static final MethodHandle X509_STORE_CTX_get_ex_data$MH = RuntimeHelper.downcallHandle(
++        "X509_STORE_CTX_get_ex_data",
++        constants$7.X509_STORE_CTX_get_ex_data$FUNC
+     );
+-    static final MethodHandle X509_STORE_set_flags$MH = RuntimeHelper.downcallHandle(
+-        "X509_STORE_set_flags",
+-        constants$7.X509_STORE_set_flags$FUNC, false
++    static final FunctionDescriptor X509_STORE_CTX_get_error$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor X509_STORE_CTX_get0_untrusted$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS
+-    );
+-    static final MethodHandle X509_STORE_CTX_get0_untrusted$MH = RuntimeHelper.downcallHandle(
+-        "X509_STORE_CTX_get0_untrusted",
+-        constants$7.X509_STORE_CTX_get0_untrusted$FUNC, false
++    static final MethodHandle X509_STORE_CTX_get_error$MH = RuntimeHelper.downcallHandle(
++        "X509_STORE_CTX_get_error",
++        constants$7.X509_STORE_CTX_get_error$FUNC
+     );
+ }
+ 
+
+==================================================
+constants$9.java
+index 338a89d1b9..aad2b8dd3c 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$8.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$8.java
+@@ -26,49 +26,49 @@ import java.lang.foreign.*;
+ import static java.lang.foreign.ValueLayout.*;
+ class constants$8 {
+ 
+-    static final FunctionDescriptor X509_STORE_add_lookup$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor X509_STORE_CTX_set_error$FUNC = FunctionDescriptor.ofVoid(
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_INT$LAYOUT
+     );
+-    static final MethodHandle X509_STORE_add_lookup$MH = RuntimeHelper.downcallHandle(
+-        "X509_STORE_add_lookup",
+-        constants$8.X509_STORE_add_lookup$FUNC, false
++    static final MethodHandle X509_STORE_CTX_set_error$MH = RuntimeHelper.downcallHandle(
++        "X509_STORE_CTX_set_error",
++        constants$8.X509_STORE_CTX_set_error$FUNC
+     );
+-    static final FunctionDescriptor X509_LOOKUP_hash_dir$FUNC = FunctionDescriptor.of(ADDRESS);
+-    static final MethodHandle X509_LOOKUP_hash_dir$MH = RuntimeHelper.downcallHandle(
+-        "X509_LOOKUP_hash_dir",
+-        constants$8.X509_LOOKUP_hash_dir$FUNC, false
++    static final FunctionDescriptor X509_STORE_CTX_get_error_depth$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final FunctionDescriptor X509_LOOKUP_file$FUNC = FunctionDescriptor.of(ADDRESS);
+-    static final MethodHandle X509_LOOKUP_file$MH = RuntimeHelper.downcallHandle(
+-        "X509_LOOKUP_file",
+-        constants$8.X509_LOOKUP_file$FUNC, false
++    static final MethodHandle X509_STORE_CTX_get_error_depth$MH = RuntimeHelper.downcallHandle(
++        "X509_STORE_CTX_get_error_depth",
++        constants$8.X509_STORE_CTX_get_error_depth$FUNC
+     );
+-    static final FunctionDescriptor X509_LOOKUP_ctrl$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS,
+-        JAVA_INT,
+-        ADDRESS,
+-        JAVA_LONG,
+-        ADDRESS
++    static final FunctionDescriptor X509_STORE_CTX_get_current_cert$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle X509_LOOKUP_ctrl$MH = RuntimeHelper.downcallHandle(
+-        "X509_LOOKUP_ctrl",
+-        constants$8.X509_LOOKUP_ctrl$FUNC, false
++    static final MethodHandle X509_STORE_CTX_get_current_cert$MH = RuntimeHelper.downcallHandle(
++        "X509_STORE_CTX_get_current_cert",
++        constants$8.X509_STORE_CTX_get_current_cert$FUNC
+     );
+-    static final FunctionDescriptor X509_STORE_CTX_get_ex_data$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS,
+-        JAVA_INT
++    static final FunctionDescriptor X509_STORE_CTX_get0_current_issuer$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle X509_STORE_CTX_get_ex_data$MH = RuntimeHelper.downcallHandle(
+-        "X509_STORE_CTX_get_ex_data",
+-        constants$8.X509_STORE_CTX_get_ex_data$FUNC, false
++    static final MethodHandle X509_STORE_CTX_get0_current_issuer$MH = RuntimeHelper.downcallHandle(
++        "X509_STORE_CTX_get0_current_issuer",
++        constants$8.X509_STORE_CTX_get0_current_issuer$FUNC
+     );
+-    static final FunctionDescriptor X509_STORE_CTX_get_error$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS
++    static final FunctionDescriptor d2i_X509_bio$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle X509_STORE_CTX_get_error$MH = RuntimeHelper.downcallHandle(
+-        "X509_STORE_CTX_get_error",
+-        constants$8.X509_STORE_CTX_get_error$FUNC, false
++    static final MethodHandle d2i_X509_bio$MH = RuntimeHelper.downcallHandle(
++        "d2i_X509_bio",
++        constants$8.d2i_X509_bio$FUNC
++    );
++    static final FunctionDescriptor X509_free$FUNC = FunctionDescriptor.ofVoid(
++        Constants$root.C_POINTER$LAYOUT
++    );
++    static final MethodHandle X509_free$MH = RuntimeHelper.downcallHandle(
++        "X509_free",
++        constants$8.X509_free$FUNC
+     );
+ }
+ 
+
+==================================================
+openssl_compat_h.java
+index 360216dbcc..953331b523 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$9.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/constants$9.java
+@@ -26,49 +26,56 @@ import java.lang.foreign.*;
+ import static java.lang.foreign.ValueLayout.*;
+ class constants$9 {
+ 
+-    static final FunctionDescriptor X509_STORE_CTX_set_error$FUNC = FunctionDescriptor.ofVoid(
+-        ADDRESS,
+-        JAVA_INT
++    static final FunctionDescriptor d2i_X509$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_LONG_LONG$LAYOUT
+     );
+-    static final MethodHandle X509_STORE_CTX_set_error$MH = RuntimeHelper.downcallHandle(
+-        "X509_STORE_CTX_set_error",
+-        constants$9.X509_STORE_CTX_set_error$FUNC, false
++    static final MethodHandle d2i_X509$MH = RuntimeHelper.downcallHandle(
++        "d2i_X509",
++        constants$9.d2i_X509$FUNC
+     );
+-    static final FunctionDescriptor X509_STORE_CTX_get_error_depth$FUNC = FunctionDescriptor.of(JAVA_INT,
+-        ADDRESS
++    static final FunctionDescriptor i2d_X509$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle X509_STORE_CTX_get_error_depth$MH = RuntimeHelper.downcallHandle(
+-        "X509_STORE_CTX_get_error_depth",
+-        constants$9.X509_STORE_CTX_get_error_depth$FUNC, false
++    static final MethodHandle i2d_X509$MH = RuntimeHelper.downcallHandle(
++        "i2d_X509",
++        constants$9.i2d_X509$FUNC
+     );
+-    static final FunctionDescriptor X509_STORE_CTX_get_current_cert$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor X509_get_ext_by_NID$FUNC = FunctionDescriptor.of(Constants$root.C_INT$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_INT$LAYOUT,
++        Constants$root.C_INT$LAYOUT
+     );
+-    static final MethodHandle X509_STORE_CTX_get_current_cert$MH = RuntimeHelper.downcallHandle(
+-        "X509_STORE_CTX_get_current_cert",
+-        constants$9.X509_STORE_CTX_get_current_cert$FUNC, false
++    static final MethodHandle X509_get_ext_by_NID$MH = RuntimeHelper.downcallHandle(
++        "X509_get_ext_by_NID",
++        constants$9.X509_get_ext_by_NID$FUNC
+     );
+-    static final FunctionDescriptor X509_STORE_CTX_get0_current_issuer$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor X509_get_ext$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_INT$LAYOUT
+     );
+-    static final MethodHandle X509_STORE_CTX_get0_current_issuer$MH = RuntimeHelper.downcallHandle(
+-        "X509_STORE_CTX_get0_current_issuer",
+-        constants$9.X509_STORE_CTX_get0_current_issuer$FUNC, false
++    static final MethodHandle X509_get_ext$MH = RuntimeHelper.downcallHandle(
++        "X509_get_ext",
++        constants$9.X509_get_ext$FUNC
+     );
+-    static final FunctionDescriptor d2i_X509_bio$FUNC = FunctionDescriptor.of(ADDRESS,
+-        ADDRESS,
+-        ADDRESS
++    static final FunctionDescriptor X509_EXTENSION_get_data$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle d2i_X509_bio$MH = RuntimeHelper.downcallHandle(
+-        "d2i_X509_bio",
+-        constants$9.d2i_X509_bio$FUNC, false
++    static final MethodHandle X509_EXTENSION_get_data$MH = RuntimeHelper.downcallHandle(
++        "X509_EXTENSION_get_data",
++        constants$9.X509_EXTENSION_get_data$FUNC
+     );
+-    static final FunctionDescriptor X509_free$FUNC = FunctionDescriptor.ofVoid(
+-        ADDRESS
++    static final FunctionDescriptor PEM_read_bio_X509_AUX$FUNC = FunctionDescriptor.of(Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT,
++        Constants$root.C_POINTER$LAYOUT
+     );
+-    static final MethodHandle X509_free$MH = RuntimeHelper.downcallHandle(
+-        "X509_free",
+-        constants$9.X509_free$FUNC, false
++    static final MethodHandle PEM_read_bio_X509_AUX$MH = RuntimeHelper.downcallHandle(
++        "PEM_read_bio_X509_AUX",
++        constants$9.PEM_read_bio_X509_AUX$FUNC
+     );
+ }
+ 
+
+==================================================
+openssl_h.java
+new file mode 100644
+index 0000000000..38d8a2d2fc
+--- /dev/null
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/openssl/openssl_compat_h.java
+@@ -0,0 +1,69 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.tomcat.util.openssl;
++
++import java.lang.invoke.MethodHandle;
++import java.lang.foreign.*;
++import static java.lang.foreign.ValueLayout.*;
++
++/**
++ * Methods used present in older OpenSSL versions but not in the current major version.
++ */
++public class openssl_compat_h  {
++
++    // OpenSSL 1.1 FIPS_mode
++    static final FunctionDescriptor FIPS_mode$FUNC = FunctionDescriptor.of(JAVA_INT);
++    static final MethodHandle FIPS_mode$MH = RuntimeHelper.downcallHandle(
++        "FIPS_mode",
++        FIPS_mode$FUNC
++    );
++    public static MethodHandle FIPS_mode$MH() {
++        return RuntimeHelper.requireNonNull(FIPS_mode$MH,"FIPS_mode");
++    }
++    public static int FIPS_mode () {
++        var mh$ = RuntimeHelper.requireNonNull(FIPS_mode$MH, "FIPS_mode");
++        try {
++            return (int)mh$.invokeExact();
++        } catch (Throwable ex$) {
++            throw new AssertionError("should not reach here", ex$);
++        }
++    }
++
++    // OpenSSL 1.1 FIPS_mode_set
++    static final FunctionDescriptor FIPS_mode_set$FUNC = FunctionDescriptor.of(JAVA_INT,
++            JAVA_INT
++        );
++    static final MethodHandle FIPS_mode_set$MH = RuntimeHelper.downcallHandle(
++            "FIPS_mode_set",
++            FIPS_mode_set$FUNC
++        );
++    public static MethodHandle FIPS_mode_set$MH() {
++        return RuntimeHelper.requireNonNull(FIPS_mode_set$MH,"FIPS_mode_set");
++    }
++    public static int FIPS_mode_set ( int r) {
++        var mh$ = RuntimeHelper.requireNonNull(FIPS_mode_set$MH, "FIPS_mode_set");
++        try {
++            return (int)mh$.invokeExact(r);
++        } catch (Throwable ex$) {
++            throw new AssertionError("should not reach here", ex$);
++        }
++    }
++
++}
++
++
+
+==================================================

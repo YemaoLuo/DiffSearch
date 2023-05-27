@@ -1,0 +1,250 @@
+6b479b119a093e9495476a983fa76c92c1dbd2e2
+==================================================
+Improve the handling of HTTP/2 stream resets due to excessive headers when a continuation frame is used.
+==================================================
+Mark Thomas
+==================================================
+Mon Jul 17 19:33:11 2017 +0000
+==================================================
+HeaderSink.java
+Improve the handling of HTTP/2 stream resets due to excessive headers when a continuation frame is used.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1802195 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+HpackDecoder.java
+index e639c7d4dc..d9fe699f6c 100644
+--- a/java/org/apache/coyote/http2/HeaderSink.java
++++ b/java/org/apache/coyote/http2/HeaderSink.java
+@@ -34,4 +34,11 @@ class HeaderSink implements HeaderEmitter {
+     public void validateHeaders() throws StreamException {
+         // NO-OP
+     }
++
++    @Override
++    public void setHeaderException(StreamException streamException) {
++        // NO-OP
++        // The connection is already closing so no need to process additional
++        // errors
++    }
+ }
+
+==================================================
+Http2Parser.java
+index db44e73b4c..d5ce644911 100644
+--- a/java/org/apache/coyote/http2/HpackDecoder.java
++++ b/java/org/apache/coyote/http2/HpackDecoder.java
+@@ -355,6 +355,16 @@ public class HpackDecoder {
+          */
+         void emitHeader(String name, String value) throws HpackException;
+ 
++        /**
++         * Inform the recipient of the headers that a stream error needs to be
++         * triggered using the given message when {@link #validateHeaders()} is
++         * called. This is used when the Parser becomes aware of an error that
++         * is not visible to the recipient.
++         *
++         * @param streamException The exception to use when resetting the stream
++         */
++        void setHeaderException(StreamException streamException);
++
+         /**
+          * Are the headers pass to the recipient so far valid? The decoder needs
+          * to process all the headers to maintain state even if there is a
+
+==================================================
+Stream.java
+index e8ea253bb9..9bcacab329 100644
+--- a/java/org/apache/coyote/http2/Http2Parser.java
++++ b/java/org/apache/coyote/http2/Http2Parser.java
+@@ -45,7 +45,6 @@ class Http2Parser {
+             ByteBuffer.allocate(Constants.DEFAULT_HEADER_READ_BUFFER_SIZE);
+     private volatile int headersCurrentStream = -1;
+     private volatile boolean headersEndStream = false;
+-    private volatile boolean streamReset = false;
+ 
+     Http2Parser(String connectionId, Input input, Output output) {
+         this.connectionId = connectionId;
+@@ -379,8 +378,8 @@ class Http2Parser {
+         readHeaderPayload(streamId, payloadSize);
+ 
+         if (Flags.isEndOfHeaders(flags)) {
+-            onHeadersComplete(streamId);
+             headersCurrentStream = -1;
++            onHeadersComplete(streamId);
+         }
+     }
+ 
+@@ -427,16 +426,18 @@ class Http2Parser {
+             headerReadBuffer.compact();
+             remaining -= toRead;
+ 
+-            if (hpackDecoder.isHeaderCountExceeded() && !streamReset) {
+-                streamReset = true;
+-                throw new StreamException(sm.getString("http2Parser.headerLimitCount", connectionId,
+-                        Integer.valueOf(streamId)), Http2Error.ENHANCE_YOUR_CALM, streamId);
++            if (hpackDecoder.isHeaderCountExceeded()) {
++                StreamException headerException = new StreamException(sm.getString(
++                        "http2Parser.headerLimitCount", connectionId, Integer.valueOf(streamId)),
++                        Http2Error.ENHANCE_YOUR_CALM, streamId);
++                hpackDecoder.getHeaderEmitter().setHeaderException(headerException);
+             }
+ 
+-            if (hpackDecoder.isHeaderSizeExceeded(headerReadBuffer.position()) && !streamReset) {
+-                streamReset = true;
+-                throw new StreamException(sm.getString("http2Parser.headerLimitSize", connectionId,
+-                        Integer.valueOf(streamId)), Http2Error.ENHANCE_YOUR_CALM, streamId);
++            if (hpackDecoder.isHeaderSizeExceeded(headerReadBuffer.position())) {
++                StreamException headerException = new StreamException(sm.getString(
++                        "http2Parser.headerLimitSize", connectionId, Integer.valueOf(streamId)),
++                        Http2Error.ENHANCE_YOUR_CALM, streamId);
++                hpackDecoder.getHeaderEmitter().setHeaderException(headerException);
+             }
+ 
+             if (hpackDecoder.isHeaderSwallowSizeExceeded(headerReadBuffer.position())) {
+@@ -444,8 +445,6 @@ class Http2Parser {
+                         connectionId, Integer.valueOf(streamId)), Http2Error.ENHANCE_YOUR_CALM);
+             }
+         }
+-
+-        hpackDecoder.getHeaderEmitter().validateHeaders();
+     }
+ 
+ 
+@@ -457,6 +456,11 @@ class Http2Parser {
+                     Http2Error.COMPRESSION_ERROR);
+         }
+ 
++        // Delay validation (and triggering any exception) until this point
++        // since all the headers still have to be read if a StreamException is
++        // going to be thrown.
++        hpackDecoder.getHeaderEmitter().validateHeaders();
++
+         output.headersEnd(streamId);
+ 
+         if (headersEndStream) {
+@@ -468,11 +472,6 @@ class Http2Parser {
+         if (headerReadBuffer.capacity() > Constants.DEFAULT_HEADER_READ_BUFFER_SIZE) {
+             headerReadBuffer = ByteBuffer.allocate(Constants.DEFAULT_HEADER_READ_BUFFER_SIZE);
+         }
+-
+-        // Clear the 'stream has been reset' flag, if set
+-        if (streamReset) {
+-            streamReset = false;
+-        }
+     }
+ 
+ 
+
+==================================================
+Http2TestBase.java
+index 2477f11a82..f4bbfc2dfd 100644
+--- a/java/org/apache/coyote/http2/Stream.java
++++ b/java/org/apache/coyote/http2/Stream.java
+@@ -70,7 +70,7 @@ class Stream extends AbstractStream implements HeaderEmitter {
+     private final StreamStateMachine state;
+     // State machine would be too much overhead
+     private int headerState = HEADER_STATE_START;
+-    private String headerStateErrorMsg = null;
++    private StreamException headerException = null;
+     // TODO: null these when finished to reduce memory used by closed stream
+     private final Request coyoteRequest;
+     private StringBuilder cookieHeader = null;
+@@ -256,7 +256,7 @@ class Stream extends AbstractStream implements HeaderEmitter {
+             }
+         }
+ 
+-        if (headerStateErrorMsg != null) {
++        if (headerException != null) {
+             // Don't bother processing the header since the stream is going to
+             // be reset anyway
+             return;
+@@ -265,8 +265,9 @@ class Stream extends AbstractStream implements HeaderEmitter {
+         boolean pseudoHeader = name.charAt(0) == ':';
+ 
+         if (pseudoHeader && headerState != HEADER_STATE_PSEUDO) {
+-            headerStateErrorMsg = sm.getString("stream.header.unexpectedPseudoHeader",
+-                    getConnectionId(), getIdentifier(), name);
++            headerException = new StreamException(sm.getString(
++                    "stream.header.unexpectedPseudoHeader", getConnectionId(), getIdentifier(),
++                    name), Http2Error.PROTOCOL_ERROR, getIdentifier().intValue());
+             // No need for further processing. The stream will be reset.
+             return;
+         }
+@@ -352,8 +353,9 @@ class Stream extends AbstractStream implements HeaderEmitter {
+                 coyoteRequest.setExpectation(true);
+             }
+             if (pseudoHeader) {
+-                headerStateErrorMsg = sm.getString("stream.header.unknownPseudoHeader",
+-                        getConnectionId(), getIdentifier(), name);
++                headerException = new StreamException(sm.getString(
++                        "stream.header.unknownPseudoHeader", getConnectionId(), getIdentifier(),
++                        name), Http2Error.PROTOCOL_ERROR, getIdentifier().intValue());
+             }
+ 
+             if (headerState == HEADER_STATE_TRAILER) {
+@@ -367,14 +369,21 @@ class Stream extends AbstractStream implements HeaderEmitter {
+     }
+ 
+ 
++    @Override
++    public void setHeaderException(StreamException streamException) {
++        if (headerException == null) {
++            headerException = streamException;
++        }
++    }
++
++
+     @Override
+     public void validateHeaders() throws StreamException {
+-        if (headerStateErrorMsg == null) {
++        if (headerException == null) {
+             return;
+         }
+ 
+-        throw new StreamException(headerStateErrorMsg, Http2Error.PROTOCOL_ERROR,
+-                getIdentifier().intValue());
++        throw headerException;
+     }
+ 
+ 
+
+==================================================
+TestHpack.java
+index 5953b2238c..c998ced7fb 100644
+--- a/test/org/apache/coyote/http2/Http2TestBase.java
++++ b/test/org/apache/coyote/http2/Http2TestBase.java
+@@ -936,6 +936,12 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+         }
+ 
+ 
++        @Override
++        public void setHeaderException(StreamException streamException) {
++            // NO-OP: Accept anything the server sends for the unit tests
++        }
++
++
+         @Override
+         public void headersEnd(int streamId) {
+             trace.append(streamId + "-HeadersEnd\n");
+
+==================================================
+TestHttp2Limits.java
+index 7d19980437..d27a661332 100644
+--- a/test/org/apache/coyote/http2/TestHpack.java
++++ b/test/org/apache/coyote/http2/TestHpack.java
+@@ -80,6 +80,10 @@ public class TestHpack {
+             headers.setValue(name).setString(value);
+         }
+         @Override
++        public void setHeaderException(StreamException streamException) {
++            // NO-OP
++        }
++        @Override
+         public void validateHeaders() throws StreamException {
+             // NO-OP
+         }
+
+==================================================

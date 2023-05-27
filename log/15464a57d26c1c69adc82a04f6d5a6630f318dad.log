@@ -1,0 +1,221 @@
+15464a57d26c1c69adc82a04f6d5a6630f318dad
+==================================================
+Fix resource leak warnings reported by Eclipse
+==================================================
+Mark Emlyn
+==================================================
+Fri Oct 26 21:22:13 2012 +0000
+==================================================
+WebappLoader.java
+Fix resource leak warnings reported by Eclipse
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1402667 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+DefaultServlet.java
+index 5f7bc71fee..34bf3a0b6c 100644
+--- a/java/org/apache/catalina/loader/WebappLoader.java
++++ b/java/org/apache/catalina/loader/WebappLoader.java
+@@ -24,7 +24,6 @@ import java.io.FileOutputStream;
+ import java.io.FilePermission;
+ import java.io.IOException;
+ import java.io.InputStream;
+-import java.io.OutputStream;
+ import java.io.UnsupportedEncodingException;
+ import java.lang.reflect.Constructor;
+ import java.lang.reflect.Method;
+@@ -772,8 +771,7 @@ public class WebappLoader extends LifecycleMBeanBase
+                 }
+ 
+                 if (copyJars) {
+-                    if (!copy(jar.getInputStream(),
+-                              new FileOutputStream(destFile))) {
++                    if (!copy(jar.getInputStream(),destFile)) {
+                         throw new IOException(
+                                 sm.getString("webappLoader.copyFailure"));
+                     }
+@@ -894,25 +892,20 @@ public class WebappLoader extends LifecycleMBeanBase
+      */
+     private boolean copyDir(WebResource src, File destDir) {
+ 
+-        try {
+-            WebResource[] resources =
+-                    src.getWebResourceRoot().listResources(src.getWebappPath());
+-            for (WebResource resource : resources) {
+-                File currentFile = new File(destDir, resource.getName());
+-                if (resource.isFile()) {
+-                    InputStream is = resource.getInputStream();
+-                    OutputStream os = new FileOutputStream(currentFile);
+-                    if (!copy(is, os))
+-                        return false;
+-                } else if (resource.isDirectory()) {
+-                    if (!currentFile.isDirectory() && !currentFile.mkdir())
+-                        return false;
+-                    if (!copyDir(resource, currentFile))
+-                        return false;
+-                }
++        WebResource[] resources =
++                src.getWebResourceRoot().listResources(src.getWebappPath());
++        for (WebResource resource : resources) {
++            File currentFile = new File(destDir, resource.getName());
++            if (resource.isFile()) {
++                InputStream is = resource.getInputStream();
++                if (!copy(is, currentFile))
++                    return false;
++            } else if (resource.isDirectory()) {
++                if (!currentFile.isDirectory() && !currentFile.mkdir())
++                    return false;
++                if (!copyDir(resource, currentFile))
++                    return false;
+             }
+-        } catch (IOException e) {
+-            return false;
+         }
+ 
+         return true;
+@@ -923,9 +916,9 @@ public class WebappLoader extends LifecycleMBeanBase
+      * Copy a file to the specified temp directory. This is required only
+      * because Jasper depends on it.
+      */
+-    private boolean copy(InputStream is, OutputStream os) {
++    private boolean copy(InputStream is, File file) {
+ 
+-        try {
++        try (FileOutputStream os = new FileOutputStream(file)){
+             byte[] buf = new byte[4096];
+             while (true) {
+                 int len = is.read(buf);
+@@ -933,10 +926,14 @@ public class WebappLoader extends LifecycleMBeanBase
+                     break;
+                 os.write(buf, 0, len);
+             }
+-            is.close();
+-            os.close();
+         } catch (IOException e) {
+             return false;
++        } finally {
++            try {
++                is.close();
++            } catch (IOException e) {
++                // Ignore
++            }
+         }
+ 
+         return true;
+
+==================================================
+ContextConfig.java
+index 4c5d44d1e9..0fe99dff96 100644
+--- a/java/org/apache/catalina/servlets/DefaultServlet.java
++++ b/java/org/apache/catalina/servlets/DefaultServlet.java
+@@ -499,25 +499,35 @@ public class DefaultServlet
+ 
+         InputStream resourceInputStream = null;
+ 
+-        // Append data specified in ranges to existing content for this
+-        // resource - create a temp. file on the local filesystem to
+-        // perform this operation
+-        // Assume just one range is specified for now
+-        if (range != null) {
+-            File contentFile = executePartialPut(req, range, path);
+-            resourceInputStream = new FileInputStream(contentFile);
+-        } else {
+-            resourceInputStream = req.getInputStream();
+-        }
++        try {
++            // Append data specified in ranges to existing content for this
++            // resource - create a temp. file on the local filesystem to
++            // perform this operation
++            // Assume just one range is specified for now
++            if (range != null) {
++                File contentFile = executePartialPut(req, range, path);
++                resourceInputStream = new FileInputStream(contentFile);
++            } else {
++                resourceInputStream = req.getInputStream();
++            }
+ 
+-        if (resources.write(path, resourceInputStream)) {
+-            if (resource.exists()) {
+-                resp.setStatus(HttpServletResponse.SC_NO_CONTENT);
++            if (resources.write(path, resourceInputStream)) {
++                if (resource.exists()) {
++                    resp.setStatus(HttpServletResponse.SC_NO_CONTENT);
++                } else {
++                    resp.setStatus(HttpServletResponse.SC_CREATED);
++                }
+             } else {
+-                resp.setStatus(HttpServletResponse.SC_CREATED);
++                resp.sendError(HttpServletResponse.SC_CONFLICT);
++            }
++        } finally {
++            if (resourceInputStream != null) {
++                try {
++                    resourceInputStream.close();
++                } catch (IOException ioe) {
++                    // Ignore
++                }
+             }
+-        } else {
+-            resp.sendError(HttpServletResponse.SC_CONFLICT);
+         }
+     }
+ 
+
+==================================================
+ExpandWar.java
+index dbf10fcd79..1943b9d815 100644
+--- a/java/org/apache/catalina/startup/ContextConfig.java
++++ b/java/org/apache/catalina/startup/ContextConfig.java
+@@ -1626,6 +1626,7 @@ public class ContextConfig implements LifecycleListener {
+      * Identify the application web.xml to be used and obtain an input source
+      * for it.
+      */
++    @SuppressWarnings("resource") // stream is meant to be left open here
+     protected InputSource getContextWebXmlSource() {
+         InputStream stream = null;
+         InputSource source = null;
+@@ -1664,6 +1665,13 @@ public class ContextConfig implements LifecycleListener {
+             if (log.isDebugEnabled()) {
+                 log.debug(sm.getString("contextConfig.applicationMissing") + " " + context);
+             }
++            if (stream != null) {
++                try {
++                    stream.close();
++                } catch (IOException e) {
++                    // Ignore
++                }
++            }
+         } else {
+             source = new InputSource(url.toExternalForm());
+             source.setByteStream(stream);
+
+==================================================
+FileHandler.java
+index 7820ace629..0bbcf49e42 100644
+--- a/java/org/apache/catalina/startup/ExpandWar.java
++++ b/java/org/apache/catalina/startup/ExpandWar.java
+@@ -152,16 +152,16 @@ public class ExpandWar {
+             if (input != null) {
+                 try {
+                     input.close();
+-                } catch (Throwable t) {
+-                    ExceptionUtils.handleThrowable(t);
++                } catch (IOException ioe) {
++                    // Ignore
+                 }
+                 input = null;
+             }
+             if (jarFile != null) {
+                 try {
+                     jarFile.close();
+-                } catch (Throwable t) {
+-                    ExceptionUtils.handleThrowable(t);
++                } catch (IOException ioe) {
++                    // Ignore
+                 }
+                 jarFile = null;
+             }
+
+==================================================

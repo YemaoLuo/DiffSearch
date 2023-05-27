@@ -1,0 +1,387 @@
+949629a440432c2efc02420e114b211682e8c17c
+==================================================
+Aligning the HTTP connectors.
+==================================================
+Mark Emlyn
+==================================================
+Tue Sep 6 15:00:02 2011 +0000
+==================================================
+AbstractHttp11Processor.java
+Aligning the HTTP connectors.
+Handle request line timeouts consistently
+Handle upload timeouts more consistently
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1165693 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Http11AprProcessor.java
+index c364a1722b..29c9fdb916 100644
+--- a/java/org/apache/coyote/http11/AbstractHttp11Processor.java
++++ b/java/org/apache/coyote/http11/AbstractHttp11Processor.java
+@@ -96,6 +96,7 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+      */
+     protected boolean keptAlive;
+ 
++
+     /**
+      * Flag that indicates that send file processing is in progress and that the
+      * socket should not be returned to the poller (where a poller is used).
+@@ -815,6 +816,12 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+     protected abstract boolean disableKeepAlive();
+ 
+ 
++    /**
++     * Configures the timeout to be used for reading the request line.
++     */
++    protected abstract void setRequestLineReadTimeout() throws IOException;
++
++
+     /**
+      * After reading the request headers, we have to setup the request filters.
+      */
+
+==================================================
+Http11NioProcessor.java
+index b481fccb8a..790c2e85e9 100644
+--- a/java/org/apache/coyote/http11/Http11AprProcessor.java
++++ b/java/org/apache/coyote/http11/Http11AprProcessor.java
+@@ -190,8 +190,6 @@ public class Http11AprProcessor extends AbstractHttp11Processor<Long> {
+             keptAlive = socketWrapper.isKeptAlive();
+         }
+ 
+-        int soTimeout = endpoint.getSoTimeout();
+-
+         if (disableKeepAlive()) {
+             socketWrapper.setKeepAliveLeft(0);
+         }
+@@ -203,9 +201,8 @@ public class Http11AprProcessor extends AbstractHttp11Processor<Long> {
+ 
+             // Parsing the request header
+             try {
+-                if( !disableUploadTimeout && keptAlive && soTimeout > 0 ) {
+-                    Socket.timeoutSet(socketRef, soTimeout * 1000);
+-                }
++                setRequestLineReadTimeout();
++                
+                 if (!inputBuffer.parseRequestLine(keptAlive)) {
+                     // This means that no data is available right now
+                     // (long keepalive), so that the processor should be recycled
+@@ -326,6 +323,10 @@ public class Http11AprProcessor extends AbstractHttp11Processor<Long> {
+                 outputBuffer.nextRequest();
+             }
+ 
++            if (!disableUploadTimeout) {
++                Socket.timeoutSet(socketRef, endpoint.getSoTimeout() * 1000);
++            }
++
+             rp.setStage(org.apache.coyote.Constants.STAGE_KEEPALIVE);
+ 
+             if (breakKeepAliveLoop(socketWrapper)) {
+@@ -357,6 +358,36 @@ public class Http11AprProcessor extends AbstractHttp11Processor<Long> {
+     }
+ 
+ 
++    @Override
++    protected boolean disableKeepAlive() {
++        return false;
++    }
++
++
++    @Override
++    protected void setRequestLineReadTimeout() throws IOException {
++        // Timeouts while in the poller are handled entirely by the poller
++        // Only need to be concerned with socket timeouts
++
++        // APR uses simulated blocking so if some request line data is present
++        // then it must all be presented (with the normal socket timeout).
++        
++        // When entering the processing loop for the first time there will
++        // always be some data to read so the keep-alive timeout is not required
++        
++        // For the second and subsequent executions of the processing loop, if
++        // there is no request line data present then no further data will be
++        // read from the socket. If there is request line data present then it
++        // must all be presented (with the normal socket timeout)
++
++        // When the socket is created it is given the correct timeout.
++        // sendfile may change the timeout but will restore it
++        // This processor may change the timeout for uploads but will restore it
++        
++        // NO-OP
++    }
++
++
+     @Override
+     protected void setCometTimeouts(SocketWrapper<Long> socketWrapper) {
+         // NO-OP for APR/native
+@@ -392,12 +423,6 @@ public class Http11AprProcessor extends AbstractHttp11Processor<Long> {
+     }
+ 
+ 
+-    @Override
+-    protected boolean disableKeepAlive() {
+-        return false;
+-    }
+-
+-
+     @Override
+     protected void resetTimeouts() {
+         // NOOP for APR
+
+==================================================
+Http11Processor.java
+index 87ebfd4fea..d80cbe649d 100644
+--- a/java/org/apache/coyote/http11/Http11NioProcessor.java
++++ b/java/org/apache/coyote/http11/Http11NioProcessor.java
+@@ -219,8 +219,6 @@ public class Http11NioProcessor extends AbstractHttp11Processor<NioChannel> {
+             keptAlive = socketWrapper.isKeptAlive();
+         }
+         
+-        int soTimeout = endpoint.getSoTimeout();
+-
+         if (disableKeepAlive()) {
+             socketWrapper.setKeepAliveLeft(0);
+         }
+@@ -228,13 +226,10 @@ public class Http11NioProcessor extends AbstractHttp11Processor<NioChannel> {
+         while (!error && keepAlive && !comet && !isAsync() &&
+                 !endpoint.isPaused()) {
+ 
+-            //always default to our soTimeout
+-            socketWrapper.setTimeout(soTimeout);
+             // Parsing the request header
+             try {
+-                if( !disableUploadTimeout && keptAlive && soTimeout > 0 ) {
+-                    socketWrapper.getSocket().getIOChannel().socket().setSoTimeout(soTimeout);
+-                }
++                setRequestLineReadTimeout();
++                
+                 if (!inputBuffer.parseRequestLine(keptAlive)) {
+                     // Haven't finished reading the request so keep the socket
+                     // open
+@@ -372,6 +367,11 @@ public class Http11NioProcessor extends AbstractHttp11Processor<NioChannel> {
+                 outputBuffer.nextRequest();
+             }
+ 
++            if (!disableUploadTimeout) { //only for body, not for request headers
++                socketWrapper.getSocket().getIOChannel().socket().setSoTimeout(
++                        endpoint.getSoTimeout());
++            }
++
+             rp.setStage(org.apache.coyote.Constants.STAGE_KEEPALIVE);
+ 
+             if (breakKeepAliveLoop(socketWrapper)) {
+@@ -403,6 +403,33 @@ public class Http11NioProcessor extends AbstractHttp11Processor<NioChannel> {
+     }
+ 
+ 
++    @Override
++    protected boolean disableKeepAlive() {
++        return false;
++    }
++
++
++    @Override
++    protected void setRequestLineReadTimeout() throws IOException {
++        // socket.setTimeout()
++        //     - timeout used by poller
++        // socket.getSocket().getIOChannel().socket().setSoTimeout()
++        //     - timeout used for blocking reads
++
++        // When entering the processing loop there will always be data to read
++        // so no point changing timeouts at this point
++        
++        // For the second and subsequent executions of the processing loop, a
++        // non-blocking read is used so again no need to set the timeouts
++        
++        // Because NIO supports non-blocking reading of the request line and
++        // headers the timeouts need to be set when returning the socket to
++        // the poller rather than here.
++        
++        // NO-OP
++    }
++
++
+     @Override
+     protected void setCometTimeouts(SocketWrapper<NioChannel> socketWrapper) {
+         // Comet support
+@@ -439,12 +466,6 @@ public class Http11NioProcessor extends AbstractHttp11Processor<NioChannel> {
+     }
+ 
+ 
+-    @Override
+-    protected boolean disableKeepAlive() {
+-        return false;
+-    }
+-
+-
+     @Override
+     public void recycleInternal() {
+         socket = null;
+
+==================================================
+AprEndpoint.java
+index fbf99b7a59..4e867c7ea7 100644
+--- a/java/org/apache/coyote/http11/Http11Processor.java
++++ b/java/org/apache/coyote/http11/Http11Processor.java
+@@ -165,48 +165,8 @@ public class Http11Processor extends AbstractHttp11Processor<Socket> {
+ 
+             // Parsing the request header
+             try {
+-                int standardTimeout = 0;
+-                if (keptAlive) {
+-                    if (keepAliveTimeout > 0) {
+-                        standardTimeout = keepAliveTimeout;
+-                    } else if (soTimeout > 0) {
+-                        standardTimeout = soTimeout;
+-                    }
+-                }
+-                /*
+-                 * When there is no data in the buffer and this is not the first
+-                 * request on this connection and timeouts are being used the
+-                 * first read for this request may need a different timeout to
+-                 * take account of time spent waiting for a processing thread.
+-                 * 
+-                 * This is a little hacky but better than exposing the socket
+-                 * and the timeout info to the InputBuffer
+-                 */
+-                if (inputBuffer.lastValid == 0 &&
+-                        socketWrapper.getLastAccess() > -1 &&
+-                        standardTimeout > 0) {
+-
+-                    long queueTime = System.currentTimeMillis() -
+-                            socketWrapper.getLastAccess();
+-                    int firstReadTimeout;
+-                    if (queueTime >= standardTimeout) {
+-                        // Queued for longer than timeout but there might be
+-                        // data so use shortest possible timeout
+-                        firstReadTimeout = 1;
+-                    } else {
+-                        // Cast is safe since queueTime must be less than
+-                        // standardTimeout which is an int
+-                        firstReadTimeout = standardTimeout - (int) queueTime;
+-                    }
+-                    socket.getSocket().setSoTimeout(firstReadTimeout);
+-                    if (!inputBuffer.fill()) {
+-                        throw new EOFException(sm.getString("iib.eof.error"));
+-                    }
+-                }
+-                if (standardTimeout > 0) {
+-                    socket.getSocket().setSoTimeout(standardTimeout);
+-                }
+-
++                setRequestLineReadTimeout();
++                
+                 inputBuffer.parseRequestLine(false);
+                 if (endpoint.isPaused()) {
+                     // 503 - Service unavailable
+@@ -320,6 +280,10 @@ public class Http11Processor extends AbstractHttp11Processor<Socket> {
+                 outputBuffer.nextRequest();
+             }
+ 
++            if (!disableUploadTimeout) {
++                socket.getSocket().setSoTimeout(endpoint.getSoTimeout());
++            }
++
+             rp.setStage(org.apache.coyote.Constants.STAGE_KEEPALIVE);
+ 
+             if (breakKeepAliveLoop(socketWrapper)) {
+@@ -351,24 +315,6 @@ public class Http11Processor extends AbstractHttp11Processor<Socket> {
+     }
+ 
+ 
+-    @Override
+-    protected void setCometTimeouts(SocketWrapper<Socket> socketWrapper) {
+-        // NO-OP for BIO
+-        return;
+-    }
+-
+-
+-    @Override
+-    protected boolean breakKeepAliveLoop(SocketWrapper<Socket> socketWrapper) {
+-        // If we don't have a pipe-lined request allow this thread to be
+-        // used by another connection
+-        if (inputBuffer.lastValid == 0) {
+-            return true;
+-        }
+-        return false;
+-    }
+-
+-    
+     @Override
+     protected boolean disableKeepAlive() {
+         int threadRatio = -1;   
+@@ -389,6 +335,70 @@ public class Http11Processor extends AbstractHttp11Processor<Socket> {
+     }
+ 
+ 
++    @Override
++    protected void setRequestLineReadTimeout() throws IOException {
++        
++        int standardTimeout = 0;
++        
++        if (keptAlive) {
++            if (keepAliveTimeout > 0) {
++                standardTimeout = keepAliveTimeout;
++            } else if (endpoint.getSoTimeout() > 0) {
++                standardTimeout = endpoint.getSoTimeout();
++            }
++        }
++        /*
++         * When there is no data in the buffer and this is not the first
++         * request on this connection and timeouts are being used the
++         * first read for this request may need a different timeout to
++         * take account of time spent waiting for a processing thread.
++         * 
++         * This is a little hacky but better than exposing the socket
++         * and the timeout info to the InputBuffer
++         */
++        if (inputBuffer.lastValid == 0 && socket.getLastAccess() > -1 &&
++                standardTimeout > 0) {
++
++            long queueTime = System.currentTimeMillis() - socket.getLastAccess();
++            int firstReadTimeout;
++            if (queueTime >= standardTimeout) {
++                // Queued for longer than timeout but there might be
++                // data so use shortest possible timeout
++                firstReadTimeout = 1;
++            } else {
++                // Cast is safe since queueTime must be less than
++                // standardTimeout which is an int
++                firstReadTimeout = standardTimeout - (int) queueTime;
++            }
++            socket.getSocket().setSoTimeout(firstReadTimeout);
++            if (!inputBuffer.fill()) {
++                throw new EOFException(sm.getString("iib.eof.error"));
++            }
++            // Once the first byte has been read, the standard timeout should be
++            // used so restore it here.
++            socket.getSocket().setSoTimeout(endpoint.getSoTimeout());
++        }
++    }
++
++
++    @Override
++    protected void setCometTimeouts(SocketWrapper<Socket> socketWrapper) {
++        // NO-OP for BIO
++        return;
++    }
++
++
++    @Override
++    protected boolean breakKeepAliveLoop(SocketWrapper<Socket> socketWrapper) {
++        // If we don't have a pipe-lined request allow this thread to be
++        // used by another connection
++        if (inputBuffer.lastValid == 0) {
++            return true;
++        }
++        return false;
++    }
++
++    
+     @Override
+     protected void resetTimeouts() {
+         // NOOP for BIO
+
+==================================================

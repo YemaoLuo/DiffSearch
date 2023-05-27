@@ -1,0 +1,288 @@
+1786c16a1ec63ae39c1e0341c72bba620e7de09c
+==================================================
+Fix connection state, make it smarter and faster.
+==================================================
+Filip Hanik
+==================================================
+Thu Nov 13 18:02:35 2008 +0000
+==================================================
+ConnectionPool.java
+Fix connection state, make it smarter and faster.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@713763 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+DataSourceProxy.java
+index 2a78ffdc72..60d8d9116b 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/ConnectionPool.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/ConnectionPool.java
+@@ -129,6 +129,7 @@ public class ConnectionPool {
+                         (JdbcInterceptor) Class.forName(proxies[i], true, //should this be the class loader?
+                                 Thread.currentThread().getContextClassLoader()).newInstance();
+                     interceptor.setNext(handler);
++                    interceptor.reset(this, con); //initialize
+                     handler = interceptor;
+                 }catch(Exception x) {
+                     SQLException sx = new SQLException("Unable to instantiate interceptor chain.");
+
+==================================================
+JdbcInterceptor.java
+index 4301686114..78b266341a 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/DataSourceProxy.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/DataSourceProxy.java
+@@ -172,13 +172,16 @@ public class DataSourceProxy  {
+         return driver.getPool(getPoolProperties().getPoolName()).getSize();
+     }
+ 
+-   public String toString() {
++    public String toString() {
+         return super.toString()+"{"+getPoolProperties()+"}";
+     }
+ 
+ /*-----------------------------------------------------------------------*/
+ //      PROPERTIES WHEN NOT USED WITH FACTORY
+ /*------------------------------------------------------------------------*/
++   
++   
++   
+     public void setPoolProperties(PoolProperties poolProperties) {
+         this.poolProperties = poolProperties;
+     }
+@@ -200,7 +203,7 @@ public class DataSourceProxy  {
+     }
+ 
+     public void setMaxActive(int maxActive) {
+-        this.poolProperties.setMaxIdle(maxActive);
++        this.poolProperties.setMaxActive(maxActive);
+     }
+ 
+     public void setMaxIdle(int maxIdle) {
+@@ -212,12 +215,11 @@ public class DataSourceProxy  {
+     }
+ 
+     public void setMinEvictableIdleTimeMillis(int minEvictableIdleTimeMillis) {
+-        this.poolProperties.setMinEvictableIdleTimeMillis(
+-            minEvictableIdleTimeMillis);
++        this.poolProperties.setMinEvictableIdleTimeMillis(minEvictableIdleTimeMillis);
+     }
+ 
+     public void setMinIdle(int minIdle) {
+-        this.setMinIdle(minIdle);
++        this.poolProperties.setMinIdle(minIdle);
+     }
+ 
+     public void setNumTestsPerEvictionRun(int numTestsPerEvictionRun) {
+@@ -253,10 +255,8 @@ public class DataSourceProxy  {
+         this.poolProperties.setTestWhileIdle(testWhileIdle);
+     }
+ 
+-    public void setTimeBetweenEvictionRunsMillis(int
+-                                                 timeBetweenEvictionRunsMillis) {
+-        this.poolProperties.setTimeBetweenEvictionRunsMillis(
+-            timeBetweenEvictionRunsMillis);
++    public void setTimeBetweenEvictionRunsMillis(int timeBetweenEvictionRunsMillis) {
++        this.poolProperties.setTimeBetweenEvictionRunsMillis(timeBetweenEvictionRunsMillis);
+     }
+ 
+     public void setUrl(String url) {
+@@ -283,26 +283,38 @@ public class DataSourceProxy  {
+     public void setJmxEnabled(boolean enabled) {
+         this.getPoolProperties().setJmxEnabled(enabled);
+     }
+-    
++
+     public void setFairQueue(boolean fairQueue) {
+         this.getPoolProperties().setFairQueue(fairQueue);
+     }
+     
++    public void setDefaultCatalog(String catalog) {
++        this.getPoolProperties().setDefaultCatalog(catalog);
++    }
++    
++    public void setDefaultAutoCommit(Boolean autocommit) {
++        this.getPoolProperties().setDefaultAutoCommit(autocommit);
++    }
++    
++    public void setDefaultTransactionIsolation(int defaultTransactionIsolation) {
++        this.getPoolProperties().setDefaultTransactionIsolation(defaultTransactionIsolation);
++    }
++
+     public void setConnectionProperties(String properties) {
+         try {
+-            java.util.Properties prop = DataSourceFactory.getProperties(properties);
++            java.util.Properties prop = DataSourceFactory
++                    .getProperties(properties);
+             Iterator i = prop.keySet().iterator();
+             while (i.hasNext()) {
+-                String key = (String)i.next();
++                String key = (String) i.next();
+                 String value = prop.getProperty(key);
+                 getPoolProperties().getDbProperties().setProperty(key, value);
+             }
+-            
+-        }catch (Exception x) {
++
++        } catch (Exception x) {
+             log.error("Unable to parse connection properties.", x);
+             throw new RuntimeException(x);
+         }
+     }
+ 
+-
+ }
+
+==================================================
+ProxyConnection.java
+index 21e26b859d..171d003080 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/JdbcInterceptor.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/JdbcInterceptor.java
+@@ -26,6 +26,7 @@ import java.lang.reflect.Method;
+ public abstract class JdbcInterceptor implements InvocationHandler {
+     public  static final String CLOSE_VAL = "close";
+     public  static final String TOSTRING_VAL = "toString";
++    public  static final String ISCLOSED_VAL = "isClosed"; 
+ 
+     private JdbcInterceptor next = null;
+ 
+@@ -47,6 +48,11 @@ public abstract class JdbcInterceptor implements InvocationHandler {
+     public void setNext(JdbcInterceptor next) {
+         this.next = next;
+     }
+-
++    
++    /**
++     * Gets called each time the connection is borrowed from the pool
++     * @param parent - the connection pool owning the connection
++     * @param con - the pooled connection
++     */
+     public abstract void reset(ConnectionPool parent, PooledConnection con);
+ }
+
+==================================================
+ConnectionState.java
+index 5aa2cf2094..871a56ea6e 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/ProxyConnection.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/ProxyConnection.java
+@@ -68,6 +68,9 @@ public class ProxyConnection extends JdbcInterceptor {
+     }
+ 
+     public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
++        if (ISCLOSED_VAL==method.getName()) {
++            return isClosed();
++        }
+         if (isClosed()) throw new SQLException("Connection has already been closed.");
+         if (CLOSE_VAL==method.getName()) {
+             PooledConnection poolc = this.connection;
+
+==================================================
+TestConnectionState.java
+index b30ae01fd9..a3f560923e 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/interceptor/ConnectionState.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/interceptor/ConnectionState.java
+@@ -17,10 +17,14 @@
+ package org.apache.tomcat.jdbc.pool.interceptor;
+ 
+ import java.lang.reflect.Method;
++import java.sql.SQLException;
+ 
++import org.apache.juli.logging.Log;
++import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.jdbc.pool.ConnectionPool;
+ import org.apache.tomcat.jdbc.pool.DataSourceFactory;
+ import org.apache.tomcat.jdbc.pool.JdbcInterceptor;
++import org.apache.tomcat.jdbc.pool.PoolProperties;
+ import org.apache.tomcat.jdbc.pool.PooledConnection;
+ 
+ /**
+@@ -30,18 +34,63 @@ import org.apache.tomcat.jdbc.pool.PooledConnection;
+  */
+ 
+ public class ConnectionState extends JdbcInterceptor  {
+-
+-    protected final String[] readState = {"getAutoCommit","getTransactionIsolation","isReadOnly"};
+-    protected final String[] writeState = {"setAutoCommit","setTransactionIsolation","setReadOnly"};
++    protected static Log log = LogFactory.getLog(ConnectionState.class);
++    
++    protected final String[] readState = {"getAutoCommit","getTransactionIsolation","isReadOnly","getCatalog"};
++    protected final String[] writeState = {"setAutoCommit","setTransactionIsolation","setReadOnly","setCatalog"};
+ 
+     protected Boolean autoCommit = null;
+     protected Integer transactionIsolation = null;
+     protected Boolean readOnly = null;
+-
++    protected String catalog = null;
++    
++    
+     public void reset(ConnectionPool parent, PooledConnection con) {
+-        autoCommit = null;
+-        transactionIsolation = null;
+-        readOnly = null;
++        PoolProperties poolProperties = parent.getPoolProperties();
++        if (poolProperties.getDefaultReadOnly()!=null) {
++            try {
++                if (readOnly==null || readOnly.booleanValue()!=poolProperties.getDefaultReadOnly().booleanValue()) {
++                    con.getConnection().setReadOnly(poolProperties.getDefaultReadOnly().booleanValue());
++                    readOnly = poolProperties.getDefaultReadOnly();
++                }
++            }catch (SQLException x) {
++                readOnly = null;
++                log.error("Unable to reset readonly state to connection.",x);
++            }
++        }
++        if (poolProperties.getDefaultAutoCommit()!=null) {
++            try {
++                if (autoCommit==null || autoCommit.booleanValue()!=poolProperties.getDefaultAutoCommit().booleanValue()) {
++                    con.getConnection().setAutoCommit(poolProperties.getDefaultAutoCommit().booleanValue());
++                    autoCommit = poolProperties.getDefaultAutoCommit();
++                }
++            }catch (SQLException x) {
++                autoCommit = null;
++                log.error("Unable to reset autocommit state to connection.",x);
++            }
++        }
++        if (poolProperties.getDefaultCatalog()!=null) {
++            try {
++                if (catalog==null || (!catalog.equals(poolProperties.getDefaultCatalog()))) {
++                    con.getConnection().setCatalog(poolProperties.getDefaultCatalog());
++                    catalog = poolProperties.getDefaultCatalog();
++                }
++            }catch (SQLException x) {
++                catalog = null;
++                log.error("Unable to reset default catalog state to connection.",x);
++            }
++        }
++        if (poolProperties.getDefaultTransactionIsolation()!=DataSourceFactory.UNKNOWN_TRANSACTIONISOLATION) {
++            try {
++                if (transactionIsolation==null || transactionIsolation.intValue()!=poolProperties.getDefaultTransactionIsolation()) {
++                    con.getConnection().setTransactionIsolation(poolProperties.getDefaultTransactionIsolation());
++                    transactionIsolation = poolProperties.getDefaultTransactionIsolation();
++                }
++            }catch (SQLException x) {
++                transactionIsolation = null;
++                log.error("Unable to reset transaction isolation state to connection.",x);
++            }
++        }
+     }
+ 
+     @Override
+@@ -64,6 +113,7 @@ public class ConnectionState extends JdbcInterceptor  {
+                 case 0:{result = autoCommit; break;}
+                 case 1:{result = transactionIsolation; break;}
+                 case 2:{result = readOnly; break;}
++                case 3:{result = catalog; break;}
+                 default: result = null;
+             }
+             //return cached result, if we have it
+@@ -76,6 +126,7 @@ public class ConnectionState extends JdbcInterceptor  {
+                 case 0:{autoCommit = (Boolean) (read?result:args[0]); break;}
+                 case 1:{transactionIsolation = (Integer)(read?result:args[0]); break;}
+                 case 2:{readOnly = (Boolean)(read?result:args[0]); break;}
++                case 3:{catalog = (String)(read?result:args[0]); break;}
+             }
+         }
+         return result;
+
+==================================================

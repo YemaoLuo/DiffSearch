@@ -1,0 +1,173 @@
+9514518bf41bf003ca7fc8ba6cd59efa91b683be
+==================================================
+Expose negotiated subProtocol to the Session
+==================================================
+Mark Emlyn
+==================================================
+Fri Feb 15 17:10:48 2013 +0000
+==================================================
+Constants.java
+Expose negotiated subProtocol to the Session
+Add some plumbing for exposing path parameters
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1446694 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+WsSession.java
+index 5292a224d1..4b627efa43 100644
+--- a/java/org/apache/tomcat/websocket/LocalStrings.properties
++++ b/java/org/apache/tomcat/websocket/LocalStrings.properties
+@@ -49,7 +49,9 @@ wsSession.invalidHandlerTypePong=A pong message handler must implement MessageHa
+ wsSession.removeHandlerFailed=Unable to remove the handler [{0}] as it was not registered with this session
+ wsSession.unknownHandler=Unable to add the message handler [{0}] as it was for the unrecognised type [{1}]
+ 
++wsWebSocketContainer.httpRequestFailed=The HTTP request to initiate the WebSocket conenction failed
+ wsWebSocketContainer.invalidStatus=The HTTP response from the server [{0}] did not permit the HTTP upgrade to WebSocket
++wsWebSocketContainer.invalidSubProtocol=The WebSocket server returned multiple values for the Sec-WebSocket-Protocol header
+ wsWebSocketContainer.maxBuffer=This implementation limits the maximum size of a buffer to Integer.MAX_VALUE
+ wsWebSocketContainer.pathNoHost=No host was specified in URI
+ wsWebSocketContainer.pathWrongScheme=The scheme [{0}] is not supported
+
+==================================================
+WsWebSocketContainer.java
+index 936437d550..d06354a3e1 100644
+--- a/java/org/apache/tomcat/websocket/WsSession.java
++++ b/java/org/apache/tomcat/websocket/WsSession.java
+@@ -54,6 +54,8 @@ public class WsSession implements Session {
+     private final ClassLoader applicationClassLoader;
+     private final WsWebSocketContainer webSocketContainer;
+     private final WsRequest request;
++    private final String subProtocol;
++    private final Map<String,String> pathParameters;
+ 
+     private MessageHandler textMessageHandler = null;
+     private MessageHandler binaryMessageHandler = null;
+@@ -81,7 +83,8 @@ public class WsSession implements Session {
+     public WsSession(Endpoint localEndpoint,
+             WsRemoteEndpointBase wsRemoteEndpoint,
+             WsWebSocketContainer wsWebSocketContainer,
+-            WsRequest request) {
++            WsRequest request, String subProtocol,
++            Map<String,String> pathParameters) {
+         this.localEndpoint = localEndpoint;
+         this.wsRemoteEndpoint = wsRemoteEndpoint;
+         this.wsRemoteEndpoint.setSession(this);
+@@ -96,6 +99,8 @@ public class WsSession implements Session {
+         this.sessionIdleTimeout =
+                 webSocketContainer.getMaxSessionIdleTimeout();
+         this.request = request;
++        this.subProtocol = subProtocol;
++        this.pathParameters = pathParameters;
+     }
+ 
+ 
+@@ -185,8 +190,7 @@ public class WsSession implements Session {
+ 
+     @Override
+     public String getNegotiatedSubprotocol() {
+-        // TODO Auto-generated method stub
+-        return null;
++        return subProtocol;
+     }
+ 
+ 
+@@ -343,8 +347,7 @@ public class WsSession implements Session {
+ 
+     @Override
+     public Map<String,String> getPathParameters() {
+-        // TODO Auto-generated method stub
+-        return null;
++        return pathParameters;
+     }
+ 
+ 
+
+==================================================
+WsProtocolHandler.java
+index 85393356b6..a200510bb2 100644
+--- a/java/org/apache/tomcat/websocket/WsWebSocketContainer.java
++++ b/java/org/apache/tomcat/websocket/WsWebSocketContainer.java
+@@ -121,6 +121,7 @@ public class WsWebSocketContainer
+         Future<Void> fConnect = channel.connect(sa);
+ 
+         ByteBuffer response;
++        String subProtocol;
+         try {
+             fConnect.get();
+ 
+@@ -141,8 +142,21 @@ public class WsWebSocketContainer
+             HandshakeResponse handshakeResponse =
+                     processResponse(response, channel);
+             clientEndpointConfiguration.afterResponse(handshakeResponse);
++
++            // Sub-protocol
++            List<String> values = handshakeResponse.getHeaders().get(
++                    Constants.WS_PROTOCOL_HEADER_NAME);
++            if (values == null || values.size() == 0) {
++                subProtocol = null;
++            } else if (values.size() == 1) {
++                subProtocol = values.get(0);
++            } else {
++                throw new DeploymentException(
++                        sm.getString("Sec-WebSocket-Protocol"));
++            }
+         } catch (ExecutionException | InterruptedException e) {
+-            throw new DeploymentException("", e);
++            throw new DeploymentException(
++                    sm.getString("wsWebSocketContainer.httpRequestFailed"), e);
+         }
+ 
+         // Switch to WebSocket
+@@ -157,8 +171,9 @@ public class WsWebSocketContainer
+                     "wsWebSocketContainer.endpointCreateFail", clazz.getName()),
+                     e);
+         }
+-        WsSession wsSession =
+-                new WsSession(endpoint, wsRemoteEndpointClient, this, null);
++
++        WsSession wsSession = new WsSession(endpoint, wsRemoteEndpointClient,
++                this, null, subProtocol, Collections.EMPTY_MAP);
+         endpoint.onOpen(wsSession, clientEndpointConfiguration);
+         registerSession(clazz, wsSession);
+ 
+
+==================================================
+WsServlet.java
+index 4de0f58bff..9c7a01eaf9 100644
+--- a/java/org/apache/tomcat/websocket/server/WsProtocolHandler.java
++++ b/java/org/apache/tomcat/websocket/server/WsProtocolHandler.java
+@@ -52,16 +52,18 @@ public class WsProtocolHandler implements HttpUpgradeHandler {
+     private final ClassLoader applicationClassLoader;
+     private final ServerContainerImpl webSocketContainer;
+     private final WsRequest request;
++    private final String subProtocol;
+ 
+     private WsSession wsSession;
+ 
+ 
+     public WsProtocolHandler(Endpoint ep, EndpointConfiguration endpointConfig,
+-            ServerContainerImpl wsc, WsRequest request) {
++            ServerContainerImpl wsc, WsRequest request, String subProtocol) {
+         this.ep = ep;
+         this.endpointConfig = endpointConfig;
+         this.webSocketContainer = wsc;
+         this.request = request;
++        this.subProtocol = subProtocol;
+         applicationClassLoader = Thread.currentThread().getContextClassLoader();
+     }
+ 
+@@ -86,8 +88,9 @@ public class WsProtocolHandler implements HttpUpgradeHandler {
+         try {
+             WsRemoteEndpointServer wsRemoteEndpointServer =
+                     new WsRemoteEndpointServer(sos, webSocketContainer);
++            // TODO Replace null with path parameter map
+             wsSession = new WsSession(ep, wsRemoteEndpointServer,
+-                    webSocketContainer, request);
++                    webSocketContainer, request, subProtocol, null);
+             WsFrameServer wsFrame = new WsFrameServer(
+                     sis,
+                     wsSession);
+
+==================================================

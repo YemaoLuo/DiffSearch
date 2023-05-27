@@ -1,0 +1,299 @@
+3ba7b0244be1a8aebdb5a238c81ddf791839f6ef
+==================================================
+Configure fair queue by default, its faster.
+==================================================
+Filip Hanik
+==================================================
+Thu Apr 23 14:40:16 2009 +0000
+==================================================
+ConnectionPool.java
+index 27880ce77b..84cf4eac92 100644
+--- a/modules/jdbc-pool/doc/jdbc-pool.xml
++++ b/modules/jdbc-pool/doc/jdbc-pool.xml
+@@ -329,6 +329,15 @@
+          This flag is required when you want to use asynchronous connection retrieval.
+       </p>
+     </attribute>
++
++    <attribute name="abandonWhenPercentageFull" required="false">
++      <p>(int) Connections that have been abandoned (timed out) wont get closed and reported up unless
++         the number of connections in use are above the percentage defined by <code>abandonWhenPercentageFull</code>.
++         The value should be between 0-100.
++         The default value is <code>0</code>, which implies that connections are eligible for closure as soon
++         as <code>removeAbandonedTimeout</code> has been reached.</p>
++    </attribute>
++
+     <attribute name="useEquals" required="false">
+       <p>(boolean) Set to true if you wish the <code>ProxyConnection</code> class to use <code>String.equals</code> instead of 
+          <code>==</code> when comparing method names. This property does not apply to added interceptors as those are configured individually.
+@@ -419,6 +428,18 @@
+     <attributes>
+     </attributes>
+   </subsection>
++  <subsection name="org.apache.tomcat.jdbc.pool.interceptor.ResetAbandonedTimer">
++    <p>
++        The abandoned timer starts when a connection is checked out from the pool.
++        This means if you have a 30second timeout and run 10x10second queries using the connection
++        it will be marked abandoned and potentially reclaimed depending on the <code>abandonWhenPercentageFull</code>
++        attribute. 
++        Using this interceptor it will reset the checkout timer every time you perform an operation on the connection or execute a 
++        query successfully.
++    </p>   
++    <attributes>
++    </attributes>
++  </subsection>
+ </section>
+ 
+ <section name="Code Example">
+
+==================================================
+DataSource.java
+index 2cea90d2b6..f5a39a2553 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/ConnectionPool.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/ConnectionPool.java
+@@ -654,9 +654,19 @@ public class ConnectionPool {
+         } //end if
+     } //checkIn
+ 
++    public boolean shouldAbandon() {
++        if (poolProperties.getAbandonWhenPercentageFull()==0) return true;
++        float used = (float)busy.size();
++        float max  = (float)poolProperties.getMaxActive();
++        float perc = (float)poolProperties.getAbandonWhenPercentageFull();
++        System.out.println("Abandon rate:"+(used/max*100f));
++        return (used/max*100f)>=perc;
++    }
++    
+     public void checkAbandoned() {
+         try {
+             if (busy.size()==0) return;
++            if (!shouldAbandon()) return;
+             Iterator<PooledConnection> locked = busy.iterator();
+             while (locked.hasNext()) {
+                 PooledConnection con = locked.next();
+
+==================================================
+DataSourceFactory.java
+index 94b84a68c8..65eb82ddd5 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/DataSource.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/DataSource.java
+@@ -374,6 +374,14 @@ public class DataSource extends DataSourceProxy implements MBeanRegistration,jav
+         }
+     }
+ 
++    public int getAbandonWhenPercentageFull() {
++        try {
++            return createPool().getPoolProperties().getAbandonWhenPercentageFull();
++        }catch (SQLException x) {
++            throw new RuntimeException(x);
++        }
++    }
++
+     public boolean isTestOnBorrow() {
+         try {
+             return createPool().getPoolProperties().isTestOnBorrow();
+
+==================================================
+PoolProperties.java
+index d78388bf3c..ac09e202cd 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/DataSourceFactory.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/DataSourceFactory.java
+@@ -94,6 +94,7 @@ public class DataSourceFactory implements ObjectFactory {
+     protected final static String PROP_REMOVEABANDONED = "removeAbandoned";
+     protected final static String PROP_REMOVEABANDONEDTIMEOUT = "removeAbandonedTimeout";
+     protected final static String PROP_LOGABANDONED = "logAbandoned";
++    protected final static String PROP_ABANDONWHENPERCENTAGEFULL = "abandonWhenPercentageFull";
+     
+     protected final static String PROP_POOLPREPAREDSTATEMENTS = "poolPreparedStatements";
+     protected final static String PROP_MAXOPENPREPAREDSTATEMENTS = "maxOpenPreparedStatements";
+@@ -147,7 +148,8 @@ public class DataSourceFactory implements ObjectFactory {
+         PROP_JMX_ENABLED,
+         PROP_FAIR_QUEUE,
+         PROP_USE_EQUALS,
+-        OBJECT_NAME
++        OBJECT_NAME,
++        PROP_ABANDONWHENPERCENTAGEFULL
+     };
+ 
+     // -------------------------------------------------- ObjectFactory Methods
+@@ -409,9 +411,13 @@ public class DataSourceFactory implements ObjectFactory {
+         if (value != null) {
+             poolProperties.setName(ObjectName.quote(value));
+         }
+-
+-        return poolProperties;
+         
++        value = properties.getProperty(PROP_ABANDONWHENPERCENTAGEFULL);
++        if (value != null) {
++            poolProperties.setAbandonWhenPercentageFull(Integer.parseInt(value));
++        }
++        
++        return poolProperties;
+     }
+ 
+     /**
+
+==================================================
+AbstractQueryReport.java
+index 760d347cde..37e01d244f 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/PoolProperties.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/PoolProperties.java
+@@ -67,12 +67,23 @@ public class PoolProperties {
+     protected boolean jmxEnabled = true;
+     protected String initSQL;
+     protected boolean testOnConnect =false;
+-    private String jdbcInterceptors=null;
+-    private boolean fairQueue = true;
+-    private boolean useEquals = false;
++    protected String jdbcInterceptors=null;
++    protected boolean fairQueue = true;
++    protected boolean useEquals = false;
++    protected int abandonWhenPercentageFull = 0;
+ 
+     private InterceptorDefinition[] interceptors = null;
+     
++    public void setAbandonWhenPercentageFull(int percentage) {
++        if (percentage<0) abandonWhenPercentageFull = 0;
++        else if (percentage>100) abandonWhenPercentageFull = 100;
++        else abandonWhenPercentageFull = percentage;
++    }
++    
++    public int getAbandonWhenPercentageFull() {
++        return abandonWhenPercentageFull;
++    }
++    
+     public boolean isFairQueue() {
+         return fairQueue;
+     }
+
+==================================================
+ResetAbandonedTimer.java
+index fe8b26eaf1..46b1763ccb 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/interceptor/AbstractQueryReport.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/interceptor/AbstractQueryReport.java
+@@ -51,7 +51,6 @@ public abstract class AbstractQueryReport extends AbstractCreateStatementInterce
+         super();
+     }
+     
+-    
+     /**
+      * Invoked when prepareStatement has been called and completed.
+      * @param sql - the string used to prepare the statement with
+
+==================================================
+ConnectionPool.java
+new file mode 100644
+index 0000000000..fd0f56759e
+--- /dev/null
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/interceptor/ResetAbandonedTimer.java
+@@ -0,0 +1,93 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++
++package org.apache.tomcat.jdbc.pool.interceptor;
++
++import java.lang.reflect.Method;
++
++import org.apache.tomcat.jdbc.pool.JdbcInterceptor;
++import org.apache.tomcat.jdbc.pool.PooledConnection;
++import org.apache.tomcat.jdbc.pool.ProxyConnection;
++
++/**
++ * Class that resets the abandoned timer on any activity on the 
++ * Connection or any successful query executions
++ * @author fhanik
++ *
++ */
++public class ResetAbandonedTimer extends AbstractQueryReport {
++
++    public ResetAbandonedTimer() {
++        // TODO Auto-generated constructor stub
++    }
++    
++    public boolean resetTimer() {
++        boolean result = false;
++        JdbcInterceptor interceptor = this.getNext();
++        while (interceptor!=null && result==false) {
++            if (interceptor instanceof ProxyConnection) {
++                PooledConnection con = ((ProxyConnection)interceptor).getConnection();
++                if (con!=null) {
++                    con.setTimestamp(System.currentTimeMillis());
++                    result = true;
++                } else {
++                    break;
++                }
++            }
++            interceptor = interceptor.getNext();
++        }
++        return result;
++    }
++    
++    
++
++    @Override
++    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
++        // TODO Auto-generated method stub
++        Object result = super.invoke(proxy, method, args);
++        resetTimer();
++        return result;
++    }
++
++    @Override
++    protected void prepareCall(String query, long time) {
++        resetTimer();
++    }
++
++    @Override
++    protected void prepareStatement(String sql, long time) {
++        resetTimer();
++
++    }
++
++    @Override
++    public void closeInvoked() {
++        resetTimer();
++    }
++
++    @Override
++    protected String reportQuery(String query, Object[] args, String name,long start, long delta) {
++        resetTimer();
++        return super.reportQuery(query, args, name, start, delta);
++    }
++
++    @Override
++    protected String reportSlowQuery(String query, Object[] args, String name,long start, long delta) {
++        resetTimer();
++        return super.reportSlowQuery(query, args, name, start, delta);
++    }
++}
+
+==================================================
+ConnectionPoolMBean.java
+index a658d9858a..cdc18a1fc2 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/jmx/ConnectionPool.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/jmx/ConnectionPool.java
+@@ -273,5 +273,8 @@ public class ConnectionPool extends NotificationBroadcasterSupport implements Co
+     public int getWaitCount() {
+         return pool.getWaitCount();
+     }
++    public int getAbandonWhenPercentageFull() {
++        return pool.getPoolProperties().getAbandonWhenPercentageFull();
++    }
+ 
+ }
+
+==================================================

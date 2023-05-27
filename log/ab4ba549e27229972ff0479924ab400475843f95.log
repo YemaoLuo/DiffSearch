@@ -1,0 +1,275 @@
+ab4ba549e27229972ff0479924ab400475843f95
+==================================================
+Simplify various SocketEvent values in to the single value ERROR which represents an error on a non-container thread.
+==================================================
+Mark Thomas
+==================================================
+Mon Dec 14 20:58:57 2015 +0000
+==================================================
+CoyoteAdapter.java
+Simplify various SocketEvent values in to the single value ERROR which represents an error on a non-container thread.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1720013 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AbstractProcessor.java
+index f1da78396c..4507fa42d3 100644
+--- a/java/org/apache/catalina/connector/CoyoteAdapter.java
++++ b/java/org/apache/catalina/connector/CoyoteAdapter.java
+@@ -157,22 +157,24 @@ public class CoyoteAdapter implements Adapter {
+                 if (!asyncConImpl.timeout()) {
+                     asyncConImpl.setErrorState(null, false);
+                 }
+-            } else if (status==SocketEvent.ASYNC_WRITE_ERROR) {
+-                // A async write error is an IO error which means the socket
+-                // needs to be closed so set success to false to trigger a
+-                // close
++            } else if (status==SocketEvent.ERROR) {
++                // An I/O error occurred on a non-container thread which means
++                // that the socket needs to be closed so set success to false to
++                // trigger a close
+                 success = false;
+-                Throwable t = (Throwable)req.getAttribute(
+-                        RequestDispatcher.ERROR_EXCEPTION);
++                Throwable t = (Throwable)req.getAttribute(RequestDispatcher.ERROR_EXCEPTION);
+                 req.getAttributes().remove(RequestDispatcher.ERROR_EXCEPTION);
+-                if (res.getWriteListener() != null) {
+-                    ClassLoader oldCL = null;
+-                    try {
+-                        oldCL = request.getContext().bind(false, null);
++                ClassLoader oldCL = null;
++                try {
++                    oldCL = request.getContext().bind(false, null);
++                    if (req.getReadListener() != null) {
++                        req.getReadListener().onError(t);
++                    }
++                    if (res.getWriteListener() != null) {
+                         res.getWriteListener().onError(t);
+-                    } finally {
+-                        request.getContext().unbind(false, oldCL);
+                     }
++                } finally {
++                    request.getContext().unbind(false, oldCL);
+                 }
+                 if (t != null) {
+                     asyncConImpl.setErrorState(t, true);
+@@ -394,34 +396,6 @@ public class CoyoteAdapter implements Adapter {
+     }
+ 
+ 
+-    @Override
+-    public void errorDispatch(org.apache.coyote.Request req,
+-            org.apache.coyote.Response res) {
+-        Request request = (Request) req.getNote(ADAPTER_NOTES);
+-        Response response = (Response) res.getNote(ADAPTER_NOTES);
+-
+-        if (request != null && request.getMappingData().context != null) {
+-            request.getMappingData().context.logAccess(
+-                    request, response,
+-                    System.currentTimeMillis() - req.getStartTime(),
+-                    false);
+-        } else {
+-            log(req, res, System.currentTimeMillis() - req.getStartTime());
+-        }
+-
+-        if (request != null) {
+-            request.recycle();
+-        }
+-
+-        if (response != null) {
+-            response.recycle();
+-        }
+-
+-        req.recycle();
+-        res.recycle();
+-    }
+-
+-
+     @Override
+     public void log(org.apache.coyote.Request req,
+             org.apache.coyote.Response res, long time) {
+
+==================================================
+AbstractProcessorLight.java
+index 5279a6f114..c256e2b2e6 100644
+--- a/java/org/apache/coyote/AbstractProcessor.java
++++ b/java/org/apache/coyote/AbstractProcessor.java
+@@ -97,7 +97,7 @@ public abstract class AbstractProcessor extends AbstractProcessorLight implement
+                 response.setStatus(500);
+             }
+             getLog().info(sm.getString("abstractProcessor.nonContainerThreadError"), t);
+-            socketWrapper.processSocket(SocketEvent.CLOSE_NOW, true);
++            socketWrapper.processSocket(SocketEvent.ERROR, true);
+         }
+     }
+ 
+@@ -174,11 +174,6 @@ public abstract class AbstractProcessor extends AbstractProcessorLight implement
+         return asyncStateMachine.asyncPostProcess();
+     }
+ 
+-    @Override
+-    public void errorDispatch() {
+-        getAdapter().errorDispatch(request, response);
+-    }
+-
+ 
+     @Override
+     public final SocketState dispatch(SocketEvent status) {
+@@ -193,7 +188,7 @@ public abstract class AbstractProcessor extends AbstractProcessorLight implement
+                 if (getLog().isDebugEnabled()) {
+                     getLog().debug("Unable to write async data.", ioe);
+                 }
+-                status = SocketEvent.ASYNC_WRITE_ERROR;
++                status = SocketEvent.ERROR;
+                 request.setAttribute(RequestDispatcher.ERROR_EXCEPTION, ioe);
+             }
+         } else if (status == SocketEvent.OPEN_READ && request.getReadListener() != null) {
+
+==================================================
+Adapter.java
+index 4bf3c8e3f1..bb72d7e4bc 100644
+--- a/java/org/apache/coyote/AbstractProcessorLight.java
++++ b/java/org/apache/coyote/AbstractProcessorLight.java
+@@ -44,10 +44,7 @@ public abstract class AbstractProcessorLight implements Processor {
+         SocketState state = SocketState.CLOSED;
+         Iterator<DispatchType> dispatches = null;
+         do {
+-            if (status == SocketEvent.CLOSE_NOW) {
+-                errorDispatch();
+-                state = SocketState.CLOSED;
+-            } else if (dispatches != null) {
++            if (dispatches != null) {
+                 DispatchType nextDispatch = dispatches.next();
+                 state = dispatch(nextDispatch.getSocketStatus());
+             } else if (status == SocketEvent.DISCONNECT) {
+@@ -152,7 +149,5 @@ public abstract class AbstractProcessorLight implements Processor {
+ 
+     protected abstract SocketState asyncPostProcess();
+ 
+-    protected abstract void errorDispatch();
+-
+     protected abstract Log getLog();
+ }
+
+==================================================
+Http11InputBuffer.java
+index 28aa27cb62..c456a0be4c 100644
+--- a/java/org/apache/coyote/Adapter.java
++++ b/java/org/apache/coyote/Adapter.java
+@@ -66,8 +66,6 @@ public interface Adapter {
+     public boolean asyncDispatch(Request req,Response res, SocketEvent status)
+             throws Exception;
+ 
+-    public void errorDispatch(Request request, Response response);
+-
+     public void log(Request req, Response res, long time);
+ 
+     /**
+
+==================================================
+UpgradeProcessorBase.java
+index 26ddf31990..f9b03a1056 100644
+--- a/java/org/apache/coyote/http11/Http11InputBuffer.java
++++ b/java/org/apache/coyote/http11/Http11InputBuffer.java
+@@ -716,7 +716,7 @@ public class Http11InputBuffer implements InputBuffer {
+     private boolean fill(boolean block) throws IOException {
+ 
+         if (parsingHeader) {
+-            if (lastValid > headerBufferSize) {
++            if (lastValid >= headerBufferSize) {
+                 throw new IllegalArgumentException
+                     (sm.getString("iib.requestheadertoolarge.error"));
+             }
+
+==================================================
+Http2UpgradeHandler.java
+index d2876550e8..d70b3bc84e 100644
+--- a/java/org/apache/coyote/http11/upgrade/UpgradeProcessorBase.java
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeProcessorBase.java
+@@ -68,12 +68,6 @@ public abstract class UpgradeProcessorBase extends AbstractProcessorLight implem
+     }
+ 
+ 
+-    @Override
+-    public void errorDispatch() {
+-        // NO-OP
+-    }
+-
+-
+     @Override
+     public final SocketState asyncPostProcess() {
+         return null;
+
+==================================================
+SocketEvent.java
+index c748808076..8ac3e4cf6b 100644
+--- a/java/org/apache/coyote/http2/LocalStrings.properties
++++ b/java/org/apache/coyote/http2/LocalStrings.properties
+@@ -118,7 +118,6 @@ upgradeHandler.stream.old=A new remote stream ID of [{0}] was requested but the
+ upgradeHandler.tooManyRemoteStreams=The client attempted to use more than [{0}] active streams
+ upgradeHandler.unexpectedAck=Connection [{0}], Stream [{1}], A settings acknowledgement was received when not expected
+ upgradeHandler.unexpectedEos=Unexpected end of stream
+-upgradeHandler.unexpectedStatus=An unexpected value of status ([{0}]) was passed to this method
+ upgradeHandler.upgrade=Connection [{0}], HTTP/1.1 upgrade to stream [1]
+ upgradeHandler.upgrade.fail=Connection [{0}], HTTP/1.1 upgrade failed
+ upgradeHandler.upgradeDispatch.entry=Entry, Connection [{0}], SocketStatus [{1}]
+
+==================================================
+WsHttpUpgradeHandler.java
+index 3489f0fbd5..9df1116604 100644
+--- a/java/org/apache/tomcat/util/net/SocketEvent.java
++++ b/java/org/apache/tomcat/util/net/SocketEvent.java
+@@ -51,25 +51,14 @@ public enum SocketEvent {
+     DISCONNECT,
+ 
+     /**
+-     * An error has occurred that does not had a dedicated event type. Currently
+-     * this is only used by NIO2 to signal the failure of a completion handler.
++     * An error has occurred on a non-container thread and processing needs to
++     * return to the container for any necessary clean-up. Examples of where
++     * this is used include:
++     * <ul>
++     * <li>by NIO2 to signal the failure of a completion handler</li>
++     * <li>by the container to signal an I/O error on a non-container thread
++     *     during Servlet 3.0 asynchronous processing.</li>
++     * </ul>
+      */
+-    ERROR,
+-
+-    /**
+-     * Used internally by the container to signal that an I/O occurred during an
+-     * asynchronous read.
+-     *
+-     * TODO: Given how this is used, it is possible to refactor the processing
+-     *       so this enum value is not required?
+-     */
+-    ASYNC_WRITE_ERROR,
+-
+-    /**
+-     * Initiated by the container when an I/O error is detected on a
+-     * non-container thread.
+-     *
+-     * TODO: Can this be combined with / replaced by ERROR?
+-     */
+-    CLOSE_NOW
++    ERROR
+ }
+
+==================================================
+TestUpgradeInternalHandler.java
+index 4eea22265d..dee9cdbc31 100644
+--- a/java/org/apache/tomcat/websocket/server/WsHttpUpgradeHandler.java
++++ b/java/org/apache/tomcat/websocket/server/WsHttpUpgradeHandler.java
+@@ -179,8 +179,6 @@ public class WsHttpUpgradeHandler implements InternalHttpUpgradeHandler {
+                 wsSession.doClose(new CloseReason(CloseCodes.GOING_AWAY, msg),
+                         new CloseReason(CloseCodes.CLOSED_ABNORMALLY, msg));
+                 //$FALL-THROUGH$
+-            case ASYNC_WRITE_ERROR:
+-            case CLOSE_NOW:
+             case DISCONNECT:
+             case TIMEOUT:
+                 return SocketState.CLOSED;
+
+==================================================

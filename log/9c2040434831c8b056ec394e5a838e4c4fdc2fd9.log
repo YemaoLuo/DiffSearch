@@ -1,0 +1,576 @@
+9c2040434831c8b056ec394e5a838e4c4fdc2fd9
+==================================================
+Complete the FileUpload implementation and use it for the html manager app.
+==================================================
+Mark Emlyn
+==================================================
+Fri Nov 20 19:27:11 2009 +0000
+==================================================
+HttpServletRequest.java
+Complete the FileUpload implementation and use it for the html manager app.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@882690 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Part.java
+index 813484dda7..a0808262b7 100644
+--- a/java/javax/servlet/http/HttpServletRequest.java
++++ b/java/javax/servlet/http/HttpServletRequest.java
+@@ -679,7 +679,11 @@ public interface HttpServletRequest extends ServletRequest {
+      * 
+      * @param username
+      * @param password
+-     * @throws ServletException
++     * @throws ServletException If any of {@link #getRemoteUser()},
++     *         {@link #getUserPrincipal()} or {@link #getAuthType()} are
++     *         non-null, if the configured authenticator does not support
++     *         user name and password authentication or if the authentication
++     *         fails
+      * @since Servlet 3.0
+      * TODO SERVLET3 - Add comments
+      */
+@@ -689,7 +693,7 @@ public interface HttpServletRequest extends ServletRequest {
+     
+     /**
+      * 
+-     * @throws ServletException
++     * @throws ServletException If the logout fails
+      * @since Servlet 3.0
+      * TODO SERVLET3 - Add comments
+      */
+
+==================================================
+Request.java
+index 909ffc1f27..efeedd2b09 100644
+--- a/java/org/apache/catalina/connector/LocalStrings.properties
++++ b/java/org/apache/catalina/connector/LocalStrings.properties
+@@ -66,6 +66,7 @@ coyoteRequest.noLoginConfig=No authentication mechanism has been configured for
+ coyoteRequest.noPasswordLogin=The authentication mechanism configured for this context does not support user name and password authentication
+ coyoteRequest.authFail=The authentication of user {0} was not successful
+ coyoteRequest.authenticate.ise=Cannot call authenticate() after the reponse has been committed
++coyoteRequest.uploadLocationInvalid=The temporary upload location [{0}] is not valid
+ 
+ requestFacade.nullRequest=The request object has been recycled and is no longer associated with this facade
+ 
+
+==================================================
+StandardPart.java
+index ec6660d689..52effc83a3 100644
+--- a/java/org/apache/catalina/connector/Request.java
++++ b/java/org/apache/catalina/connector/Request.java
+@@ -20,6 +20,7 @@ package org.apache.catalina.connector;
+ 
+ 
+ import java.io.BufferedReader;
++import java.io.File;
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.io.UnsupportedEncodingException;
+@@ -31,6 +32,7 @@ import java.util.Collections;
+ import java.util.Enumeration;
+ import java.util.HashMap;
+ import java.util.Iterator;
++import java.util.List;
+ import java.util.Locale;
+ import java.util.Map;
+ import java.util.TimeZone;
+@@ -65,12 +67,14 @@ import org.apache.catalina.Session;
+ import org.apache.catalina.Wrapper;
+ import org.apache.catalina.core.ApplicationSessionCookieConfig;
+ import org.apache.catalina.core.AsyncContextImpl;
++import org.apache.catalina.core.StandardPart;
+ import org.apache.catalina.deploy.LoginConfig;
+ import org.apache.catalina.realm.GenericPrincipal;
+ import org.apache.catalina.util.Enumerator;
+ import org.apache.catalina.util.ParameterMap;
+ import org.apache.catalina.util.StringParser;
+ import org.apache.coyote.ActionCode;
++import org.apache.jasper.compiler.ServletWriter;
+ import org.apache.tomcat.util.buf.B2CConverter;
+ import org.apache.tomcat.util.buf.ByteChunk;
+ import org.apache.tomcat.util.buf.MessageBytes;
+@@ -79,7 +83,12 @@ import org.apache.tomcat.util.http.Cookies;
+ import org.apache.tomcat.util.http.FastHttpDateFormat;
+ import org.apache.tomcat.util.http.Parameters;
+ import org.apache.tomcat.util.http.ServerCookie;
++import org.apache.tomcat.util.http.fileupload.DiskFileItemFactory;
++import org.apache.tomcat.util.http.fileupload.FileItem;
+ import org.apache.tomcat.util.http.fileupload.FileUploadBase;
++import org.apache.tomcat.util.http.fileupload.FileUploadException;
++import org.apache.tomcat.util.http.fileupload.ServletFileUpload;
++import org.apache.tomcat.util.http.fileupload.FileUploadBase.InvalidContentTypeException;
+ import org.apache.tomcat.util.http.mapper.MappingData;
+ import org.apache.tomcat.util.res.StringManager;
+ import org.apache.tools.ant.util.CollectionUtils;
+@@ -2335,11 +2344,7 @@ public class Request
+     }
+     
+     /**
+-     * @throws ServletException If any of {@link #getRemoteUser()},
+-     *         {@link #getUserPrincipal()} or {@link #getAuthType()} are
+-     *         non-null, if the configured authenticator does not support
+-     *         user name and password authentication or if the authentication
+-     *         fails
++     * {@inheritDoc}
+      */
+     public void login(String username, String password)
+     throws ServletException {
+@@ -2377,31 +2382,63 @@ public class Request
+     }
+ 
+     /**
+-     * @throws ServletException If the logout fails
++     * {@inheritDoc}
+      */
+     public void logout() throws ServletException {
+         context.getAuthenticator().register(this, getResponse(), null,
+                 null, null, null);
+     }
+     
++    /**
++     * {@inheritDoc}
++     */
+     public Collection<Part> getParts() throws IOException, IllegalStateException,
+             ServletException {
+         
+-        String contentType = getContentType();
+-        if (contentType == null ||
+-                !contentType.startsWith(FileUploadBase.MULTIPART_FORM_DATA)) {
+-            return Collections.emptyList();
+-        }
+-        
+         MultipartConfigElement mce = getWrapper().getMultipartConfig();
+         if (mce == null) {
+             return Collections.emptyList();
+         }
+         
+-        // TODO SERVLET3 - file upload
+-        return Collections.emptyList();
++        File location = new File(mce.getLocation());
++        
++        if (!location.isAbsolute() || !location.isDirectory()) {
++            throw new IOException(
++                    sm.getString("coyoteRequest.uploadLocationInvalid",
++                            location));
++        }
++        
++        // Create a new file upload handler
++        DiskFileItemFactory factory = new DiskFileItemFactory();
++        factory.setRepository(location.getCanonicalFile());
++        factory.setSizeThreshold(mce.getFileSizeThreshold());
++        
++        ServletFileUpload upload = new ServletFileUpload();
++        upload.setFileItemFactory(factory);
++        upload.setFileSizeMax(mce.getMaxFileSize());
++        upload.setSizeMax(mce.getMaxRequestSize());
++        
++        List<Part> result = new ArrayList<Part>();
++        try {
++           List<FileItem> items = upload.parseRequest(this);
++           for (FileItem item : items) {
++                result.add(new StandardPart(item, mce));
++            }
++            
++        } catch (InvalidContentTypeException e) {
++            throw new ServletException(e);
++        } catch (FileUploadBase.SizeException e) {
++            throw new IllegalStateException(e);
++        } catch (FileUploadException e) {
++            throw new IOException();
++        }
++        
++        return result;
+     }
+     
++    /**
++     * {@inheritDoc}
++     */
+     public Part getPart(String name) throws IOException, IllegalStateException,
+             ServletException {
+         Collection<Part> parts = getParts();
+
+==================================================
+HTMLManagerServlet.java
+new file mode 100644
+index 0000000000..7f83a25697
+--- /dev/null
++++ b/java/org/apache/catalina/core/StandardPart.java
+@@ -0,0 +1,124 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.catalina.core;
++
++import java.io.File;
++import java.io.IOException;
++import java.io.InputStream;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.Iterator;
++
++import javax.servlet.MultipartConfigElement;
++import javax.servlet.ServletContext;
++import javax.servlet.http.Part;
++
++import org.apache.tomcat.util.http.fileupload.DiskFileItem;
++import org.apache.tomcat.util.http.fileupload.FileItem;
++
++/**
++ * Adaptor to allow {@link FileItem} objects generated by the package renamed
++ * commons-upload to be used by the Servlet 3.0 upload API that expects
++ * {@link Part}s.
++ */
++public class StandardPart implements Part {
++
++    private FileItem fileItem;
++    private MultipartConfigElement mce;
++
++    public StandardPart(FileItem fileItem, MultipartConfigElement mce) {
++        this.fileItem = fileItem;
++        this.mce = mce;
++    }
++
++    @Override
++    public void delete() throws IOException {
++        fileItem.delete();
++    }
++
++    @Override
++    public String getContentType() {
++        return fileItem.getContentType();
++    }
++
++    @Override
++    public String getHeader(String name) {
++        if (fileItem instanceof DiskFileItem) {
++            return ((DiskFileItem) fileItem).getHeaders().getHeader(name);
++        }
++        return null;
++    }
++
++    @Override
++    public Collection<String> getHeaderNames() {
++        if (fileItem instanceof DiskFileItem) {
++            HashSet<String> headerNames = new HashSet<String>();
++            Iterator<String> iter =
++                ((DiskFileItem) fileItem).getHeaders().getHeaderNames();
++            while (iter.hasNext()) {
++                headerNames.add(iter.next());
++            }
++            return headerNames;
++        }
++        return Collections.emptyList();
++    }
++
++    @Override
++    public Collection<String> getHeaders(String name) {
++        if (fileItem instanceof DiskFileItem) {
++            HashSet<String> headers = new HashSet<String>();
++            Iterator<String> iter =
++                ((DiskFileItem) fileItem).getHeaders().getHeaders(name);
++            while (iter.hasNext()) {
++                headers.add(iter.next());
++            }
++            return headers;
++        }
++        return Collections.emptyList();
++    }
++
++    @Override
++    public InputStream getInputStream() throws IOException {
++        return fileItem.getInputStream();
++    }
++
++    @Override
++    public String getName() {
++        return fileItem.getFieldName();
++    }
++
++    @Override
++    public long getSize() {
++        return fileItem.getSize();
++    }
++
++    @Override
++    public void write(String fileName) throws IOException {
++        File file = new File(fileName);
++        if (!file.isAbsolute()) {
++            file = new File(mce.getLocation(), fileName);
++        }
++        try {
++            fileItem.write(file);
++        } catch (Exception e) {
++            throw new IOException(e);
++        }
++    }
++
++}
+
+==================================================
+WebXml.java
+index 338e4653c8..2955d9e523 100644
+--- a/java/org/apache/catalina/manager/HTMLManagerServlet.java
++++ b/java/org/apache/catalina/manager/HTMLManagerServlet.java
+@@ -24,6 +24,7 @@ import java.io.PrintWriter;
+ import java.io.StringWriter;
+ import java.text.MessageFormat;
+ import java.util.Arrays;
++import java.util.Collection;
+ import java.util.Collections;
+ import java.util.Comparator;
+ import java.util.Date;
+@@ -33,7 +34,6 @@ import java.util.Map;
+ import java.util.Random;
+ import java.util.TreeMap;
+ 
+-import javax.servlet.ServletContext;
+ import javax.servlet.ServletException;
+ import javax.servlet.http.HttpServletRequest;
+ import javax.servlet.http.HttpServletResponse;
+@@ -50,9 +50,7 @@ import org.apache.catalina.manager.util.SessionUtils;
+ import org.apache.catalina.util.RequestUtil;
+ import org.apache.catalina.util.ServerInfo;
+ import org.apache.catalina.util.URLEncoder;
+-import org.apache.tomcat.util.http.fileupload.DiskFileItemFactory;
+-import org.apache.tomcat.util.http.fileupload.ServletFileUpload;
+-import org.apache.tomcat.util.http.fileupload.FileItem;
++import org.apache.tomcat.util.http.fileupload.ParameterParser;
+ 
+ /**
+ * Servlet that enables remote management of the web applications deployed
+@@ -263,69 +261,54 @@ public final class HTMLManagerServlet extends ManagerServlet {
+             throws IOException, ServletException {
+         String message = "";
+ 
+-        // TODO - Rewrite this to use the Servlet 3 file upload API
+-        Part part = request.getPart("deployWar");
+-        
+-        // Get the tempdir
+-        File tempdir = (File) getServletContext().getAttribute
+-            (ServletContext.TEMPDIR);
+-
+-        // Create a new file upload handler
+-        DiskFileItemFactory factory = new DiskFileItemFactory();
+-        factory.setRepository(tempdir.getCanonicalFile());
+-        ServletFileUpload upload = new ServletFileUpload();
+-        upload.setFileItemFactory(factory);
+-        
+-        // Set upload parameters
+-        upload.setSizeMax(-1);
+-    
+-        // Parse the request
++        Part warPart = null;
++        String filename = null;
+         String basename = null;
+-        String war = null;
+-        FileItem warUpload = null;
+-        try {
+-            List<FileItem> items = upload.parseRequest(request);
++
++        Collection<Part> parts = request.getParts();
++        Iterator<Part> iter = parts.iterator();
+         
+-            // Process the uploaded fields
+-            Iterator<FileItem> iter = items.iterator();
++        try {
+             while (iter.hasNext()) {
+-                FileItem item = iter.next();
+-        
+-                if (!item.isFormField()) {
+-                    if (item.getFieldName().equals("deployWar") &&
+-                        warUpload == null) {
+-                        warUpload = item;
+-                    } else {
+-                        item.delete();
+-                    }
++                Part part = iter.next();
++                if (part.getName().equals("deployWar") && warPart == null) {
++                    warPart = part;
++                } else {
++                    part.delete();
+                 }
+             }
++
+             while (true) {
+-                if (warUpload == null) {
+-                    message = sm.getString
+-                        ("htmlManagerServlet.deployUploadNoFile");
++                if (warPart == null) {
++                    message =
++                        sm.getString("htmlManagerServlet.deployUploadNoFile");
+                     break;
+                 }
+-                war = warUpload.getName();
+-                if (!war.toLowerCase().endsWith(".war")) {
+-                    message = sm.getString
+-                        ("htmlManagerServlet.deployUploadNotWar",war);
++                filename =
++                    extractFilename(warPart.getHeader("Content-Disposition"));
++                if (!filename.toLowerCase().endsWith(".war")) {
++                    message = sm.getString(
++                            "htmlManagerServlet.deployUploadNotWar", filename);
+                     break;
+                 }
+                 // Get the filename if uploaded name includes a path
+-                if (war.lastIndexOf('\\') >= 0) {
+-                    war = war.substring(war.lastIndexOf('\\') + 1);
++                if (filename.lastIndexOf('\\') >= 0) {
++                    filename =
++                        filename.substring(filename.lastIndexOf('\\') + 1);
+                 }
+-                if (war.lastIndexOf('/') >= 0) {
+-                    war = war.substring(war.lastIndexOf('/') + 1);
++                if (filename.lastIndexOf('/') >= 0) {
++                    filename =
++                        filename.substring(filename.lastIndexOf('/') + 1);
+                 }
+                 // Identify the appBase of the owning Host of this Context
+                 // (if any)
+-                basename = war.substring(0, war.toLowerCase().indexOf(".war"));
+-                File file = new File(getAppBase(), war);
++                basename = filename.substring(0,
++                        filename.toLowerCase().indexOf(".war"));
++                File file = new File(getAppBase(), filename);
+                 if (file.exists()) {
+-                    message = sm.getString
+-                        ("htmlManagerServlet.deployUploadWarExists",war);
++                    message = sm.getString(
++                            "htmlManagerServlet.deployUploadWarExists",
++                            filename);
+                     break;
+                 }
+                 String path = null;
+@@ -336,15 +319,16 @@ public final class HTMLManagerServlet extends ManagerServlet {
+                 }
+ 
+                 if ((host.findChild(path) != null) && !isDeployed(path)) {
+-                    message = sm.getString
+-                        ("htmlManagerServlet.deployUploadInServerXml", war);
++                    message = sm.getString(
++                            "htmlManagerServlet.deployUploadInServerXml",
++                            filename);
+                     break;
+                 }
+ 
+                 if (!isServiced(path)) {
+                     addServiced(path);
+                     try {
+-                        warUpload.write(file);
++                        warPart.write(file.getAbsolutePath());
+                         // Perform new deployment
+                         check(path);
+                     } finally {
+@@ -358,14 +342,43 @@ public final class HTMLManagerServlet extends ManagerServlet {
+                 ("htmlManagerServlet.deployUploadFail", e.getMessage());
+             log(message, e);
+         } finally {
+-            if (warUpload != null) {
+-                warUpload.delete();
++            if (warPart != null) {
++                warPart.delete();
+             }
+-            warUpload = null;
++            warPart = null;
+         }
+         return message;
+     }
+ 
++    /*
++     * Adapted from FileUploadBase.getFileName()
++     */
++    private String extractFilename(String cd) {
++        String fileName = null;
++        if (cd != null) {
++            String cdl = cd.toLowerCase();
++            if (cdl.startsWith("form-data") || cdl.startsWith("attachment")) {
++                ParameterParser parser = new ParameterParser();
++                parser.setLowerCaseNames(true);
++                // Parameter parser can handle null input
++                Map<String,String> params =
++                    parser.parse(cd, ';');
++                if (params.containsKey("filename")) {
++                    fileName = params.get("filename");
++                    if (fileName != null) {
++                        fileName = fileName.trim();
++                    } else {
++                        // Even if there is no value, the parameter is present,
++                        // so we return an empty file name rather than no file
++                        // name.
++                        fileName = "";
++                    }
++                }
++            }
++        }
++        return fileName;
++    }
++
+     /**
+      * Deploy an application for the specified path from the specified
+      * web application archive.
+
+==================================================
+FileUploadBase.java
+index 0088e4a797..8ace5ff4e4 100644
+--- a/java/org/apache/catalina/startup/WebXml.java
++++ b/java/org/apache/catalina/startup/WebXml.java
+@@ -18,6 +18,7 @@
+ 
+ package org.apache.catalina.startup;
+ 
++import java.io.File;
+ import java.net.URL;
+ import java.util.HashMap;
+ import java.util.HashSet;
+@@ -29,6 +30,7 @@ import java.util.Map;
+ import java.util.Set;
+ 
+ import javax.servlet.MultipartConfigElement;
++import javax.servlet.ServletContext;
+ 
+ import org.apache.catalina.Context;
+ import org.apache.catalina.Wrapper;
+@@ -566,18 +568,23 @@ public class WebXml {
+             wrapper.setServletClass(servlet.getServletClass());
+             MultipartDef multipartdef = servlet.getMultipartDef();
+             if (multipartdef != null) {
++                String location = multipartdef.getLocation();
++                if (location == null || location.length() == 0) {
++                    location = ((File) context.getServletContext().getAttribute(
++                            ServletContext.TEMPDIR)).getAbsolutePath();
++                }
+                 if (multipartdef.getMaxFileSize() != null &&
+                         multipartdef.getMaxRequestSize()!= null &&
+                         multipartdef.getFileSizeThreshold() != null) {
+                     wrapper.setMultipartConfig(new MultipartConfigElement(
+-                            multipartdef.getLocation(),
++                            location,
+                             Long.parseLong(multipartdef.getMaxFileSize()),
+                             Long.parseLong(multipartdef.getMaxRequestSize()),
+                             Integer.parseInt(
+                                     multipartdef.getFileSizeThreshold())));
+                 } else {
+                     wrapper.setMultipartConfig(new MultipartConfigElement(
+-                            multipartdef.getLocation()));
++                            location));
+                 }
+             }
+             context.addChild(wrapper);
+
+==================================================

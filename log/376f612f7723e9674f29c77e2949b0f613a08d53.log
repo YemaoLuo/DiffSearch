@@ -1,0 +1,1143 @@
+376f612f7723e9674f29c77e2949b0f613a08d53
+==================================================
+- Add plumbing code for supporting web services references.
+==================================================
+Remy Maucherat
+==================================================
+Thu Mar 1 14:33:06 2007 +0000
+==================================================
+NamingContextListener.java
+index fabc1fb038..9f052932fa 100644
+--- a/java/org/apache/catalina/core/LocalStrings.properties
++++ b/java/org/apache/catalina/core/LocalStrings.properties
+@@ -40,6 +40,7 @@ httpEngineMapper.container=This container is not a StandardEngine
+ httpHostMapper.container=This container is not a StandardHost
+ interceptorValve.alreadyStarted=InterceptorValve has already been started
+ interceptorValve.notStarted=InterceptorValve has not yet been started
++naming.wsdlFailed=Failed to find wsdl file: {0}
+ naming.bindFailed=Failed to bind object: {0}
+ naming.jmxRegistrationFailed=Failed to register in JMX: {0}
+ naming.unbindFailed=Failed to unbind object: {0}
+
+==================================================
+ContextHandler.java
+index c0702c8763..e81930b5b4 100644
+--- a/java/org/apache/catalina/core/NamingContextListener.java
++++ b/java/org/apache/catalina/core/NamingContextListener.java
+@@ -21,6 +21,8 @@ package org.apache.catalina.core;
+ 
+ import java.beans.PropertyChangeEvent;
+ import java.beans.PropertyChangeListener;
++import java.net.MalformedURLException;
++import java.net.URL;
+ import java.util.HashMap;
+ import java.util.Hashtable;
+ import java.util.Iterator;
+@@ -46,10 +48,12 @@ import org.apache.catalina.Server;
+ import org.apache.catalina.Service;
+ import org.apache.catalina.deploy.ContextEjb;
+ import org.apache.catalina.deploy.ContextEnvironment;
++import org.apache.catalina.deploy.ContextHandler;
+ import org.apache.catalina.deploy.ContextLocalEjb;
+ import org.apache.catalina.deploy.ContextResource;
+ import org.apache.catalina.deploy.ContextResourceEnvRef;
+ import org.apache.catalina.deploy.ContextResourceLink;
++import org.apache.catalina.deploy.ContextService;
+ import org.apache.catalina.deploy.ContextTransaction;
+ import org.apache.catalina.deploy.NamingResources;
+ import org.apache.catalina.util.StringManager;
+@@ -58,10 +62,12 @@ import org.apache.juli.logging.LogFactory;
+ import org.apache.naming.ContextAccessController;
+ import org.apache.naming.ContextBindings;
+ import org.apache.naming.EjbRef;
++import org.apache.naming.HandlerRef;
+ import org.apache.naming.NamingContext;
+ import org.apache.naming.ResourceEnvRef;
+ import org.apache.naming.ResourceLinkRef;
+ import org.apache.naming.ResourceRef;
++import org.apache.naming.ServiceRef;
+ import org.apache.naming.TransactionRef;
+ import org.apache.tomcat.util.modeler.Registry;
+ 
+@@ -373,6 +379,15 @@ public class NamingContextListener
+                 addResourceEnvRef(resourceEnvRef);
+             }
+ 
++        } else if (type.equals("addService")) {
++
++            String serviceName = (String) event.getData();
++            if (serviceName != null) {
++                ContextService service = 
++                    namingResources.findService(serviceName);
++                addService(service);
++            }
++
+         } else if (type.equals("removeEjb")) {
+ 
+             String ejbName = (String) event.getData();
+@@ -415,6 +430,13 @@ public class NamingContextListener
+                 removeResourceEnvRef(resourceEnvRefName);
+             }
+ 
++        } else if (type.equals("removeService")) {
++
++            String serviceName = (String) event.getData();
++            if (serviceName != null) {
++                removeService(serviceName);
++            }
++
+         }
+ 
+         // Setting the context in read only mode
+@@ -554,6 +576,19 @@ public class NamingContextListener
+                     addResourceLink(rl);
+                 }
+             }
++        } else if (name.equals("service")) {
++            if (oldValue != null) {
++                ContextService service = (ContextService) oldValue;
++                if (service.getName() != null) {
++                    removeService(service.getName());
++                }
++            }
++            if (newValue != null) {
++                ContextService service = (ContextService) newValue;
++                if (service.getName() != null) {
++                    addService(service);
++                }
++            }
+         }
+ 
+ 
+@@ -617,6 +652,12 @@ public class NamingContextListener
+             addEjb(ejbs[i]);
+         }
+ 
++        // WebServices references
++        ContextService[] services = namingResources.findServices();
++        for (i = 0; i < services.length; i++) {
++            addService(services[i]);
++        }
++
+         // Binding a User Transaction reference
+         if (container instanceof Context) {
+             try {
+@@ -819,6 +860,102 @@ public class NamingContextListener
+     }
+ 
+ 
++    /**
++     * Set the specified web service in the naming context.
++     */
++    public void addService(ContextService service) {
++
++        if (service.getWsdlfile() != null) {
++            URL wsdlURL = null;
++
++            try {
++                wsdlURL = new URL(service.getWsdlfile());
++            } catch (MalformedURLException e) {
++                wsdlURL = null;
++            }
++            if (wsdlURL == null) {
++                try {
++                    wsdlURL = ((Context) container).
++                                                    getServletContext().
++                                                    getResource(service.getWsdlfile());
++                } catch (MalformedURLException e) {
++                    wsdlURL = null;
++                }
++            }
++            if (wsdlURL == null) {
++                try {
++                    wsdlURL = ((Context) container).
++                                                    getServletContext().
++                                                    getResource("/" + service.getWsdlfile());
++                    logger.debug("  Changing service ref wsdl file for /" 
++                                + service.getWsdlfile());
++                } catch (MalformedURLException e) {
++                    logger.error(sm.getString("naming.wsdlFailed", e));
++                }
++            }
++            if (wsdlURL == null)
++                service.setWsdlfile(null);
++            else
++                service.setWsdlfile(wsdlURL.toString());
++        }
++
++        // Create a reference to the resource.
++        Reference ref = new ServiceRef
++            (service.getName(), service.getType(), service.getServiceqname(),
++             service.getWsdlfile(), service.getJaxrpcmappingfile());
++        // Adding the additional port-component-ref, if any
++        Iterator portcomponent = service.getServiceendpoints();
++        while (portcomponent.hasNext()) {
++            String serviceendpoint = (String) portcomponent.next();
++            StringRefAddr refAddr = new StringRefAddr(ServiceRef.SERVICEENDPOINTINTERFACE, serviceendpoint);
++            ref.add(refAddr);
++            String portlink = (String) service.getPortlink(serviceendpoint);
++            refAddr = new StringRefAddr(ServiceRef.PORTCOMPONENTLINK, portlink);
++            ref.add(refAddr);
++        }
++        // Adding the additional parameters, if any
++        Iterator handlers = service.getHandlers();
++        while (handlers.hasNext()) {
++            String handlername = (String) handlers.next();
++            ContextHandler handler = (ContextHandler) service.getHandler(handlername);
++            HandlerRef handlerRef = new HandlerRef(handlername, handler.getHandlerclass());
++            Iterator localParts = handler.getLocalparts();
++            while (localParts.hasNext()) {
++                String localPart = (String) localParts.next();
++                String namespaceURI = (String) handler.getNamespaceuri(localPart);
++                handlerRef.add(new StringRefAddr(HandlerRef.HANDLER_LOCALPART, localPart));
++                handlerRef.add(new StringRefAddr(HandlerRef.HANDLER_NAMESPACE, namespaceURI));
++            }
++            Iterator params = handler.listProperties();
++            while (params.hasNext()) {
++                String paramName = (String) params.next();
++                String paramValue = (String) handler.getProperty(paramName);
++                handlerRef.add(new StringRefAddr(HandlerRef.HANDLER_PARAMNAME, paramName));
++                handlerRef.add(new StringRefAddr(HandlerRef.HANDLER_PARAMVALUE, paramValue));
++            }
++            for (int i = 0; i < handler.getSoapRolesSize(); i++) {
++                handlerRef.add(new StringRefAddr(HandlerRef.HANDLER_SOAPROLE, handler.getSoapRole(i)));
++            }
++            for (int i = 0; i < handler.getPortNamesSize(); i++) {
++                handlerRef.add(new StringRefAddr(HandlerRef.HANDLER_PORTNAME, handler.getPortName(i)));
++            }
++            ((ServiceRef) ref).addHandler(handlerRef);
++        }
++
++        try {
++            if (logger.isDebugEnabled()) {
++                logger.debug("  Adding service ref " 
++                             + service.getName() + "  " + ref);
++            }
++            createSubcontexts(envCtx, service.getName());
++            envCtx.bind(service.getName(), ref);
++        } catch (NamingException e) {
++            logger.error(sm.getString("naming.bindFailed", e));
++        }
++
++    }
++
++
+     /**
+      * Set the specified resources in the naming context.
+      */
+@@ -953,6 +1090,20 @@ public class NamingContextListener
+     }
+ 
+ 
++    /**
++     * Set the specified web services in the naming context.
++     */
++    public void removeService(String name) {
++
++        try {
++            envCtx.unbind(name);
++        } catch (NamingException e) {
++            logger.error(sm.getString("naming.unbindFailed", e));
++        }
++
++    }
++
++
+     /**
+      * Set the specified resources in the naming context.
+      */
+
+==================================================
+ContextService.java
+new file mode 100644
+index 0000000000..48ce513dcc
+--- /dev/null
++++ b/java/org/apache/catalina/deploy/ContextHandler.java
+@@ -0,0 +1,154 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ * 
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ * 
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++
++package org.apache.catalina.deploy;
++
++import java.io.Serializable;
++import java.util.ArrayList;
++import java.util.Iterator;
++import java.util.HashMap;
++
++/**
++ * Representation of a handler reference for a web service, as
++ * represented in a <code>&lt;handler&gt;</code> element in the
++ * deployment descriptor.
++ *
++ * @author Fabien Carrion
++ */
++
++public class ContextHandler extends ResourceBase implements Serializable {
++
++
++    // ------------------------------------------------------------- Properties
++
++
++    /**
++     * The Handler reference class.
++     */
++    private String handlerclass = null;
++
++    public String getHandlerclass() {
++        return (this.handlerclass);
++    }
++
++    public void setHandlerclass(String handlerclass) {
++        this.handlerclass = handlerclass;
++    }
++
++    /**
++     * A list of QName specifying the SOAP Headers the handler will work on. 
++     * -namespace and locapart values must be found inside the WSDL.
++     *
++     * A service-qname is composed by a namespaceURI and a localpart.
++     *
++     * soapHeader[0] : namespaceURI
++     * soapHeader[1] : localpart
++     */
++    private HashMap soapHeaders = new HashMap();
++
++    public Iterator getLocalparts() {
++        return soapHeaders.keySet().iterator();
++    }
++
++    public String getNamespaceuri(String localpart) {
++        return (String) soapHeaders.get(localpart);
++    }
++
++    public void addSoapHeaders(String localpart, String namespaceuri) {
++        soapHeaders.put(localpart, namespaceuri);
++    }
++
++    /**
++     * Set a configured property.
++     */
++    public void setProperty(String name, String value) {
++        this.setProperty(name, (Object) value);
++    }
++
++    /**
++     * The soapRole.
++     */
++    private ArrayList<String> soapRoles = new ArrayList();
++
++    public String getSoapRole(int i) {
++        return this.soapRoles.get(i);
++    }
++
++    public int getSoapRolesSize() {
++        return this.soapRoles.size();
++    }
++
++    public void addSoapRole(String soapRole) {
++        this.soapRoles.add(soapRole);
++    }
++
++    /**
++     * The portName.
++     */
++    private ArrayList<String> portNames = new ArrayList();
++
++    public String getPortName(int i) {
++        return this.portNames.get(i);
++    }
++
++    public int getPortNamesSize() {
++        return this.portNames.size();
++    }
++
++    public void addPortName(String portName) {
++        this.portNames.add(portName);
++    }
++
++    // --------------------------------------------------------- Public Methods
++
++
++    /**
++     * Return a String representation of this object.
++     */
++    public String toString() {
++
++        StringBuffer sb = new StringBuffer("ContextHandler[");
++        sb.append("name=");
++        sb.append(getName());
++        if (handlerclass != null) {
++            sb.append(", class=");
++            sb.append(handlerclass);
++        }
++        if (this.soapHeaders != null) {
++            sb.append(", soap-headers=");
++            sb.append(this.soapHeaders);
++        }
++        if (this.getSoapRolesSize() > 0) {
++            sb.append(", soap-roles=");
++            sb.append(soapRoles);
++        }
++        if (this.getPortNamesSize() > 0) {
++            sb.append(", port-name=");
++            sb.append(portNames);
++        }
++        if (this.listProperties() != null) {
++            sb.append(", init-param=");
++            sb.append(this.listProperties());
++        }
++        sb.append("]");
++        return (sb.toString());
++
++    }
++
++
++}
+
+==================================================
+NamingResources.java
+index 629f4036f1..96576c8c44 100644
+--- a/java/org/apache/catalina/deploy/ContextService.java
++++ b/java/org/apache/catalina/deploy/ContextService.java
+@@ -19,6 +19,9 @@
+ package org.apache.catalina.deploy;
+ 
+ import java.io.Serializable;
++import java.util.ArrayList;
++import java.util.Iterator;
++import java.util.HashMap;
+ 
+ /**
+  * Representation of a web service reference for a web application, as
+@@ -61,19 +64,6 @@ public class ContextService extends ResourceBase implements Serializable {
+         this.icon = icon;
+     }
+ 
+-    /**
+-     * An icon for this WebService.
+-     */
+-    private String serviceinterface = null;
+-
+-    public String getServiceinterface() {
+-        return (this.serviceinterface);
+-    }
+-
+-    public void setServiceinterface(String serviceinterface) {
+-        this.serviceinterface = serviceinterface;
+-    }
+-
+     /**
+      * Contains the location (relative to the root of
+      * the module) of the web service WSDL description.
+@@ -119,6 +109,18 @@ public class ContextService extends ResourceBase implements Serializable {
+         return (this.serviceqname);
+     }
+ 
++    public String getServiceqname(int i) {
++        return this.serviceqname[i];
++    }
++
++    public String getServiceqnameNamespaceURI() {
++        return this.serviceqname[0];
++    }
++
++    public String getServiceqnameLocalpart() {
++        return this.serviceqname[1];
++    }
++
+     public void setServiceqname(String[] serviceqname) {
+         this.serviceqname = serviceqname;
+     }
+@@ -127,11 +129,11 @@ public class ContextService extends ResourceBase implements Serializable {
+         this.serviceqname[i] = serviceqname;
+     }
+ 
+-    public void setNamespaceURI(String namespaceuri) {
++    public void setServiceqnameNamespaceURI(String namespaceuri) {
+         this.serviceqname[0] = namespaceuri;
+     }
+ 
+-    public void setLocalpart(String localpart) {
++    public void setServiceqnameLocalpart(String localpart) {
+         this.serviceqname[1] = localpart;
+     }
+ 
+@@ -140,44 +142,38 @@ public class ContextService extends ResourceBase implements Serializable {
+      * to a WSDL port. It optionally associates the Service Endpoint Interface with a
+      * particular port-component.
+      *
+-     * portcomponent[0] : service-endpoint-interface
+-     * portcomponent[1] : port-component-link
+      */
+-    private String[] portcomponent = new String[2];
+-
+-    public String[] getPortcomponent() {
+-        return (this.portcomponent);
++    public Iterator getServiceendpoints() {
++        return this.listProperties();
+     }
+ 
+-    public void setPortcomponent(String[] portcomponent) {
+-        this.portcomponent = portcomponent;
++    public String getPortlink(String serviceendpoint) {
++        return (String) this.getProperty(serviceendpoint);
+     }
+ 
+-    public void setPortcomponent(String portcomponent, int i) {
+-        this.portcomponent[i] = portcomponent;
+-    }
+-
+-    public void setServiceendpoint(String serviceendpoint) {
+-        this.portcomponent[0] = serviceendpoint;
+-    }
+-
+-    public void setPortlink(String portlink) {
+-        this.portcomponent[1] = portlink;
++    public void addPortcomponent(String serviceendpoint, String portlink) {
++        if (portlink == null)
++            portlink = "";
++        this.setProperty(serviceendpoint, portlink);
+     }
+ 
+     /**
+-     * A list of Handler to use for this service-ref.
++     * A list of Handlers to use for this service-ref.
+      *
+      * The instanciation of the handler have to be done.
+      */
+-    private String handler = null;
++    private HashMap handlers = new HashMap();
++
++    public Iterator getHandlers() {
++        return handlers.keySet().iterator();
++    }
+ 
+-    public String getHandler() {
+-        return (this.handler);
++    public ContextHandler getHandler(String handlername) {
++        return (ContextHandler) handlers.get(handlername);
+     }
+ 
+-    public void setHandler(String handler) {
+-        this.handler = handler;
++    public void addHandler(ContextHandler handler) {
++        handlers.put(handler.getName(), handler);
+     }
+ 
+ 
+@@ -204,10 +200,6 @@ public class ContextService extends ResourceBase implements Serializable {
+             sb.append(", displayname=");
+             sb.append(displayname);
+         }
+-        if (serviceinterface != null) {
+-            sb.append(", serviceinterface=");
+-            sb.append(serviceinterface);
+-        }
+         if (icon != null) {
+             sb.append(", icon=");
+             sb.append(icon);
+@@ -220,17 +212,21 @@ public class ContextService extends ResourceBase implements Serializable {
+             sb.append(", jaxrpc-mapping-file=");
+             sb.append(jaxrpcmappingfile);
+         }
+-        if (serviceqname != null) {
+-            sb.append(", service-qname=");
+-            sb.append(serviceqname);
++        if (serviceqname[0] != null) {
++            sb.append(", service-qname/namespaceURI=");
++            sb.append(serviceqname[0]);
++        }
++        if (serviceqname[1] != null) {
++            sb.append(", service-qname/localpart=");
++            sb.append(serviceqname[1]);
+         }
+-        if (portcomponent != null) {
+-            sb.append(", port-component=");
+-            sb.append(portcomponent);
++        if (this.getServiceendpoints() != null) {
++            sb.append(", port-component/service-endpoint-interface=");
++            sb.append(this.getServiceendpoints());
+         }
+-        if (handler != null) {
++        if (handlers != null) {
+             sb.append(", handler=");
+-            sb.append(handler);
++            sb.append(handlers);
+         }
+         sb.append("]");
+         return (sb.toString());
+
+==================================================
+NamingRuleSet.java
+index a2972344de..26f1e68935 100644
+--- a/java/org/apache/catalina/deploy/NamingResources.java
++++ b/java/org/apache/catalina/deploy/NamingResources.java
+@@ -345,7 +345,11 @@ public class NamingResources implements Serializable {
+         if (entries.containsKey(service.getName())) {
+             return;
+         } else {
+-            entries.put(service.getName(), service.getServiceinterface());
++            Object value = service.getType();
++            if (value == null) {
++                value = "";
++            }
++            entries.put(service.getName(), value);
+         }
+         
+         synchronized (services) {
+
+==================================================
+WebRuleSet.java
+index 10fdd69f4d..010ef3834e 100644
+--- a/java/org/apache/catalina/startup/NamingRuleSet.java
++++ b/java/org/apache/catalina/startup/NamingRuleSet.java
+@@ -123,6 +123,13 @@ public class NamingRuleSet extends RuleSetBase {
+                 new SetNextNamingRule("addResourceEnvRef",
+                             "org.apache.catalina.deploy.ContextResourceEnvRef"));
+ 
++        digester.addObjectCreate(prefix + "ServiceRef",
++            "org.apache.catalina.deploy.Contextservice");
++        digester.addRule(prefix + "ServiceRef", new SetAllPropertiesRule());
++        digester.addRule(prefix + "ServiceRef",
++                new SetNextNamingRule("addService",
++                            "org.apache.catalina.deploy.ContextService"));
++
+         digester.addObjectCreate(prefix + "Transaction",
+             "org.apache.catalina.deploy.ContextTransaction");
+         digester.addRule(prefix + "Transaction", new SetAllPropertiesRule());
+
+==================================================
+HandlerRef.java
+index cc4f631c1a..2c3c006ebe 100644
+--- a/java/org/apache/catalina/startup/WebRuleSet.java
++++ b/java/org/apache/catalina/startup/WebRuleSet.java
+@@ -31,6 +31,7 @@ import org.apache.tomcat.util.digester.CallParamRule;
+ import org.apache.tomcat.util.digester.Digester;
+ import org.apache.tomcat.util.digester.Rule;
+ import org.apache.tomcat.util.digester.RuleSetBase;
++import org.apache.tomcat.util.digester.SetNextRule;
+ import org.xml.sax.Attributes;
+ 
+ 
+@@ -375,7 +376,7 @@ public class WebRuleSet extends RuleSetBase {
+         digester.addRule(prefix + "web-app/service-ref",
+                          new SetNextNamingRule("addService",
+                          "org.apache.catalina.deploy.ContextService"));
+-        
++
+         digester.addCallMethod(prefix + "web-app/service-ref/description",
+                                "setDescription", 0);
+         digester.addCallMethod(prefix + "web-app/service-ref/display-name",
+@@ -385,24 +386,50 @@ public class WebRuleSet extends RuleSetBase {
+         digester.addCallMethod(prefix + "web-app/service-ref/service-ref-name",
+                                "setName", 0);
+         digester.addCallMethod(prefix + "web-app/service-ref/service-interface",
+-                               "setServiceinterface", 0);
++                               "setType", 0);
+         digester.addCallMethod(prefix + "web-app/service-ref/wsdl-file",
+                                "setWsdlfile", 0);
+         digester.addCallMethod(prefix + "web-app/service-ref/jaxrpc-mapping-file",
+                                "setJaxrpcmappingfile", 0);
+         digester.addCallMethod(prefix + "web-app/service-ref/service-qname/namespaceURI",
+-                               "setNamespaceURI", 0);
++                               "setServiceqnameNamespaceURI", 0);
+         digester.addCallMethod(prefix + "web-app/service-ref/service-qname/localpart",
+-                               "setLocalpart", 0);
+-        digester.addCallMethod(prefix + 
+-                               "web-app/service-ref/port-component/service-endpoint-interface",
+-                               "setServiceendpoint", 0);
+-        digester.addCallMethod(prefix + "web-app/service-ref/port-component/port-component-link",
+-                               "setPortlink", 0);
+-        digester.addCallMethod(prefix + "web-app/service-ref/handler",
+-                               "setHandler", 0);
+-        digester.addCallMethod(prefix + "web-app/service-ref/service-ref-type",
+-                               "setType", 0);
++                               "setServiceqnameLocalpart", 0);
++
++        digester.addRule(prefix + "web-app/service-ref/port-component-ref",
++                               new CallMethodMultiRule("addPortcomponent", 2, 1));
++        digester.addCallParam(prefix + "web-app/service-ref/port-component-ref/service-endpoint-interface", 0);
++        digester.addRule(prefix + "web-app/service-ref/port-component-ref/port-component-link", new CallParamMultiRule(1));
++
++        digester.addObjectCreate(prefix + "web-app/service-ref/handler",
++                                 "org.apache.catalina.deploy.ContextHandler");
++        digester.addRule(prefix + "web-app/service-ref/handler",
++                         new SetNextRule("addHandler",
++                         "org.apache.catalina.deploy.ContextHandler"));
++        
++        digester.addCallMethod(prefix + "web-app/service-ref/handler/handler-name",
++                               "setName", 0);
++        digester.addCallMethod(prefix + "web-app/service-ref/handler/handler-class",
++                               "setHandlerclass", 0);
++
++        digester.addCallMethod(prefix + "web-app/service-ref/handler/init-param",
++                               "setProperty", 2);
++        digester.addCallParam(prefix + "web-app/service-ref/handler/init-param/param-name",
++                              0);
++        digester.addCallParam(prefix + "web-app/service-ref/handler/init-param/param-value",
++                              1);
++
++        digester.addCallMethod(prefix + "web-app/service-ref/handler/soap-header",
++                               "addSoapHeaders", 2);
++        digester.addCallParam(prefix + "web-app/service-ref/handler/soap-header/localpart",
++                              0);
++        digester.addCallParam(prefix + "web-app/service-ref/handler/soap-header/namespaceURI",
++                              1);
++
++        digester.addCallMethod(prefix + "web-app/service-ref/handler/soap-role",
++                               "addSoapRole", 0);
++        digester.addCallMethod(prefix + "web-app/service-ref/handler/port-name",
++                               "addPortName", 0);
+         
+         digester.addRule(prefix + "web-app/servlet",
+                          new WrapperCreateRule());
+@@ -748,6 +775,13 @@ final class CallMethodMultiRule extends CallMethodRule {
+             throw new org.xml.sax.SAXException(sb.toString());
+         }
+         
++        if (multiParams == null) {
++            paramValues[multiParamIndex] = null;
++            Object result = IntrospectionUtils.callMethodN(target, methodName,
++                    paramValues, paramTypes);   
++            return;
++        }
++        
+         for (int j = 0; j < multiParams.size(); j++) {
+             Object param = multiParams.get(j);
+             if(param == null || (param instanceof String 
+
+==================================================
+ServiceRef.java
+new file mode 100644
+index 0000000000..d9a6973f5b
+--- /dev/null
++++ b/java/org/apache/naming/HandlerRef.java
+@@ -0,0 +1,187 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ * 
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ * 
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */ 
++
++
++package org.apache.naming;
++
++import java.util.Enumeration;
++
++import javax.naming.Context;
++import javax.naming.RefAddr;
++import javax.naming.Reference;
++import javax.naming.StringRefAddr;
++
++/**
++ * Represents a reference handler for a web service.
++ *
++ * @author Fabien Carrion
++ */
++
++public class HandlerRef
++    extends Reference {
++
++
++    // -------------------------------------------------------------- Constants
++
++
++    /**
++     * Default factory for this reference.
++     */
++    public static final String DEFAULT_FACTORY = 
++        org.apache.naming.factory.Constants.DEFAULT_HANDLER_FACTORY;
++
++
++    /**
++     * HandlerName address type.
++     */
++    public static final String HANDLER_NAME  = "handlername";
++
++
++    /**
++     * Handler Classname address type.
++     */
++    public static final String HANDLER_CLASS  = "handlerclass";
++
++
++    /**
++     * Handler Classname address type.
++     */
++    public static final String HANDLER_LOCALPART  = "handlerlocalpart";
++
++
++    /**
++     * Handler Classname address type.
++     */
++    public static final String HANDLER_NAMESPACE  = "handlernamespace";
++
++
++    /**
++     * Handler Classname address type.
++     */
++    public static final String HANDLER_PARAMNAME  = "handlerparamname";
++
++
++    /**
++     * Handler Classname address type.
++     */
++    public static final String HANDLER_PARAMVALUE  = "handlerparamvalue";
++
++
++    /**
++     * Handler SoapRole address type.
++     */
++    public static final String HANDLER_SOAPROLE  = "handlersoaprole";
++
++
++    /**
++     * Handler PortName address type.
++     */
++    public static final String HANDLER_PORTNAME  = "handlerportname";
++
++
++    // ----------------------------------------------------------- Constructors
++
++
++    /**
++     * Service Reference.
++     * 
++     * @param serviceClass Service class
++     */
++    public HandlerRef(String refname, String handlerClass) {
++        this(refname, handlerClass, null, null);
++    }
++
++
++    /**
++     * Service Reference.
++     * 
++     * @param serviceClass Service class
++     */
++    public HandlerRef(String refname, String handlerClass,
++                    String factory, String factoryLocation) {
++        super(refname, factory, factoryLocation);
++        StringRefAddr refAddr = null;
++        if (refname != null) {
++            refAddr = new StringRefAddr(HANDLER_NAME, refname);
++            add(refAddr);
++        }
++        if (handlerClass != null) {
++            refAddr = new StringRefAddr(HANDLER_CLASS, handlerClass);
++            add(refAddr);
++        }
++    }
++
++
++    // ----------------------------------------------------- Instance Variables
++
++
++    // ------------------------------------------------------ Reference Methods
++
++
++    /**
++     * Retrieves the class name of the factory of the object to which this 
++     * reference refers.
++     */
++    public String getFactoryClassName() {
++        String factory = super.getFactoryClassName();
++        if (factory != null) {
++            return factory;
++        } else {
++            factory = System.getProperty(Context.OBJECT_FACTORIES);
++            if (factory != null) {
++                return null;
++            } else {
++                return DEFAULT_FACTORY;
++            }
++        }
++    }
++
++
++    // --------------------------------------------------------- Public Methods
++
++
++    /**
++     * Return a String rendering of this object.
++     */
++    public String toString() {
++
++        StringBuffer sb = new StringBuffer("HandlerRef[");
++        sb.append("className=");
++        sb.append(getClassName());
++        sb.append(",factoryClassLocation=");
++        sb.append(getFactoryClassLocation());
++        sb.append(",factoryClassName=");
++        sb.append(getFactoryClassName());
++        Enumeration refAddrs = getAll();
++        while (refAddrs.hasMoreElements()) {
++            RefAddr refAddr = (RefAddr) refAddrs.nextElement();
++            sb.append(",{type=");
++            sb.append(refAddr.getType());
++            sb.append(",content=");
++            sb.append(refAddr.getContent());
++            sb.append("}");
++        }
++        sb.append("]");
++        return (sb.toString());
++
++    }
++
++
++    // ------------------------------------------------------------- Properties
++
++
++}
+
+==================================================
+Constants.java
+new file mode 100644
+index 0000000000..ebeed76c86
+--- /dev/null
++++ b/java/org/apache/naming/ServiceRef.java
+@@ -0,0 +1,216 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ * 
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ * 
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */ 
++
++
++package org.apache.naming;
++
++import java.util.Enumeration;
++import java.util.Vector;
++
++import javax.naming.Context;
++import javax.naming.RefAddr;
++import javax.naming.Reference;
++import javax.naming.StringRefAddr;
++
++/**
++ * Represents a reference web service.
++ *
++ * @author Fabien Carrion
++ */
++
++public class ServiceRef
++    extends Reference {
++
++
++    // -------------------------------------------------------------- Constants
++
++
++    /**
++     * Default factory for this reference.
++     */
++    public static final String DEFAULT_FACTORY = 
++        org.apache.naming.factory.Constants.DEFAULT_SERVICE_FACTORY;
++
++
++    /**
++     * Service Classname address type.
++     */
++    public static final String SERVICE_INTERFACE  = "serviceInterface";
++
++
++    /**
++     * ServiceQname address type.
++     */
++    public static final String SERVICE_NAMESPACE  = "service namespace";
++    public static final String SERVICE_LOCAL_PART = "service local part";
++
++
++    /**
++     * Wsdl Location address type.
++     */
++    public static final String WSDL      = "wsdl";
++
++
++    /**
++     * Jaxrpcmapping address type.
++     */
++    public static final String JAXRPCMAPPING = "jaxrpcmapping";
++
++
++    /**
++     * port-component-ref/port-component-link address type.
++     */
++    public static final String PORTCOMPONENTLINK = "portcomponentlink";
++
++
++    /**
++     * port-component-ref/service-endpoint-interface address type.
++     */
++    public static final String SERVICEENDPOINTINTERFACE = "serviceendpointinterface";
++
++
++    /**
++     * The vector to save the handler Reference objects, because they can't be saved in the addrs vector.
++     */
++    private Vector<HandlerRef> handlers = new Vector<HandlerRef>();
++
++
++    // ----------------------------------------------------------- Constructors
++
++
++    /**
++     * Service Reference.
++     * 
++     * @param serviceClass Service class
++     */
++    public ServiceRef(String refname, String serviceInterface, String[] serviceQname, 
++                       String wsdl, String jaxrpcmapping) {
++        this(refname, serviceInterface, serviceQname, wsdl, jaxrpcmapping,
++                        null, null);
++    }
++
++
++    /**
++     * Service Reference.
++     * 
++     * @param serviceClass Service class
++     */
++    public ServiceRef(String refname, String serviceInterface, String[] serviceQname, 
++                       String wsdl, String jaxrpcmapping,
++                       String factory, String factoryLocation) {
++        super(serviceInterface, factory, factoryLocation);
++        StringRefAddr refAddr = null;
++        if (serviceInterface != null) {
++            refAddr = new StringRefAddr(SERVICE_INTERFACE, serviceInterface);
++            add(refAddr);
++        }
++        if (serviceQname[0] != null) {
++            refAddr = new StringRefAddr(SERVICE_NAMESPACE, serviceQname[0]);
++            add(refAddr);
++        }
++        if (serviceQname[1] != null) {
++            refAddr = new StringRefAddr(SERVICE_LOCAL_PART, serviceQname[1]);
++            add(refAddr);
++        }
++        if (wsdl != null) {
++            refAddr = new StringRefAddr(WSDL, wsdl);
++            add(refAddr);
++        }
++        if (jaxrpcmapping != null) {
++            refAddr = new StringRefAddr(JAXRPCMAPPING, jaxrpcmapping);
++            add(refAddr);
++        }
++    }
++
++
++    // ----------------------------------------------------- Instance Variables
++
++
++    // ------------------------------------------------------ Reference Methods
++
++
++    /**
++     * Add and Get Handlers classes.
++     */
++    public HandlerRef getHandler() {
++        return handlers.remove(0);
++    }
++
++
++    public int getHandlersSize() {
++        return handlers.size();
++    }
++
++
++    public void addHandler(HandlerRef handler) {
++        handlers.add(handler);
++    }
++
++
++    /**
++     * Retrieves the class name of the factory of the object to which this 
++     * reference refers.
++     */
++    public String getFactoryClassName() {
++        String factory = super.getFactoryClassName();
++        if (factory != null) {
++            return factory;
++        } else {
++            factory = System.getProperty(Context.OBJECT_FACTORIES);
++            if (factory != null) {
++                return null;
++            } else {
++                return DEFAULT_FACTORY;
++            }
++        }
++    }
++
++
++    // --------------------------------------------------------- Public Methods
++
++
++    /**
++     * Return a String rendering of this object.
++     */
++    public String toString() {
++
++        StringBuffer sb = new StringBuffer("ServiceRef[");
++        sb.append("className=");
++        sb.append(getClassName());
++        sb.append(",factoryClassLocation=");
++        sb.append(getFactoryClassLocation());
++        sb.append(",factoryClassName=");
++        sb.append(getFactoryClassName());
++        Enumeration refAddrs = getAll();
++        while (refAddrs.hasMoreElements()) {
++            RefAddr refAddr = (RefAddr) refAddrs.nextElement();
++            sb.append(",{type=");
++            sb.append(refAddr.getType());
++            sb.append(",content=");
++            sb.append(refAddr.getContent());
++            sb.append("}");
++        }
++        sb.append("]");
++        return (sb.toString());
++
++    }
++
++
++    // ------------------------------------------------------------- Properties
++
++
++}
+
+==================================================

@@ -1,0 +1,399 @@
+b9b99f656bcad1140427f86b41384997df1fad29
+==================================================
+Clarify receiveEndOfStream vs sendEndOfStream
+==================================================
+Mark Thomas
+==================================================
+Fri Jun 5 18:59:09 2015 +0000
+==================================================
+Http2Parser.java
+Clarify receiveEndOfStream vs sendEndOfStream
+Correct comment re streamId for initial HTTP upgrade
+Refactor the handling of the switch from HTTP/1.1 to HTTP/2 (still not completely happy with this)
+Refactor StreamStateMachine
+- add debug logging for state changes
+- remove checks for changes - these are handled by checkFrameType
+  (considering more changes here too)
+Use -1 as the connection ID for the test client to make debug logs easier to read
+Add another test for section 5.1
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1683844 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Http2UpgradeHandler.java
+index 6e3acd97c8..4abb14478d 100644
+--- a/java/org/apache/coyote/http2/Http2Parser.java
++++ b/java/org/apache/coyote/http2/Http2Parser.java
+@@ -138,13 +138,13 @@ class Http2Parser {
+         if (dest == null) {
+             swallow(payloadSize);
+             if (endOfStream) {
+-                output.endOfStream(streamId);
++                output.receiveEndOfStream(streamId);
+             }
+         } else {
+             synchronized (dest) {
+                 input.fill(true, dest, payloadSize);
+                 if (endOfStream) {
+-                    output.endOfStream(streamId);
++                    output.receiveEndOfStream(streamId);
+                 }
+                 dest.notifyAll();
+             }
+@@ -200,7 +200,7 @@ class Http2Parser {
+ 
+         if (Flags.isEndOfStream(flags)) {
+             if (headersCurrentStream == -1) {
+-                output.endOfStream(streamId);
++                output.receiveEndOfStream(streamId);
+             } else {
+                 headersEndStream = true;
+             }
+@@ -318,7 +318,7 @@ class Http2Parser {
+             output.headersEnd(streamId);
+             headersCurrentStream = -1;
+             if (headersEndStream) {
+-                output.endOfStream(streamId);
++                output.receiveEndOfStream(streamId);
+                 headersEndStream = false;
+             }
+         }
+@@ -494,7 +494,7 @@ class Http2Parser {
+ 
+         // Data frames
+         ByteBuffer getInputByteBuffer(int streamId, int payloadSize) throws Http2Exception;
+-        void endOfStream(int streamId);
++        void receiveEndOfStream(int streamId);
+ 
+         // Header frames
+         HeaderEmitter headersStart(int streamId) throws Http2Exception;
+
+==================================================
+Stream.java
+index 97adf780ad..ebbc946f99 100644
+--- a/java/org/apache/coyote/http2/LocalStrings.properties
++++ b/java/org/apache/coyote/http2/LocalStrings.properties
+@@ -61,8 +61,8 @@ stream.write=Connection [{0}], Stream [{1}]
+ 
+ streamProcessor.httpupgrade.notsupported=HTTP upgrade is not supported within HTTP/2 streams
+ 
+-streamStateMachine.invalidFrame.windowUpdate=Connection [{0}], Received Data frame for stream [{1}] in state [{2}]
+-streamStateMachine.invalidFrame.windowUpdate=Connection [{0}], Received Window Update frame for stream [{1}] in state [{2}]
++streamStateMachine.debug.change=Connection [{0}], Stream [{1}], State changed from [{2}] to [{3}]
++streamStateMachine.invalidFrame=Connection [{0}], Stream [{1}], State [{2}], Frame type [{3}]
+ 
+ upgradeHandler.connectionError=An error occurred that requires the HTTP/2 connection to be closed.
+ upgradeHandler.goaway.debug=Connection [{0}], Goaway, Last stream [{1}], Error code [{2}], Debug data [{3}]
+
+==================================================
+StreamStateMachine.java
+index 5ff5898051..f8221266dd 100644
+--- a/java/org/apache/coyote/http2/Stream.java
++++ b/java/org/apache/coyote/http2/Stream.java
+@@ -40,13 +40,13 @@ public class Stream extends AbstractStream implements HeaderEmitter {
+     private final Http2UpgradeHandler handler;
+     private final Request coyoteRequest;
+     private final Response coyoteResponse = new Response();
+-    private final StreamInputBuffer inputBuffer = new StreamInputBuffer();
++    private final StreamInputBuffer inputBuffer;
+     private final StreamOutputBuffer outputBuffer = new StreamOutputBuffer();
+     private final StreamStateMachine state;
+ 
+ 
+     public Stream(Integer identifier, Http2UpgradeHandler handler) {
+-        this(identifier, handler, new Request());
++        this(identifier, handler, null);
+     }
+ 
+ 
+@@ -56,15 +56,22 @@ public class Stream extends AbstractStream implements HeaderEmitter {
+         setParentStream(handler);
+         setWindowSize(handler.getRemoteSettings().getInitialWindowSize());
+         state = new StreamStateMachine(this);
+-        this.coyoteRequest = coyoteRequest;
+-        this.coyoteRequest.setInputBuffer(inputBuffer);
+-        this.coyoteResponse.setOutputBuffer(outputBuffer);
+-        this.coyoteRequest.setResponse(coyoteResponse);
+-        if (coyoteRequest.isFinished()) {
+-            // Update the state machine
++        if (coyoteRequest == null) {
++            // HTTP/2 new request
++            this.coyoteRequest = new Request();
++            this.inputBuffer = new StreamInputBuffer();
++            this.coyoteRequest.setInputBuffer(inputBuffer);
++        } else {
++            // HTTP/1.1 upgrade
++            this.coyoteRequest = coyoteRequest;
++            this.inputBuffer = null;
++            // Headers have been populated by this point
+             state.receiveHeaders();
++            // TODO Assuming the body has been read at this point is not valid
+             state.recieveEndOfStream();
+         }
++        this.coyoteResponse.setOutputBuffer(outputBuffer);
++        this.coyoteRequest.setResponse(coyoteResponse);
+     }
+ 
+ 
+@@ -101,7 +108,7 @@ public class Stream extends AbstractStream implements HeaderEmitter {
+             log.debug(sm.getString("stream.reset.debug", getConnectionId(), getIdentifier(),
+                     Long.toString(errorCode)));
+         }
+-        state.recieveReset();
++        state.receiveReset();
+     }
+ 
+ 
+@@ -233,10 +240,16 @@ public class Stream extends AbstractStream implements HeaderEmitter {
+     }
+ 
+ 
+-    void setEndOfStream() {
++    void receiveEndOfStream() {
+         state.recieveEndOfStream();
+     }
+ 
++
++    void sendEndOfStream() {
++        state.sendEndOfStream();
++    }
++
++
+     StreamOutputBuffer getOutputBuffer() {
+         return outputBuffer;
+     }
+
+==================================================
+Http2TestBase.java
+index df4264c9e5..660fe09178 100644
+--- a/java/org/apache/coyote/http2/StreamStateMachine.java
++++ b/java/org/apache/coyote/http2/StreamStateMachine.java
+@@ -19,6 +19,8 @@ package org.apache.coyote.http2;
+ import java.util.HashSet;
+ import java.util.Set;
+ 
++import org.apache.juli.logging.Log;
++import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+ /**
+@@ -33,107 +35,71 @@ import org.apache.tomcat.util.res.StringManager;
+  */
+ public class StreamStateMachine {
+ 
++    private static final Log log = LogFactory.getLog(StreamStateMachine.class);
+     private static final StringManager sm = StringManager.getManager(StreamStateMachine.class);
+ 
+     private final Stream stream;
+-    private State state = State.IDLE;
++    private State state;
+ 
+ 
+     public StreamStateMachine(Stream stream) {
+         this.stream = stream;
++        stateChange(null, State.IDLE);
+     }
+ 
+ 
+     public synchronized void sendPushPromise() {
+-        if (state == State.IDLE) {
+-            state = State.RESERVED_LOCAL;
+-        } else {
+-            // TODO: ProtocolExcpetion? i18n
+-            throw new IllegalStateException();
+-        }
++        stateChange(State.IDLE, State.RESERVED_LOCAL);
+     }
+ 
+ 
+     public synchronized void receivePushPromis() {
+-        if (state == State.IDLE) {
+-            state = State.RESERVED_REMOTE;
+-        } else {
+-            // TODO: ProtocolExcpetion? i18n
+-            throw new IllegalStateException();
+-        }
++        stateChange(State.IDLE, State.RESERVED_REMOTE);
+     }
+ 
+ 
+     public synchronized void sendHeaders() {
+-        if (state == State.IDLE) {
+-            state = State.OPEN;
+-        } else if (state == State.RESERVED_LOCAL) {
+-            state = State.HALF_CLOSED_REMOTE;
+-        } else {
+-            // TODO: ProtocolExcpetion? i18n
+-            throw new IllegalStateException();
+-        }
++        stateChange(State.IDLE, State.OPEN);
++        stateChange(State.RESERVED_LOCAL, State.HALF_CLOSED_REMOTE);
+     }
+ 
+ 
+     public synchronized void receiveHeaders() {
+-        if (state == State.IDLE) {
+-            state = State.OPEN;
+-        } else if (state == State.RESERVED_REMOTE) {
+-            state = State.HALF_CLOSED_LOCAL;
+-        } else {
+-            // TODO: ProtocolExcpetion? i18n
+-            throw new IllegalStateException();
+-        }
++        stateChange(State.IDLE, State.OPEN);
++        stateChange(State.RESERVED_REMOTE, State.HALF_CLOSED_LOCAL);
+     }
+ 
+ 
+     public synchronized void sendEndOfStream() {
+-        if (state == State.OPEN) {
+-            state = State.HALF_CLOSED_LOCAL;
+-        } else if (state == State.HALF_CLOSED_REMOTE) {
+-            state = State.CLOSED;
+-        } else {
+-            // TODO: ProtocolExcpetion? i18n
+-            throw new IllegalStateException();
+-        }
++        stateChange(State.OPEN, State.HALF_CLOSED_LOCAL);
++        stateChange(State.HALF_CLOSED_REMOTE, State.CLOSED_TX);
+     }
+ 
+ 
+     public synchronized void recieveEndOfStream() {
+-        if (state == State.OPEN) {
+-            state = State.HALF_CLOSED_REMOTE;
+-        } else if (state == State.HALF_CLOSED_LOCAL) {
+-            state = State.CLOSED;
+-        } else {
+-            // TODO: ProtocolExcpetion? i18n
+-            throw new IllegalStateException();
+-        }
++        stateChange(State.OPEN, State.HALF_CLOSED_REMOTE);
++        stateChange(State.HALF_CLOSED_LOCAL, State.CLOSED_RX);
+     }
+ 
+ 
+-    public synchronized void sendReset() {
+-        state = State.CLOSED;
++    private void stateChange(State oldState, State newState) {
++        if (state == oldState) {
++            state = newState;
++            if (log.isDebugEnabled()) {
++                log.debug(sm.getString("streamStateMachine.debug.change", stream.getConnectionId(),
++                        stream.getIdentifier(), oldState, newState));
++            }
++        }
+     }
+ 
+ 
+-    public synchronized void recieveReset() {
+-        state = State.CLOSED_RESET;
++    public synchronized void sendReset() {
++        state = State.CLOSED_TX;
+     }
+ 
+ 
+-    public synchronized void receiveHeader() {
+-        // Doesn't change state (that happens at the end of the headers when
+-        // receiveHeaders() is called. This just checks that the stream is in a
+-        // valid state to receive headers.
+-        if (state == State.CLOSED_RESET) {
+-            // Allow this. Client may not know that stream has been reset.
+-        } else if (state == State.IDLE || state == State.RESERVED_REMOTE) {
+-            // Allow these. This is normal operation.
+-        } else {
+-            // TODO: ProtocolExcpetion? i18n
+-            throw new IllegalStateException();
+-        }
++    public synchronized void receiveReset() {
++        state = State.CLOSED_RST;
+     }
+ 
+ 
+@@ -141,9 +107,15 @@ public class StreamStateMachine {
+         // No state change. Checks that the frame type is valid for the current
+         // state of this stream.
+         if (!isFrameTypePermitted(frameType)) {
++            int errorStream;
++            if (state.connectionErrorForInvalidFrame) {
++                errorStream = 0;
++            } else {
++                errorStream = stream.getIdentifier().intValue();
++            }
+             throw new Http2Exception(sm.getString("streamStateMachine.invalidFrame",
+                     stream.getConnectionId(), stream.getIdentifier(), state, frameType),
+-                    0, state.errorCodeForInvalidFrame);
++                    errorStream, state.errorCodeForInvalidFrame);
+         }
+     }
+ 
+@@ -154,27 +126,31 @@ public class StreamStateMachine {
+ 
+ 
+     private enum State {
+-        IDLE               (ErrorCode.PROTOCOL_ERROR, FrameType.HEADERS, FrameType.PRIORITY),
+-        OPEN               (ErrorCode.PROTOCOL_ERROR, FrameType.DATA, FrameType.HEADERS,
++        IDLE               (true,  ErrorCode.PROTOCOL_ERROR, FrameType.HEADERS, FrameType.PRIORITY),
++        OPEN               (true,  ErrorCode.PROTOCOL_ERROR, FrameType.DATA, FrameType.HEADERS,
+                                     FrameType.PRIORITY, FrameType.RST, FrameType.PUSH_PROMISE,
+                                     FrameType.WINDOW_UPDATE),
+-        RESERVED_LOCAL     (ErrorCode.PROTOCOL_ERROR, FrameType.PRIORITY, FrameType.RST,
++        RESERVED_LOCAL     (true,  ErrorCode.PROTOCOL_ERROR, FrameType.PRIORITY, FrameType.RST,
+                                     FrameType.WINDOW_UPDATE),
+-        RESERVED_REMOTE    (ErrorCode.PROTOCOL_ERROR, FrameType.HEADERS, FrameType.PRIORITY,
++        RESERVED_REMOTE    (true,  ErrorCode.PROTOCOL_ERROR, FrameType.HEADERS, FrameType.PRIORITY,
+                                     FrameType.RST),
+-        HALF_CLOSED_LOCAL  (ErrorCode.PROTOCOL_ERROR, FrameType.DATA, FrameType.HEADERS,
++        HALF_CLOSED_LOCAL  (true,  ErrorCode.PROTOCOL_ERROR, FrameType.DATA, FrameType.HEADERS,
+                                     FrameType.PRIORITY, FrameType.RST, FrameType.PUSH_PROMISE,
+                                     FrameType.WINDOW_UPDATE),
+-        HALF_CLOSED_REMOTE (ErrorCode.STREAM_CLOSED, FrameType.PRIORITY, FrameType.RST,
+-                                    FrameType.WINDOW_UPDATE),
+-        CLOSED             (ErrorCode.PROTOCOL_ERROR, FrameType.PRIORITY, FrameType.RST,
++        HALF_CLOSED_REMOTE (true,  ErrorCode.STREAM_CLOSED, FrameType.PRIORITY, FrameType.RST,
+                                     FrameType.WINDOW_UPDATE),
+-        CLOSED_RESET       (ErrorCode.PROTOCOL_ERROR, FrameType.PRIORITY);
++        CLOSED_RX          (true,  ErrorCode.STREAM_CLOSED, FrameType.PRIORITY),
++        CLOSED_RST         (false, ErrorCode.STREAM_CLOSED, FrameType.PRIORITY),
++        CLOSED_TX          (true,  ErrorCode.STREAM_CLOSED, FrameType.PRIORITY, FrameType.RST,
++                                    FrameType.WINDOW_UPDATE);
+ 
++        private final boolean connectionErrorForInvalidFrame;
+         private final ErrorCode errorCodeForInvalidFrame;
+         private final Set<FrameType> frameTypesPermitted = new HashSet<>();
+ 
+-        private State(ErrorCode errorCode, FrameType... frameTypes) {
++        private State(boolean connectionErrorForInvalidFrame, ErrorCode errorCode,
++                FrameType... frameTypes) {
++            this.connectionErrorForInvalidFrame = connectionErrorForInvalidFrame;
+             this.errorCodeForInvalidFrame = errorCode;
+             for (FrameType frameType : frameTypes) {
+                 frameTypesPermitted.add(frameType);
+
+==================================================
+TestHttp2Section_5_1.java
+index cb07e2e80c..ab4800f5f4 100644
+--- a/test/org/apache/coyote/http2/Http2TestBase.java
++++ b/test/org/apache/coyote/http2/Http2TestBase.java
+@@ -236,7 +236,7 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+ 
+         input = new TestInput(is);
+         output = new TestOutput();
+-        parser = new Http2Parser("0", input, output);
++        parser = new Http2Parser("-1", input, output);
+     }
+ 
+ 
+@@ -442,7 +442,7 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+ 
+ 
+         @Override
+-        public void endOfStream(int streamId) {
++        public void receiveEndOfStream(int streamId) {
+             lastStreamId = Integer.toString(streamId);
+             trace.append(lastStreamId + "-EndOfStream\n");
+         }
+
+==================================================

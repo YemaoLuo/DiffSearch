@@ -1,0 +1,262 @@
+e1c4251bc225c4c42723671a8b3e56aab9bdc818
+==================================================
+Partial fix for BZ 50019
+==================================================
+Mark Thomas
+==================================================
+Thu May 10 12:46:44 2018 +0000
+==================================================
+NamingContextListener.java
+index e86acf3432..c5b55b1b3b 100644
+--- a/java/org/apache/catalina/core/LocalStrings.properties
++++ b/java/org/apache/catalina/core/LocalStrings.properties
+@@ -105,6 +105,9 @@ jreLeakListener.xmlParseFail=Error whilst attempting to prevent memory leaks dur
+ jreLeakListener.authPolicyFail=Error whilst attempting to prevent memory leak in javax.security.auth.Policy class
+ jreLeakListener.ldapPoolManagerFail=Failed to trigger creation of the com.sun.jndi.ldap.LdapPoolManager class during Tomcat start to prevent possible memory leaks. This is expected on non-Sun JVMs.
+ jreLeakListener.classToInitializeFail=Failed to load class [{0}] during Tomcat start to prevent possible memory leaks.
++
++naming.addEnvEntry=Adding environment entry [{0}]
++naming.addResourceEnvRef=Adding resource env ref [{0}]
+ naming.wsdlFailed=Failed to find wsdl file: [{0}]
+ naming.bindFailed=Failed to bind object: [{0}]
+ naming.jmxRegistrationFailed=Failed to register in JMX: [{0}]
+
+==================================================
+NamingResourcesImpl.java
+index ddcdf76c3d..5c178b7262 100644
+--- a/java/org/apache/catalina/deploy/LocalStrings.properties
++++ b/java/org/apache/catalina/deploy/LocalStrings.properties
+@@ -18,6 +18,7 @@ namingResources.cleanupCloseSecurity=Unable to retrieve method [{0}] for resourc
+ namingResources.cleanupNoClose=Resource [{0}] in container [{1}] does not have a [{2}] method so no cleanup was performed for that resource
+ namingResources.cleanupNoContext=Failed to retrieve JNDI naming context for container [{0}] so no cleanup was performed for that container
+ namingResources.cleanupNoResource=Failed to retrieve JNDI resource [{0}] for container [{1}] so no cleanup was performed for that resource
++namingResources.envEntryLookupValue=The environment entry [{0}] specifies both a lookup-name and a value
+ namingResources.mbeanCreateFail=Failed to create MBean for naming resource [{0}]
+ namingResources.mbeanDestroyFail=Failed to destroy MBean for naming resource [{0}]
+ namingResources.resourceTypeFail=The JNDI resource named [{0}] is of type [{1}] but the type is inconsistent with the type(s) of the injection target(s) configured for that resource
+
+==================================================
+TestEnvEntry.java
+index 41a372ab15..b7f0769548 100644
+--- a/java/org/apache/catalina/deploy/NamingResourcesImpl.java
++++ b/java/org/apache/catalina/deploy/NamingResourcesImpl.java
+@@ -24,6 +24,7 @@ import java.lang.reflect.InvocationTargetException;
+ import java.lang.reflect.Method;
+ import java.util.HashMap;
+ import java.util.HashSet;
++import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+ 
+@@ -262,12 +263,22 @@ public class NamingResourcesImpl extends LifecycleMBeanBase
+             }
+         }
+ 
++        List<InjectionTarget> injectionTargets = environment.getInjectionTargets();
++        String value = environment.getValue();
++        String lookupName = environment.getLookupName();
++
+         // Entries with injection targets but no value are effectively ignored
+-        if (environment.getInjectionTargets() != null && environment.getInjectionTargets().size() > 0 &&
+-                (environment.getValue() == null || environment.getValue().length() == 0)) {
++        if (injectionTargets != null && injectionTargets.size() > 0 &&
++                (value == null || value.length() == 0)) {
+             return;
+         }
+ 
++        // Entries with lookup-name and value are an error (EE.5.4.1.3)
++        if (value != null && value.length() > 0 && lookupName != null && lookupName.length() > 0) {
++            throw new IllegalArgumentException(
++                    sm.getString("namingResources.envEntryLookupValue", environment.getName()));
++        }
++
+         if (!checkResourceType(environment)) {
+             throw new IllegalArgumentException(sm.getString(
+                     "namingResources.resourceTypeFail", environment.getName(),
+
+==================================================
+TesterEnvEntry.java
+new file mode 100644
+index 0000000000..6eebd1fba6
+--- /dev/null
++++ b/test/org/apache/naming/TestEnvEntry.java
+@@ -0,0 +1,136 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.naming;
++
++import java.io.File;
++
++import javax.servlet.http.HttpServletResponse;
++
++import org.junit.Assert;
++import org.junit.Test;
++
++import org.apache.catalina.Context;
++import org.apache.catalina.startup.Tomcat;
++import org.apache.catalina.startup.TomcatBaseTest;
++import org.apache.tomcat.util.buf.ByteChunk;
++
++public class TestEnvEntry extends TomcatBaseTest {
++
++    @Test
++    public void testEnvEntryBasic() throws Exception {
++        doTestJndiLookup("env-entry/basic", "basic-value");
++    }
++
++
++    @Test
++    public void testEnvEntryValid() throws Exception {
++        doTestJndiLookup("env-entry/valid", "valid");
++    }
++
++
++    @Test
++    public void testEnvEntryInvalid() throws Exception {
++        doTestJndiLookup("env-entry/invalid", "Not Found");
++    }
++
++
++    @Test
++    public void testEnvEntryInjectField() throws Exception {
++        doTestJndiInjection("property1", "inject-value-1");
++    }
++
++
++    @Test
++    public void testEnvEntryInjectProperty() throws Exception {
++        doTestJndiInjection("property2", "inject-value-2");
++    }
++
++
++    @Test
++    public void testEnvEntryInjectFieldNoType() throws Exception {
++        doTestJndiInjection("property3", "inject-value-3");
++    }
++
++
++    @Test
++    public void testEnvEntryInjectionNoValue() throws Exception {
++        doTestJndiLookup("env-entry/injectNoValue", "Not Found");
++    }
++
++
++    @Test
++    public void testEnvEntryLookup() throws Exception {
++        doTestJndiLookup("env-entry/lookup", "basic-value");
++    }
++
++
++    @Test
++    public void testEnvEntryLookupCircular() throws Exception {
++        doTestJndiLookup("env-entry/circular1", "Naming Error");
++    }
++
++
++    @Test
++    public void testEnvEntryLookupInvalid() throws Exception {
++        doTestJndiLookup("env-entry/lookup-invalid", "Naming Error");
++    }
++
++
++    private void doTestJndiLookup(String jndiName, String expected) throws Exception {
++        Tomcat tomcat = getTomcatInstance();
++
++        File appDir = new File("test/webapp-fragments");
++        tomcat.addWebapp(null, "/test", appDir.getAbsolutePath());
++
++        tomcat.enableNaming();
++        tomcat.start();
++
++        ByteChunk out = new ByteChunk();
++
++        int rc = getUrl("http://localhost:" + getPort() + "/test/jndi.jsp?jndiName=" +
++                jndiName, out, null);
++        Assert.assertEquals(HttpServletResponse.SC_OK, rc);
++
++        // JSP has leading and trailing white-space
++        String result = out.toString().trim();
++        Assert.assertEquals(expected, result);
++    }
++
++
++    private void doTestJndiInjection(String injectionName, String expected) throws Exception {
++        Tomcat tomcat = getTomcatInstance();
++
++        File appDir = new File("test/webapp-fragments");
++        Context context = tomcat.addWebapp(null, "/test", appDir.getAbsolutePath());
++
++        Tomcat.addServlet(context, "InjectionServlet", "org.apache.naming.TesterInjectionServlet");
++        context.addServletMappingDecoded("/injection", "InjectionServlet");
++
++        tomcat.enableNaming();
++        tomcat.start();
++
++        ByteChunk out = new ByteChunk();
++
++        int rc = getUrl("http://localhost:" + getPort() + "/test/injection?injectionName=" +
++                injectionName, out, null);
++        Assert.assertEquals(HttpServletResponse.SC_OK, rc);
++
++        // JSP has leading and trailing white-space
++        String result = out.toString().trim();
++        Assert.assertEquals(expected, result);
++    }
++}
+
+==================================================
+TesterInjectionServlet.java
+new file mode 100644
+index 0000000000..62c589d8a3
+--- /dev/null
++++ b/test/org/apache/naming/TesterEnvEntry.java
+@@ -0,0 +1,33 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.naming;
++
++public class TesterEnvEntry {
++
++    private static final String VALID = "valid";
++
++    public TesterEnvEntry(String value) {
++        if (!VALID.equals(value)) {
++            throw new IllegalArgumentException();
++        }
++    }
++
++    @Override
++    public String toString() {
++        return VALID;
++    }
++}
+
+==================================================

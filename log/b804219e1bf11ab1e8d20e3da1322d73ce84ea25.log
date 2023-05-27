@@ -1,0 +1,1863 @@
+b804219e1bf11ab1e8d20e3da1322d73ce84ea25
+==================================================
+Refactor so client and server can share common code for WsFrame and WsRemoteEndpoint.
+==================================================
+Mark Emlyn
+==================================================
+Tue Jan 22 22:57:04 2013 +0000
+==================================================
+WsFrameBase.java
+index 1ce1dfb0cb..ef812e4f5e 100644
+--- a/java/org/apache/tomcat/websocket/LocalStrings.properties
++++ b/java/org/apache/tomcat/websocket/LocalStrings.properties
+@@ -13,6 +13,9 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++messageSendStateMachine.closed=Message will not be sent because the WebSocket session has been closed
++messageSendStateMachine.inProgress=Message will not be sent because the WebSocket session is currently sending another message
++
+ # Note the wsFrame.* messages are used as close reasons in WebSocket control
+ # frames and therefore must be 123 bytes (not characters) or less in length.
+ # Messages are encoded using UTF-8 where a single character may be encoded in
+@@ -28,4 +31,10 @@ wsFrame.noContinuation=A new message was started when a continuation frame was e
+ wsFrame.notMasked=The client frame was not masked but all client frames must be masked
+ wsFrame.oneByteCloseCode=The client sent a close frame with a single byte payload which is not valid
+ wsFrame.textMessageTooBig=The decoded text message was too big for the output buffer and the endpoint does not support partial messages
+-wsFrame.wrongRsv=The client frame set the reserved bits to [{0}] which was not supported by this endpoint
+\ No newline at end of file
++wsFrame.wrongRsv=The client frame set the reserved bits to [{0}] which was not supported by this endpoint
++
++wsRemoteEndpoint.concurrentMessageSend=Messages may not be send concurrently even when using the asynchronous send messages. The client must wait for the previous message to complete before sending the next.
++
++wsWebSocketContainer.invalidStatus=The HTTP response from the server [{0}] did not permit the HTTP upgrade to WebSocket
++wsWebSocketContainer.pathNoHost=No host was specified in URI
++wsWebSocketContainer.pathWrongScheme=The scheme [{0}] is not supported
+\ No newline at end of file
+
+==================================================
+WsFrameClient.java
+index 4860d5849c..ece2cdddc3 100644
+--- a/java/org/apache/tomcat/websocket/WsFrameBase.java
++++ b/java/org/apache/tomcat/websocket/WsFrameBase.java
+@@ -16,7 +16,6 @@
+  */
+ package org.apache.tomcat.websocket;
+ 
+-import java.io.EOFException;
+ import java.io.IOException;
+ import java.nio.ByteBuffer;
+ import java.nio.CharBuffer;
+@@ -42,9 +41,8 @@ public abstract class WsFrameBase {
+             StringManager.getManager(Constants.PACKAGE_NAME);
+ 
+     // Connection level attributes
+-    private final Object connectionReadLock = new Object();
+     private final WsSession wsSession;
+-    private final byte[] inputBuffer;
++    protected final byte[] inputBuffer;
+ 
+     // Attributes for control messages
+     // Control messages can appear in the middle of other messages so need
+@@ -76,7 +74,7 @@ public abstract class WsFrameBase {
+     // Attributes tracking state
+     private State state = State.NEW_FRAME;
+     private int readPos = 0;
+-    private int writePos = 0;
++    protected int writePos = 0;
+ 
+     public WsFrameBase(WsSession wsSession) {
+         this.wsSession = wsSession;
+@@ -95,64 +93,27 @@ public abstract class WsFrameBase {
+     }
+ 
+ 
+-    /**
+-     * Called when there is data in the ServletInputStream to process.
+-     */
+-    public void onDataAvailable() throws IOException {
+-        synchronized (connectionReadLock) {
+-            while (isDataAvailable()) {
+-                // Fill up the input buffer with as much data as we can
+-                int read = fillInputBuffer(inputBuffer, writePos);
+-                if (read == 0) {
+-                    return;
++    protected void processInputBuffer() throws IOException {
++        while (true) {
++            if (state == State.NEW_FRAME) {
++                if (!processInitialHeader()) {
++                    break;
+                 }
+-                if (read == -1) {
+-                    throw new EOFException();
++            }
++            if (state == State.PARTIAL_HEADER) {
++                if (!processRemainingHeader()) {
++                    break;
+                 }
+-                writePos += read;
+-                while (true) {
+-                    if (state == State.NEW_FRAME) {
+-                        if (!processInitialHeader()) {
+-                            break;
+-                        }
+-                    }
+-                    if (state == State.PARTIAL_HEADER) {
+-                        if (!processRemainingHeader()) {
+-                            break;
+-                        }
+-                    }
+-                    if (state == State.DATA) {
+-                        if (!processData()) {
+-                            break;
+-                        }
+-                    }
++            }
++            if (state == State.DATA) {
++                if (!processData()) {
++                    break;
+                 }
+             }
+         }
+     }
+ 
+ 
+-    /**
+-     * Allows sub-classes to control whether the read loop in
+-     * {@link #onDataAvailable()} should continue or terminate.
+-     *
+-     * @return  <code>true</code> if the data source is ready to be read
+-     */
+-    protected abstract boolean isDataAvailable();
+-
+-
+-    /**
+-     * Fill as much of the input buffer as possible (i.e. to the end of the
+-     * supplied buffer).
+-     *
+-     * @param inputBuffer   The input buffer
+-     * @param start         The start point
+-     * @return  The number of bytes (possibly zero) added to the buffer
+-     */
+-    protected abstract int fillInputBuffer(byte[] inputBuffer, int start)
+-            throws IOException;
+-
+-
+     /**
+      * @return <code>true</code> if sufficient data was present to process all
+      *         of the initial header
+@@ -172,7 +133,7 @@ public abstract class WsFrameBase {
+                     sm.getString("wsFrame.wrongRsv", Integer.valueOf(rsv))));
+         }
+         opCode = (byte) (b & 0x0F);
+-        if (isControl()) {
++        if (Util.isControl(opCode)) {
+             if (!fin) {
+                 throw new WsIOException(new CloseReason(
+                         CloseCodes.PROTOCOL_ERROR,
+@@ -209,7 +170,7 @@ public abstract class WsFrameBase {
+         }
+         b = inputBuffer[readPos++];
+         // Client data must be masked
+-        if ((b & 0x80) == 0) {
++        if ((b & 0x80) == 0 && isMasked()) {
+             throw new WsIOException(new CloseReason(
+                     CloseCodes.PROTOCOL_ERROR,
+                     sm.getString("wsFrame.notMasked")));
+@@ -220,6 +181,9 @@ public abstract class WsFrameBase {
+     }
+ 
+ 
++    protected abstract boolean isMasked();
++
++
+     /**
+      * @return <code>true</code> if sufficient data was present to complete the
+      *         processing of the header
+@@ -244,7 +208,7 @@ public abstract class WsFrameBase {
+             payloadLength = byteArrayToLong(inputBuffer, readPos, 8);
+             readPos += 8;
+         }
+-        if (isControl()) {
++        if (Util.isControl(opCode)) {
+             if (payloadLength > 125) {
+                 throw new WsIOException(new CloseReason(
+                         CloseCodes.PROTOCOL_ERROR,
+@@ -257,8 +221,10 @@ public abstract class WsFrameBase {
+                         sm.getString("wsFrame.controlNoFin")));
+             }
+         }
+-        System.arraycopy(inputBuffer, readPos, mask, 0, 4);
+-        readPos += 4;
++        if (isMasked()) {
++            System.arraycopy(inputBuffer, readPos, mask, 0, 4);
++            readPos += 4;
++        }
+         state = State.DATA;
+         return true;
+     }
+@@ -266,7 +232,7 @@ public abstract class WsFrameBase {
+ 
+     private boolean processData() throws IOException {
+         checkRoomPayload();
+-        if (isControl()) {
++        if (Util.isControl(opCode)) {
+             return processDataControl();
+         } else if (textMessage) {
+             return processDataText();
+@@ -312,7 +278,9 @@ public abstract class WsFrameBase {
+             wsSession.onClose(
+                     new CloseReason(Util.getCloseCode(code), reason));
+         } else if (opCode == Constants.OPCODE_PING) {
+-            wsSession.getRemote().sendPong(controlBufferBinary);
++            if (wsSession.isOpen()) {
++                wsSession.getRemote().sendPong(controlBufferBinary);
++            }
+         } else if (opCode == Constants.OPCODE_PONG) {
+             MessageHandler.Basic<PongMessage> mhPong =
+                     wsSession.getPongMessageHandler();
+@@ -520,7 +488,7 @@ public abstract class WsFrameBase {
+ 
+     private void checkRoomPayload() throws IOException {
+         if (inputBuffer.length - readPos - payloadLength + payloadWritten < 0) {
+-            if (isControl()) {
++            if (Util.isControl(opCode)) {
+                 makeRoom();
+                 return;
+             }
+@@ -547,7 +515,7 @@ public abstract class WsFrameBase {
+ 
+ 
+     private boolean usePartial() {
+-        if (isControl()) {
++        if (Util.isControl(opCode)) {
+             return false;
+         } else if (textMessage) {
+             MessageHandler mh = wsSession.getTextMessageHandler();
+@@ -567,18 +535,30 @@ public abstract class WsFrameBase {
+ 
+ 
+     private boolean appendPayloadToMessage(ByteBuffer dest) {
+-        while (payloadWritten < payloadLength && readPos < writePos &&
+-                dest.hasRemaining()) {
+-            byte b = (byte) ((inputBuffer[readPos] ^ mask[maskIndex]) & 0xFF);
+-            maskIndex++;
+-            if (maskIndex == 4) {
+-                maskIndex = 0;
++        if (isMasked()) {
++            while (payloadWritten < payloadLength && readPos < writePos &&
++                    dest.hasRemaining()) {
++                byte b = (byte) ((inputBuffer[readPos] ^ mask[maskIndex]) & 0xFF);
++                maskIndex++;
++                if (maskIndex == 4) {
++                    maskIndex = 0;
++                }
++                readPos++;
++                payloadWritten++;
++                dest.put(b);
+             }
+-            readPos++;
+-            payloadWritten++;
+-            dest.put(b);
++            return (payloadWritten == payloadLength);
++        } else {
++            long toWrite = Math.min(
++                    payloadLength - payloadWritten, writePos - readPos);
++            toWrite = Math.min(toWrite, dest.remaining());
++
++            dest.put(inputBuffer, readPos, (int) toWrite);
++            readPos += toWrite;
++            payloadWritten += toWrite;
++            return (payloadWritten == payloadLength);
++
+         }
+-        return (payloadWritten == payloadLength);
+     }
+ 
+ 
+@@ -598,11 +578,6 @@ public abstract class WsFrameBase {
+     }
+ 
+ 
+-    private boolean isControl() {
+-        return (opCode & 0x08) > 0;
+-    }
+-
+-
+     private static enum State {
+         NEW_FRAME, PARTIAL_HEADER, DATA
+     }
+
+==================================================
+WsRemoteEndpointBase.java
+new file mode 100644
+index 0000000000..faca0f80be
+--- /dev/null
++++ b/java/org/apache/tomcat/websocket/WsFrameClient.java
+@@ -0,0 +1,89 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.tomcat.websocket;
++
++import java.io.IOException;
++import java.nio.ByteBuffer;
++import java.nio.channels.AsynchronousSocketChannel;
++import java.nio.channels.CompletionHandler;
++
++public class WsFrameClient extends WsFrameBase {
++
++    private ByteBuffer response;
++    private AsynchronousSocketChannel channel;
++    private final CompletionHandler<Integer,Void> handler;
++
++    public WsFrameClient(ByteBuffer response, AsynchronousSocketChannel channel,
++            WsSession wsSession) throws IOException {
++        super(wsSession);
++        this.response = response;
++        this.channel = channel;
++        this.handler = new WsFrameClientCompletionHandler();
++
++        tbd();
++    }
++
++
++    private void tbd() throws IOException {
++
++        while (response.hasRemaining()) {
++            int remaining = response.remaining();
++
++            int toCopy = Math.min(remaining, inputBuffer.length - writePos);
++
++            // Copy remaining bytes read in HTTP phase to input buffer used by
++            // frame processing
++            response.get(inputBuffer, writePos, toCopy);
++            writePos += toCopy;
++
++            // Process the data we have
++            processInputBuffer();
++        }
++        response.clear();
++
++        // Get some more data
++        channel.read(response, null, handler);
++    }
++
++
++    @Override
++    protected boolean isMasked() {
++        // Data is from the server so it is not masked
++        return false;
++    }
++
++
++    private class WsFrameClientCompletionHandler
++            implements CompletionHandler<Integer,Void> {
++
++        @Override
++        public void completed(Integer result, Void attachment) {
++            response.flip();
++            try {
++                tbd();
++            } catch (IOException e) {
++                // TODO Auto-generated catch block
++                e.printStackTrace();
++            }
++        }
++
++        @Override
++        public void failed(Throwable exc, Void attachment) {
++            // TODO Auto-generated method stub
++        }
++    }
++}
+
+==================================================
+WsRemoteEndpointClient.java
+index b80903566b..21ce784343 100644
+--- a/java/org/apache/tomcat/websocket/WsRemoteEndpointBase.java
++++ b/java/org/apache/tomcat/websocket/WsRemoteEndpointBase.java
+@@ -21,183 +21,199 @@ import java.io.OutputStream;
+ import java.io.Writer;
+ import java.nio.ByteBuffer;
+ import java.nio.CharBuffer;
++import java.nio.channels.CompletionHandler;
+ import java.nio.charset.Charset;
+ import java.nio.charset.CharsetEncoder;
+ import java.nio.charset.CoderResult;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.Future;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.TimeoutException;
++import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ import javax.websocket.EncodeException;
+ import javax.websocket.RemoteEndpoint;
+ import javax.websocket.SendHandler;
+ import javax.websocket.SendResult;
+ 
++import org.apache.tomcat.util.res.StringManager;
++
+ public abstract class WsRemoteEndpointBase implements RemoteEndpoint {
+ 
+-    // Max length for outgoing WebSocket frame header is 10 bytes
+-    private final ByteBuffer header = ByteBuffer.allocate(10);
++    private static final StringManager sm =
++            StringManager.getManager(Constants.PACKAGE_NAME);
+ 
+-    private final ByteBuffer textToByte = ByteBuffer.allocate(8192);
++    // TODO Make the size of this conversion buffer configurable
++    private final ByteBuffer toBytes = ByteBuffer.allocate(8192);
++    private final AtomicBoolean toBytesInProgress = new AtomicBoolean(false);
+     private final CharsetEncoder encoder = Charset.forName("UTF8").newEncoder();
+-    private volatile Boolean isText = null;
++    private final MessageSendStateMachine state = new MessageSendStateMachine();
++    // Max length for WebSocket frame header is 14 bytes
++    protected final ByteBuffer header = ByteBuffer.allocate(14);
++    protected ByteBuffer payload = null;
+ 
+ 
+     @Override
+-    public void sendString(String text) throws IOException {
+-        if (isText != null) {
+-            // Another message is being sent using fragments
+-            // TODO i18n
+-            throw new IllegalStateException();
+-        }
+-        sendPartialString(text, true);
++    public void setBatchingAllowed(boolean batchingAllowed) {
++        // TODO Auto-generated method stub
++
+     }
+ 
+ 
+     @Override
+-    public void sendBytes(ByteBuffer data) throws IOException {
+-        if (isText != null) {
+-            // Another message is being sent using fragments
+-            // TODO i18n
+-            throw new IllegalStateException();
+-        }
+-        sendPartialBytes(data, true);
++    public boolean getBatchingAllowed() {
++        // TODO Auto-generated method stub
++        return false;
+     }
+ 
+ 
+     @Override
+-    public void sendPartialString(String fragment, boolean isLast)
+-            throws IOException {
+-
+-        if (isText != null && !isText.booleanValue()) {
+-            // Can't write a text fragment in the middle of a binary message
+-            // TODO i18n
+-            throw new IllegalStateException();
+-        }
++    public void flushBatch() {
++        // TODO Auto-generated method stub
+ 
+-        boolean first = (isText == null);
+-        encoder.reset();
+-        textToByte.clear();
+-        CharBuffer cb = CharBuffer.wrap(fragment);
+-        CoderResult cr = encoder.encode(cb, textToByte, true);
+-        textToByte.flip();
+-        while (cr.isOverflow()) {
+-            sendMessage(Constants.OPCODE_TEXT, textToByte, first, false);
+-            textToByte.clear();
+-            cr = encoder.encode(cb, textToByte, true);
+-            textToByte.flip();
+-            first = false;
+-        }
+-        sendMessage(Constants.OPCODE_TEXT, textToByte, first, isLast);
+-        if (isLast) {
+-            isText = null;
+-        } else {
+-            isText = Boolean.TRUE;
+-        }
+     }
+ 
+ 
+     @Override
+-    public void sendPartialBytes(ByteBuffer partialByte, boolean isLast)
+-            throws IOException {
+-
+-        if (isText != null && isText.booleanValue()) {
+-            // Can't write a binary fragment in the middle of a text message
+-            // TODO i18n
+-            throw new IllegalStateException();
+-        }
+-
+-        boolean first = (isText == null);
+-        sendMessage(Constants.OPCODE_BINARY, partialByte, first, isLast);
+-        if (isLast) {
+-            isText = null;
+-        } else {
+-            isText = Boolean.FALSE;
+-        }
++    public long getAsyncSendTimeout() {
++        // TODO Auto-generated method stub
++        return 0;
+     }
+ 
+ 
+     @Override
+-    public OutputStream getSendStream() throws IOException {
++    public void setAsyncSendTimeout(long timeout) {
+         // TODO Auto-generated method stub
+-        return null;
++
+     }
+ 
+ 
+     @Override
+-    public Writer getSendWriter() throws IOException {
+-        // TODO Auto-generated method stub
+-        return null;
++    public final void sendString(String text) throws IOException {
++        sendPartialString(text, true);
+     }
+ 
+ 
+     @Override
+-    public void sendObject(Object o) throws IOException, EncodeException {
+-        // TODO Auto-generated method stub
++    public final void sendBytes(ByteBuffer data) throws IOException {
++        sendPartialBytes(data, true);
+     }
+ 
+ 
+     @Override
+-    public void sendStringByCompletion(String text, SendHandler completion) {
+-        // TODO Auto-generated method stub
++    public void sendPartialString(String fragment, boolean isLast)
++            throws IOException {
++
++        // The toBytes buffer needs to be protected from multiple threads and
++        // the state check happens to late.
++        if (!toBytesInProgress.compareAndSet(false, true)) {
++            throw new IllegalStateException(sm.getString(
++                    "wsRemoteEndpoint.concurrentMessageSend"));
++        }
++
++        try {
++            encoder.reset();
++            toBytes.clear();
++            CharBuffer cb = CharBuffer.wrap(fragment);
++            CoderResult cr = encoder.encode(cb, toBytes, true);
++            toBytes.flip();
++            while (cr.isOverflow()) {
++                sendMessageBlocking(Constants.OPCODE_TEXT, toBytes, false);
++                toBytes.clear();
++                cr = encoder.encode(cb, toBytes, true);
++                toBytes.flip();
++            }
++            sendMessageBlocking(Constants.OPCODE_TEXT, toBytes, isLast);
++        } finally {
++            // Make sure flag is reset before method exists
++            toBytesInProgress.set(false);
++        }
+     }
+ 
+ 
+     @Override
+-    public Future<SendResult> sendStringByFuture(String text) {
+-        // TODO Auto-generated method stub
+-        return null;
++    public void sendPartialBytes(ByteBuffer partialByte, boolean isLast)
++            throws IOException {
++        sendMessageBlocking(Constants.OPCODE_BINARY, partialByte, isLast);
+     }
+ 
+ 
+     @Override
+-    public Future<SendResult> sendBytesByFuture(ByteBuffer data) {
+-        // TODO Auto-generated method stub
+-        return null;
++    public void sendPing(ByteBuffer applicationData) throws IOException {
++        sendMessageBlocking(Constants.OPCODE_PING, applicationData, true);
+     }
+ 
+ 
+     @Override
+-    public void sendBytesByCompletion(ByteBuffer data, SendHandler completion) {
+-        // TODO Auto-generated method stub
++    public void sendPong(ByteBuffer applicationData) throws IOException {
++        sendMessageBlocking(Constants.OPCODE_PONG, applicationData, true);
+     }
+ 
+ 
+     @Override
+-    public Future<SendResult> sendObjectByFuture(Object obj) {
+-        // TODO Auto-generated method stub
+-        return null;
++    public Future<SendResult> sendBytesByFuture(ByteBuffer data) {
++        this.payload = data;
++        return sendMessageByFuture(Constants.OPCODE_BINARY, true);
+     }
+ 
+ 
+     @Override
+-    public void sendObjectByCompletion(Object obj, SendHandler completion) {
+-        // TODO Auto-generated method stub
++    public void sendBytesByCompletion(ByteBuffer data, SendHandler completion) {
++        this.payload = data;
++        sendMessageByCompletion(Constants.OPCODE_BINARY, true,
++                new WsCompletionHandler(this, completion, state, false));
+     }
+ 
+ 
+-    @Override
+-    public void sendPing(ByteBuffer applicationData) {
+-        sendMessage(Constants.OPCODE_PING, applicationData, true, true);
++
++
++
++
++
++    protected void sendMessageBlocking(byte opCode, ByteBuffer payload,
++            boolean isLast) throws IOException {
++
++        this.payload = payload;
++
++        Future<SendResult> f = sendMessageByFuture(opCode, isLast);
++        SendResult sr = null;
++        try {
++            sr = f.get();
++        } catch (InterruptedException | ExecutionException e) {
++            throw new IOException(e);
++        }
++
++        if (!sr.isOK()) {
++            throw new IOException(sr.getException());
++        }
+     }
+ 
+ 
+-    @Override
+-    public void sendPong(ByteBuffer applicationData) {
+-        sendMessage(Constants.OPCODE_PONG, applicationData, true, true);
++    private Future<SendResult> sendMessageByFuture(byte opCode,
++            boolean isLast) {
++
++        WsCompletionHandler wsCompletionHandler = new WsCompletionHandler(
++                this, state, opCode == Constants.OPCODE_CLOSE);
++        sendMessageByCompletion(opCode, isLast, wsCompletionHandler);
++        return wsCompletionHandler;
+     }
+ 
+ 
+-    protected void sendMessage(byte opCode, ByteBuffer message,
+-            boolean isFirstFragment, boolean isLastFragment) {
+-        // Clear header, ready for new message
++    private void sendMessageByCompletion(byte opCode, boolean isLast,
++            WsCompletionHandler handler) {
++
++        boolean isFirst = state.startMessage(opCode, isLast);
++
+         header.clear();
+         byte first = 0;
+ 
+-        if (isLastFragment) {
++        if (isLast) {
+             // Set the fin bit
+             first = -128;
+         }
+ 
+-        if (isFirstFragment) {
++        if (isFirst) {
+             // This is the first fragment of this message
+             first = (byte) (first + opCode);
+         }
+@@ -205,66 +221,264 @@ public abstract class WsRemoteEndpointBase implements RemoteEndpoint {
+ 
+         header.put(first);
+ 
+-        // Next write the length
+-        if (message.limit() < 126) {
+-            header.put((byte) message.limit());
+-        } else if (message.limit() < 65536) {
+-            header.put((byte) 126);
+-            header.put((byte) (message.limit() >>> 8));
+-            header.put((byte) (message.limit() & 0xFF));
++        byte masked = getMasked();
++
++        // Next write the mask && length length
++        if (payload.limit() < 126) {
++            header.put((byte) (payload.limit() | masked));
++        } else if (payload.limit() < 65536) {
++            header.put((byte) (126 | masked));
++            header.put((byte) (payload.limit() >>> 8));
++            header.put((byte) (payload.limit() & 0xFF));
+         } else {
+             // Will never be more than 2^31-1
+-            header.put((byte) 127);
++            header.put((byte) (127 | masked));
++            header.put((byte) 0);
++            header.put((byte) 0);
++            header.put((byte) 0);
++            header.put((byte) 0);
++            header.put((byte) (payload.limit() >>> 24));
++            header.put((byte) (payload.limit() >>> 16));
++            header.put((byte) (payload.limit() >>> 8));
++            header.put((byte) (payload.limit() & 0xFF));
++        }
++        if (masked != 0) {
++            // TODO Mask the data properly
+             header.put((byte) 0);
+             header.put((byte) 0);
+             header.put((byte) 0);
+             header.put((byte) 0);
+-            header.put((byte) (message.limit() >>> 24));
+-            header.put((byte) (message.limit() >>> 16));
+-            header.put((byte) (message.limit() >>> 8));
+-            header.put((byte) (message.limit() & 0xFF));
+         }
+         header.flip();
+ 
+-
+-        writeMessage(opCode, header, message);
++        sendMessage(handler);
+     }
+ 
+-    protected abstract void writeMessage(int opCode, ByteBuffer header,
+-            ByteBuffer message);
++    protected abstract byte getMasked();
++
++    protected abstract void sendMessage(WsCompletionHandler handler);
++
++    protected abstract void close();
++
++
++
++
++
++
++
+ 
+ 
+     @Override
+-    public void setBatchingAllowed(boolean batchingAllowed) {
++    public OutputStream getSendStream() throws IOException {
+         // TODO Auto-generated method stub
++        return null;
++    }
++
+ 
++    @Override
++    public Writer getSendWriter() throws IOException {
++        // TODO Auto-generated method stub
++        return null;
+     }
+ 
+ 
+     @Override
+-    public boolean getBatchingAllowed() {
++    public Future<SendResult> sendStringByFuture(String text) {
+         // TODO Auto-generated method stub
+-        return false;
++        return null;
+     }
+ 
+ 
+     @Override
+-    public void flushBatch() {
++    public void sendObject(Object o) throws IOException, EncodeException {
+         // TODO Auto-generated method stub
++    }
++
+ 
++    @Override
++    public void sendStringByCompletion(String text, SendHandler completion) {
++        // TODO Auto-generated method stub
+     }
+ 
+ 
+     @Override
+-    public long getAsyncSendTimeout() {
++    public Future<SendResult> sendObjectByFuture(Object obj) {
+         // TODO Auto-generated method stub
+-        return 0;
++        return null;
+     }
+ 
+ 
+     @Override
+-    public void setAsyncSendTimeout(long timeout) {
++    public void sendObjectByCompletion(Object obj, SendHandler completion) {
+         // TODO Auto-generated method stub
++    }
++
++
+ 
++
++
++
++
++
++    protected static class WsCompletionHandler implements Future<SendResult>,
++            CompletionHandler<Long,Void> {
++
++        private final WsRemoteEndpointBase wsRemoteEndpoint;
++        private final MessageSendStateMachine state;
++        private final SendHandler sendHandler;
++        private final boolean close;
++        private final CountDownLatch latch = new CountDownLatch(1);
++
++        private volatile SendResult result = null;
++
++
++        public WsCompletionHandler(WsRemoteEndpointBase wsRemoteEndpoint,
++                MessageSendStateMachine state, boolean close) {
++            this(wsRemoteEndpoint, null, state, close);
++        }
++
++
++        public WsCompletionHandler(WsRemoteEndpointBase wsRemoteEndpoint,
++                SendHandler sendHandler, MessageSendStateMachine state,
++                boolean close) {
++            this.wsRemoteEndpoint = wsRemoteEndpoint;
++            this.sendHandler = sendHandler;
++            this.state = state;
++            this.close = close;
++        }
++
++
++        // ------------------------------------------- CompletionHandler methods
++
++        @Override
++        public void completed(Long result, Void attachment) {
++            state.endMessage();
++            if (close) {
++                wsRemoteEndpoint.close();
++            }
++            this.result = new SendResult();
++            latch.countDown();
++            if (sendHandler != null) {
++                sendHandler.setResult(this.result);
++            }
++        }
++
++
++        @Override
++        public void failed(Throwable exc, Void attachment) {
++            state.endMessage();
++            if (close) {
++                wsRemoteEndpoint.close();
++            }
++            this.result = new SendResult(exc);
++            latch.countDown();
++            if (sendHandler != null) {
++                sendHandler.setResult(this.result);
++            }
++        }
++
++
++        // ------------------------------------------------------ Future methods
++
++        @Override
++        public boolean cancel(boolean mayInterruptIfRunning) {
++            // Cancelling the task is not supported
++            return false;
++        }
++
++
++        @Override
++        public boolean isCancelled() {
++            // Cancelling the task is not supported
++            return false;
++        }
++
++
++        @Override
++        public boolean isDone() {
++            return latch.getCount() == 0;
++        }
++
++
++        @Override
++        public SendResult get() throws InterruptedException, ExecutionException {
++            latch.await();
++            return result;
++        }
++
++
++        @Override
++        public SendResult get(long timeout, TimeUnit unit)
++                throws InterruptedException, ExecutionException,
++                TimeoutException {
++
++            latch.await(timeout, unit);
++            return result;
++        }
++    }
++
++
++    private static class MessageSendStateMachine {
++        private boolean closed = false;
++        private boolean inProgress = false;
++        private boolean fragmented = false;
++        private boolean text = false;
++
++        private boolean nextFragmented = false;
++        private boolean nextText = false;
++
++        public synchronized boolean startMessage(byte opCode, boolean isLast) {
++
++            if (closed) {
++                throw new IllegalStateException(
++                        sm.getString("messageSendStateMachine.closed"));
++            }
++
++            if (inProgress) {
++                throw new IllegalStateException(
++                        sm.getString("messageSendStateMachine.inProgress"));
++            }
++
++            inProgress = true;
++
++            // Control messages may be sent in the middle of fragmented message
++            // so they have no effect on the fragmented or text flags
++            if (Util.isControl(opCode)) {
++                nextFragmented = fragmented;
++                nextText = text;
++                if (opCode == Constants.OPCODE_CLOSE) {
++                    closed = true;
++                }
++                return true;
++            }
++
++            boolean isText = Util.isText(opCode);
++
++            if (fragmented) {
++                // Currently fragmented
++                if (text != isText) {
++                    // TODO i18n
++                    throw new IllegalStateException();
++                }
++                nextText = text;
++                nextFragmented = !isLast;
++                return false;
++            } else {
++                // Wasn't fragmented. Might be now
++                if (isLast) {
++                    nextFragmented = false;
++                } else {
++                    nextFragmented = true;
++                    nextText = isText;
++                }
++                return true;
++            }
++        }
++
++        public synchronized void endMessage() {
++            inProgress = false;
++            fragmented = nextFragmented;
++            text = nextText;
++        }
+     }
+ }
+
+==================================================
+WsSession.java
+index f3777e5bd8..26230475cb 100644
+--- a/java/org/apache/tomcat/websocket/WsRemoteEndpointClient.java
++++ b/java/org/apache/tomcat/websocket/WsRemoteEndpointClient.java
+@@ -16,8 +16,10 @@
+  */
+ package org.apache.tomcat.websocket;
+ 
++import java.io.IOException;
+ import java.nio.ByteBuffer;
+ import java.nio.channels.AsynchronousSocketChannel;
++import java.util.concurrent.TimeUnit;
+ 
+ public class WsRemoteEndpointClient extends WsRemoteEndpointBase {
+ 
+@@ -29,9 +31,24 @@ public class WsRemoteEndpointClient extends WsRemoteEndpointBase {
+ 
+ 
+     @Override
+-    protected void writeMessage(int opCode, ByteBuffer header,
+-            ByteBuffer message) {
+-        // TODO Auto-generated method stub
++    protected byte getMasked() {
++        return (byte) 0x80;
++    }
++
++
++    @Override
++    protected void sendMessage(WsCompletionHandler handler) {
++        channel.write(new ByteBuffer[] {header, payload}, 0, 2, Long.MAX_VALUE,
++                TimeUnit.DAYS, null, handler);
++    }
+ 
++    @Override
++    protected void close() {
++        try {
++            channel.close();
++        } catch (IOException e) {
++            // TODO Auto-generated catch block
++            e.printStackTrace();
++        }
+     }
+ }
+
+==================================================
+WsWebSocketContainer.java
+index 54d9c40dbd..644a89f1fd 100644
+--- a/java/org/apache/tomcat/websocket/WsSession.java
++++ b/java/org/apache/tomcat/websocket/WsSession.java
+@@ -47,6 +47,7 @@ public class WsSession implements Session {
+     private MessageHandler textMessageHandler = null;
+     private MessageHandler binaryMessageHandler = null;
+     private MessageHandler.Basic<PongMessage> pongMessageHandler = null;
++    private volatile boolean open = true;
+ 
+     public WsSession(Endpoint localEndpoint) {
+         this.localEndpoint = localEndpoint;
+@@ -157,8 +158,7 @@ public class WsSession implements Session {
+ 
+     @Override
+     public boolean isOpen() {
+-        // TODO Auto-generated method stub
+-        return false;
++        return open;
+     }
+ 
+ 
+@@ -202,7 +202,7 @@ public class WsSession implements Session {
+ 
+     @Override
+     public void close(CloseReason closeStatus) throws IOException {
+-        // TODO Send the close message to the remote endpoint
++        open = false;
+         // 125 is maximum size for the payload of a control message
+         ByteBuffer msg = ByteBuffer.allocate(125);
+         msg.putShort((short) closeStatus.getCloseCode().getCode());
+@@ -211,7 +211,7 @@ public class WsSession implements Session {
+             msg.put(reason.getBytes(UTF8));
+         }
+         msg.flip();
+-        wsRemoteEndpoint.sendMessage(Constants.OPCODE_CLOSE, msg, true, true);
++        wsRemoteEndpoint.sendMessageBlocking(Constants.OPCODE_CLOSE, msg, true);
+     }
+ 
+ 
+
+==================================================
+PojoEndpoint.java
+index 8be1c35a66..8a0ad8bf1f 100644
+--- a/java/org/apache/tomcat/websocket/WsWebSocketContainer.java
++++ b/java/org/apache/tomcat/websocket/WsWebSocketContainer.java
+@@ -16,18 +16,44 @@
+  */
+ package org.apache.tomcat.websocket;
+ 
++import java.io.IOException;
++import java.net.InetSocketAddress;
++import java.net.SocketAddress;
+ import java.net.URI;
++import java.nio.ByteBuffer;
++import java.nio.channels.AsynchronousSocketChannel;
++import java.nio.charset.Charset;
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.Iterator;
++import java.util.List;
++import java.util.Map;
++import java.util.Map.Entry;
++import java.util.Random;
+ import java.util.Set;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.Future;
+ 
+ import javax.websocket.ClientEndpointConfiguration;
+ import javax.websocket.DeploymentException;
+ import javax.websocket.Endpoint;
+ import javax.websocket.Extension;
++import javax.websocket.HandshakeResponse;
+ import javax.websocket.Session;
+ import javax.websocket.WebSocketContainer;
++import javax.xml.bind.DatatypeConverter;
++
++import org.apache.tomcat.util.res.StringManager;
+ 
+ public class WsWebSocketContainer implements WebSocketContainer {
+ 
++    private static final StringManager sm =
++            StringManager.getManager(Constants.PACKAGE_NAME);
++    private static final Random random = new Random();
++    private static final Charset iso88591 = Charset.forName("ISO-8859-1");
++    private static final byte[] crlf = new byte[] {13, 10};
++
++
+     @Override
+     public Session connectToServer(Class<?> annotatedEndpointClass, URI path)
+             throws DeploymentException {
+@@ -41,15 +67,72 @@ public class WsWebSocketContainer implements WebSocketContainer {
+             ClientEndpointConfiguration clientEndpointConfiguration, URI path)
+             throws DeploymentException {
+ 
+-        // Create HTTP connection
+-        // TODO
++        String scheme = path.getScheme();
++        if (!("http".equalsIgnoreCase(scheme) ||
++                "https".equalsIgnoreCase(scheme))) {
++            throw new DeploymentException(sm.getString(
++                    "wsWebSocketContainer.pathWrongScheme", scheme));
++        }
++        String host = path.getHost();
++        if (host == null) {
++            throw new DeploymentException(
++                    sm.getString("wsWebSocketContainer.pathNoHost"));
++        }
++        int port = path.getPort();
++        Map<String,List<String>> reqHeaders = createRequestHeaders(host, port);
++        clientEndpointConfiguration.beforeRequest(reqHeaders);
++
++        ByteBuffer request = createRequest(path.getRawPath(), reqHeaders);
++
++        SocketAddress sa;
++        if (port == -1) {
++            if ("http".equalsIgnoreCase(scheme)) {
++                sa = new InetSocketAddress(host, 80);
++            } else {
++                // TODO HTTPS support
++                // sa = new InetSocketAddress(host, 443);
++                throw new DeploymentException("TODO: HTTPS");
++            }
++        } else {
++            sa = new InetSocketAddress(host, port);
++        }
+ 
+-        // Handshake
+-        // TODO
++        AsynchronousSocketChannel channel;
++        try {
++            channel = AsynchronousSocketChannel.open();
++        } catch (IOException ioe) {
++            throw new DeploymentException("TODO", ioe);
++        }
++        Future<Void> fConnect = channel.connect(sa);
++
++        ByteBuffer response;
++        try {
++            fConnect.get();
++
++            int toWrite = request.limit();
++
++            Future<Integer> fWrite = channel.write(request);
++            Integer thisWrite = fWrite.get();
++            toWrite -= thisWrite.intValue();
++
++            while (toWrite > 0) {
++                fWrite = channel.write(request);
++                thisWrite = fWrite.get();
++                toWrite -= thisWrite.intValue();
++            }
++            // TODO Needs to be same size or smaller than WsFrame input buffer
++            response = ByteBuffer.allocate(4 * 1024);
++
++            HandshakeResponse handshakeResponse =
++                    processResponse(response, channel);
++            clientEndpointConfiguration.afterResponse(handshakeResponse);
++        } catch (ExecutionException | InterruptedException e) {
++            throw new DeploymentException("", e);
++        }
+ 
+         // Switch to WebSocket
+         WsRemoteEndpointClient wsRemoteEndpointClient =
+-                new WsRemoteEndpointClient();
++                new WsRemoteEndpointClient(channel);
+ 
+         WsSession wsSession;
+         try {
+@@ -58,12 +141,202 @@ public class WsWebSocketContainer implements WebSocketContainer {
+             // TODO
+             throw new DeploymentException("TBD", e);
+         }
+-
+         wsSession.setRemote(wsRemoteEndpointClient);
++
++        try {
++            // Object creation will trigger input processing
++            @SuppressWarnings("unused")
++            WsFrameClient wsFrameClient =
++                    new WsFrameClient(response, channel, wsSession);
++        } catch (IOException e) {
++            throw new DeploymentException("", e);
++        }
++
+         return wsSession;
+     }
+ 
+ 
++    private Map<String,List<String>> createRequestHeaders(String host,
++            int port) {
++
++        Map<String,List<String>> headers = new HashMap<>();
++
++        // Host header
++        List<String> hostValues = new ArrayList<>(1);
++        if (port == -1) {
++            hostValues.add(host);
++        } else {
++            hostValues.add(host + ':' + port);
++        }
++
++        headers.put(Constants.HOST_HEADER_NAME, hostValues);
++
++        // Upgrade header
++        List<String> upgradeValues = new ArrayList<>(1);
++        upgradeValues.add(Constants.UPGRADE_HEADER_VALUE);
++        headers.put(Constants.UPGRADE_HEADER_NAME, upgradeValues);
++
++        // Connection header
++        List<String> connectionValues = new ArrayList<>(1);
++        connectionValues.add(Constants.CONNECTION_HEADER_VALUE);
++        headers.put(Constants.CONNECTION_HEADER_NAME, connectionValues);
++
++        // WebSocket version header
++        List<String> wsVersionValues = new ArrayList<>(1);
++        wsVersionValues.add(Constants.WS_VERSION_HEADER_VALUE);
++        headers.put(Constants.WS_VERSION_HEADER_NAME, wsVersionValues);
++
++        // WebSocket key
++        List<String> wsKeyValues = new ArrayList<>(1);
++        wsKeyValues.add(generateWsKeyValue());
++        headers.put(Constants.WS_KEY_HEADER_NAME, wsKeyValues);
++
++        return headers;
++    }
++
++
++    private String generateWsKeyValue() {
++        byte[] keyBytes = new byte[16];
++        random.nextBytes(keyBytes);
++        return DatatypeConverter.printBase64Binary(keyBytes);
++    }
++
++
++    private ByteBuffer createRequest(String rawPath,
++            Map<String,List<String>> reqHeaders) {
++        ByteBuffer result = ByteBuffer.allocate(4 * 1024);
++
++        // Request line
++        result.put("GET ".getBytes(iso88591));
++        result.put(rawPath.getBytes(iso88591));
++        result.put(" HTTP/1.1\r\n".getBytes(iso88591));
++
++        // Headers
++        Iterator<Entry<String,List<String>>> iter =
++                reqHeaders.entrySet().iterator();
++        while (iter.hasNext()) {
++            Entry<String,List<String>> entry = iter.next();
++            addHeader(result, entry.getKey(), entry.getValue());
++        }
++
++        // Terminating CRLF
++        result.put(crlf);
++
++        result.flip();
++
++        return result;
++    }
++
++
++    private void addHeader(ByteBuffer result, String key, List<String> values) {
++        StringBuilder sb = new StringBuilder();
++
++        Iterator<String> iter = values.iterator();
++        if (!iter.hasNext()) {
++            return;
++        }
++        sb.append(iter.next());
++        while (iter.hasNext()) {
++            sb.append(',');
++            sb.append(iter.next());
++        }
++
++        result.put(key.getBytes(iso88591));
++        result.put(": ".getBytes(iso88591));
++        result.put(sb.toString().getBytes(iso88591));
++        result.put(crlf);
++    }
++
++
++    /**
++     * Process response, blocking until HTTP response has been fully received.
++     * @throws ExecutionException
++     * @throws InterruptedException
++     * @throws DeploymentException
++     */
++    private HandshakeResponse processResponse(ByteBuffer response,
++            AsynchronousSocketChannel channel) throws InterruptedException,
++            ExecutionException, DeploymentException {
++
++        Map<String,List<String>> headers = new HashMap<>();
++
++        boolean readStatus = false;
++        boolean readHeaders = false;
++        String line = null;
++        while (!readHeaders) {
++            // Blocking read
++            Future<Integer> written = channel.read(response);
++            written.get();
++            response.flip();
++            while (response.hasRemaining()) {
++                if (line == null) {
++                    line = readLine(response);
++                } else {
++                    line += readLine(response);
++                }
++                if ("\r\n".equals(line)) {
++                    readHeaders = true;
++                } else if (line.endsWith("\r\n")) {
++                    if (readStatus) {
++                        parseHeaders(line, headers);
++                    } else {
++                        parseStatus(line);
++                        readStatus = true;
++                    }
++                    line = null;
++                }
++            }
++        }
++
++        return new WsHandshakeResponse(headers);
++    }
++
++
++    private void parseStatus(String line) throws DeploymentException {
++        // This client only understands HTTP 1.1
++        // RFC2616 is case specific
++        if (!line.startsWith("HTTP/1.1 101")) {
++            throw new DeploymentException(sm.getString(
++                    "wsWebSocketContainer.invalidStatus", line));
++        }
++    }
++
++
++    private void parseHeaders(String line, Map<String,List<String>> headers) {
++        // Treat headers as single values by default.
++
++        int index = line.indexOf(':');
++        if (index == -1) {
++            // TODO Log invalid header
++            return;
++        }
++        String headerName = line.substring(0, index).trim().toLowerCase();
++        // TODO handle known multi-value headers
++        String headerValue = line.substring(index + 1).trim();
++
++        List<String> values = headers.get(headerName);
++        if (values == null) {
++            values = new ArrayList<>(1);
++            headers.put(headerName, values);
++        }
++        values.add(headerValue);
++    }
++
++
++    private String readLine(ByteBuffer response) {
++        // All ISO-8859-1
++        StringBuilder sb = new StringBuilder();
++
++        char c = 0;
++        while (response.hasRemaining() && c != 10) {
++            c = (char) response.get();
++            sb.append(c);
++        }
++
++        return sb.toString();
++    }
++
++
+     @Override
+     public Set<Session> getOpenSessions() {
+         // TODO Auto-generated method stub
+@@ -127,6 +400,19 @@ public class WsWebSocketContainer implements WebSocketContainer {
+     @Override
+     public void setAsyncSendTimeout(long timeout) {
+         // TODO Auto-generated method stub
++    }
++
++    private static class WsHandshakeResponse implements HandshakeResponse {
+ 
++        private final Map<String,List<String>> headers;
++
++        public WsHandshakeResponse(Map<String,List<String>> headers) {
++            this.headers = headers;
++        }
++
++        @Override
++        public Map<String,List<String>> getHeaders() {
++            return headers;
++        }
+     }
+ }
+
+==================================================
+WsFrameServer.java
+index 14fb6cca77..57a6bf3aaa 100644
+--- a/java/org/apache/tomcat/websocket/pojo/PojoEndpoint.java
++++ b/java/org/apache/tomcat/websocket/pojo/PojoEndpoint.java
+@@ -69,7 +69,9 @@ public class PojoEndpoint extends Endpoint {
+         if (methodMapping.getOnClose() == null) {
+             // If the POJO doesn't handle the close, close the connection
+             try {
+-                session.close(closeReason);
++                if (session.isOpen()) {
++                    session.close(closeReason);
++                }
+             } catch (IOException e) {
+                 // TODO Auto-generated catch block
+                 e.printStackTrace();
+
+==================================================
+WsProtocolHandler.java
+index 70cde7bb67..6a7bd8b93d 100644
+--- a/java/org/apache/tomcat/websocket/server/WsFrameServer.java
++++ b/java/org/apache/tomcat/websocket/server/WsFrameServer.java
+@@ -16,6 +16,7 @@
+  */
+ package org.apache.tomcat.websocket.server;
+ 
++import java.io.EOFException;
+ import java.io.IOException;
+ 
+ import javax.servlet.ServletInputStream;
+@@ -26,21 +27,50 @@ import org.apache.tomcat.websocket.WsSession;
+ public class WsFrameServer extends WsFrameBase {
+ 
+     private final ServletInputStream sis;
++    private final Object connectionReadLock = new Object();
+ 
+     public WsFrameServer(ServletInputStream sis, WsSession wsSession) {
+         super(wsSession);
+         this.sis = sis;
+     }
+ 
+-    @Override
+-    protected boolean isDataAvailable() {
++
++    /**
++     * Allows sub-classes to control whether the read loop in
++     * {@link #onDataAvailable()} should continue or terminate.
++     *
++     * @return  <code>true</code> if the data source is ready to be read
++     */
++    private boolean isDataAvailable() {
+         return sis.isReady();
+     }
+ 
++
++    /**
++     * Called when there is data in the ServletInputStream to process.
++     */
++    public void onDataAvailable() throws IOException {
++        synchronized (connectionReadLock) {
++            while (isDataAvailable()) {
++                // Fill up the input buffer with as much data as we can
++                int read = sis.read(
++                        inputBuffer, writePos, inputBuffer.length - writePos);
++                if (read == 0) {
++                    return;
++                }
++                if (read == -1) {
++                    throw new EOFException();
++                }
++                writePos += read;
++                processInputBuffer();
++            }
++        }
++    }
++
++
+     @Override
+-    protected int fillInputBuffer(byte[] inputBuffer, int start)
+-            throws IOException {
+-        return sis.read(inputBuffer, start,
+-                inputBuffer.length - start);
++    protected boolean isMasked() {
++        // Data is from the client so it should be masked
++        return true;
+     }
+ }
+
+==================================================
+WsRemoteEndpointServer.java
+index d01bb36589..d130a87381 100644
+--- a/java/org/apache/tomcat/websocket/server/WsProtocolHandler.java
++++ b/java/org/apache/tomcat/websocket/server/WsProtocolHandler.java
+@@ -30,7 +30,6 @@ import javax.websocket.CloseReason.CloseCodes;
+ import javax.websocket.Endpoint;
+ import javax.websocket.EndpointConfiguration;
+ 
+-import org.apache.tomcat.websocket.WsFrameBase;
+ import org.apache.tomcat.websocket.WsIOException;
+ import org.apache.tomcat.websocket.WsSession;
+ 
+@@ -71,10 +70,10 @@ public class WsProtocolHandler implements ProtocolHandler {
+         ClassLoader cl = t.getContextClassLoader();
+         t.setContextClassLoader(applicationClassLoader);
+         try {
+-            WsFrameBase wsFrame = new WsFrameServer(sis, wsSession);
++            WsFrameServer wsFrame = new WsFrameServer(sis, wsSession);
+             sis.setReadListener(new WsReadListener(this, wsFrame, wsSession));
+             WsRemoteEndpointServer wsRemoteEndpointServer =
+-                    new WsRemoteEndpointServer(wsSession, sos);
++                    new WsRemoteEndpointServer(sos);
+             wsSession.setRemote(wsRemoteEndpointServer);
+             sos.setWriteListener(
+                     new WsWriteListener(this, wsRemoteEndpointServer));
+@@ -100,12 +99,12 @@ public class WsProtocolHandler implements ProtocolHandler {
+     private static class WsReadListener implements ReadListener {
+ 
+         private final WsProtocolHandler wsProtocolHandler;
+-        private final WsFrameBase wsFrame;
++        private final WsFrameServer wsFrame;
+         private final WsSession wsSession;
+ 
+ 
+         private WsReadListener(WsProtocolHandler wsProtocolHandler,
+-                WsFrameBase wsFrame, WsSession wsSession) {
++                WsFrameServer wsFrame, WsSession wsSession) {
+             this.wsProtocolHandler = wsProtocolHandler;
+             this.wsFrame = wsFrame;
+             this.wsSession = wsSession;
+@@ -119,10 +118,14 @@ public class WsProtocolHandler implements ProtocolHandler {
+             } catch (WsIOException ws) {
+                 CloseReason cr = ws.getCloseReason();
+                 wsSession.onClose(cr);
+-                try {
+-                    wsSession.close(cr);
+-                } catch (IOException e) {
+-                    // TODO Log?
++                // Explicitly close the session if it wasn't closed during the
++                // onClose() event
++                if (wsSession.isOpen()) {
++                    try {
++                        wsSession.close(cr);
++                    } catch (IOException e) {
++                        // TODO Log
++                    }
+                 }
+             } catch (EOFException eof) {
+                 try {
+
+==================================================
+TestWsWebSocketContainer.java
+index 84070acd73..41c64eaa55 100644
+--- a/java/org/apache/tomcat/websocket/server/WsRemoteEndpointServer.java
++++ b/java/org/apache/tomcat/websocket/server/WsRemoteEndpointServer.java
+@@ -17,15 +17,10 @@
+ package org.apache.tomcat.websocket.server;
+ 
+ import java.io.IOException;
+-import java.nio.ByteBuffer;
+-import java.util.concurrent.BrokenBarrierException;
+-import java.util.concurrent.CyclicBarrier;
+ 
+ import javax.servlet.ServletOutputStream;
+ 
+-import org.apache.tomcat.websocket.Constants;
+ import org.apache.tomcat.websocket.WsRemoteEndpointBase;
+-import org.apache.tomcat.websocket.WsSession;
+ 
+ /**
+  * This is the server side {@link javax.websocket.RemoteEndpoint} implementation
+@@ -34,74 +29,71 @@ import org.apache.tomcat.websocket.WsSession;
+  */
+ public class WsRemoteEndpointServer extends WsRemoteEndpointBase {
+ 
+-    private final WsSession wsSession;
+     private final ServletOutputStream sos;
+-    private final Object messageWriteLock = new Object();
++    private volatile WsCompletionHandler handler = null;
++    private volatile boolean close;
++    private volatile Long size = null;
++    private volatile boolean headerWritten = false;
++    private volatile boolean payloadWritten = false;
+ 
+-    private volatile CyclicBarrier writeBarrier = new CyclicBarrier(2);
+-
+-
+-    public WsRemoteEndpointServer(WsSession wsSession,
+-            ServletOutputStream sos) {
+-        this.wsSession = wsSession;
++    public WsRemoteEndpointServer(ServletOutputStream sos) {
+         this.sos = sos;
+     }
+ 
+ 
+-    protected void onWritePossible() {
+-        try {
+-            writeBarrier.await();
+-        } catch (InterruptedException | BrokenBarrierException e) {
+-            // TODO Auto-generated catch block
+-            e.printStackTrace();
+-        }
++    @Override
++    protected byte getMasked() {
++        // Messages from the server are not masked
++        return 0;
+     }
+ 
+ 
+     @Override
+-    protected void writeMessage(int opCode, ByteBuffer header,
+-            ByteBuffer message) {
+-        // Could sync on sos but don't as other (user or container) code may
+-        // sync on this creating the potential for deadlocks.
+-        synchronized (messageWriteLock) {
+-            doBlockingWrite(header);
+-            doBlockingWrite(message);
+-            try {
+-                sos.flush();
+-            } catch (IOException e) {
+-                // TODO Auto-generated catch block
+-                e.printStackTrace();
+-            }
++    protected void sendMessage(WsCompletionHandler handler) {
++        this.handler = handler;
++        onWritePossible();
++    }
+ 
+-            if (Constants.OPCODE_CLOSE == opCode) {
+-                try {
+-                    sos.close();
+-                } catch (IOException e) {
+-                    // TODO Auto-generated catch block
+-                    e.printStackTrace();
++
++    public void onWritePossible() {
++        try {
++            // If this is false there will be a call back when it is true
++            while (sos.canWrite()) {
++                if (!headerWritten) {
++                    headerWritten = true;
++                    size = Long.valueOf(
++                            header.remaining() + payload.remaining());
++                    sos.write(header.array(), header.arrayOffset(),
++                            header.limit());
++                } else if (!payloadWritten) {
++                    payloadWritten = true;
++                    sos.write(payload.array(), payload.arrayOffset(),
++                            payload.limit());
++                } else {
++                    if (close) {
++                        sos.close();
++                    }
++                    handler.completed(size, null);
++                    size = null;
++                    handler = null;
++                    headerWritten = false;
++                    payloadWritten = false;
++                    break;
+                 }
+             }
+-        }
+-        if (opCode == Constants.OPCODE_CLOSE) {
+-            // Connection is closing - ensure no threads are stuck waiting on
+-            // the write barrier
+-            writeBarrier.reset();
++        } catch (IOException ioe) {
++            handler.failed(ioe, null);
+         }
+     }
+ 
+ 
+-    private void doBlockingWrite(ByteBuffer data) {
+-        if (!sos.canWrite()) {
+-            try {
+-                writeBarrier.await();
+-            } catch (InterruptedException | BrokenBarrierException e) {
+-                wsSession.getLocalEndpoint().onError(wsSession, e);
+-            }
+-        }
++    @Override
++    protected void close() {
+         try {
+-            sos.write(data.array(), data.arrayOffset(), data.limit());
++            sos.close();
+         } catch (IOException e) {
+-            wsSession.getLocalEndpoint().onError(wsSession, e);
++            // TODO Auto-generated catch block
++            e.printStackTrace();
+         }
+     }
+ }
+
+==================================================
+EchoAnnotation.java
+index e7e770ce5e..181a2df45a 100644
+--- a/test/org/apache/tomcat/websocket/TestWsWebSocketContainer.java
++++ b/test/org/apache/tomcat/websocket/TestWsWebSocketContainer.java
+@@ -16,13 +16,15 @@
+  */
+ package org.apache.tomcat.websocket;
+ 
+-import java.io.File;
++import java.io.IOException;
+ import java.net.URI;
+ import java.util.ArrayList;
+ import java.util.List;
+ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.TimeUnit;
+ 
++import javax.servlet.ServletContextEvent;
++import javax.servlet.ServletContextListener;
+ import javax.websocket.ContainerProvider;
+ import javax.websocket.DefaultClientConfiguration;
+ import javax.websocket.Endpoint;
+@@ -30,35 +32,39 @@ import javax.websocket.EndpointConfiguration;
+ import javax.websocket.MessageHandler;
+ import javax.websocket.Session;
+ import javax.websocket.WebSocketContainer;
++import javax.websocket.WebSocketMessage;
+ 
+ import org.junit.Assert;
+-//import org.junit.Test;
++import org.junit.Test;
+ 
++import org.apache.catalina.Context;
+ import org.apache.catalina.startup.Tomcat;
+ import org.apache.catalina.startup.TomcatBaseTest;
++import org.apache.tomcat.websocket.server.ServerContainerImpl;
+ 
+ public class TestWsWebSocketContainer extends TomcatBaseTest {
+ 
+     private static final String MESSAGE_STRING_1 = "qwerty";
+ 
+-    //@Test Disable until client implementation progresses
++    @Test
+     public void testConnectToServerEndpoint() throws Exception {
+-        // Examples app includes WebSocket Echo endpoint
+         Tomcat tomcat = getTomcatInstance();
+-        File appDir = new File(getBuildDirectory(), "webapps/examples");
+-        tomcat.addWebapp(null, "/examples", appDir.getAbsolutePath());
++        // Must have a real docBase - just use temp
++        Context ctx =
++            tomcat.addContext("", System.getProperty("java.io.tmpdir"));
++        ctx.addApplicationListener(EchoConfig.class.getName());
+ 
+         tomcat.start();
+ 
+         WebSocketContainer wsContainer = ContainerProvider.getClientContainer();
+         Session wsSession = wsContainer.connectToServer(TesterEndpoint.class,
+                 new DefaultClientConfiguration(), new URI("http://localhost:" +
+-                        getPort() + "/examples/echoAnnotation"));
++                        getPort() + EchoConfig.PATH));
+         TesterMessageHandlerString handler = new TesterMessageHandlerString(1);
+         wsSession.addMessageHandler(handler);
+         wsSession.getRemote().sendString(MESSAGE_STRING_1);
+ 
+-        boolean latchResult = handler.getLatch().await(10, TimeUnit.SECONDS);
++        boolean latchResult = handler.getLatch().await(100, TimeUnit.SECONDS);
+ 
+         Assert.assertTrue(latchResult);
+ 
+@@ -67,6 +73,38 @@ public class TestWsWebSocketContainer extends TomcatBaseTest {
+         Assert.assertEquals(MESSAGE_STRING_1, messages.get(0));
+     }
+ 
++    @Test(expected=javax.websocket.DeploymentException.class)
++    public void testConnectToServerEndpointInvalidScheme() throws Exception {
++        Tomcat tomcat = getTomcatInstance();
++        // Must have a real docBase - just use temp
++        Context ctx =
++            tomcat.addContext("", System.getProperty("java.io.tmpdir"));
++        ctx.addApplicationListener(EchoConfig.class.getName());
++
++        tomcat.start();
++
++        WebSocketContainer wsContainer = ContainerProvider.getClientContainer();
++        wsContainer.connectToServer(TesterEndpoint.class,
++                new DefaultClientConfiguration(), new URI("ftp://localhost:" +
++                        getPort() + EchoConfig.PATH));
++    }
++
++    @Test(expected=javax.websocket.DeploymentException.class)
++    public void testConnectToServerEndpointNoHost() throws Exception {
++        Tomcat tomcat = getTomcatInstance();
++        // Must have a real docBase - just use temp
++        Context ctx =
++            tomcat.addContext("", System.getProperty("java.io.tmpdir"));
++        ctx.addApplicationListener(EchoConfig.class.getName());
++
++        tomcat.start();
++
++        WebSocketContainer wsContainer = ContainerProvider.getClientContainer();
++        wsContainer.connectToServer(TesterEndpoint.class,
++                new DefaultClientConfiguration(),
++                new URI("http://" + EchoConfig.PATH));
++    }
++
+     private static class TesterMessageHandlerString
+             implements MessageHandler.Basic<String> {
+ 
+@@ -99,11 +137,42 @@ public class TestWsWebSocketContainer extends TomcatBaseTest {
+         }
+     }
+ 
+-    private static class TesterEndpoint extends Endpoint {
++    public static class TesterEndpoint extends Endpoint {
+ 
+-        @Override
++       @Override
+         public void onOpen(Session session, EndpointConfiguration config) {
+-            // TODO Auto-generated method stub
++            // NO-OP
++        }
++    }
++
++    public static class EchoConfig implements ServletContextListener {
++
++        public static final String PATH = "/echo";
++
++        @Override
++        public void contextInitialized(ServletContextEvent sce) {
++            ServerContainerImpl sc = ServerContainerImpl.getServerContainer();
++            sc.publishServer(Echo.class, sce.getServletContext(), PATH);
++        }
++
++        @Override
++        public void contextDestroyed(ServletContextEvent sce) {
++            // NO-OP
++        }
++    }
++
++    public static class Echo {
++        @WebSocketMessage
++        public void echoTextMessage(Session session, String msg, boolean last) {
++            try {
++                session.getRemote().sendPartialString(msg, last);
++            } catch (IOException e) {
++                try {
++                    session.close();
++                } catch (IOException e1) {
++                    // Ignore
++                }
++            }
+         }
+     }
+ }
+
+==================================================

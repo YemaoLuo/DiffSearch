@@ -1,0 +1,264 @@
+3daee59d37376de2f1b62d906d69547a27bb1d81
+==================================================
+Enable strict host/port validation for all connectors.
+==================================================
+Mark Thomas
+==================================================
+Tue Jan 30 13:59:11 2018 +0000
+==================================================
+AbstractProcessor.java
+Enable strict host/port validation for all connectors.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1822644 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AjpProcessor.java
+index 7a4ca71bd7..ee7060b3fc 100644
+--- a/java/org/apache/coyote/AbstractProcessor.java
++++ b/java/org/apache/coyote/AbstractProcessor.java
+@@ -27,6 +27,8 @@ import javax.servlet.RequestDispatcher;
+ 
+ import org.apache.tomcat.util.ExceptionUtils;
+ import org.apache.tomcat.util.buf.ByteChunk;
++import org.apache.tomcat.util.buf.MessageBytes;
++import org.apache.tomcat.util.http.parser.Host;
+ import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
+ import org.apache.tomcat.util.net.DispatchType;
+ import org.apache.tomcat.util.net.SSLSupport;
+@@ -42,6 +44,9 @@ public abstract class AbstractProcessor extends AbstractProcessorLight implement
+ 
+     private static final StringManager sm = StringManager.getManager(AbstractProcessor.class);
+ 
++    // Used to avoid useless B2C conversion on the host name.
++    private char[] hostNameC = new char[0];
++
+     protected final Adapter adapter;
+     protected final AsyncStateMachine asyncStateMachine;
+     private volatile long asyncTimeout = -1;
+@@ -244,6 +249,68 @@ public abstract class AbstractProcessor extends AbstractProcessorLight implement
+     }
+ 
+ 
++    protected void parseHost(MessageBytes valueMB) {
++        if (valueMB == null || valueMB.isNull()) {
++            populateHost();
++            return;
++        }
++
++        ByteChunk valueBC = valueMB.getByteChunk();
++        byte[] valueB = valueBC.getBytes();
++        int valueL = valueBC.getLength();
++        int valueS = valueBC.getStart();
++        if (hostNameC.length < valueL) {
++            hostNameC = new char[valueL];
++        }
++
++        try {
++            // Validates the host name
++            int colonPos = Host.parse(valueMB);
++
++            // Extract the port information first, if any
++            if (colonPos != -1) {
++                int port = 0;
++                for (int i = colonPos + 1; i < valueL; i++) {
++                    char c = (char) valueB[i + valueS];
++                    if (c < '0' || c > '9') {
++                        response.setStatus(400);
++                        setErrorState(ErrorState.CLOSE_CLEAN, null);
++                        return;
++                    }
++                    port = port * 10 + c - '0';
++                }
++                request.setServerPort(port);
++
++                // Only need to copy the host name up to the :
++                valueL = colonPos;
++            }
++
++            // Extract the host name
++            for (int i = 0; i < valueL; i++) {
++                hostNameC[i] = (char) valueB[i + valueS];
++            }
++            request.serverName().setChars(hostNameC, 0, valueL);
++
++        } catch (IllegalArgumentException e) {
++            // IllegalArgumentException indicates that the host name is invalid
++            response.setStatus(400);
++            setErrorState(ErrorState.CLOSE_CLEAN, null);
++        }
++    }
++
++
++    /**
++     * Called when a host name is not present in the request (e.g. HTTP/1.0).
++     * It populates the server name and port with appropriate information. The
++     * source is expected to vary by protocol.
++     * <p>
++     * The default implementation is a NO-OP.
++     */
++    protected void populateHost() {
++        // NO-OP
++    }
++
++
+     @Override
+     public final void action(ActionCode actionCode, Object param) {
+         switch (actionCode) {
+
+==================================================
+Http11Processor.java
+index 7a3ddc0140..7220f24457 100644
+--- a/java/org/apache/coyote/ajp/AjpProcessor.java
++++ b/java/org/apache/coyote/ajp/AjpProcessor.java
+@@ -39,7 +39,6 @@ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.ExceptionUtils;
+ import org.apache.tomcat.util.buf.ByteChunk;
+-import org.apache.tomcat.util.buf.HexUtils;
+ import org.apache.tomcat.util.buf.MessageBytes;
+ import org.apache.tomcat.util.http.MimeHeaders;
+ import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
+@@ -174,12 +173,6 @@ public class AjpProcessor extends AbstractProcessor {
+     private final MessageBytes bodyBytes = MessageBytes.newInstance();
+ 
+ 
+-    /**
+-     * Host name (used to avoid useless B2C conversion on the host name).
+-     */
+-    private char[] hostNameC = new char[0];
+-
+-
+     /**
+      * Temp message bytes used for processing.
+      */
+@@ -866,69 +859,20 @@ public class AjpProcessor extends AbstractProcessor {
+ 
+ 
+     /**
+-     * Parse host.
++     * {@inheritDoc}
++     * <p>
++     * This implementation populates the server name and port from the local
++     * name and port provided by the AJP message.
+      */
+-    private void parseHost(MessageBytes valueMB) {
+-
+-        if (valueMB == null || valueMB.isNull()) {
+-            // No host information (HTTP/1.0)
+-            // Ensure the local port field is populated and then use it.
+-            request.action(ActionCode.REQ_LOCALPORT_ATTRIBUTE, request);
+-            request.setServerPort(request.getLocalPort());
+-            try {
+-                request.serverName().duplicate(request.localName());
+-            } catch (IOException e) {
+-                response.setStatus(400);
+-                setErrorState(ErrorState.CLOSE_CLEAN, e);
+-            }
+-            return;
+-        }
+-
+-        ByteChunk valueBC = valueMB.getByteChunk();
+-        byte[] valueB = valueBC.getBytes();
+-        int valueL = valueBC.getLength();
+-        int valueS = valueBC.getStart();
+-        int colonPos = -1;
+-        if (hostNameC.length < valueL) {
+-            hostNameC = new char[valueL];
+-        }
+-
+-        boolean ipv6 = (valueB[valueS] == '[');
+-        boolean bracketClosed = false;
+-        for (int i = 0; i < valueL; i++) {
+-            char b = (char) valueB[i + valueS];
+-            hostNameC[i] = b;
+-            if (b == ']') {
+-                bracketClosed = true;
+-            } else if (b == ':') {
+-                if (!ipv6 || bracketClosed) {
+-                    colonPos = i;
+-                    break;
+-                }
+-            }
+-        }
+-
+-        if (colonPos < 0) {
+-            request.serverName().setChars(hostNameC, 0, valueL);
+-        } else {
+-
+-            request.serverName().setChars(hostNameC, 0, colonPos);
+-
+-            int port = 0;
+-            int mult = 1;
+-            for (int i = valueL - 1; i > colonPos; i--) {
+-                int charValue = HexUtils.getDec(valueB[i + valueS]);
+-                if (charValue == -1) {
+-                    // Invalid character
+-                    // 400 - Bad request
+-                    response.setStatus(400);
+-                    setErrorState(ErrorState.CLOSE_CLEAN, null);
+-                    break;
+-                }
+-                port = port + (charValue * mult);
+-                mult = 10 * mult;
+-            }
+-            request.setServerPort(port);
++    @Override
++    protected void populateHost() {
++        // No host information (HTTP/1.0)
++        request.setServerPort(request.getLocalPort());
++        try {
++            request.serverName().duplicate(request.localName());
++        } catch (IOException e) {
++            response.setStatus(400);
++            setErrorState(ErrorState.CLOSE_CLEAN, e);
+         }
+     }
+ 
+
+==================================================
+Stream.java
+index e7b8bc00af..9d376db1ba 100644
+--- a/java/org/apache/coyote/http2/LocalStrings.properties
++++ b/java/org/apache/coyote/http2/LocalStrings.properties
+@@ -79,6 +79,7 @@ stream.header.connection=Connection [{0}], Stream [{1}], HTTP header [connection
+ stream.header.contentLength=Connection [{0}], Stream [{1}], The content length header value [{2}] does not agree with the size of the data received [{3}]
+ stream.header.debug=Connection [{0}], Stream [{1}], HTTP header [{2}], Value [{3}]
+ stream.header.duplicate=Connection [{0}], Stream [{1}], received multiple [{3}] headers
++stream.header.invalid=Connection [{0}], Stream [{1}], The header [{2}] contained invalid date [{3}]
+ stream.header.noPath=Connection [{0}], Stream [{1}], The [:path] pseudo header was empty
+ stream.header.required=Connection [{0}], Stream [{1}], One or more required headers was missing
+ stream.header.te=Connection [{0}], Stream [{1}], HTTP header [te] is not permitted to have the value [{2}] in an HTTP/2 request
+
+==================================================
+Host.java
+index 678f4bf753..51dfe01ef8 100644
+--- a/java/org/apache/coyote/http2/Stream.java
++++ b/java/org/apache/coyote/http2/Stream.java
+@@ -41,6 +41,7 @@ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.buf.ByteChunk;
+ import org.apache.tomcat.util.buf.MessageBytes;
+ import org.apache.tomcat.util.http.MimeHeaders;
++import org.apache.tomcat.util.http.parser.Host;
+ import org.apache.tomcat.util.net.ApplicationBufferHandler;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+@@ -325,7 +326,14 @@ class Stream extends AbstractStream implements HeaderEmitter {
+         }
+         case ":authority": {
+             if (coyoteRequest.serverName().isNull()) {
+-                int i = value.lastIndexOf(':');
++                int i;
++                try {
++                    i = Host.parse(value);
++                } catch (IllegalArgumentException iae) {
++                    // Host value invalid
++                    throw new HpackException(sm.getString("stream.header.invalid",
++                            getConnectionId(), getIdentifier(), ":authority", value));
++                }
+                 if (i > -1) {
+                     coyoteRequest.serverName().setString(value.substring(0, i));
+                     coyoteRequest.setServerPort(Integer.parseInt(value.substring(i + 1)));
+
+==================================================

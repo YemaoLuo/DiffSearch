@@ -1,0 +1,248 @@
+15e8d8ee925c2ef985932d186b0e768862bb0e0c
+==================================================
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=53714
+==================================================
+Mark Emlyn
+==================================================
+Fri Aug 24 20:05:41 2012 +0000
+==================================================
+Constants.java
+index bdc1347b0f..1ee6e922f0 100644
+--- a/conf/catalina.properties
++++ b/conf/catalina.properties
+@@ -73,8 +73,12 @@ server.loader=
+ # starting with file:.
+ shared.loader=
+ 
+-# List of JAR files that should not be scanned for configuration information
+-# such as web fragments, TLD files etc. It must be a comma separated list of
++# List of JAR files that should not be scanned using the JarScanner
++# functionality. This is typically used to scan JARs for configuration
++# information. JARs that do not contain such information may be excluded from
++# the scan to speed up the scanning process. This is the default list. JARs on
++# this list are excluded from all scans. Scan specific lists (to exclude JARs
++# from individual scans) follow this. The list must be a comma separated list of
+ # JAR file names.
+ # The JARs listed below include:
+ # - Tomcat Bootstrap JARs
+@@ -104,14 +108,24 @@ geronimo-spec-jaxrpc*.jar,wsdl4j*.jar,\
+ ant.jar,ant-junit*.jar,aspectj*.jar,jmx.jar,h2*.jar,hibernate*.jar,httpclient*.jar,\
+ jmx-tools.jar,jta*.jar,log4j*.jar,mail*.jar,slf4j*.jar,\
+ xercesImpl.jar,xmlParserAPIs.jar,xml-apis.jar,\
+-dnsns.jar,ldapsec.jar,localedata.jar,sunjce_provider.jar,sunmscapi.jar,\
+-sunpkcs11.jar,jhall.jar,tools.jar,\
++access-bridge-64.jar,dnsns.jar,jaccess.jar,ldapsec.jar,localedata.jar,\
++sunjce_provider.jar,sunmscapi.jar,sunpkcs11.jar,jhall.jar,tools.jar,\
+ sunec.jar,zipfs.jar,\
+ apple_provider.jar,AppleScriptEngine.jar,CoreAudio.jar,dns_sd.jar,\
+ j3daudio.jar,j3dcore.jar,j3dutils.jar,jai_core.jar,jai_codec.jar,\
+ mlibwrapper_jai.jar,MRJToolkit.jar,vecmath.jar,\
+ junit.jar,junit-*.jar,ant-launcher.jar
+ 
++# Additional JARs (over and above the default JARs listed above) to skip when
++# scanning for Servlet 3.0 pluggability features. These features include web
++# fragments, annotations, SCIs and classes that match @HandlesTypes. The list
++# must be a comma separated list of JAR file names.
++org.apache.catalina.startup.ContextConfig.jarsToSkip=
++
++# Additional JARs (over and above the default JARs listed above) to skip when
++# scanning for TLDs. The list must be a comma separated list of JAR file names.
++org.apache.catalina.startup.TldConfig.jarsToSkip=
++
+ #
+ # String cache configuration.
+ tomcat.util.buf.StringCache.byte.enabled=true
+
+==================================================
+ContextConfig.java
+index 1150b29321..4b85062cfa 100644
+--- a/java/org/apache/catalina/startup/Constants.java
++++ b/java/org/apache/catalina/startup/Constants.java
+@@ -38,6 +38,13 @@ public final class Constants {
+     public static final String HostContextXml = "context.xml.default";
+     public static final String HostWebXml = "web.xml.default";
+ 
++    public static final String DEFAULT_JARS_TO_SKIP =
++            "tomcat.util.scan.DefaultJarScanner.jarsToSkip";
++    public static final String PLUGGABILITY_JARS_TO_SKIP =
++            "org.apache.catalina.startup.ContextConfig.jarsToSkip";
++    public static final String TLD_JARS_TO_SKIP =
++            "org.apache.catalina.startup.TldConfig.jarsToSkip";
++
+     /**
+      * A dummy value used to suppress loading the default web.xml file.
+      *
+
+==================================================
+TldConfig.java
+index 79f21d1194..82a2cfe38f 100644
+--- a/java/org/apache/catalina/startup/ContextConfig.java
++++ b/java/org/apache/catalina/startup/ContextConfig.java
+@@ -41,6 +41,7 @@ import java.util.Locale;
+ import java.util.Map;
+ import java.util.Properties;
+ import java.util.Set;
++import java.util.StringTokenizer;
+ import java.util.concurrent.ConcurrentHashMap;
+ 
+ import javax.naming.Binding;
+@@ -134,6 +135,13 @@ public class ContextConfig implements LifecycleListener {
+      */
+     protected static final Properties authenticators;
+ 
++    /**
++     * The list of JARs that will be skipped when scanning a web application
++     * for JARs. This means the JAR will not be scanned for web fragments, SCIs,
++     * annotations or classes that match @HandlesTypes.
++     */
++    private static final Set<String> pluggabilityJarsToSkip = new HashSet<>();
++
+     static {
+         // Load our mapping properties for the standard authenticators
+         InputStream is =
+@@ -149,8 +157,22 @@ public class ContextConfig implements LifecycleListener {
+             }
+         }
+         authenticators = props;
++
++        // Load the list of JARS to skip
++        addJarsToSkip(Constants.DEFAULT_JARS_TO_SKIP);
++        addJarsToSkip(Constants.PLUGGABILITY_JARS_TO_SKIP);
+     }
+ 
++    private static void addJarsToSkip(String systemPropertyName) {
++        String jarList = System.getProperty(systemPropertyName);
++        if (jarList != null) {
++            StringTokenizer tokenizer = new StringTokenizer(jarList, ",");
++            while (tokenizer.hasMoreElements()) {
++                pluggabilityJarsToSkip.add(tokenizer.nextToken());
++            }
++        }
++
++    }
+ 
+     /**
+      * Deployment count.
+@@ -1793,7 +1815,8 @@ public class ContextConfig implements LifecycleListener {
+         FragmentJarScannerCallback callback = new FragmentJarScannerCallback();
+ 
+         jarScanner.scan(context.getServletContext(),
+-                context.getLoader().getClassLoader(), callback, null);
++                context.getLoader().getClassLoader(), callback,
++                pluggabilityJarsToSkip);
+ 
+         return callback.getFragments();
+     }
+
+==================================================
+Constants.java
+index 85d298c933..269201baba 100644
+--- a/java/org/apache/catalina/startup/TldConfig.java
++++ b/java/org/apache/catalina/startup/TldConfig.java
+@@ -119,6 +119,47 @@ public final class TldConfig  implements LifecycleListener {
+     }
+ 
+ 
++    static {
++        // Set the default list of JARs to skip for TLDs
++        StringBuilder jarList = new StringBuilder(System.getProperty(
++                Constants.DEFAULT_JARS_TO_SKIP, ""));
++
++        String tldJars = System.getProperty(Constants.TLD_JARS_TO_SKIP, "");
++        if (tldJars.length() > 0) {
++            if (jarList.length() > 0) {
++                jarList.append(',');
++            }
++            jarList.append(tldJars);
++        }
++
++        if (jarList.length() > 0) {
++            setNoTldJars(jarList.toString());
++        }
++    }
++
++    /**
++     * Sets the list of JARs that are known not to contain any TLDs.
++     *
++     * @param jarNames List of comma-separated names of JAR files that are
++     * known not to contain any TLDs.
++     */
++    public static synchronized void setNoTldJars(String jarNames) {
++        if (jarNames == null) {
++            noTldJars = null;
++        } else {
++            if (noTldJars == null) {
++                noTldJars = new HashSet<>();
++            } else {
++                noTldJars.clear();
++            }
++            StringTokenizer tokenizer = new StringTokenizer(jarNames, ",");
++            while (tokenizer.hasMoreElements()) {
++                noTldJars.add(tokenizer.nextToken());
++            }
++        }
++    }
++
++
+     // ----------------------------------------------------- Instance Variables
+ 
+     /**
+@@ -168,29 +209,6 @@ public final class TldConfig  implements LifecycleListener {
+         return webxmlTaglibUris.contains(uri);
+     }
+ 
+-    /**
+-     * Sets the list of JARs that are known not to contain any TLDs.
+-     *
+-     * @param jarNames List of comma-separated names of JAR files that are
+-     * known not to contain any TLDs.
+-     */
+-    public static void setNoTldJars(String jarNames) {
+-        if (jarNames == null) {
+-            noTldJars = null;
+-        } else {
+-            if (noTldJars == null) {
+-                noTldJars = new HashSet<>();
+-            } else {
+-                noTldJars.clear();
+-            }
+-            StringTokenizer tokenizer = new StringTokenizer(jarNames, ",");
+-            while (tokenizer.hasMoreElements()) {
+-                noTldJars.add(tokenizer.nextToken());
+-            }
+-        }
+-    }
+-
+-
+     public void addApplicationListener( String s ) {
+         if(log.isDebugEnabled())
+             log.debug( "Add tld listener " + s);
+
+==================================================
+TldLocationsCache.java
+index ca5663a3ad..bde8eb53ec 100644
+--- a/java/org/apache/jasper/Constants.java
++++ b/java/org/apache/jasper/Constants.java
+@@ -221,6 +221,20 @@ public class Constants {
+      */
+     public static final String CATALINA_BASE_PROP = "catalina.base";
+ 
++    /**
++     * Name of system property containing default list of JARs to skip when
++     * scanning JARs for configuration elements such as TLDs.
++     */
++    public static final String DEFAULT_JAR_SKIP_PROP=
++            "tomcat.util.scan.DefaultJarScanner.jarsToSkip";
++
++    /**
++     * Name of system property containing additional list of JARs to skip when
++     * scanning for TLDs.
++     */
++    public static final String TLD_JAR_SKIP_PROP=
++            "org.apache.catalina.startup.TldConfig.jarsToSkip";
++
+     /**
+      * Retain reference to default character set so we don't have to look it up.
+      */
+
+==================================================

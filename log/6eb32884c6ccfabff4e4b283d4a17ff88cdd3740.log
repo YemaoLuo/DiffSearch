@@ -1,0 +1,180 @@
+6eb32884c6ccfabff4e4b283d4a17ff88cdd3740
+==================================================
+Copy (untested) ping and window update frame support from Http2UpgradeHandler to Http2Parser
+==================================================
+Mark Thomas
+==================================================
+Tue Jun 2 10:29:20 2015 +0000
+==================================================
+Http2Parser.java
+Copy (untested) ping and window update frame support from Http2UpgradeHandler to Http2Parser
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1683070 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Http2UpgradeHandler.java
+index 781475d5cb..d0926167b5 100644
+--- a/java/org/apache/coyote/http2/Http2Parser.java
++++ b/java/org/apache/coyote/http2/Http2Parser.java
+@@ -37,6 +37,8 @@ class Http2Parser implements HeaderEmitter {
+     private static final int FRAME_TYPE_HEADERS = 1;
+     private static final int FRAME_TYPE_PRIORITY = 2;
+     private static final int FRAME_TYPE_SETTINGS = 4;
++    private static final int FRAME_TYPE_PING = 6;
++    private static final int FRAME_TYPE_WINDOW_UPDATE = 8;
+ 
+     private final String connectionId;
+     private final Input input;
+@@ -93,11 +95,17 @@ class Http2Parser implements HeaderEmitter {
+             readHeadersFrame(streamId, flags, payloadSize);
+             break;
+         case FRAME_TYPE_PRIORITY:
+-            processFramePriority(streamId, flags, payloadSize);
++            readPriorityFrame(streamId, flags, payloadSize);
+             break;
+         case FRAME_TYPE_SETTINGS:
+             readSettingsFrame(streamId, flags, payloadSize);
+             break;
++        case FRAME_TYPE_PING:
++            readPingFrame(streamId, flags, payloadSize);
++            break;
++        case FRAME_TYPE_WINDOW_UPDATE:
++            readWindowUpdateFrame(streamId, flags, payloadSize);
++            break;
+         // TODO: Missing types
+         default:
+             readUnknownFrame(streamId, frameType, flags, payloadSize);
+@@ -231,7 +239,7 @@ class Http2Parser implements HeaderEmitter {
+     }
+ 
+ 
+-    private void processFramePriority(int flags, int streamId, int payloadSize) throws IOException {
++    private void readPriorityFrame(int flags, int streamId, int payloadSize) throws IOException {
+         if (log.isDebugEnabled()) {
+             log.debug(sm.getString("http2Parser.processFrame", connectionId,
+                     Integer.toString(streamId), Integer.toString(flags),
+@@ -297,6 +305,66 @@ class Http2Parser implements HeaderEmitter {
+     }
+ 
+ 
++    private void readPingFrame(int flags, int streamId, int payloadSize)
++            throws IOException {
++        if (log.isDebugEnabled()) {
++            log.debug(sm.getString("http2Parser.processFrame", connectionId,
++                    Integer.toString(streamId), Integer.toString(flags),
++                    Integer.toString(payloadSize)));
++        }
++        // Validate the frame
++        if (streamId != 0) {
++            throw new Http2Exception(sm.getString("http2Parser.processFramePing.invalidStream",
++                    Integer.toString(streamId)), 0, Http2Exception.FRAME_SIZE_ERROR);
++        }
++        if (payloadSize != 8) {
++            throw new Http2Exception(sm.getString("http2Parser.processFramePing.invalidPayloadSize",
++                    Integer.toString(payloadSize)), 0, Http2Exception.FRAME_SIZE_ERROR);
++        }
++        if ((flags & 0x1) == 0) {
++            // Read the payload
++            byte[] payload = new byte[8];
++            input.fill(true, payload);
++            output.pingReceive(payload);
++        } else {
++            output.pingAck();
++        }
++    }
++
++
++    private void readWindowUpdateFrame(int flags, int streamId, int payloadSize)
++            throws IOException {
++        if (log.isDebugEnabled()) {
++            log.debug(sm.getString("http2Parser.processFrame", connectionId,
++                    Integer.toString(streamId), Integer.toString(flags),
++                    Integer.toString(payloadSize)));
++        }
++        // Validate the frame
++        if (payloadSize != 4) {
++            // Use stream 0 since this is always a connection error
++            throw new Http2Exception(sm.getString("http2Parser.processFrameWindowUpdate.invalidPayloadSize",
++                    Integer.toString(payloadSize)), 0, Http2Exception.FRAME_SIZE_ERROR);
++        }
++
++        byte[] payload = new byte[4];
++        input.fill(true,  payload);
++        int windowSizeIncrement = ByteUtil.get31Bits(payload, 0);
++
++        if (log.isDebugEnabled()) {
++            log.debug(sm.getString("http2Parser.processFrameWindowUpdate.debug", connectionId,
++                    Integer.toString(streamId), Integer.toString(windowSizeIncrement)));
++        }
++
++        // Validate the data
++        if (windowSizeIncrement == 0) {
++            throw new Http2Exception("http2Parser.processFrameWindowUpdate.invalidIncrement",
++                    streamId, Http2Exception.PROTOCOL_ERROR);
++        }
++
++        output.incrementWindowSize(streamId, windowSizeIncrement);
++    }
++
++
+     private void readUnknownFrame(int streamId, int frameType, int flags, int payloadSize)
+             throws IOException {
+         output.swallow(streamId, frameType, flags, payloadSize);
+@@ -424,6 +492,13 @@ class Http2Parser implements HeaderEmitter {
+         void settingsAck();
+         void setting(int identifier, long value) throws IOException;
+ 
++        // Ping frames
++        void pingReceive(byte[] payload);
++        void pingAck();
++
++        // Window size
++        void incrementWindowSize(int streamId, int increment);
++
+         // Testing
+         void swallow(int streamId, int frameType, int flags, int size) throws IOException;
+     }
+
+==================================================
+Http2TestBase.java
+index 0302a18b50..54b1c1e8a6 100644
+--- a/java/org/apache/coyote/http2/LocalStrings.properties
++++ b/java/org/apache/coyote/http2/LocalStrings.properties
+@@ -40,11 +40,16 @@ http2Parser.processFrameData.invalidStream=Data frame received for stream [0]
+ http2Parser.processFrameHeaders.invalidStream=Headers frame received for stream [0]
+ http2Parser.processFrameHeaders.decodingFailed=There was an error during the HPACK decoding of HTTP headers
+ http2Parser.processFrameHeaders.decodingDataLeft=Data left over after HPACK decoding - it should have been consumed
++http2Parser.processFramePing.invalidPayloadSize=Settings frame received with an invalid payload size of [{0}] (should be 8)
++http2Parser.processFramePing.invalidStream=Ping frame received for stream [{0}]
+ http2Parser.processFramePriority.invalidPayloadSize=Priority frame received with an invalid payload size of [{0}] (should be 5)
+ http2Parser.processFramePriority.invalidStream=Priority frame received for stream [0]
+ http2Parser.processFrameSettings.ackWithNonZeroPayload=Settings frame received with the ACK flag set and payload present
+ http2Parser.processFrameSettings.invalidPayloadSize=Settings frame received with a payload size of [{0}] which is not a multiple of 6
+ http2Parser.processFrameSettings.invalidStream=Settings frame received for stream [{0}]
++http2Parser.processFrameWindowUpdate.debug=Connection [{0}], Stream [{1}], Window size increment [{2}]
++http2Parser.processFrameWindowUpdate.invalidIncrement=Window update frame received with an invalid increment size of [0]
++http2Parser.processFrameWindowUpdate.invalidPayloadSize=Window update frame received with an invalid payload size of [{0}]
+ 
+ stream.header.debug=Connection [{0}], Stream [{1}], HTTP header [{2}], Value [{3}]
+ stream.write=Connection [{0}], Stream [{1}]
+@@ -59,16 +64,11 @@ upgradeHandler.processFrame=Connection [{0}], Stream [{1}], Flags [{2}], Payload
+ upgradeHandler.processFrameHeaders.invalidStream=Headers frame received for stream [0]
+ upgradeHandler.processFrameHeaders.decodingFailed=There was an error during the HPACK decoding of HTTP headers
+ upgradeHandler.processFrameHeaders.decodingDataLeft=Data left over after HPACK decoding - it should have been consumed
+-upgradeHandler.processFramePing.invalidPayloadSize=Settings frame received with an invalid payload size of [{0}] (should be 8)
+-upgradeHandler.processFramePing.invalidStream=Ping frame received for stream [{0}]
+ upgradeHandler.processFramePriority.invalidPayloadSize=Priority frame received with an invalid payload size of [{0}] (should be 5)
+ upgradeHandler.processFramePriority.invalidStream=Priority frame received for stream [0]
+ upgradeHandler.processFrameSettings.ackWithNonZeroPayload=Settings frame received with the ACK flag set and payload present
+ upgradeHandler.processFrameSettings.invalidPayloadSize=Settings frame received with a payload size of [{0}] which is not a multiple of 6
+ upgradeHandler.processFrameSettings.invalidStream=Settings frame received for stream [{0}]
+-upgradeHandler.processFrameWindowUpdate.debug=Connection [{0}], Stream [{1}], Window size increment [{2}]
+-upgradeHandler.processFrameWindowUpdate.invalidIncrement=Window update frame received with an invalid increment size of [0]
+-upgradeHandler.processFrameWindowUpdate.invalidPayloadSize=Window update frame received with an invalid payload size of [{0}]
+ upgradeHandler.receivePrefaceNotSettings=The first frame received from the client was not a settings frame
+ upgradeHandler.sendPrefaceFail=Failed to send preface to client
+ upgradeHandler.socketCloseFailed=Error closing socket
+
+==================================================

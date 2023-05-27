@@ -1,0 +1,574 @@
+0129025094fe0d88e0aef3ac02cfaa7f479cc146
+==================================================
+Fix https://bz.apache.org/bugzilla/show_bug.cgi?id=61993
+==================================================
+Mark Thomas
+==================================================
+Tue Jan 16 19:29:39 2018 +0000
+==================================================
+AbstractChunk.java
+Fix https://bz.apache.org/bugzilla/show_bug.cgi?id=61993
+Improve handling for ByteChunk and CharChunk instances that grow close to the maximum size allowed by the JRE.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1821293 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+ByteChunk.java
+index b1c6ee98b0..1573fd4473 100644
+--- a/java/org/apache/tomcat/util/buf/AbstractChunk.java
++++ b/java/org/apache/tomcat/util/buf/AbstractChunk.java
+@@ -25,16 +25,52 @@ public abstract class AbstractChunk implements Cloneable, Serializable {
+ 
+     private static final long serialVersionUID = 1L;
+ 
++    /*
++     * JVMs may limit the maximum array size to slightly less than
++     * Integer.MAX_VALUE. On markt's desktop the limit is MAX_VALUE - 2.
++     * Comments in the JRE source code for ArrayList and other classes indicate
++     * that it may be as low as MAX_VALUE - 8 on some systems.
++     */
++    public static final int ARRAY_MAX_SIZE = Integer.MAX_VALUE - 8;
+ 
+     private int hashCode = 0;
+     protected boolean hasHashCode = false;
+ 
+     protected boolean isSet;
+ 
++    private int limit = -1;
++
+     protected int start;
+     protected int end;
+ 
+ 
++    /**
++     * Maximum amount of data in this buffer. If -1 or not set, the buffer will
++     * grow to {{@link #ARRAY_MAX_SIZE}. Can be smaller than the current buffer
++     * size ( which will not shrink ). When the limit is reached, the buffer
++     * will be flushed (if out is set) or throw exception.
++     *
++     * @param limit The new limit
++     */
++    public void setLimit(int limit) {
++        this.limit = limit;
++    }
++
++
++    public int getLimit() {
++        return limit;
++    }
++
++
++    protected int getLimitInternal() {
++        if (limit > 0) {
++            return limit;
++        } else {
++            return ARRAY_MAX_SIZE;
++        }
++    }
++
++
+     /**
+      * @return the start position of the data in the buffer
+      */
+
+==================================================
+CharChunk.java
+index 5ba69fb432..43d7cb0044 100644
+--- a/java/org/apache/tomcat/util/buf/ByteChunk.java
++++ b/java/org/apache/tomcat/util/buf/ByteChunk.java
+@@ -130,10 +130,6 @@ public final class ByteChunk extends AbstractChunk {
+     // byte[]
+     private byte[] buff;
+ 
+-    // -1: grow indefinitely
+-    // maximum amount to be cached
+-    private int limit = -1;
+-
+     // transient as serialization is primarily for values via, e.g. JMX
+     private transient ByteInputChannel in = null;
+     private transient ByteOutputChannel out = null;
+@@ -182,7 +178,7 @@ public final class ByteChunk extends AbstractChunk {
+         if (buff == null || buff.length < initial) {
+             buff = new byte[initial];
+         }
+-        this.limit = limit;
++        setLimit(limit);
+         start = 0;
+         end = 0;
+         isSet = true;
+@@ -235,24 +231,6 @@ public final class ByteChunk extends AbstractChunk {
+     }
+ 
+ 
+-    /**
+-     * Maximum amount of data in this buffer. If -1 or not set, the buffer will
+-     * grow indefinitely. Can be smaller than the current buffer size ( which
+-     * will not shrink ). When the limit is reached, the buffer will be flushed
+-     * ( if out is set ) or throw exception.
+-     *
+-     * @param limit The new limit
+-     */
+-    public void setLimit(int limit) {
+-        this.limit = limit;
+-    }
+-
+-
+-    public int getLimit() {
+-        return limit;
+-    }
+-
+-
+     /**
+      * When the buffer is empty, read the data from the input channel.
+      *
+@@ -279,9 +257,10 @@ public final class ByteChunk extends AbstractChunk {
+ 
+     public void append(byte b) throws IOException {
+         makeSpace(1);
++        int limit = getLimitInternal();
+ 
+         // couldn't make space
+-        if (limit > 0 && end >= limit) {
++        if (end >= limit) {
+             flushBuffer();
+         }
+         buff[end++] = b;
+@@ -304,14 +283,7 @@ public final class ByteChunk extends AbstractChunk {
+     public void append(byte src[], int off, int len) throws IOException {
+         // will grow, up to limit
+         makeSpace(len);
+-
+-        // if we don't have limit: makeSpace can grow as it wants
+-        if (limit < 0) {
+-            // assert: makeSpace made enough space
+-            System.arraycopy(src, off, buff, end, len);
+-            end += len;
+-            return;
+-        }
++        int limit = getLimitInternal();
+ 
+         // Optimize on a common case.
+         // If the buffer is empty and the source is going to fill up all the
+@@ -322,23 +294,19 @@ public final class ByteChunk extends AbstractChunk {
+             return;
+         }
+ 
+-        // if we have limit and we're below
++        // if we are below the limit
+         if (len <= limit - end) {
+-            // makeSpace will grow the buffer to the limit,
+-            // so we have space
+             System.arraycopy(src, off, buff, end, len);
+-
+             end += len;
+             return;
+         }
+ 
+-        // need more space than we can afford, need to flush
+-        // buffer
++        // Need more space than we can afford, need to flush buffer.
+ 
+-        // the buffer is already at ( or bigger than ) limit
++        // The buffer is already at (or bigger than) limit.
+ 
+         // We chunk the data into slices fitting in the buffer limit, although
+-        // if the data is written directly if it doesn't fit
++        // if the data is written directly if it doesn't fit.
+ 
+         int avail = limit - end;
+         System.arraycopy(src, off, buff, end, avail);
+@@ -355,7 +323,6 @@ public final class ByteChunk extends AbstractChunk {
+ 
+         System.arraycopy(src, (off + len) - remain, buff, end, remain);
+         end += remain;
+-
+     }
+ 
+ 
+@@ -370,14 +337,7 @@ public final class ByteChunk extends AbstractChunk {
+ 
+         // will grow, up to limit
+         makeSpace(len);
+-
+-        // if we don't have limit: makeSpace can grow as it wants
+-        if (limit < 0) {
+-            // assert: makeSpace made enough space
+-            from.get(buff, end, len);
+-            end += len;
+-            return;
+-        }
++        int limit = getLimitInternal();
+ 
+         // Optimize on a common case.
+         // If the buffer is empty and the source is going to fill up all the
+@@ -506,7 +466,7 @@ public final class ByteChunk extends AbstractChunk {
+     public void flushBuffer() throws IOException {
+         // assert out!=null
+         if (out == null) {
+-            throw new IOException("Buffer overflow, no sink " + limit + " " + buff.length);
++            throw new IOException("Buffer overflow, no sink " + getLimit() + " " + buff.length);
+         }
+         out.realWriteBytes(buff, start, end - start);
+         end = start;
+@@ -515,18 +475,20 @@ public final class ByteChunk extends AbstractChunk {
+ 
+     /**
+      * Make space for len bytes. If len is small, allocate a reserve space too.
+-     * Never grow bigger than limit.
++     * Never grow bigger than the limit or {@link AbstractChunk#ARRAY_MAX_SIZE}.
+      *
+      * @param count The size
+      */
+     public void makeSpace(int count) {
+         byte[] tmp = null;
+ 
+-        int newSize;
+-        int desiredSize = end + count;
++        int limit = getLimitInternal();
++
++        long newSize;
++        long desiredSize = end + count;
+ 
+         // Can't grow above the limit
+-        if (limit > 0 && desiredSize > limit) {
++        if (desiredSize > limit) {
+             desiredSize = limit;
+         }
+ 
+@@ -534,25 +496,25 @@ public final class ByteChunk extends AbstractChunk {
+             if (desiredSize < 256) {
+                 desiredSize = 256; // take a minimum
+             }
+-            buff = new byte[desiredSize];
++            buff = new byte[(int) desiredSize];
+         }
+ 
+-        // limit < buf.length ( the buffer is already big )
++        // limit < buf.length (the buffer is already big)
+         // or we already have space XXX
+         if (desiredSize <= buff.length) {
+             return;
+         }
+         // grow in larger chunks
+-        if (desiredSize < 2 * buff.length) {
+-            newSize = buff.length * 2;
++        if (desiredSize < 2L * buff.length) {
++            newSize = buff.length * 2L;
+         } else {
+-            newSize = buff.length * 2 + count;
++            newSize = buff.length * 2L + count;
+         }
+ 
+-        if (limit > 0 && newSize > limit) {
++        if (newSize > limit) {
+             newSize = limit;
+         }
+-        tmp = new byte[newSize];
++        tmp = new byte[(int) newSize];
+ 
+         // Compacts buffer
+         System.arraycopy(buff, start, tmp, 0, end - start);
+
+==================================================
+TestByteChunk.java
+index 4b337c70b7..7cd73e95cf 100644
+--- a/java/org/apache/tomcat/util/buf/CharChunk.java
++++ b/java/org/apache/tomcat/util/buf/CharChunk.java
+@@ -70,10 +70,6 @@ public final class CharChunk extends AbstractChunk implements CharSequence {
+     // char[]
+     private char[] buff;
+ 
+-    // -1: grow indefinitely
+-    // maximum amount to be cached
+-    private int limit = -1;
+-
+     // transient as serialization is primarily for values via, e.g. JMX
+     private transient CharInputChannel in = null;
+     private transient CharOutputChannel out = null;
+@@ -105,7 +101,7 @@ public final class CharChunk extends AbstractChunk implements CharSequence {
+         if (buff == null || buff.length < initial) {
+             buff = new char[initial];
+         }
+-        this.limit = limit;
++        setLimit(limit);
+         start = 0;
+         end = 0;
+         isSet = true;
+@@ -145,24 +141,6 @@ public final class CharChunk extends AbstractChunk implements CharSequence {
+     }
+ 
+ 
+-    /**
+-     * Maximum amount of data in this buffer. If -1 or not set, the buffer will
+-     * grow indefinitely. Can be smaller than the current buffer size ( which
+-     * will not shrink ). When the limit is reached, the buffer will be flushed
+-     * ( if out is set ) or throw exception.
+-     *
+-     * @param limit The new limit
+-     */
+-    public void setLimit(int limit) {
+-        this.limit = limit;
+-    }
+-
+-
+-    public int getLimit() {
+-        return limit;
+-    }
+-
+-
+     /**
+      * When the buffer is empty, read the data from the input channel.
+      *
+@@ -189,9 +167,10 @@ public final class CharChunk extends AbstractChunk implements CharSequence {
+ 
+     public void append(char b) throws IOException {
+         makeSpace(1);
++        int limit = getLimitInternal();
+ 
+         // couldn't make space
+-        if (limit > 0 && end >= limit) {
++        if (end >= limit) {
+             flushBuffer();
+         }
+         buff[end++] = b;
+@@ -214,14 +193,7 @@ public final class CharChunk extends AbstractChunk implements CharSequence {
+     public void append(char src[], int off, int len) throws IOException {
+         // will grow, up to limit
+         makeSpace(len);
+-
+-        // if we don't have limit: makeSpace can grow as it wants
+-        if (limit < 0) {
+-            // assert: makeSpace made enough space
+-            System.arraycopy(src, off, buff, end, len);
+-            end += len;
+-            return;
+-        }
++        int limit = getLimitInternal();
+ 
+         // Optimize on a common case.
+         // If the buffer is empty and the source is going to fill up all the
+@@ -232,27 +204,22 @@ public final class CharChunk extends AbstractChunk implements CharSequence {
+             return;
+         }
+ 
+-        // if we have limit and we're below
++        // if we are below the limit
+         if (len <= limit - end) {
+-            // makeSpace will grow the buffer to the limit,
+-            // so we have space
+             System.arraycopy(src, off, buff, end, len);
+-
+             end += len;
+             return;
+         }
+ 
+-        // need more space than we can afford, need to flush
+-        // buffer
++        // Need more space than we can afford, need to flush buffer.
+ 
+-        // the buffer is already at ( or bigger than ) limit
++        // The buffer is already at (or bigger than) limit.
+ 
+         // Optimization:
+-        // If len-avail < length ( i.e. after we fill the buffer with
+-        // what we can, the remaining will fit in the buffer ) we'll just
+-        // copy the first part, flush, then copy the second part - 1 write
+-        // and still have some space for more. We'll still have 2 writes, but
+-        // we write more on the first.
++        // If len-avail < length (i.e. after we fill the buffer with what we
++        // can, the remaining will fit in the buffer) we'll just copy the first
++        // part, flush, then copy the second part - 1 write and still have some
++        // space for more. We'll still have 2 writes, but we write more on the first.
+ 
+         if (len + end < 2 * limit) {
+             /*
+@@ -305,14 +272,7 @@ public final class CharChunk extends AbstractChunk implements CharSequence {
+ 
+         // will grow, up to limit
+         makeSpace(len);
+-
+-        // if we don't have limit: makeSpace can grow as it wants
+-        if (limit < 0) {
+-            // assert: makeSpace made enough space
+-            s.getChars(off, off + len, buff, end);
+-            end += len;
+-            return;
+-        }
++        int limit = getLimitInternal();
+ 
+         int sOff = off;
+         int sEnd = off + len;
+@@ -375,7 +335,7 @@ public final class CharChunk extends AbstractChunk implements CharSequence {
+     public void flushBuffer() throws IOException {
+         // assert out!=null
+         if (out == null) {
+-            throw new IOException("Buffer overflow, no sink " + limit + " " + buff.length);
++            throw new IOException("Buffer overflow, no sink " + getLimit() + " " + buff.length);
+         }
+         out.realWriteChars(buff, start, end - start);
+         end = start;
+@@ -384,18 +344,20 @@ public final class CharChunk extends AbstractChunk implements CharSequence {
+ 
+     /**
+      * Make space for len chars. If len is small, allocate a reserve space too.
+-     * Never grow bigger than limit.
++     * Never grow bigger than the limit or {@link AbstractChunk#ARRAY_MAX_SIZE}.
+      *
+      * @param count The size
+      */
+     public void makeSpace(int count) {
+         char[] tmp = null;
+ 
+-        int newSize;
+-        int desiredSize = end + count;
++        int limit = getLimitInternal();
++
++        long newSize;
++        long desiredSize = end + count;
+ 
+         // Can't grow above the limit
+-        if (limit > 0 && desiredSize > limit) {
++        if (desiredSize > limit) {
+             desiredSize = limit;
+         }
+ 
+@@ -403,25 +365,25 @@ public final class CharChunk extends AbstractChunk implements CharSequence {
+             if (desiredSize < 256) {
+                 desiredSize = 256; // take a minimum
+             }
+-            buff = new char[desiredSize];
++            buff = new char[(int) desiredSize];
+         }
+ 
+-        // limit < buf.length ( the buffer is already big )
++        // limit < buf.length (the buffer is already big)
+         // or we already have space XXX
+         if (desiredSize <= buff.length) {
+             return;
+         }
+         // grow in larger chunks
+-        if (desiredSize < 2 * buff.length) {
+-            newSize = buff.length * 2;
++        if (desiredSize < 2L * buff.length) {
++            newSize = buff.length * 2L;
+         } else {
+-            newSize = buff.length * 2 + count;
++            newSize = buff.length * 2L + count;
+         }
+ 
+-        if (limit > 0 && newSize > limit) {
++        if (newSize > limit) {
+             newSize = limit;
+         }
+-        tmp = new char[newSize];
++        tmp = new char[(int) newSize];
+ 
+         // Some calling code assumes buffer will not be compacted
+         System.arraycopy(buff, 0, tmp, 0, end);
+
+==================================================
+TestCharChunk.java
+index c2485a4c00..27f2e45965 100644
+--- a/test/org/apache/tomcat/util/buf/TestByteChunk.java
++++ b/test/org/apache/tomcat/util/buf/TestByteChunk.java
+@@ -18,15 +18,20 @@ package org.apache.tomcat.util.buf;
+ 
+ import java.io.ByteArrayInputStream;
+ import java.io.ByteArrayOutputStream;
++import java.io.IOException;
+ import java.io.ObjectInputStream;
+ import java.io.ObjectOutputStream;
+ import java.io.UnsupportedEncodingException;
++import java.nio.ByteBuffer;
+ import java.nio.charset.StandardCharsets;
+ import java.util.Arrays;
+ 
+ import org.junit.Assert;
++import org.junit.Ignore;
+ import org.junit.Test;
+ 
++import org.apache.tomcat.util.buf.ByteChunk.ByteOutputChannel;
++
+ /**
+  * Test cases for {@link ByteChunk}.
+  */
+@@ -40,6 +45,7 @@ public class TestByteChunk {
+         Assert.assertTrue(Arrays.equals(bytes, expected));
+     }
+ 
++
+     /*
+      * Test for {@code findByte} vs. {@code indexOf} methods difference.
+      *
+@@ -75,6 +81,7 @@ public class TestByteChunk {
+         Assert.assertEquals(-1, ByteChunk.indexOf(bytes, 5, 5, 'w'));
+     }
+ 
++
+     @Test
+     public void testIndexOf_Char() throws UnsupportedEncodingException {
+         byte[] bytes = "Hello\u00a0world".getBytes("ISO-8859-1");
+@@ -97,6 +104,7 @@ public class TestByteChunk {
+         Assert.assertEquals(-1, bc.indexOf('d', 0));
+     }
+ 
++
+     @Test
+     public void testIndexOf_String() throws UnsupportedEncodingException {
+         byte[] bytes = "Hello\u00a0world".getBytes("ISO-8859-1");
+@@ -122,6 +130,7 @@ public class TestByteChunk {
+         Assert.assertEquals(-1, bc.indexOf("d", 0, 1, 0));
+     }
+ 
++
+     @Test
+     public void testFindBytes() throws UnsupportedEncodingException {
+         byte[] bytes = "Hello\u00a0world".getBytes("ISO-8859-1");
+@@ -139,6 +148,7 @@ public class TestByteChunk {
+         Assert.assertEquals(-1, ByteChunk.findBytes(bytes, 2, 5, new byte[] { 'w' }));
+     }
+ 
++
+     @Test
+     public void testSerialization() throws Exception {
+         String data = "Hello world!";
+@@ -160,4 +170,35 @@ public class TestByteChunk {
+         Assert.assertArrayEquals(bytes, bcOut.getBytes());
+         Assert.assertEquals(bcIn.getCharset(), bcOut.getCharset());
+     }
++
++
++    @Ignore // Requires a 6GB heap (on markt's desktop - YMMV)
++    @Test
++    public void testAppend() throws Exception {
++        ByteChunk bc = new ByteChunk();
++        bc.setByteOutputChannel(new Sink());
++        // Defaults to no limit
++
++        byte data[] = new byte[32 * 1024 * 1024];
++
++        for (int i = 0; i < 100; i++) {
++            bc.append(data, 0, data.length);
++        }
++
++        Assert.assertEquals(AbstractChunk.ARRAY_MAX_SIZE, bc.getBuffer().length);
++    }
++
++
++    public class Sink implements ByteOutputChannel {
++
++        @Override
++        public void realWriteBytes(byte[] cbuf, int off, int len) throws IOException {
++            // NO-OP
++        }
++
++        @Override
++        public void realWriteBytes(ByteBuffer from) throws IOException {
++            // NO-OP
++        }
++    }
+ }
+
+==================================================

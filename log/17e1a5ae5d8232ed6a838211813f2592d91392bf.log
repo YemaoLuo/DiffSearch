@@ -1,0 +1,248 @@
+17e1a5ae5d8232ed6a838211813f2592d91392bf
+==================================================
+Implement SRV.3.2. Non file parts should be exposed via getParameters()
+==================================================
+Mark Emlyn
+==================================================
+Thu Apr 15 22:57:36 2010 +0000
+==================================================
+Request.java
+Implement SRV.3.2. Non file parts should be exposed via getParameters()
+Cache results so multiple calls to getParts() work
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@934634 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+ApplicationPart.java
+index 02b0cd7c21..5377bf5532 100644
+--- a/java/org/apache/catalina/connector/Request.java
++++ b/java/org/apache/catalina/connector/Request.java
+@@ -317,6 +317,18 @@ public class Request
+     protected ParameterMap<String, String[]> parameterMap = new ParameterMap<String, String[]>();
+ 
+ 
++    /**
++     * The parts, if any, uploaded with this request.
++     */
++    protected Collection<Part> parts = null;
++    
++    
++    /**
++     * The exception thrown, if any when parsing the parts.
++     */
++    protected Exception partsParseException = null;
++    
++    
+     /**
+      * The currently active session for this request.
+      */
+@@ -441,6 +453,8 @@ public class Request
+         subject = null;
+         sessionParsed = false;
+         parametersParsed = false;
++        parts = null;
++        partsParseException = null;
+         cookiesParsed = false;
+         locales.clear();
+         localesParsed = false;
+@@ -2431,11 +2445,35 @@ public class Request
+     public Collection<Part> getParts() throws IOException, IllegalStateException,
+             ServletException {
+         
++        parseParts();
++        
++        if (partsParseException != null) {
++            if (partsParseException instanceof IOException) { 
++                throw (IOException) partsParseException;
++            } else if (partsParseException instanceof IllegalStateException) {
++                throw (IllegalStateException) partsParseException;
++            } else if (partsParseException instanceof ServletException) {
++                throw (ServletException) partsParseException;
++            }
++        }
++        
++        return parts;
++    }
++    
++    private void parseParts() {
++
++        // Return immediately if the parts have already been parsed
++        if (parts != null || partsParseException != null)
++            return;
++
+         MultipartConfigElement mce = getWrapper().getMultipartConfigElement();
+         if (mce == null) {
+-            return Collections.emptyList();
++            parts = Collections.emptyList();
++            return;
+         }
+         
++        Parameters parameters = coyoteRequest.getParameters();
++        
+         File location;
+         String locationStr = mce.getLocation();
+         if (locationStr == null || locationStr.length() == 0) {
+@@ -2446,14 +2484,20 @@ public class Request
+         }
+         
+         if (!location.isAbsolute() || !location.isDirectory()) {
+-            throw new IOException(
++            partsParseException = new IOException(
+                     sm.getString("coyoteRequest.uploadLocationInvalid",
+                             location));
++            return;
+         }
+         
+         // Create a new file upload handler
+         DiskFileItemFactory factory = new DiskFileItemFactory();
+-        factory.setRepository(location.getCanonicalFile());
++        try {
++            factory.setRepository(location.getCanonicalFile());
++        } catch (IOException ioe) {
++            partsParseException = ioe;
++            return;
++        }
+         factory.setSizeThreshold(mce.getFileSizeThreshold());
+         
+         ServletFileUpload upload = new ServletFileUpload();
+@@ -2461,31 +2505,48 @@ public class Request
+         upload.setFileSizeMax(mce.getMaxFileSize());
+         upload.setSizeMax(mce.getMaxRequestSize());
+         
+-        List<Part> result = new ArrayList<Part>();
++        parts = new ArrayList<Part>();
+         try {
+-           List<FileItem> items = upload.parseRequest(this);
+-           for (FileItem item : items) {
+-                result.add(new ApplicationPart(item, mce));
++            List<FileItem> items = upload.parseRequest(this);
++            for (FileItem item : items) {
++                ApplicationPart part = new ApplicationPart(item, mce);
++                parts.add(part);
++                if (part.getFilename() == null) {
++                    try {
++                        parameters.addParameterValues(part.getName(),
++                                new String[] {part.getString(
++                                        parameters.getEncoding())});
++                    } catch (UnsupportedEncodingException uee) {
++                        try {
++                            parameters.addParameterValues(part.getName(),
++                                    new String[] {part.getString(
++                                            Parameters.DEFAULT_ENCODING)});
++                        } catch (UnsupportedEncodingException e) {
++                            // Should not be possible
++                        }
++                    }
++                }
+             }
+             
+         } catch (InvalidContentTypeException e) {
+-            throw new ServletException(e);
++            partsParseException = new ServletException(e);
+         } catch (FileUploadBase.SizeException e) {
+-            throw new IllegalStateException(e);
++            partsParseException = new IllegalStateException(e);
+         } catch (FileUploadException e) {
+-            throw new IOException();
++            partsParseException = new IOException();
+         }
+         
+-        return result;
++        return;
+     }
+-    
++
++
+     /**
+      * {@inheritDoc}
+      */
+     public Part getPart(String name) throws IOException, IllegalStateException,
+             ServletException {
+-        Collection<Part> parts = getParts();
+-        Iterator<Part> iterator = parts.iterator();
++        Collection<Part> c = getParts();
++        Iterator<Part> iterator = c.iterator();
+         while (iterator.hasNext()) {
+             Part part = iterator.next();
+             if (name.equals(part.getName())) {
+@@ -2677,6 +2738,12 @@ public class Request
+         } else {
+             contentType = contentType.trim();
+         }
++        
++        if ("multipart/form-data".equals(contentType)) {
++            parseParts();
++            return;
++        }
++        
+         if (!("application/x-www-form-urlencoded".equals(contentType)))
+             return;
+ 
+
+==================================================
+Parameters.java
+index 171b4750cc..13c9b7eddf 100644
+--- a/java/org/apache/catalina/core/ApplicationPart.java
++++ b/java/org/apache/catalina/core/ApplicationPart.java
+@@ -20,16 +20,19 @@ package org.apache.catalina.core;
+ import java.io.File;
+ import java.io.IOException;
+ import java.io.InputStream;
++import java.io.UnsupportedEncodingException;
+ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.HashSet;
+ import java.util.Iterator;
++import java.util.Map;
+ 
+ import javax.servlet.MultipartConfigElement;
+ import javax.servlet.http.Part;
+ 
+ import org.apache.tomcat.util.http.fileupload.DiskFileItem;
+ import org.apache.tomcat.util.http.fileupload.FileItem;
++import org.apache.tomcat.util.http.fileupload.ParameterParser;
+ 
+ /**
+  * Adaptor to allow {@link FileItem} objects generated by the package renamed
+@@ -120,4 +123,37 @@ public class ApplicationPart implements Part {
+         }
+     }
+ 
++    public String getString(String encoding) throws UnsupportedEncodingException {
++        return fileItem.getString(encoding);
++    }
++
++    /*
++     * Adapted from FileUploadBase.getFileName()
++     */
++    public String getFilename() {
++        String fileName = null;
++        String cd = getHeader("Content-Disposition");
++        if (cd != null) {
++            String cdl = cd.toLowerCase();
++            if (cdl.startsWith("form-data") || cdl.startsWith("attachment")) {
++                ParameterParser paramParser = new ParameterParser();
++                paramParser.setLowerCaseNames(true);
++                // Parameter parser can handle null input
++                Map<String,String> params =
++                    paramParser.parse(cd, ';');
++                if (params.containsKey("filename")) {
++                    fileName = params.get("filename");
++                    if (fileName != null) {
++                        fileName = fileName.trim();
++                    } else {
++                        // Even if there is no value, the parameter is present,
++                        // so we return an empty file name rather than no file
++                        // name.
++                        fileName = "";
++                    }
++                }
++            }
++        }
++        return fileName;
++    }
+ }
+
+==================================================

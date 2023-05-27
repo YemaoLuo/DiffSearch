@@ -1,0 +1,201 @@
+44dd79d68beec3309998e51db705793deab078be
+==================================================
+Add in some debug, what is causing some TCK failures is a request/response pair not being recycled properly
+==================================================
+Filip Hanik
+==================================================
+Sat Mar 27 01:50:13 2010 +0000
+==================================================
+CoyoteAdapter.java
+Add in some debug, what is causing some TCK failures is a request/response pair not being recycled properly
+
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@928120 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Request.java
+index aebfffa926..b71fe1d005 100644
+--- a/java/org/apache/catalina/connector/CoyoteAdapter.java
++++ b/java/org/apache/catalina/connector/CoyoteAdapter.java
+@@ -344,7 +344,7 @@ public class CoyoteAdapter implements Adapter {
+         } finally {
+             req.getRequestProcessor().setWorkerThreadName(null);
+             // Recycle the wrapper request and response
+-            if (!comet && !async) {
++            if (!success || (!comet && !async)) {
+                 request.recycle();
+                 response.recycle();
+             } else {
+
+==================================================
+AsyncContextImpl.java
+index 62ad7eb3cd..f343338a1b 100644
+--- a/java/org/apache/catalina/connector/Request.java
++++ b/java/org/apache/catalina/connector/Request.java
+@@ -490,6 +490,7 @@ public class Request
+         
+         asyncSupported = null;
+         if (asyncContext!=null) asyncContext.recycle();
++        asyncContext = null;
+ 
+     }
+ 
+
+==================================================
+AccessLogValve.java
+index 5abda6f28f..c699bdeded 100644
+--- a/java/org/apache/catalina/core/AsyncContextImpl.java
++++ b/java/org/apache/catalina/core/AsyncContextImpl.java
+@@ -66,18 +66,22 @@ public class AsyncContextImpl implements AsyncContext {
+     private Request request;
+     
+     public AsyncContextImpl(Request request) {
++        if (log.isDebugEnabled()) {
++            log.debug("AsyncContext created["+request.getRequestURI()+"?"+request.getQueryString()+"]", new DebugException());
++        }
+         //TODO SERVLET3 - async
+         this.request = request;
+     }
+ 
+     @Override
+     public void complete() {
++        if (log.isDebugEnabled()) {
++            log.debug("AsyncContext Complete Called["+state.get()+"; "+request.getRequestURI()+"?"+request.getQueryString()+"]", new DebugException());
++        }
+         if (state.get()==AsyncState.COMPLETING) {
+             //do nothing
+-        } else if (state.compareAndSet(AsyncState.STARTED, AsyncState.COMPLETING)) {
+-                // TODO SERVLET3 - async
+-                doInternalComplete(false);
+-        } else if (state.compareAndSet(AsyncState.DISPATCHED, AsyncState.COMPLETING)) {
++        } else if (state.compareAndSet(AsyncState.DISPATCHED, AsyncState.COMPLETING) ||
++                   state.compareAndSet(AsyncState.STARTED, AsyncState.COMPLETING)) {
+             // TODO SERVLET3 - async
+             AtomicBoolean dispatched = new AtomicBoolean(false);
+             request.getCoyoteRequest().action(ActionCode.ACTION_ASYNC_COMPLETE,dispatched);
+@@ -104,12 +108,16 @@ public class AsyncContextImpl implements AsyncContext {
+ 
+     @Override
+     public void dispatch(ServletContext context, String path) {
++        if (log.isDebugEnabled()) {
++            log.debug("AsyncContext Dispatch Called["+state.get()+"; "+path+"; "+request.getRequestURI()+"?"+request.getQueryString()+"]", new DebugException());
++        }
++
+         // TODO SERVLET3 - async
+         if (state.compareAndSet(AsyncState.STARTED, AsyncState.DISPATCHING) ||
+             state.compareAndSet(AsyncState.DISPATCHED, AsyncState.DISPATCHING)) {
+ 
+             if (request.getAttribute(ASYNC_REQUEST_URI)==null) {
+-                request.setAttribute(ASYNC_REQUEST_URI, request.getRequestURI());
++                request.setAttribute(ASYNC_REQUEST_URI, request.getRequestURI()+"?"+request.getQueryString());
+                 request.setAttribute(ASYNC_CONTEXT_PATH, request.getContextPath());
+                 request.setAttribute(ASYNC_SERVLET_PATH, request.getServletPath());
+                 request.setAttribute(ASYNC_QUERY_STRING, request.getQueryString());
+@@ -166,6 +174,10 @@ public class AsyncContextImpl implements AsyncContext {
+ 
+     @Override
+     public void start(final Runnable run) {
++        if (log.isDebugEnabled()) {
++            log.debug("AsyncContext Start Called["+state.get()+"; "+request.getRequestURI()+"?"+request.getQueryString()+"]", new DebugException());
++        }
++
+         if (state.compareAndSet(AsyncState.STARTED, AsyncState.DISPATCHING) ||
+             state.compareAndSet(AsyncState.DISPATCHED, AsyncState.DISPATCHING)) {
+             // TODO SERVLET3 - async
+@@ -386,5 +398,5 @@ public class AsyncContextImpl implements AsyncContext {
+         this.servletResponse = response;
+         event = new AsyncEvent(this, request, response); 
+     }
+-
++    public static class DebugException extends Exception {}
+ }
+
+==================================================
+AjpProcessor.java
+index 5bae26b6c8..1fb23bcbae 100644
+--- a/java/org/apache/catalina/valves/AccessLogValve.java
++++ b/java/org/apache/catalina/valves/AccessLogValve.java
+@@ -124,7 +124,7 @@ public class AccessLogValve extends ValveBase {
+ 
+     //------------------------------------------------------ Constructor
+     public AccessLogValve() {
+-        super(false);
++        super(true);
+     }
+ 
+     // ----------------------------------------------------- Instance Variables
+@@ -543,13 +543,24 @@ public class AccessLogValve extends ValveBase {
+     @Override
+     public void invoke(Request request, Response response) throws IOException,
+             ServletException {
+-
++        final String t1Name = AccessLogValve.class.getName()+".t1";
+         if (getState().isAvailable() && getEnabled()) {                
+             // Pass this request on to the next valve in our pipeline
+             long t1 = System.currentTimeMillis();
++            boolean asyncdispatch = request.isAsyncDispatching();
++            if (!asyncdispatch) {
++                request.setAttribute(t1Name, new Long(t1));
++            }
+     
+             getNext().invoke(request, response);
+     
++            //we're not done with the request
++            if (request.isAsyncDispatching()) {
++                return;
++            } else if (asyncdispatch && request.getAttribute(t1Name)!=null) {
++                t1 = ((Long)request.getAttribute(t1Name)).longValue();
++            }
++            
+             long t2 = System.currentTimeMillis();
+             long time = t2 - t1;
+     
+
+==================================================
+Http11NioProcessor.java
+index 2bd43fc58c..6f44911a4a 100644
+--- a/java/org/apache/coyote/ajp/AjpProcessor.java
++++ b/java/org/apache/coyote/ajp/AjpProcessor.java
+@@ -674,7 +674,7 @@ public class AjpProcessor implements ActionHook {
+                 dispatch.set(true);
+                 endpoint.processSocket(this.socket, SocketStatus.STOP);
+             } else {
+-                dispatch.set(true);
++                dispatch.set(false);
+             }
+         } else if (actionCode == ActionCode.ACTION_ASYNC_SETTIMEOUT) {
+           //TODO SERVLET3 - async
+
+==================================================
+Http11Processor.java
+index b27a00561e..3eeb5bd750 100644
+--- a/java/org/apache/coyote/http11/Http11NioProcessor.java
++++ b/java/org/apache/coyote/http11/Http11NioProcessor.java
+@@ -778,7 +778,7 @@ public class Http11NioProcessor extends AbstractHttp11Processor implements Actio
+                 dispatch.set(true);
+                 endpoint.processSocket(this.socket, SocketStatus.STOP, true);
+             } else {
+-                dispatch.set(true);
++                dispatch.set(false);
+             }
+         } else if (actionCode == ActionCode.ACTION_ASYNC_SETTIMEOUT) {
+           //TODO SERVLET3 - async
+
+==================================================
+Http11Protocol.java
+index 2e8f8015b2..54bd9a907c 100644
+--- a/java/org/apache/coyote/http11/Http11Processor.java
++++ b/java/org/apache/coyote/http11/Http11Processor.java
+@@ -619,7 +619,7 @@ public class Http11Processor extends AbstractHttp11Processor implements ActionHo
+                 dispatch.set(true);
+                 endpoint.processSocket(this.socket, SocketStatus.STOP);
+             } else {
+-                dispatch.set(true);
++                dispatch.set(false);
+             }
+         } else if (actionCode == ActionCode.ACTION_ASYNC_SETTIMEOUT) {
+           //TODO SERVLET3 - async
+
+==================================================

@@ -1,0 +1,261 @@
+d94dfa72b6c71c4b604613f077b9394e881725ea
+==================================================
+More decoder plumbing
+==================================================
+Mark Emlyn
+==================================================
+Fri Mar 8 00:09:27 2013 +0000
+==================================================
+PojoEndpointBase.java
+More decoder plumbing
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1454181 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+PojoEndpointClient.java
+index de45c3db9c..d0a9070167 100644
+--- a/java/org/apache/tomcat/websocket/pojo/PojoEndpointBase.java
++++ b/java/org/apache/tomcat/websocket/pojo/PojoEndpointBase.java
+@@ -18,9 +18,11 @@ package org.apache.tomcat.websocket.pojo;
+ 
+ import java.lang.reflect.InvocationTargetException;
+ import java.util.Map;
++import java.util.Set;
+ 
+ import javax.websocket.CloseReason;
+ import javax.websocket.Endpoint;
++import javax.websocket.EndpointConfig;
+ import javax.websocket.MessageHandler;
+ import javax.websocket.Session;
+ 
+@@ -39,7 +41,7 @@ public abstract class PojoEndpointBase extends Endpoint {
+     private PojoMethodMapping methodMapping;
+ 
+ 
+-    protected final void doOnOpen(Session session) {
++    protected final void doOnOpen(Session session, EndpointConfig config) {
+         PojoMethodMapping methodMapping = getMethodMapping();
+         Object pojo = getPojo();
+         Map<String,String> pathParameters = getPathParameters();
+@@ -55,7 +57,7 @@ public abstract class PojoEndpointBase extends Endpoint {
+             }
+         }
+         for (MessageHandler mh : methodMapping.getMessageHandlers(pojo,
+-                pathParameters, session)) {
++                pathParameters, session, config)) {
+             session.addMessageHandler(mh);
+         }
+     }
+@@ -74,6 +76,14 @@ public abstract class PojoEndpointBase extends Endpoint {
+                         pojo.getClass().getName()), e);
+             }
+         }
++
++        // Trigger the destroy method for any associated decoders
++        Set<MessageHandler> messageHandlers = session.getMessageHandlers();
++        for (MessageHandler messageHandler : messageHandlers) {
++            if (messageHandler instanceof PojoMessageHandlerWholeBase<?>) {
++                ((PojoMessageHandlerWholeBase<?>) messageHandler).onClose();
++            }
++        }
+     }
+ 
+ 
+
+==================================================
+PojoEndpointServer.java
+index 80735e8bad..1284de55fc 100644
+--- a/java/org/apache/tomcat/websocket/pojo/PojoEndpointClient.java
++++ b/java/org/apache/tomcat/websocket/pojo/PojoEndpointClient.java
+@@ -32,6 +32,6 @@ public class PojoEndpointClient extends PojoEndpointBase {
+ 
+     @Override
+     public void onOpen(Session session, EndpointConfig config) {
+-        doOnOpen(session);
++        doOnOpen(session, config);
+     }
+ }
+
+==================================================
+PojoMessageHandlerWholeBase.java
+index 2606831d22..9ebebeb0fe 100644
+--- a/java/org/apache/tomcat/websocket/pojo/PojoEndpointServer.java
++++ b/java/org/apache/tomcat/websocket/pojo/PojoEndpointServer.java
+@@ -66,6 +66,6 @@ public class PojoEndpointServer extends PojoEndpointBase {
+                         POJO_METHOD_MAPPING_KEY);
+         setMethodMapping(methodMapping);
+ 
+-        doOnOpen(session);
++        doOnOpen(session, endpointConfig);
+     }
+ }
+
+==================================================
+PojoMessageHandlerWholeBinary.java
+index e53bbdc44e..4637e289e0 100644
+--- a/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerWholeBase.java
++++ b/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerWholeBase.java
+@@ -76,4 +76,5 @@ public abstract class PojoMessageHandlerWholeBase<T>
+ 
+ 
+     protected abstract Object decode(T message);
++    protected abstract void onClose();
+ }
+
+==================================================
+PojoMessageHandlerWholePong.java
+index 1f1b84ac83..3047282ead 100644
+--- a/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerWholeBinary.java
++++ b/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerWholeBinary.java
+@@ -18,7 +18,13 @@ package org.apache.tomcat.websocket.pojo;
+ 
+ import java.lang.reflect.Method;
+ import java.nio.ByteBuffer;
++import java.util.ArrayList;
++import java.util.List;
+ 
++import javax.websocket.Decoder;
++import javax.websocket.Decoder.Binary;
++import javax.websocket.Decoder.BinaryStream;
++import javax.websocket.EndpointConfig;
+ import javax.websocket.Session;
+ 
+ /**
+@@ -27,15 +33,45 @@ import javax.websocket.Session;
+ public class PojoMessageHandlerWholeBinary
+         extends PojoMessageHandlerWholeBase<ByteBuffer> {
+ 
++    private final List<Decoder> decoders = new ArrayList<>();
++
+     public PojoMessageHandlerWholeBinary(Object pojo, Method method,
+-            Session session, Object[] params, int indexPayload, boolean unwrap,
+-            int indexSession) {
++            Session session, EndpointConfig config, Object[] params,
++            int indexPayload, boolean unwrap, int indexSession) {
+         super(pojo, method, session, params, indexPayload, unwrap, indexSession);
++        try {
++            for (Class<? extends Decoder> decoderClazz : config.getDecoders()) {
++                if (Binary.class.isAssignableFrom(decoderClazz)) {
++                    Binary<?> decoder = (Binary<?>) decoderClazz.newInstance();
++                    decoder.init(config);
++                    decoders.add(decoder);
++                } else if (Decoder.TextStream.class.isAssignableFrom(
++                        decoderClazz)) {
++                    BinaryStream<?> decoder =
++                            (BinaryStream<?>) decoderClazz.newInstance();
++                    decoder.init(config);
++                    decoders.add(decoder);
++                } else {
++                    // Text decoder - ignore is
++                }
++            }
++        } catch (IllegalAccessException | InstantiationException e) {
++            throw new IllegalArgumentException(e);
++        }
+     }
+ 
++
+     @Override
+     protected Object decode(ByteBuffer message) {
+         // TODO Not implemented
+         return null;
+     }
++
++
++    @Override
++    protected void onClose() {
++        for (Decoder decoder : decoders) {
++            decoder.destroy();
++        }
++    }
+ }
+
+==================================================
+PojoMessageHandlerWholeText.java
+index 7955e17244..c92c6ba705 100644
+--- a/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerWholePong.java
++++ b/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerWholePong.java
+@@ -38,4 +38,10 @@ public class PojoMessageHandlerWholePong
+         // Never decoded
+         return null;
+     }
++
++
++    @Override
++    protected void onClose() {
++        // NO-OP
++    }
+ }
+
+==================================================
+PojoMethodMapping.java
+index cb952fa326..db6594318f 100644
+--- a/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerWholeText.java
++++ b/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerWholeText.java
+@@ -17,7 +17,13 @@
+ package org.apache.tomcat.websocket.pojo;
+ 
+ import java.lang.reflect.Method;
++import java.util.ArrayList;
++import java.util.List;
+ 
++import javax.websocket.Decoder;
++import javax.websocket.Decoder.Text;
++import javax.websocket.Decoder.TextStream;
++import javax.websocket.EndpointConfig;
+ import javax.websocket.Session;
+ 
+ /**
+@@ -26,16 +32,46 @@ import javax.websocket.Session;
+ public class PojoMessageHandlerWholeText
+         extends PojoMessageHandlerWholeBase<String> {
+ 
++    private final List<Decoder> decoders = new ArrayList<>();
++
+     public PojoMessageHandlerWholeText(Object pojo, Method method,
+-            Session session, Object[] params, int indexPayload, boolean unwrap,
+-            int indexSession) {
++            Session session, EndpointConfig config, Object[] params,
++            int indexPayload, boolean unwrap, int indexSession) {
+         super(pojo, method, session, params, indexPayload, unwrap,
+                 indexSession);
++        try {
++            for (Class<? extends Decoder> decoderClazz : config.getDecoders()) {
++                if (Text.class.isAssignableFrom(decoderClazz)) {
++                    Text<?> decoder = (Text<?>) decoderClazz.newInstance();
++                    decoder.init(config);
++                    decoders.add(decoder);
++                } else if (Decoder.TextStream.class.isAssignableFrom(
++                        decoderClazz)) {
++                    TextStream<?> decoder =
++                            (TextStream<?>) decoderClazz.newInstance();
++                    decoder.init(config);
++                    decoders.add(decoder);
++                } else {
++                    // Binary decoder - ignore is
++                }
++            }
++        } catch (IllegalAccessException | InstantiationException e) {
++            throw new IllegalArgumentException(e);
++        }
+     }
+ 
++
+     @Override
+     protected Object decode(String message) {
+         // TODO Auto-generated method stub
+         return null;
+     }
++
++
++    @Override
++    protected void onClose() {
++        for (Decoder decoder : decoders) {
++            decoder.destroy();
++        }
++    }
+ }
+
+==================================================

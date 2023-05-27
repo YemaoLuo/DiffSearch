@@ -1,0 +1,288 @@
+ebd2d0a125dad59a9271029c05f928443dc1368f
+==================================================
+Allow HTTP headers to be sent using encodings other than ISO-8859-1
+==================================================
+Mark Emlyn
+==================================================
+Fri Oct 10 14:28:52 2014 +0000
+==================================================
+Response.java
+Allow HTTP headers to be sent using encodings other than ISO-8859-1
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1630910 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Response.java
+index d93a38ba7e..a8fc2cfdb5 100644
+--- a/java/org/apache/catalina/connector/Response.java
++++ b/java/org/apache/catalina/connector/Response.java
+@@ -19,6 +19,7 @@ package org.apache.catalina.connector;
+ import java.io.IOException;
+ import java.io.PrintWriter;
+ import java.net.MalformedURLException;
++import java.nio.charset.Charset;
+ import java.security.AccessController;
+ import java.security.PrivilegedAction;
+ import java.security.PrivilegedActionException;
+@@ -1000,6 +1001,11 @@ public class Response
+      */
+     @Override
+     public void addHeader(String name, String value) {
++        addHeader(name, value, null);
++    }
++
++
++    private void addHeader(String name, String value, Charset charset) {
+ 
+         if (name == null || name.length() == 0 || value == null) {
+             return;
+@@ -1020,7 +1026,7 @@ public class Response
+             return;
+         }
+ 
+-        coyoteResponse.addHeader(name, value);
++        coyoteResponse.addHeader(name, value, charset);
+     }
+ 
+ 
+
+==================================================
+AjpMessage.java
+index d1e5d9f957..d50e94b39b 100644
+--- a/java/org/apache/coyote/Response.java
++++ b/java/org/apache/coyote/Response.java
+@@ -18,12 +18,14 @@ package org.apache.coyote;
+ 
+ import java.io.IOException;
+ import java.io.StringReader;
++import java.nio.charset.Charset;
+ import java.util.Locale;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ import javax.servlet.WriteListener;
+ 
+ import org.apache.tomcat.util.buf.ByteChunk;
++import org.apache.tomcat.util.buf.MessageBytes;
+ import org.apache.tomcat.util.http.MimeHeaders;
+ import org.apache.tomcat.util.http.parser.MediaType;
+ import org.apache.tomcat.util.res.StringManager;
+@@ -297,12 +299,21 @@ public final class Response {
+ 
+ 
+     public void addHeader(String name, String value) {
++        addHeader(name, value, null);
++    }
++
++
++    public void addHeader(String name, String value, Charset charset) {
+         char cc=name.charAt(0);
+         if( cc=='C' || cc=='c' ) {
+             if( checkSpecialHeader(name, value) )
+             return;
+         }
+-        headers.addValue(name).setString( value );
++        MessageBytes mb = headers.addValue(name);
++        if (charset != null) {
++            mb.getByteChunk().setCharset(charset);
++        }
++        mb.setString(value);
+     }
+ 
+ 
+
+==================================================
+AbstractOutputBuffer.java
+index a9ee2f40f2..a3b94f177e 100644
+--- a/java/org/apache/coyote/ajp/AjpMessage.java
++++ b/java/org/apache/coyote/ajp/AjpMessage.java
+@@ -20,7 +20,6 @@ package org.apache.coyote.ajp;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.buf.ByteChunk;
+-import org.apache.tomcat.util.buf.CharChunk;
+ import org.apache.tomcat.util.buf.HexUtils;
+ import org.apache.tomcat.util.buf.MessageBytes;
+ import org.apache.tomcat.util.res.StringManager;
+@@ -159,15 +158,21 @@ public class AjpMessage {
+             appendByte(0);
+             return;
+         }
+-        if (mb.getType() == MessageBytes.T_BYTES) {
++        if (mb.getType() != MessageBytes.T_BYTES) {
++            mb.toBytes();
+             ByteChunk bc = mb.getByteChunk();
+-            appendByteChunk(bc);
+-        } else if (mb.getType() == MessageBytes.T_CHARS) {
+-            CharChunk cc = mb.getCharChunk();
+-            appendCharChunk(cc);
+-        } else {
+-            appendString(mb.toString());
++            // Need to filter out CTLs excluding TAB. ISO-8859-1 and UTF-8
++            // values will be OK. Strings using other encodings may be
++            // corrupted.
++            byte[] buffer = bc.getBuffer();
++            for (int i = bc.getOffset(); i < bc.getLength(); i++) {
++                if (((buffer[i] <= 31) && (buffer[i] != 9)) ||
++                        buffer[i] == 127 || buffer[i] > 255) {
++                    buffer[i] = ' ';
++                }
++            }
+         }
++        appendByteChunk(mb.getByteChunk());
+     }
+ 
+ 
+@@ -187,70 +192,6 @@ public class AjpMessage {
+     }
+ 
+ 
+-    /**
+-     * Write a CharChunk out at the current write position.
+-     * A null CharChunk is encoded as a string with length 0.
+-     */
+-    public void appendCharChunk(CharChunk cc) {
+-        if (cc == null) {
+-            log.error(sm.getString("ajpmessage.null"),
+-                    new NullPointerException());
+-            appendInt(0);
+-            appendByte(0);
+-            return;
+-        }
+-        int start = cc.getStart();
+-        int end = cc.getEnd();
+-        appendInt(end - start);
+-        char[] cbuf = cc.getBuffer();
+-        for (int i = start; i < end; i++) {
+-            char c = cbuf[i];
+-            // Note:  This is clearly incorrect for many strings,
+-            // but is the only consistent approach within the current
+-            // servlet framework.  It must suffice until servlet output
+-            // streams properly encode their output.
+-            if (((c <= 31) && (c != 9)) || c == 127 || c > 255) {
+-                c = ' ';
+-            }
+-            appendByte(c);
+-        }
+-        appendByte(0);
+-    }
+-
+-
+-    /**
+-     * Write a String out at the current write position.  Strings are
+-     * encoded with the length in two bytes first, then the string, and
+-     * then a terminating \0 (which is <B>not</B> included in the
+-     * encoded length).  The terminator is for the convenience of the C
+-     * code, where it saves a round of copying.  A null string is
+-     * encoded as a string with length 0.
+-     */
+-    public void appendString(String str) {
+-        if (str == null) {
+-            log.error(sm.getString("ajpmessage.null"),
+-                    new NullPointerException());
+-            appendInt(0);
+-            appendByte(0);
+-            return;
+-        }
+-        int len = str.length();
+-        appendInt(len);
+-        for (int i = 0; i < len; i++) {
+-            char c = str.charAt (i);
+-            // Note:  This is clearly incorrect for many strings,
+-            // but is the only consistent approach within the current
+-            // servlet framework.  It must suffice until servlet output
+-            // streams properly encode their output.
+-            if (((c <= 31) && (c != 9)) || c == 127 || c > 255) {
+-                c = ' ';
+-            }
+-            appendByte(c);
+-        }
+-        appendByte(0);
+-    }
+-
+-
+     /**
+      * Copy a chunk of bytes into the packet, starting at the current
+      * write position.  The chunk of bytes is encoded with the length
+
+==================================================
+TesterAjpMessage.java
+index a72268445a..4558fc0dcd 100644
+--- a/java/org/apache/coyote/http11/AbstractOutputBuffer.java
++++ b/java/org/apache/coyote/http11/AbstractOutputBuffer.java
+@@ -28,7 +28,6 @@ import org.apache.coyote.OutputBuffer;
+ import org.apache.coyote.Response;
+ import org.apache.coyote.http11.filters.GzipOutputFilter;
+ import org.apache.tomcat.util.buf.ByteChunk;
+-import org.apache.tomcat.util.buf.CharChunk;
+ import org.apache.tomcat.util.buf.MessageBytes;
+ import org.apache.tomcat.util.http.HttpMessages;
+ import org.apache.tomcat.util.net.AbstractEndpoint;
+@@ -488,16 +487,21 @@ public abstract class AbstractOutputBuffer<S> implements OutputBuffer {
+      */
+     protected void write(MessageBytes mb) {
+ 
+-        if (mb.getType() == MessageBytes.T_BYTES) {
++        if (mb.getType() != MessageBytes.T_BYTES) {
++            mb.toBytes();
+             ByteChunk bc = mb.getByteChunk();
+-            write(bc);
+-        } else if (mb.getType() == MessageBytes.T_CHARS) {
+-            CharChunk cc = mb.getCharChunk();
+-            write(cc);
+-        } else {
+-            write(mb.toString());
++            // Need to filter out CTLs excluding TAB. ISO-8859-1 and UTF-8
++            // values will be OK. Strings using other encodings may be
++            // corrupted.
++            byte[] buffer = bc.getBuffer();
++            for (int i = bc.getOffset(); i < bc.getLength(); i++) {
++                if (((buffer[i] <= 31) && (buffer[i] != 9)) ||
++                        buffer[i] == 127 || buffer[i] > 255) {
++                    buffer[i] = ' ';
++                }
++            }
+         }
+-
++        write(mb.getByteChunk());
+     }
+ 
+ 
+@@ -519,34 +523,6 @@ public abstract class AbstractOutputBuffer<S> implements OutputBuffer {
+     }
+ 
+ 
+-    /**
+-     * This method will write the contents of the specified char
+-     * buffer to the output stream, without filtering. This method is meant to
+-     * be used to write the response header.
+-     *
+-     * @param cc data to be written
+-     */
+-    protected void write(CharChunk cc) {
+-
+-        int start = cc.getStart();
+-        int end = cc.getEnd();
+-        checkLengthBeforeWrite(end-start);
+-        char[] cbuf = cc.getBuffer();
+-        for (int i = start; i < end; i++) {
+-            char c = cbuf[i];
+-            // Note:  This is clearly incorrect for many strings,
+-            // but is the only consistent approach within the current
+-            // servlet framework.  It must suffice until servlet output
+-            // streams properly encode their output.
+-            if (((c <= 31) && (c != 9)) || c == 127 || c > 255) {
+-                c = ' ';
+-            }
+-            headerBuffer[pos++] = (byte) c;
+-        }
+-
+-    }
+-
+-
+     /**
+      * This method will write the contents of the specified byte
+      * buffer to the output stream, without filtering. This method is meant to
+
+==================================================

@@ -1,0 +1,300 @@
+469a9162612bfb3f7c7a5902a7cf1674e9873d88
+==================================================
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=50016
+==================================================
+Mark Emlyn
+==================================================
+Fri Oct 8 14:02:05 2010 +0000
+==================================================
+Authenticator.java
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=50016
+Re-factor isUserInRole() and login() / logout() methods to support JACC implementations and to improve encapsulation.
+Patch provided by David Jencks. 
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1005834 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Realm.java
+index 7a6349e2e4..46e9861b00 100644
+--- a/java/org/apache/catalina/Authenticator.java
++++ b/java/org/apache/catalina/Authenticator.java
+@@ -19,8 +19,8 @@
+ package org.apache.catalina;
+ 
+ import java.io.IOException;
+-import java.security.Principal;
+ 
++import javax.servlet.ServletException;
+ import javax.servlet.http.HttpServletResponse;
+ 
+ import org.apache.catalina.connector.Request;
+@@ -53,21 +53,8 @@ public interface Authenticator {
+     public boolean authenticate(Request request, HttpServletResponse response,
+             LoginConfig config) throws IOException;
+     
+-    /**
+-     * Register an authenticated Principal and authentication type in our
+-     * request, in the current session (if there is one), and with our
+-     * SingleSignOn valve, if there is one.  Set the appropriate cookie
+-     * to be returned. Passing in a null principal will de-register any
+-     * SSO sessions.
+-     *
+-     * @param request The servlet request we are processing
+-     * @param response The servlet response we are populating
+-     * @param principal The authenticated Principal to be registered
+-     * @param authType The authentication type to be registered
+-     * @param username Username used to authenticate (if any)
+-     * @param password Password used to authenticate (if any)
+-     */
+-    public void register(Request request, HttpServletResponse response,
+-            Principal principal, String authType,
+-            String username, String password);
++    public void login(String userName, String password, Request request)
++            throws ServletException;
++
++    public void logout(Request request) throws ServletException;
+ }
+
+==================================================
+AuthenticatorBase.java
+index 5cfdb8503e..f66a91d527 100644
+--- a/java/org/apache/catalina/Realm.java
++++ b/java/org/apache/catalina/Realm.java
+@@ -158,10 +158,11 @@ public interface Realm {
+      * security role, within the context of this Realm; otherwise return
+      * <code>false</code>.
+      *
++     * @param wrapper wrapper context for evaluating role
+      * @param principal Principal for whom the role is to be checked
+      * @param role Security role to be checked
+      */
+-    public boolean hasRole(Principal principal, String role);
++    public boolean hasRole(Wrapper wrapper, Principal principal, String role);
+ 
+         /**
+      * Enforce any user data constraint required by the security constraint
+
+==================================================
+BasicAuthenticator.java
+index 6d8eb7d22f..5f858cb993 100644
+--- a/java/org/apache/catalina/authenticator/AuthenticatorBase.java
++++ b/java/org/apache/catalina/authenticator/AuthenticatorBase.java
+@@ -829,6 +829,29 @@ public abstract class AuthenticatorBase extends ValveBase
+ 
+     }
+ 
++    public void login(String username, String password, Request request)
++            throws ServletException {
++        Principal principal = doLogin(request, username, password);
++        register(request, request.getResponse(), principal,
++                    getAuthMethod(), username, password);
++    }
++
++    protected abstract String getAuthMethod();
++
++    protected Principal doLogin(Request request, String username,
++            String password) throws ServletException {
++        Principal p = context.getRealm().authenticate(username, password);
++        if (p == null) {
++            throw new ServletException(sm.getString("authenticator.loginFail"));
++        }
++        return p;
++    }
++
++    public void logout(Request request) throws ServletException {
++        register(request, request.getResponse(), null,
++                null, null, null);
++
++    }
+ 
+     /**
+      * Start this component and implement the requirements
+
+==================================================
+DigestAuthenticator.java
+index a325771c13..cbbab8a52d 100644
+--- a/java/org/apache/catalina/authenticator/BasicAuthenticator.java
++++ b/java/org/apache/catalina/authenticator/BasicAuthenticator.java
+@@ -177,4 +177,8 @@ public class BasicAuthenticator
+     }
+ 
+ 
++    @Override
++    protected String getAuthMethod() {
++        return Constants.BASIC_METHOD;
++    }
+ }
+
+==================================================
+FormAuthenticator.java
+index 67ce74e639..90aab2243d 100644
+--- a/java/org/apache/catalina/authenticator/DigestAuthenticator.java
++++ b/java/org/apache/catalina/authenticator/DigestAuthenticator.java
+@@ -198,6 +198,12 @@ public class DigestAuthenticator
+     }
+ 
+ 
++    @Override
++    protected String getAuthMethod() {
++        return Constants.DIGEST_METHOD;
++    }
++
++
+     // ------------------------------------------------------ Protected Methods
+ 
+ 
+
+==================================================
+NonLoginAuthenticator.java
+index 37dda3111e..b1ed7e62d9 100644
+--- a/java/org/apache/catalina/authenticator/LocalStrings.properties
++++ b/java/org/apache/catalina/authenticator/LocalStrings.properties
+@@ -17,6 +17,7 @@ authenticator.certificates=No client certificate chain in this request
+ authenticator.forbidden=Access to the requested resource has been denied
+ authenticator.formlogin=Invalid direct reference to form login page
+ authenticator.invalid=Invalid client certificate chain in this request
++authenticator.loginFail=Login failed
+ authenticator.keystore=Exception loading key store
+ authenticator.manager=Exception initializing trust managers
+ authenticator.notAuthenticated=Configuration error:  Cannot perform access control without an authenticated principal
+
+==================================================
+SSLAuthenticator.java
+index d97afb8f3c..0c29e88c56 100644
+--- a/java/org/apache/catalina/authenticator/NonLoginAuthenticator.java
++++ b/java/org/apache/catalina/authenticator/NonLoginAuthenticator.java
+@@ -103,4 +103,8 @@ public final class NonLoginAuthenticator
+     }
+ 
+ 
++    @Override
++    protected String getAuthMethod() {
++        return "NONE";
++    }
+ }
+
+==================================================
+Request.java
+index 1089f7d3ef..50b63af0f5 100644
+--- a/java/org/apache/catalina/connector/LocalStrings.properties
++++ b/java/org/apache/catalina/connector/LocalStrings.properties
+@@ -61,8 +61,6 @@ coyoteRequest.postTooLarge=Parameters were not parsed because the size of the po
+ coyoteRequest.chunkedPostTooLarge=Parameters were not parsed because the size of the posted data was too big. Because this request was a chunked request, it could not be processed further. Use the maxPostSize attribute of the connector to resolve this if the application should accept large POSTs.
+ coyoteRequest.alreadyAuthenticated=This is request has already been authenticated
+ coyoteRequest.noLoginConfig=No authentication mechanism has been configured for this context
+-coyoteRequest.noPasswordLogin=The authentication mechanism configured for this context does not support user name and password authentication
+-coyoteRequest.authFail=The authentication of user {0} was not successful
+ coyoteRequest.authenticate.ise=Cannot call authenticate() after the reponse has been committed
+ coyoteRequest.uploadLocationInvalid=The temporary upload location [{0}] is not valid
+ 
+
+==================================================
+RealmBase.java
+index acce561712..fb1457bc47 100644
+--- a/java/org/apache/catalina/connector/Request.java
++++ b/java/org/apache/catalina/connector/Request.java
+@@ -2325,15 +2325,8 @@ public class Request
+         if (realm == null)
+             return false;
+ 
+-        // Check for a role alias defined in a <security-role-ref> element
+-        if (wrapper != null) {
+-            String realRole = wrapper.findSecurityReference(role);
+-            if ((realRole != null) && realm.hasRole(userPrincipal, realRole))
+-                return true;
+-        }
+-
+         // Check for a role defined directly as a <security-role>
+-        return (realm.hasRole(userPrincipal, role));
++        return (realm.hasRole(wrapper, userPrincipal, role));
+     }
+ 
+ 
+@@ -2499,31 +2492,11 @@ public class Request
+                     sm.getString("coyoteRequest.alreadyAuthenticated"));
+         }
+         
+-        LoginConfig config = context.getLoginConfig();
+-        if (config == null) {
+-            throw new ServletException(
+-                    sm.getString("coyoteRequest.noLoginConfig"));
++        if (context.getAuthenticator() == null) {
++            throw new ServletException("no authenticator");
+         }
+         
+-        String authMethod = config.getAuthMethod();
+-        if (BASIC_AUTH.equals(authMethod) || FORM_AUTH.equals(authMethod) ||
+-                DIGEST_AUTH.equals(authMethod)) {
+-            // Methods support user name and password authentication
+-            Realm realm = context.getRealm();
+-            
+-            Principal principal = realm.authenticate(username, password);
+-
+-            if (principal == null) {
+-                throw new ServletException(
+-                        sm.getString("coyoteRequest.authFail", username));
+-            }
+-            // Assume if we have a non-null LoginConfig then we must have an
+-            // authenticator
+-            context.getAuthenticator().register(this, getResponse(), principal,
+-                    authMethod, username, password);
+-        } else {
+-            throw new ServletException("coyoteRequest.noPasswordLogin");
+-        }
++        context.getAuthenticator().login(username, password, this);
+     }
+ 
+     /**
+@@ -2531,8 +2504,7 @@ public class Request
+      */
+     @Override
+     public void logout() throws ServletException {
+-        context.getAuthenticator().register(this, getResponse(), null,
+-                null, null, null);
++        context.getAuthenticator().logout(this);
+     }
+     
+     /**
+
+==================================================
+UserDatabaseRealm.java
+index b9897ee278..797cb7f463 100644
+--- a/java/org/apache/catalina/realm/RealmBase.java
++++ b/java/org/apache/catalina/realm/RealmBase.java
+@@ -40,6 +40,7 @@ import org.apache.catalina.LifecycleState;
+ import org.apache.catalina.Realm;
+ import org.apache.catalina.Server;
+ import org.apache.catalina.Service;
++import org.apache.catalina.Wrapper;
+ import org.apache.catalina.connector.Request;
+ import org.apache.catalina.connector.Response;
+ import org.apache.catalina.core.ApplicationSessionCookieConfig;
+@@ -763,7 +764,7 @@ public abstract class RealmBase extends LifecycleMBeanBase implements Realm {
+                     log.debug("  No user authenticated, cannot grant access");
+             } else {
+                 for (int j = 0; j < roles.length; j++) {
+-                    if (hasRole(principal, roles[j])) {
++                    if (hasRole(null, principal, roles[j])) {
+                         status = true;
+                         if( log.isDebugEnabled() )
+                             log.debug( "Role found:  " + roles[j]);
+@@ -828,7 +829,14 @@ public abstract class RealmBase extends LifecycleMBeanBase implements Realm {
+      * @param principal Principal for whom the role is to be checked
+      * @param role Security role to be checked
+      */
+-    public boolean hasRole(Principal principal, String role) {
++    @Override
++    public boolean hasRole(Wrapper wrapper, Principal principal, String role) {
++        // Check for a role alias defined in a <security-role-ref> element
++        if (wrapper != null) {
++            String realRole = wrapper.findSecurityReference(role);
++            if (realRole != null)
++                role = realRole;
++        }
+ 
+         // Should be overridden in JAASRealm - to avoid pretty inefficient conversions
+         if ((principal == null) || (role == null) ||
+
+==================================================

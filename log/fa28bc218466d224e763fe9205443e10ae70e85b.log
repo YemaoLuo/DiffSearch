@@ -1,0 +1,156 @@
+fa28bc218466d224e763fe9205443e10ae70e85b
+==================================================
+Handle infinite timeouts for both soTimeout and keepAliveTimeout
+==================================================
+Mark Emlyn
+==================================================
+Tue Sep 6 22:56:40 2011 +0000
+==================================================
+Http11NioProcessor.java
+Handle infinite timeouts for both soTimeout and keepAliveTimeout
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1165918 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Http11Processor.java
+index 6ad66d4003..d105fa5afb 100644
+--- a/java/org/apache/coyote/http11/Http11NioProcessor.java
++++ b/java/org/apache/coyote/http11/Http11NioProcessor.java
+@@ -137,7 +137,7 @@ public class Http11NioProcessor extends AbstractHttp11Processor<NioChannel> {
+                         if (comettimeout != null) attach.setTimeout(comettimeout.longValue());
+                     } else {
+                         //reset the timeout
+-                        if (keepAlive && keepAliveTimeout>0) {
++                        if (keepAlive) {
+                             attach.setTimeout(keepAliveTimeout);
+                         } else {
+                             attach.setTimeout(soTimeout);
+@@ -177,7 +177,7 @@ public class Http11NioProcessor extends AbstractHttp11Processor<NioChannel> {
+             long soTimeout = endpoint.getSoTimeout();
+ 
+             //reset the timeout
+-            if (keepAlive && keepAliveTimeout>0) {
++            if (keepAlive) {
+                 attach.setTimeout(keepAliveTimeout);
+             } else {
+                 attach.setTimeout(soTimeout);
+@@ -421,9 +421,11 @@ public class Http11NioProcessor extends AbstractHttp11Processor<NioChannel> {
+         openSocket = true;
+         // Check to see if we have read any of the request line yet
+         if (inputBuffer.getParsingRequestLinePhase() < 2) {
+-            // Haven't read the request line. Must be keep-alive
+-            // Make sure poller uses keepAlive from here onwards
+-            socket.setTimeout(endpoint.getKeepAliveTimeout());
++            if (socket.getLastAccess() > -1 || keptAlive) {
++                // Haven't read the request line and have previously processed a
++                // request. Must be keep-alive. Make sure poller uses keepAlive.
++                socket.setTimeout(endpoint.getKeepAliveTimeout());
++            }
+         } else {
+             // Started to read request line. Need to keep processor
+             // associated with socket
+
+==================================================
+AbstractEndpoint.java
+index 6b4178cd36..51db71df64 100644
+--- a/java/org/apache/coyote/http11/Http11Processor.java
++++ b/java/org/apache/coyote/http11/Http11Processor.java
+@@ -345,15 +345,6 @@ public class Http11Processor extends AbstractHttp11Processor<Socket> {
+     @Override
+     protected void setRequestLineReadTimeout() throws IOException {
+         
+-        int standardTimeout = 0;
+-        
+-        if (keptAlive) {
+-            if (keepAliveTimeout > 0) {
+-                standardTimeout = keepAliveTimeout;
+-            } else if (endpoint.getSoTimeout() > 0) {
+-                standardTimeout = endpoint.getSoTimeout();
+-            }
+-        }
+         /*
+          * When there is no data in the buffer and this is not the first
+          * request on this connection and timeouts are being used the
+@@ -363,19 +354,23 @@ public class Http11Processor extends AbstractHttp11Processor<Socket> {
+          * This is a little hacky but better than exposing the socket
+          * and the timeout info to the InputBuffer
+          */
+-        if (inputBuffer.lastValid == 0 && socket.getLastAccess() > -1 &&
+-                standardTimeout > 0) {
+-
+-            long queueTime = System.currentTimeMillis() - socket.getLastAccess();
++        if (inputBuffer.lastValid == 0 && socket.getLastAccess() > -1) {
+             int firstReadTimeout;
+-            if (queueTime >= standardTimeout) {
+-                // Queued for longer than timeout but there might be
+-                // data so use shortest possible timeout
+-                firstReadTimeout = 1;
++            if (keepAliveTimeout == -1) {
++                firstReadTimeout = 0;
+             } else {
+-                // Cast is safe since queueTime must be less than
+-                // standardTimeout which is an int
+-                firstReadTimeout = standardTimeout - (int) queueTime;
++                long queueTime =
++                    System.currentTimeMillis() - socket.getLastAccess();
++
++                if (queueTime >= keepAliveTimeout) {
++                    // Queued for longer than timeout but there might be
++                    // data so use shortest possible timeout
++                    firstReadTimeout = 1;
++                } else {
++                    // Cast is safe since queueTime must be less than
++                    // keepAliveTimeout which is an int
++                    firstReadTimeout = keepAliveTimeout - (int) queueTime;
++                }
+             }
+             socket.getSocket().setSoTimeout(firstReadTimeout);
+             if (!inputBuffer.fill()) {
+
+==================================================
+AprEndpoint.java
+index 54aad90aae..27ef98be12 100644
+--- a/java/org/apache/tomcat/util/net/AbstractEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AbstractEndpoint.java
+@@ -170,12 +170,18 @@ public abstract class AbstractEndpoint {
+     private BindState bindState = BindState.UNBOUND;
+ 
+     /**
+-     * Keepalive timeout, if lesser or equal to 0 then soTimeout will be used.
++     * Keepalive timeout, if not set the soTimeout is used.
+      */
+-    private int keepAliveTimeout = -1;
+-    public int getKeepAliveTimeout() { return keepAliveTimeout;}
++    private Integer keepAliveTimeout = null;
++    public int getKeepAliveTimeout() {
++        if (keepAliveTimeout == null) {
++            return getSoTimeout();
++        } else {
++            return keepAliveTimeout.intValue();
++        }
++    }
+     public void setKeepAliveTimeout(int keepAliveTimeout) {
+-        this.keepAliveTimeout = keepAliveTimeout;
++        this.keepAliveTimeout = Integer.valueOf(keepAliveTimeout);
+     }
+ 
+ 
+
+==================================================
+NioEndpoint.java
+index da5f8636fd..7534cfbd40 100644
+--- a/java/org/apache/tomcat/util/net/AprEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AprEndpoint.java
+@@ -1129,7 +1129,7 @@ public class AprEndpoint extends AbstractEndpoint {
+             int size = getMaxConnections() / pollerThreadCount;
+             int keepAliveTimeout = getKeepAliveTimeout();
+             int socketTimeout = socketProperties.getSoTimeout();
+-            if (keepAliveTimeout > 0 && !comet) {
++            if (keepAliveTimeout != socketTimeout && !comet) {
+                 separateKeepAlive = true;
+             }
+             connectionPollset = allocatePoller(size, pool, socketTimeout);
+
+==================================================

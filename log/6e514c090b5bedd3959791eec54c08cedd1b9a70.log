@@ -1,0 +1,426 @@
+6e514c090b5bedd3959791eec54c08cedd1b9a70
+==================================================
+Fix for https://issues.apache.org/bugzilla/show_bug.cgi?id=55287
+==================================================
+Jeremy Boynes
+==================================================
+Sun Jul 28 23:01:23 2013 +0000
+==================================================
+ContextConfig.java
+Fix for https://issues.apache.org/bugzilla/show_bug.cgi?id=55287
+
+Decouple service loading for ServletContainerInitializers from ContextConfig and 
+ensure services defined by the parent ClassLoader are discovered.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1507870 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+WebappServiceLoader.java
+index 28783012f2..5311aea7cf 100644
+--- a/java/org/apache/catalina/startup/ContextConfig.java
++++ b/java/org/apache/catalina/startup/ContextConfig.java
+@@ -16,19 +16,17 @@
+  */
+ package org.apache.catalina.startup;
+ 
+-import java.io.BufferedReader;
+ import java.io.File;
+ import java.io.FileInputStream;
+ import java.io.FileNotFoundException;
+ import java.io.IOException;
+ import java.io.InputStream;
+-import java.io.InputStreamReader;
+-import java.io.UnsupportedEncodingException;
+ import java.net.MalformedURLException;
+ import java.net.URISyntaxException;
+ import java.net.URL;
+ import java.net.URLConnection;
+ import java.util.ArrayList;
++import java.util.Collection;
+ import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.HashSet;
+@@ -1129,7 +1127,7 @@ public class ContextConfig implements LifecycleListener {
+ 
+         // Step 3. Look for ServletContainerInitializer implementations
+         if (ok) {
+-            processServletContainerInitializers(orderedFragments);
++            processServletContainerInitializers(context.getServletContext());
+         }
+ 
+         if  (!webXml.isMetadataComplete() || typeInitializerMap.size() > 0) {
+@@ -1591,152 +1589,65 @@ public class ContextConfig implements LifecycleListener {
+ 
+     /**
+      * Scan JARs for ServletContainerInitializer implementations.
+-     * Implementations will be added in web-fragment.xml priority order.
+      */
+-    protected void processServletContainerInitializers(
+-            Set<WebXml> fragments) {
++    protected void processServletContainerInitializers(ServletContext servletContext) {
+ 
+-        for (WebXml fragment : fragments) {
+-            URL url = fragment.getURL();
+-            Jar jar = null;
+-            InputStream is = null;
+-            List<ServletContainerInitializer> detectedScis = null;
++        Collection<ServletContainerInitializer> detectedScis;
++        try {
++            WebappServiceLoader<ServletContainerInitializer> loader =
++                    new WebappServiceLoader<>(servletContext);
++            detectedScis = loader.load(ServletContainerInitializer.class);
++        } catch (IOException e) {
++            log.error(sm.getString(
++                    "contextConfig.servletContainerInitializerFail",
++                    context.getName()),
++                e);
++            ok = false;
++            return;
++        }
++
++        for (ServletContainerInitializer sci : detectedScis) {
++            initializerClassMap.put(sci, new HashSet<Class<?>>());
++
++            HandlesTypes ht;
+             try {
+-                if ("jar".equals(url.getProtocol())) {
+-                    jar = JarFactory.newInstance(url);
+-                    is = jar.getInputStream(SCI_LOCATION);
+-                } else if ("file".equals(url.getProtocol())) {
+-                    String path = url.getPath();
+-                    File file = new File(path, SCI_LOCATION);
+-                    if (file.exists()) {
+-                        is = new FileInputStream(file);
+-                    }
+-                }
+-                if (is != null) {
+-                    detectedScis = getServletContainerInitializers(is);
+-                }
+-            } catch (IOException ioe) {
+-                log.error(sm.getString(
+-                        "contextConfig.servletContainerInitializerFail", url,
+-                        context.getName()));
+-                ok = false;
+-                return;
+-            } finally {
+-                if (is != null) {
+-                    try {
+-                        is.close();
+-                    } catch (IOException e) {
+-                        // Ignore
+-                    }
+-                }
+-                if (jar != null) {
+-                    jar.close();
++                ht = sci.getClass().getAnnotation(HandlesTypes.class);
++            } catch (Exception e) {
++                if (log.isDebugEnabled()) {
++                    log.info(sm.getString("contextConfig.sci.debug",
++                            sci.getClass().getName()),
++                            e);
++                } else {
++                    log.info(sm.getString("contextConfig.sci.info",
++                            sci.getClass().getName()));
+                 }
++                continue;
+             }
+-
+-            if (detectedScis == null) {
++            if (ht == null) {
+                 continue;
+             }
+-
+-            for (ServletContainerInitializer sci : detectedScis) {
+-                initializerClassMap.put(sci, new HashSet<Class<?>>());
+-
+-                HandlesTypes ht = null;
+-                try {
+-                    ht = sci.getClass().getAnnotation(HandlesTypes.class);
+-                } catch (Exception e) {
+-                    if (log.isDebugEnabled()) {
+-                        log.info(sm.getString("contextConfig.sci.debug", url),
+-                                e);
+-                    } else {
+-                        log.info(sm.getString("contextConfig.sci.info", url));
+-                    }
+-                }
+-                if (ht != null) {
+-                    Class<?>[] types = ht.value();
+-                    if (types != null) {
+-                        for (Class<?> type : types) {
+-                            if (type.isAnnotation()) {
+-                                handlesTypesAnnotations = true;
+-                            } else {
+-                                handlesTypesNonAnnotations = true;
+-                            }
+-                            Set<ServletContainerInitializer> scis = typeInitializerMap
+-                                    .get(type);
+-                            if (scis == null) {
+-                                scis = new HashSet<>();
+-                                typeInitializerMap.put(type, scis);
+-                            }
+-                            scis.add(sci);
+-                        }
+-                    }
+-                }
++            Class<?>[] types = ht.value();
++            if (types == null) {
++                continue;
+             }
+-        }
+-    }
+-
+ 
+-    /**
+-     * Extract the name of the ServletContainerInitializer.
+-     *
+-     * @param is    The resource where the name is defined
+-     * @return      The class name
+-     * @throws IOException
+-     */
+-    protected List<ServletContainerInitializer> getServletContainerInitializers(
+-            InputStream is) throws IOException {
+-
+-        List<ServletContainerInitializer> initializers = new ArrayList<>();
+-
+-        if (is != null) {
+-            String line = null;
+-            try {
+-                BufferedReader br = new BufferedReader(new InputStreamReader(
+-                        is, "UTF-8"));
+-                while ((line = br.readLine()) != null) {
+-                    line = line.trim();
+-                    if (line.length() > 0) {
+-                        int i = line.indexOf('#');
+-                        if (i > -1) {
+-                            if (i == 0) {
+-                                continue;
+-                            }
+-                            line = line.substring(0, i).trim();
+-                        }
+-                        initializers.add(getServletContainerInitializer(line));
+-                    }
++            for (Class<?> type : types) {
++                if (type.isAnnotation()) {
++                    handlesTypesAnnotations = true;
++                } else {
++                    handlesTypesNonAnnotations = true;
+                 }
+-            } catch (UnsupportedEncodingException e) {
+-                // Should never happen with UTF-8
+-                // If it does - ignore & return null
++                Set<ServletContainerInitializer> scis =
++                        typeInitializerMap.get(type);
++                if (scis == null) {
++                    scis = new HashSet<>();
++                    typeInitializerMap.put(type, scis);
++                }
++                scis.add(sci);
+             }
+         }
+-
+-        return initializers;
+     }
+ 
+-    protected ServletContainerInitializer getServletContainerInitializer(
+-            String className) throws IOException {
+-        ServletContainerInitializer sci = null;
+-        try {
+-            Class<?> clazz = Class.forName(className, true, context.getLoader()
+-                    .getClassLoader());
+-            sci = (ServletContainerInitializer) clazz.newInstance();
+-        } catch (ClassNotFoundException e) {
+-            log.error(sm.getString("contextConfig.invalidSci", className), e);
+-            throw new IOException(e);
+-        } catch (InstantiationException e) {
+-            log.error(sm.getString("contextConfig.invalidSci", className), e);
+-            throw new IOException(e);
+-        } catch (IllegalAccessException e) {
+-            log.error(sm.getString("contextConfig.invalidSci", className), e);
+-            throw new IOException(e);
+-        }
+-
+-        return sci;
+-    }
+-
+-
+     /**
+      * Scan JARs that contain web-fragment.xml files that will be used to
+      * configure this application to see if they also contain static resources.
+
+==================================================
+TestWebappServiceLoader.java
+new file mode 100644
+index 0000000000..c6e851659e
+--- /dev/null
++++ b/java/org/apache/catalina/startup/WebappServiceLoader.java
+@@ -0,0 +1,165 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.catalina.startup;
++
++import java.io.BufferedReader;
++import java.io.FileNotFoundException;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.InputStreamReader;
++import java.net.URL;
++import java.nio.charset.Charset;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.Enumeration;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Set;
++
++import javax.servlet.ServletContext;
++
++/**
++ * A variation of Java's JAR ServiceLoader that respects exclusion rules for web applications.
++ * <p/>
++ * Primarily intended for use loading ServletContainerInitializers as defined by Servlet 8.2.4.
++ * This implementation does not attempt lazy loading as the container is required to
++ * introspect all implementations discovered.
++ * <p/>
++ * If the ServletContext defines ORDERED_LIBS, then only JARs in WEB-INF/lib
++ * that are named in that set will be included in the search for
++ * provider configuration files; if ORDERED_LIBS is not defined then
++ * all JARs will be searched for provider configuration files. Providers
++ * defined by resources in the parent ClassLoader will always be returned.
++ * <p/>
++ * Provider classes will be loaded using the context's ClassLoader.
++ *
++ * @see javax.servlet.ServletContainerInitializer
++ * @see java.util.ServiceLoader
++ */
++public class WebappServiceLoader<T> {
++    private static final String LIB = "/WEB-INF/lib/";
++    private static final String SERVICES = "META-INF/services/";
++    private static final Charset UTF8 = Charset.forName("UTF-8");
++
++    private final ServletContext context;
++
++    /**
++     * Construct a loader to load services from a ServletContext.
++     *
++     * @param context the context to use
++     */
++    public WebappServiceLoader(ServletContext context) {
++        this.context = context;
++    }
++
++    /**
++     * Load the providers for a service type.
++     *
++     * @param serviceType the type of service to load
++     * @return an unmodifiable collection of service providers
++     * @throws IOException if there was a problem loading any service
++     */
++    public Collection<T> load(Class<T> serviceType) throws IOException {
++        String configFile = SERVICES + serviceType.getName();
++
++        Set<String> servicesFound = new HashSet<>();
++        ClassLoader loader = context.getClassLoader();
++
++        // if the ServletContext has ORDERED_LIBS, then use that to specify the
++        // set of JARs from WEB-INF/lib that should be used for loading services
++        @SuppressWarnings("unchecked")
++        List<String> orderedLibs = (List<String>) context.getAttribute(ServletContext.ORDERED_LIBS);
++        if (orderedLibs != null) {
++            // handle ordered libs directly, ...
++            for (String lib : orderedLibs) {
++                URL jarUrl = context.getResource(LIB + lib);
++                if (jarUrl == null) {
++                    // should not happen, just ignore
++                    continue;
++                }
++
++                String base = jarUrl.toExternalForm();
++                URL url;
++                if (base.endsWith("/")) {
++                    url = new URL(base + configFile);
++                } else {
++                    url = new URL("jar:" + base + "!/" + configFile);
++                }
++                try {
++                    parseConfigFile(servicesFound, url);
++                } catch (FileNotFoundException e) {
++                    // no provider file found, this is OK
++                }
++            }
++
++            // and the parent ClassLoader for all others
++            loader = loader.getParent();
++        }
++
++        Enumeration<URL> resources;
++        if (loader == null) {
++            resources = ClassLoader.getSystemResources(configFile);
++        } else {
++            resources = loader.getResources(configFile);
++        }
++        while (resources.hasMoreElements()) {
++            parseConfigFile(servicesFound, resources.nextElement());
++        }
++
++        // load the discovered services
++        if (servicesFound.isEmpty()) {
++            return Collections.emptyList();
++        }
++        return loadServices(serviceType, servicesFound);
++    }
++
++    private void parseConfigFile(Set<String> servicesFound, URL url) throws IOException {
++        try (InputStream is = url.openStream()) {
++            BufferedReader reader = new BufferedReader(new InputStreamReader(is, UTF8));
++            String line;
++            while ((line = reader.readLine()) != null) {
++                int i = line.indexOf('#');
++                if (i >= 0) {
++                    line = line.substring(0, i);
++                }
++                line = line.trim();
++                if (line.length() == 0) {
++                    continue;
++                }
++                if (servicesFound.contains(line)) {
++                    continue;
++                }
++                servicesFound.add(line);
++            }
++        }
++    }
++
++    private Collection<T> loadServices(Class<T> serviceType, Set<String> servicesFound) throws IOException {
++        ClassLoader loader = context.getClassLoader();
++        List<T> services = new ArrayList<>(servicesFound.size());
++        for (String serviceClass : servicesFound) {
++            try {
++                Class<?> clazz = Class.forName(serviceClass, true, loader);
++                services.add(serviceType.cast(clazz.newInstance()));
++            } catch (ClassNotFoundException | InstantiationException | IllegalAccessException | ClassCastException e) {
++                throw new IOException(e);
++            }
++        }
++        return Collections.unmodifiableCollection(services);
++    }
++}
+
+==================================================

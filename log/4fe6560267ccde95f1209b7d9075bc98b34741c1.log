@@ -1,0 +1,150 @@
+4fe6560267ccde95f1209b7d9075bc98b34741c1
+==================================================
+Improve handling of situation where socket / connector closes down while an application thread is using the socket. This ismost likely to occur with upgraded connections that use concurrent read/write (e.g. WebSocket)
+==================================================
+Mark Emlyn
+==================================================
+Tue Sep 17 09:44:32 2013 +0000
+==================================================
+AbstractProtocol.java
+Improve handling of situation where socket / connector closes down while an application thread is using the socket. This ismost likely to occur with upgraded connections that use concurrent read/write (e.g. WebSocket)
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1523964 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Http11AprProtocol.java
+index beac2b97c9..bb2003af48 100644
+--- a/java/org/apache/coyote/AbstractProtocol.java
++++ b/java/org/apache/coyote/AbstractProtocol.java
+@@ -703,6 +703,7 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+                 } else {
+                     // Connection closed. OK to recycle the processor. Upgrade
+                     // processors are not recycled.
++                    wrapper.setClosing(true);
+                     connections.remove(socket);
+                     if (processor.isUpgrade()) {
+                         processor.getHttpUpgradeHandler().destroy();
+
+==================================================
+AprServletInputStream.java
+index c899b80d05..1c0d9be430 100644
+--- a/java/org/apache/coyote/http11/Http11AprProtocol.java
++++ b/java/org/apache/coyote/http11/Http11AprProtocol.java
+@@ -28,6 +28,7 @@ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.net.AbstractEndpoint;
+ import org.apache.tomcat.util.net.AprEndpoint;
+ import org.apache.tomcat.util.net.AprEndpoint.Handler;
++import org.apache.tomcat.util.net.AprEndpoint.Poller;
+ import org.apache.tomcat.util.net.SocketStatus;
+ import org.apache.tomcat.util.net.SocketWrapper;
+ 
+@@ -309,8 +310,13 @@ public class Http11AprProtocol extends AbstractHttp11Protocol<Long> {
+                 }
+             } else {
+                 // Upgraded
+-                ((AprEndpoint) proto.endpoint).getPoller().add(
+-                        socket.getSocket().longValue(), -1, true, false);
++                Poller p = ((AprEndpoint) proto.endpoint).getPoller();
++                if (p == null) {
++                    // Connector has been stopped
++                    release(socket, processor, true, false);
++                } else {
++                    p.add(socket.getSocket().longValue(), -1, true, false);
++                }
+             }
+         }
+ 
+
+==================================================
+AprServletOutputStream.java
+index 3c339e2b64..fe96c38542 100644
+--- a/java/org/apache/coyote/http11/upgrade/AprServletInputStream.java
++++ b/java/org/apache/coyote/http11/upgrade/AprServletInputStream.java
+@@ -50,7 +50,7 @@ public class AprServletInputStream extends AbstractServletInputStream {
+         try {
+             readLock.lock();
+             if (wrapper.getBlockingStatus() == block) {
+-                if (closed) {
++                if (closed || wrapper.isClosing()) {
+                     throw new IOException(sm.getString("apr.closed"));
+                 }
+                 result = Socket.recv(socket, b, off, len);
+@@ -70,7 +70,7 @@ public class AprServletInputStream extends AbstractServletInputStream {
+                 try {
+                     readLock.lock();
+                     writeLock.unlock();
+-                    if (closed) {
++                    if (closed || wrapper.isClosing()) {
+                         throw new IOException(sm.getString("apr.closed"));
+                     }
+                     result = Socket.recv(socket, b, off, len);
+
+==================================================
+AbstractEndpoint.java
+index fb15fd1257..7abdb859e4 100644
+--- a/java/org/apache/coyote/http11/upgrade/AprServletOutputStream.java
++++ b/java/org/apache/coyote/http11/upgrade/AprServletOutputStream.java
+@@ -60,7 +60,7 @@ public class AprServletOutputStream extends AbstractServletOutputStream {
+         try {
+             readLock.lock();
+             if (wrapper.getBlockingStatus() == block) {
+-                if (closed) {
++                if (closed || wrapper.isClosing()) {
+                     throw new IOException(sm.getString("apr.closed"));
+                 }
+                 return doWriteInternal(b, off, len);
+@@ -83,7 +83,7 @@ public class AprServletOutputStream extends AbstractServletOutputStream {
+             try {
+                 readLock.lock();
+                 writeLock.unlock();
+-                if (closed) {
++                if (closed || wrapper.isClosing()) {
+                     throw new IOException(sm.getString("apr.closed"));
+                 }
+                 return doWriteInternal(b, off, len);
+
+==================================================
+AprEndpoint.java
+index 69af7aa56f..4d34f9733d 100644
+--- a/java/org/apache/tomcat/util/net/AbstractEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AbstractEndpoint.java
+@@ -519,6 +519,18 @@ public abstract class AbstractEndpoint<S> {
+                 //this is our internal one, so we need to shut it down
+                 ThreadPoolExecutor tpe = (ThreadPoolExecutor) executor;
+                 tpe.shutdownNow();
++                int count = 0;
++                while (count < 50 && tpe.isTerminating()) {
++                    try {
++                        Thread.sleep(100);
++                        count++;
++                    } catch (InterruptedException e) {
++                        // Ignore
++                    }
++                }
++                if (tpe.isTerminating()) {
++                    getLog().warn(sm.getString("endpoint.warn.executorShutdown", getName()));
++                }
+                 TaskQueue queue = (TaskQueue) tpe.getQueue();
+                 queue.setParent(null);
+             }
+
+==================================================
+SocketWrapper.java
+index d1b4767cff..0a6716807f 100644
+--- a/java/org/apache/tomcat/util/net/AprEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AprEndpoint.java
+@@ -1593,6 +1593,10 @@ public class AprEndpoint extends AbstractEndpoint<Long> {
+                     }
+                 }
+ 
++                if (!pollerRunning) {
++                    break;
++                }
++
+                 try {
+                     // Add sockets which are waiting to the poller
+                     if (addList.size() > 0) {
+
+==================================================

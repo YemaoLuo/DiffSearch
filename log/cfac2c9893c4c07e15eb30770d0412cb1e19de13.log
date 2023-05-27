@@ -1,0 +1,353 @@
+cfac2c9893c4c07e15eb30770d0412cb1e19de13
+==================================================
+remove dependency on the modeler so that the pool can run outside of tomcat and still have jmx query notifications.
+==================================================
+Filip Hanik
+==================================================
+Wed Jul 8 22:34:40 2009 +0000
+==================================================
+DataSourceProxy.java
+index 055716bb05..aa1863f108 100644
+--- a/modules/jdbc-pool/doc/jdbc-pool.xml
++++ b/modules/jdbc-pool/doc/jdbc-pool.xml
+@@ -444,8 +444,15 @@
+     <p>Extends the <code>SlowQueryReport</code> and in addition to log entries it issues JMX notification
+        for monitoring tools to react to. Inherits all the attributes from its parent class.
+        This class uses Tomcat's JMX engine so it wont work outside of the Tomcat container.
++       By default, JMX notifications are sent through the ConnectionPool mbean if it is enabled.
++       The SlowQueryReportJmx can also register an MBean if <code>notifyPool=false</code>
+     </p>   
+     <attributes>
++      <attribute name="notifyPool" required="false">
++        <p>(boolean as String) Set to false if you want JMX notifications to go to the SlowQueryReportJmx MBean
++           The default value is <code>true</code>.
++        </p>
++      </attribute>
+     </attributes>
+   </subsection>
+   <subsection name="org.apache.tomcat.jdbc.pool.interceptor.ResetAbandonedTimer">
+@@ -687,9 +694,8 @@
+   <p>Other examples of Tomcat configuration for JDBC usage can be found <a href="http://tomcat.apache.org/tomcat-6.0-doc/jndi-datasource-examples-howto.html">in the Tomcat documentation</a>. </p>
+   <subsection name="Building from source">
+     <p>Building is pretty simple. The pool has a dependency on <code>tomcat-juli.jar</code> and in case you want the <code>SlowQueryReportJmx</code>
+-    it also requires the <code>tomcat-coyote.jar</code> library.</p>
+     <source>
+-       javac -classpath tomcat-juli.jar:tomcat-coyote.jar \
++       javac -classpath tomcat-juli.jar \
+              -d . \
+              org/apache/tomcat/jdbc/pool/*.java \
+              org/apache/tomcat/jdbc/pool/interceptor/*.java \
+
+==================================================
+SlowQueryReportJmx.java
+index 5c0a32f28c..430bad3764 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/DataSourceProxy.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/DataSourceProxy.java
+@@ -21,6 +21,9 @@ import java.sql.Connection;
+ import java.sql.SQLException;
+ import java.util.Iterator;
+ import java.util.concurrent.Future;
++import java.util.concurrent.LinkedBlockingQueue;
++import java.util.concurrent.ThreadPoolExecutor;
++import java.util.concurrent.TimeUnit;
+ 
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+@@ -187,7 +190,13 @@ public class DataSourceProxy  {
+ 
+     protected void finalize() throws Throwable {
+         //terminate the pool?
+-        close(true);
++        ThreadPoolExecutor closer = new ThreadPoolExecutor(0,1,1000,TimeUnit.MILLISECONDS,new LinkedBlockingQueue<Runnable>());
++        final Runnable r = new Runnable() {
++            public void run(){ 
++                close(true);                
++            }
++        };
++        closer.execute(r);
+     }
+ 
+     public int getPoolSize() throws SQLException{
+
+==================================================
+SlowQueryReportJmxMBean.java
+index a29590bbfc..11c675e9db 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/interceptor/SlowQueryReportJmx.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/interceptor/SlowQueryReportJmx.java
+@@ -16,19 +16,26 @@
+  */
+ package org.apache.tomcat.jdbc.pool.interceptor;
+ 
++import java.lang.management.ManagementFactory;
+ import java.util.Iterator;
+ import java.util.Map;
+ import java.util.Set;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.atomic.AtomicLong;
+ 
+-import javax.management.DynamicMBean;
+ import javax.management.InstanceAlreadyExistsException;
+ import javax.management.InstanceNotFoundException;
++import javax.management.ListenerNotFoundException;
+ import javax.management.MBeanException;
++import javax.management.MBeanNotificationInfo;
++import javax.management.MBeanRegistrationException;
+ import javax.management.MalformedObjectNameException;
+ import javax.management.NotCompliantMBeanException;
+ import javax.management.Notification;
++import javax.management.NotificationBroadcasterSupport;
++import javax.management.NotificationEmitter;
++import javax.management.NotificationFilter;
++import javax.management.NotificationListener;
+ import javax.management.ObjectName;
+ import javax.management.RuntimeOperationsException;
+ import javax.management.openmbean.CompositeData;
+@@ -40,16 +47,14 @@ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.jdbc.pool.ConnectionPool;
+ import org.apache.tomcat.jdbc.pool.PooledConnection;
+-import org.apache.tomcat.util.modeler.BaseModelMBean;
+-import org.apache.tomcat.util.modeler.ManagedBean;
+-import org.apache.tomcat.util.modeler.Registry;
++import org.apache.tomcat.jdbc.pool.PoolProperties.InterceptorProperty;
+ /**
+  * Publishes data to JMX and provides notifications 
+  * when failures happen.
+  * @author fhanik
+  *
+  */
+-public class SlowQueryReportJmx extends SlowQueryReport {
++public class SlowQueryReportJmx extends SlowQueryReport implements NotificationEmitter, SlowQueryReportJmxMBean{
+     public static final String SLOW_QUERY_NOTIFICATION = "SLOW QUERY";
+     public static final String FAILED_QUERY_NOTIFICATION = "FAILED QUERY";
+ 
+@@ -58,8 +63,35 @@ public class SlowQueryReportJmx extends SlowQueryReport {
+     protected static Log log = LogFactory.getLog(SlowQueryReportJmx.class);
+     
+     
+-    protected static ConcurrentHashMap<String,DynamicMBean> mbeans = 
+-        new ConcurrentHashMap<String,DynamicMBean>(); 
++    protected static ConcurrentHashMap<String,SlowQueryReportJmxMBean> mbeans = 
++        new ConcurrentHashMap<String,SlowQueryReportJmxMBean>(); 
++    
++    
++    //==============================JMX STUFF========================
++    protected volatile NotificationBroadcasterSupport notifier = new NotificationBroadcasterSupport();
++
++    public void addNotificationListener(NotificationListener listener, NotificationFilter filter, Object handback) throws IllegalArgumentException {
++        notifier.addNotificationListener(listener, filter, handback);
++    }
++
++    
++    public MBeanNotificationInfo[] getNotificationInfo() {
++        return notifier.getNotificationInfo();
++    }
++
++    public void removeNotificationListener(NotificationListener listener) throws ListenerNotFoundException {
++        notifier.removeNotificationListener(listener);
++        
++    }
++
++    public void removeNotificationListener(NotificationListener listener, NotificationFilter filter, Object handback) throws ListenerNotFoundException {
++        notifier.removeNotificationListener(listener, filter, handback);
++        
++    }
++
++    
++    
++    //==============================JMX STUFF========================    
+     
+     protected String poolName = null;
+     
+@@ -92,6 +124,7 @@ public class SlowQueryReportJmx extends SlowQueryReport {
+         if (parent!=null) {
+             poolName = parent.getName();
+             pool = parent;
++            registerJmx();
+         }
+     }
+ 
+@@ -109,7 +142,6 @@ public class SlowQueryReportJmx extends SlowQueryReport {
+         this.pool = pool;
+         super.poolStarted(pool);
+         this.poolName = pool.getName();
+-        registerJmx();
+     }
+ 
+     @Override
+@@ -121,7 +153,6 @@ public class SlowQueryReportJmx extends SlowQueryReport {
+ 
+     protected void notifyJmx(String query, String type) {
+         try {
+-            DynamicMBean mbean = mbeans.get(poolName);
+             long sequence = notifySequence.incrementAndGet();
+             
+             if (isNotifyPool()) {
+@@ -129,25 +160,21 @@ public class SlowQueryReportJmx extends SlowQueryReport {
+                     this.pool.getJmxPool().notify(type, query);
+                 }
+             } else {
+-                if (mbean!=null && mbean instanceof BaseModelMBean) {
++                if (notifier!=null) {
+                     Notification notification = 
+                         new Notification(type, 
+-                                         mbean, 
++                                         this, 
+                                          sequence, 
+                                          System.currentTimeMillis(),
+                                          query);
+-                    BaseModelMBean bmbean = (BaseModelMBean)mbean;
+-                    bmbean.sendNotification(notification);
++                    
++                    notifier.sendNotification(notification);
+                 }
+             }
+         } catch (RuntimeOperationsException e) {
+             if (log.isDebugEnabled()) {
+                 log.debug("Unable to send failed query notification.",e);
+             }
+-        } catch (MBeanException e) {
+-            if (log.isDebugEnabled()) {
+-                log.debug("Unable to send failed query notification.",e);
+-            }
+         }
+     }
+ 
+@@ -221,16 +248,14 @@ public class SlowQueryReportJmx extends SlowQueryReport {
+     
+     protected void deregisterJmx() {
+         try {
+-            DynamicMBean mbean = null;
+-            if ((mbean=mbeans.remove(poolName))!=null) {
+-                Registry registry = Registry.getRegistry(null, null);
+-                ManagedBean managed = registry.findManagedBean(this.getClass().getName());
+-                if (managed!=null) {
+-                    ObjectName oname = new ObjectName(ConnectionPool.POOL_JMX_TYPE_PREFIX+getClass().getName()+",name=" + poolName);
+-                    registry.unregisterComponent(oname);
+-                    registry.removeManagedBean(managed);
+-                }
++            if (mbeans.remove(poolName)!=null) {
++                ObjectName oname = getObjectName(getClass(),poolName);
++                ManagementFactory.getPlatformMBeanServer().unregisterMBean(oname);
+             }
++        } catch (MBeanRegistrationException e) {
++            log.debug("Jmx deregistration failed.",e);
++        } catch (InstanceNotFoundException e) {
++            log.debug("Jmx deregistration failed.",e);
+         } catch (MalformedObjectNameException e) {
+             log.warn("Jmx deregistration failed.",e);
+         } catch (RuntimeOperationsException e) {
+@@ -238,6 +263,12 @@ public class SlowQueryReportJmx extends SlowQueryReport {
+         }
+         
+     }
++
++
++    public static ObjectName getObjectName(Class clazz, String poolName) throws MalformedObjectNameException {
++        ObjectName oname = new ObjectName(ConnectionPool.POOL_JMX_TYPE_PREFIX+clazz.getName()+",name=" + poolName);
++        return oname;
++    }
+     
+     protected void registerJmx() {
+         try {
+@@ -245,23 +276,15 @@ public class SlowQueryReportJmx extends SlowQueryReport {
+             if (isNotifyPool()) {
+                 
+             } else if (getCompositeType()!=null) {
+-                ObjectName oname = new ObjectName(ConnectionPool.POOL_JMX_TYPE_PREFIX+"SlowQueryReport"+",name=" + poolName);
+-                Registry registry = Registry.getRegistry(null, null);
+-                registry.loadDescriptors(getClass().getPackage().getName(),getClass().getClassLoader());
+-                ManagedBean managed = registry.findManagedBean(this.getClass().getName());
+-                DynamicMBean mbean = managed!=null?managed.createMBean(this):null;
+-                if (mbean!=null && mbeans.putIfAbsent(poolName, mbean)==null) {
+-                    registry.getMBeanServer().registerMBean( mbean, oname);
+-                } else if (mbean==null){
+-                    log.warn(SlowQueryReport.class.getName()+ "- No JMX support, unable to initiate Tomcat JMX. This requires the system to run inside the Tomcat container.");
++                ObjectName oname = getObjectName(getClass(),poolName);
++                if (mbeans.putIfAbsent(poolName, this)==null) {
++                    ManagementFactory.getPlatformMBeanServer().registerMBean(this, oname);
+                 }
+             } else {
+                 log.warn(SlowQueryReport.class.getName()+ "- No JMX support, composite type was not found.");
+             }
+         } catch (MalformedObjectNameException e) {
+             log.error("Jmx registration failed, no JMX data will be exposed for the query stats.",e);
+-        } catch (InstanceNotFoundException e) {
+-            log.error("Jmx registration failed, no JMX data will be exposed for the query stats.",e);
+         } catch (RuntimeOperationsException e) {
+             log.error("Jmx registration failed, no JMX data will be exposed for the query stats.",e);
+         } catch (MBeanException e) {
+@@ -272,4 +295,16 @@ public class SlowQueryReportJmx extends SlowQueryReport {
+             log.error("Jmx registration failed, no JMX data will be exposed for the query stats.",e);
+         }
+     }
++    
++    @Override
++    public void setProperties(Map<String, InterceptorProperty> properties) {
++        super.setProperties(properties);
++        final String threshold = "notifyPool";
++        InterceptorProperty p1 = properties.get(threshold);
++        if (p1!=null) {
++            this.setNotifyPool(Boolean.parseBoolean(p1.getValue()));
++        }
++    }
++
++
+ }
+
+==================================================
+CreateTestTable.java
+index a63bfe12f3..37c0f3ae87 100644
+--- a/modules/jdbc-pool/resources/MANIFEST.MF
++++ b/modules/jdbc-pool/resources/MANIFEST.MF
+@@ -19,5 +19,4 @@ Import-Package:
+   javax.management.openmbean;version="0",
+   javax.naming;version="0",
+   javax.sql;version="0",
+-  org.apache.juli.logging;version="[6.0.18, 7.0.0)",
+-  org.apache.tomcat.util.modeler;version="[6.0.18, 7.0.0)"
++  org.apache.juli.logging;version="[6.0.18, 7.0.0)"
+
+==================================================
+TestSlowQueryReport.java
+index b59c21196b..cb28908326 100644
+--- a/modules/jdbc-pool/test/org/apache/tomcat/jdbc/test/CreateTestTable.java
++++ b/modules/jdbc-pool/test/org/apache/tomcat/jdbc/test/CreateTestTable.java
+@@ -25,12 +25,12 @@ import java.sql.ResultSet;
+ 
+ public class CreateTestTable extends DefaultTestCase {
+     
+-    public static final boolean recreate = Boolean.getBoolean("recreate");
++    public static volatile boolean recreate = Boolean.getBoolean("recreate");
+     
+     public CreateTestTable(String name) {
+         super(name);
+     }
+-    
++
+     public void testCreateTestTable() throws Exception {
+         this.init();
+         Connection con = datasource.getConnection();
+@@ -73,7 +73,7 @@ public class CreateTestTable extends DefaultTestCase {
+         }
+         PreparedStatement ps = con.prepareStatement(insert);
+         ps.setQueryTimeout(0);
+-        for (int i=testCheckData(); i<1000000; i++) {
++        for (int i=testCheckData(); i<100000; i++) {
+             ps.setInt(1,i);
+             String s = getRandom();
+             ps.setString(2, s);
+@@ -107,5 +107,11 @@ public class CreateTestTable extends DefaultTestCase {
+         }
+         return s.toString();
+     }
++    
++    public static void main(String[] args) throws Exception {
++        recreate = true;
++        CreateTestTable test = new CreateTestTable("CreateTestTable");
++        test.testPopulateData();
++    }
+ 
+ }
+
+==================================================

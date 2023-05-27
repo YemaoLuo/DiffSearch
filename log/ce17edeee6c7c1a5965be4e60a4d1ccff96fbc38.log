@@ -1,0 +1,375 @@
+ce17edeee6c7c1a5965be4e60a4d1ccff96fbc38
+==================================================
+Add a bloom filter to speed up archive lookup
+==================================================
+remm remm@apache.org
+==================================================
+Wed Sep 23 11:49:12 2020 +0200
+==================================================
+Context.java
+Add a bloom filter to speed up archive lookup
+
+The can improve deployment speed of applications with a large number of
+JARs.
+Patch provided by Jatin Kamnani, with changes. PR #352
+
+
+==================================================
+StandardContext.java
+index 4cf844cda8..275063bb1f 100644
+--- a/java/org/apache/catalina/Context.java
++++ b/java/org/apache/catalina/Context.java
+@@ -1946,4 +1946,17 @@ public interface Context extends Container, ContextBind {
+     public void setDispatcherWrapsSameObject(boolean dispatcherWrapsSameObject);
+ 
+ 
++    /**
++     * @return <code>true</code> if the resources archive lookup will
++     * use a bloom filter.
++     */
++    public boolean getUseBloomFilterForArchives();
++
++    /**
++     * Set bloom filter flag value.
++     *
++     * @param useBloomFilterForArchives The new fast class path scan flag
++     */
++    public void setUseBloomFilterForArchives(boolean useBloomFilterForArchives);
++
+ }
+
+==================================================
+FailedContext.java
+index 50be99f74b..c02cff3063 100644
+--- a/java/org/apache/catalina/core/mbeans-descriptors.xml
++++ b/java/org/apache/catalina/core/mbeans-descriptors.xml
+@@ -325,6 +325,10 @@
+                description="Unpack WAR property"
+                type="boolean"/>
+ 
++    <attribute name="useBloomFilterForArchives"
++               description="Use a bloom filter for archives lookups"
++               type="boolean"/>
++
+     <attribute name="useHttpOnly"
+                description="Indicates that session cookies should use HttpOnly"
+                type="boolean"/>
+
+==================================================
+AbstractArchiveResourceSet.java
+index 84b12f5e0e..4fee683521 100644
+--- a/java/org/apache/catalina/startup/FailedContext.java
++++ b/java/org/apache/catalina/startup/FailedContext.java
+@@ -836,4 +836,10 @@ public class FailedContext extends LifecycleMBeanBase implements Context {
+     @Override
+     public void setParallelAnnotationScanning(boolean parallelAnnotationScanning) {}
+ 
++    @Override
++    public boolean getUseBloomFilterForArchives() { return false; }
++
++    @Override
++    public void setUseBloomFilterForArchives(boolean useBloomFilterForArchives) {}
++
+ }
+\ No newline at end of file
+
+==================================================
+JarContents.java
+index 8473480861..223649101e 100644
+--- a/java/org/apache/catalina/webresources/AbstractArchiveResourceSet.java
++++ b/java/org/apache/catalina/webresources/AbstractArchiveResourceSet.java
+@@ -36,12 +36,11 @@ public abstract class AbstractArchiveResourceSet extends AbstractResourceSet {
+ 
+     private URL baseUrl;
+     private String baseUrlString;
+-
+     private JarFile archive = null;
+     protected Map<String,JarEntry> archiveEntries = null;
+     protected final Object archiveLock = new Object();
+     private long archiveUseCount = 0;
+-
++    private JarContents jarContents;
+ 
+     protected final void setBaseUrl(URL baseUrl) {
+         this.baseUrl = baseUrl;
+@@ -211,6 +210,14 @@ public abstract class AbstractArchiveResourceSet extends AbstractResourceSet {
+         String webAppMount = getWebAppMount();
+         WebResourceRoot root = getRoot();
+ 
++        /*
++         * If jarContents reports that this resource definitely does not contain
++         * the path, we can end this method and move on to the next jar.
++         */
++        if (jarContents != null && !jarContents.mightContainResource(path, webAppMount)) {
++            return new EmptyResource(root, path);
++        }
++
+         /*
+          * Implementation notes
+          *
+@@ -305,6 +312,10 @@ public abstract class AbstractArchiveResourceSet extends AbstractResourceSet {
+         synchronized (archiveLock) {
+             if (archive == null) {
+                 archive = JreCompat.getInstance().jarFileNewInstance(getBase());
++                WebResourceRoot root = getRoot();
++                if ((root.getContext() != null) && root.getContext().getUseBloomFilterForArchives()) {
++                    jarContents = new JarContents(archive);
++                }
+             }
+             archiveUseCount++;
+             return archive;
+@@ -328,6 +339,7 @@ public abstract class AbstractArchiveResourceSet extends AbstractResourceSet {
+                 }
+                 archive = null;
+                 archiveEntries = null;
++                jarContents = null;
+             }
+         }
+     }
+
+==================================================
+TestJarContents.java
+new file mode 100644
+index 0000000000..1642d4c812
+--- /dev/null
++++ b/java/org/apache/catalina/webresources/JarContents.java
+@@ -0,0 +1,135 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.catalina.webresources;
++
++import java.util.BitSet;
++import java.util.Enumeration;
++import java.util.jar.JarEntry;
++import java.util.jar.JarFile;
++
++/**
++ * This class represents the contents of a jar by determining whether a given
++ * resource <b>might</b> be in the cache, based on a bloom filter. This is not a
++ * general-purpose bloom filter because it contains logic to strip out
++ * characters from the beginning of the key.
++ *
++ * The hash methods are simple but good enough for this purpose.
++ */
++public final class JarContents {
++    private final BitSet bits1;
++    private final BitSet bits2;
++    /**
++     * Constant used by a typical hashing method.
++     */
++    private static final int HASH_PRIME_1 = 31;
++
++    /**
++     * Constant used by a typical hashing method.
++     */
++    private static final int HASH_PRIME_2 = 17;
++
++    /**
++     * Size of the fixed-length bit table. Larger reduces false positives,
++     * smaller saves memory.
++     */
++    private static final int TABLE_SIZE = 2048;
++
++    /**
++     * Parses the passed-in jar and populates the bit array.
++     *
++     * @param jar
++     */
++    public JarContents(JarFile jar) {
++        Enumeration<JarEntry> entries = jar.entries();
++        bits1 = new BitSet(TABLE_SIZE);
++        bits2 = new BitSet(TABLE_SIZE);
++
++        // Enumerations. When will they update this API?!
++        while (entries.hasMoreElements()) {
++            JarEntry entry = entries.nextElement();
++            String name = entry.getName();
++            int startPos = 0;
++
++            // If the path starts with a slash, that's not useful information.
++            // Skipping it increases the significance of our key by
++            // removing an insignificant character.
++            boolean precedingSlash = name.charAt(0) == '/';
++            if (precedingSlash) {
++                startPos = 1;
++            }
++
++            // Find the correct table slot
++            int pathHash1 = hashcode(name, startPos, HASH_PRIME_1);
++            int pathHash2 = hashcode(name, startPos, HASH_PRIME_2);
++
++            bits1.set(pathHash1 % TABLE_SIZE);
++            bits2.set(pathHash2 % TABLE_SIZE);
++        }
++    }
++
++    /**
++     * Simple hashcode of a portion of the string. Typically we would use
++     * substring, but memory and runtime speed are critical.
++     *
++     * @param content
++     *            Wrapping String.
++     * @param startPos
++     *            First character in the range.
++     * @return hashcode of the range.
++     */
++    private int hashcode(String content, int startPos, int hashPrime) {
++        int h = hashPrime/2;
++        int contentLength = content.length();
++        for (int i = startPos; i < contentLength; i++) {
++            h = hashPrime * h + content.charAt(i);
++        }
++
++        if (h < 0) {
++            h = h * -1;
++        }
++        return h;
++    }
++
++
++    /**
++     * Method that identifies whether a given path <b>MIGHT</b> be in this jar.
++     * Uses the Bloom filter mechanism.
++     *
++     * @param path
++     *            Requested path. Sometimes starts with "/WEB-INF/classes".
++     * @param webappRoot
++     *            The value of the webapp location, which can be stripped from
++     *            the path. Typically is "/WEB-INF/classes".
++     * @return Whether the prefix of the path is known to be in this jar.
++     */
++    public final boolean mightContainResource(String path, String webappRoot) {
++        int startPos = 0;
++        if (path.startsWith(webappRoot)) {
++            startPos = webappRoot.length();
++        }
++
++        if (path.charAt(startPos) == '/') {
++            // ignore leading slash
++            startPos++;
++        }
++
++        // calculate the hash lazyly and return a boolean value for this path
++        return (bits1.get(hashcode(path, startPos, HASH_PRIME_1) % TABLE_SIZE) &&
++                bits2.get(hashcode(path, startPos, HASH_PRIME_2) % TABLE_SIZE));
++    }
++
++}
+\ No newline at end of file
+
+==================================================
+TesterContext.java
+new file mode 100644
+index 0000000000..6d55281a53
+--- /dev/null
++++ b/test/org/apache/catalina/webresources/TestJarContents.java
+@@ -0,0 +1,93 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.catalina.webresources;
++
++import java.io.File;
++import java.util.jar.JarFile;
++
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++import org.apache.catalina.WebResourceSet;
++
++/**
++ * @author Kamnani, Jatin
++ */
++public class TestJarContents {
++
++    private static File empty;
++    private static File jar;
++    private static TesterWebResourceRoot root;
++    private static WebResourceSet webResourceSet;
++    private static JarResourceSet test;
++    private static JarContents testJarContentsObject;
++
++    @BeforeClass
++    public static void setup() {
++        try {
++        empty = new File("test/webresources/dir3");
++        jar = new File("test/webresources/dir1.jar");
++
++        root = new TesterWebResourceRoot();
++
++        // Use empty dir for root of web app.
++        webResourceSet = new DirResourceSet(root, "/", empty.getAbsolutePath(), "/");
++        root.setMainResources(webResourceSet);
++
++        // If this JAR was in a web application, this is equivalent to how it
++        // would be added
++        test = new JarResourceSet(root, "/", jar.getAbsolutePath(), "/META-INF/resources");
++        test.setStaticOnly(true);
++        root.addJarResources(test);
++
++        testJarContentsObject = new JarContents(new JarFile("test/webresources/dir1.jar"));
++
++        } catch (Exception e) {
++            Assert.fail("Error happened while testing JarContents, " + e.getMessage());
++        }
++    }
++
++    @Test
++    public void testMightContainResource() {
++        Assert.assertTrue(testJarContentsObject.mightContainResource(
++                "/d1/d1-f1.txt", jar.getAbsolutePath()));
++
++        Assert.assertTrue(testJarContentsObject.mightContainResource(
++                "d1/d1-f1.txt", jar.getAbsolutePath()));
++
++        Assert.assertFalse(testJarContentsObject.mightContainResource(
++                "/d7/d1-f1.txt", jar.getAbsolutePath()));
++
++        Assert.assertFalse(testJarContentsObject.mightContainResource(
++                "/", jar.getAbsolutePath()));
++
++        Assert.assertFalse(testJarContentsObject.mightContainResource(
++                "/////", jar.getAbsolutePath()));
++
++    }
++
++    @Test(expected = StringIndexOutOfBoundsException.class)
++    public void testStringOutOfBoundExceptions() {
++        testJarContentsObject.mightContainResource("", jar.getAbsolutePath());
++    }
++
++    @Test(expected = NullPointerException.class)
++    public void testNullPointerExceptions() {
++        testJarContentsObject.mightContainResource(null, jar.getAbsolutePath());
++    }
++}
+
+==================================================

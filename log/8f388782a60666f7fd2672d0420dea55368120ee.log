@@ -1,0 +1,183 @@
+8f388782a60666f7fd2672d0420dea55368120ee
+==================================================
+Remove synchronization on the DeltaRequest object, and let the object that manages the delta request (session/manager) to handle the locking properly, using the session lock
+==================================================
+Filip Hanik
+==================================================
+Tue Feb 5 23:29:56 2008 +0000
+==================================================
+DeltaManager.java
+Remove synchronization on the DeltaRequest object, and let the object that manages the delta request (session/manager) to handle the locking properly, using the session lock
+There is a case with a non sticky load balancer where using synchronized and a lock (essentially two locks) can end up in a dead lock
+
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@618823 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+DeltaRequest.java
+index 7c695d1b79..0e46482b2c 100644
+--- a/java/org/apache/catalina/ha/session/DeltaManager.java
++++ b/java/org/apache/catalina/ha/session/DeltaManager.java
+@@ -615,10 +615,15 @@ public class DeltaManager extends ClusterManagerBase{
+      * @throws IOException
+      */
+     protected DeltaRequest deserializeDeltaRequest(DeltaSession session, byte[] data) throws ClassNotFoundException, IOException {
+-        ReplicationStream ois = getReplicationStream(data);
+-        session.getDeltaRequest().readExternal(ois);
+-        ois.close();
+-        return session.getDeltaRequest();
++        try {
++            session.lock();
++            ReplicationStream ois = getReplicationStream(data);
++            session.getDeltaRequest().readExternal(ois);
++            ois.close();
++            return session.getDeltaRequest();
++        }finally {
++            session.unlock();
++        }
+     }
+ 
+     /**
+@@ -629,8 +634,13 @@ public class DeltaManager extends ClusterManagerBase{
+      * @return serialized delta request
+      * @throws IOException
+      */
+-    protected byte[] serializeDeltaRequest(DeltaRequest deltaRequest) throws IOException {
+-        return deltaRequest.serialize();
++    protected byte[] serializeDeltaRequest(DeltaSession session, DeltaRequest deltaRequest) throws IOException {
++        try {
++            session.lock();
++            return deltaRequest.serialize();
++        }finally {
++            session.unlock();
++        }
+     }
+ 
+     /**
+@@ -1096,16 +1106,18 @@ public class DeltaManager extends ClusterManagerBase{
+      * @return a SessionMessage to be sent,
+      */
+     public ClusterMessage requestCompleted(String sessionId) {
++        DeltaSession session = null;
+         try {
+-            DeltaSession session = (DeltaSession) findSession(sessionId);
++            session = (DeltaSession) findSession(sessionId);
+             DeltaRequest deltaRequest = session.getDeltaRequest();
++            session.lock();
+             SessionMessage msg = null;
+             boolean isDeltaRequest = false ;
+             synchronized(deltaRequest) {
+                 isDeltaRequest = deltaRequest.getSize() > 0 ;
+                 if (isDeltaRequest) {    
+                     counterSend_EVT_SESSION_DELTA++;
+-                    byte[] data = serializeDeltaRequest(deltaRequest);
++                    byte[] data = serializeDeltaRequest(session,deltaRequest);
+                     msg = new SessionMessageImpl(getName(),
+                                                  SessionMessage.EVT_SESSION_DELTA, 
+                                                  data, 
+@@ -1155,6 +1167,8 @@ public class DeltaManager extends ClusterManagerBase{
+         } catch (IOException x) {
+             log.error(sm.getString("deltaManager.createMessage.unableCreateDeltaRequest",sessionId), x);
+             return null;
++        }finally {
++            if (session!=null) session.unlock();
+         }
+ 
+     }
+@@ -1360,9 +1374,14 @@ public class DeltaManager extends ClusterManagerBase{
+         DeltaSession session = (DeltaSession) findSession(msg.getSessionID());
+         if (session != null) {
+             if (log.isDebugEnabled()) log.debug(sm.getString("deltaManager.receiveMessage.delta",getName(), msg.getSessionID()));
+-            DeltaRequest dreq = deserializeDeltaRequest(session, delta);
+-            dreq.execute(session, notifyListenersOnReplication);
+-            session.setPrimarySession(false);
++            try {
++                session.lock();
++                DeltaRequest dreq = deserializeDeltaRequest(session, delta);
++                dreq.execute(session, notifyListenersOnReplication);
++                session.setPrimarySession(false);
++            }finally {
++                session.unlock();
++            }
+         }
+     }
+ 
+
+==================================================
+DeltaSession.java
+index 83c6426863..0683479733 100644
+--- a/java/org/apache/catalina/ha/session/DeltaRequest.java
++++ b/java/org/apache/catalina/ha/session/DeltaRequest.java
+@@ -118,7 +118,7 @@ public class DeltaRequest implements Externalizable {
+         addAction(TYPE_ISNEW,action,NAME_ISNEW,new Boolean(n));
+     }
+ 
+-    protected synchronized void addAction(int type,
++    protected void addAction(int type,
+                              int action,
+                              String name,
+                              Object value) {
+@@ -151,7 +151,7 @@ public class DeltaRequest implements Externalizable {
+         execute(session,true);
+     }
+ 
+-    public synchronized void execute(DeltaSession session, boolean notifyListeners) {
++    public void execute(DeltaSession session, boolean notifyListeners) {
+         if ( !this.sessionId.equals( session.getId() ) )
+             throw new java.lang.IllegalArgumentException("Session id mismatch, not executing the delta request");
+         session.access();
+@@ -195,7 +195,7 @@ public class DeltaRequest implements Externalizable {
+         reset();
+     }
+ 
+-    public synchronized void reset() {
++    public void reset() {
+         while ( actions.size() > 0 ) {
+             try {
+                 AttributeInfo info = (AttributeInfo) actions.removeFirst();
+@@ -221,12 +221,12 @@ public class DeltaRequest implements Externalizable {
+         return actions.size();
+     }
+     
+-    public synchronized void clear() {
++    public void clear() {
+         actions.clear();
+         actionPool.clear();
+     }
+     
+-    public synchronized void readExternal(java.io.ObjectInput in) throws IOException,ClassNotFoundException {
++    public void readExternal(java.io.ObjectInput in) throws IOException,ClassNotFoundException {
+         //sessionId - String
+         //recordAll - boolean
+         //size - int
+@@ -259,7 +259,7 @@ public class DeltaRequest implements Externalizable {
+         
+ 
+ 
+-    public synchronized void writeExternal(java.io.ObjectOutput out ) throws java.io.IOException {
++    public void writeExternal(java.io.ObjectOutput out ) throws java.io.IOException {
+         //sessionId - String
+         //recordAll - boolean
+         //size - int
+@@ -348,7 +348,7 @@ public class DeltaRequest implements Externalizable {
+             return other.getName().equals(this.getName());
+         }
+         
+-        public synchronized void readExternal(java.io.ObjectInput in ) throws IOException,ClassNotFoundException {
++        public void readExternal(java.io.ObjectInput in ) throws IOException,ClassNotFoundException {
+             //type - int
+             //action - int
+             //name - String
+@@ -361,7 +361,7 @@ public class DeltaRequest implements Externalizable {
+             if ( hasValue ) value = in.readObject();
+         }
+ 
+-        public synchronized void writeExternal(java.io.ObjectOutput out) throws IOException {
++        public void writeExternal(java.io.ObjectOutput out) throws IOException {
+             //type - int
+             //action - int
+             //name - String
+
+==================================================

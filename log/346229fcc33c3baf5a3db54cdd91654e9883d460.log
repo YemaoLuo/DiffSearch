@@ -1,0 +1,274 @@
+346229fcc33c3baf5a3db54cdd91654e9883d460
+==================================================
+Align onWritePossible behaviour with the spec.
+==================================================
+Mark Emlyn
+==================================================
+Wed May 29 15:55:28 2013 +0000
+==================================================
+CoyoteAdapter.java
+Align onWritePossible behaviour with the spec.
+This passes the unit tests on Windows.
+Still some TODOs to resolve once I have checked this passes the tests on other platforms (including the CI system)
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1487523 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+OutputBuffer.java
+index 95f0650fe2..6c157e1d8e 100644
+--- a/java/org/apache/catalina/connector/CoyoteAdapter.java
++++ b/java/org/apache/catalina/connector/CoyoteAdapter.java
+@@ -356,7 +356,7 @@ public class CoyoteAdapter implements Adapter {
+                             request.getContext().getLoader().getClassLoader();
+                     try {
+                         Thread.currentThread().setContextClassLoader(newCL);
+-                        res.getWriteListener().onWritePossible();
++                        res.onWritePossible();
+                     } finally {
+                         Thread.currentThread().setContextClassLoader(oldCL);
+                     }
+
+==================================================
+ActionCode.java
+index 2520f4e896..6229352dff 100644
+--- a/java/org/apache/catalina/connector/OutputBuffer.java
++++ b/java/org/apache/catalina/connector/OutputBuffer.java
+@@ -22,7 +22,6 @@ import java.security.AccessController;
+ import java.security.PrivilegedActionException;
+ import java.security.PrivilegedExceptionAction;
+ import java.util.HashMap;
+-import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ import javax.servlet.WriteListener;
+ 
+@@ -647,13 +646,7 @@ public class OutputBuffer extends Writer
+ 
+ 
+     public boolean isReady() {
+-        if (coyoteResponse.getWriteListener() == null) {
+-            throw new IllegalStateException("not in non blocking mode.");
+-        }
+-        // Assume write is not possible
+-        AtomicBoolean isReady = new AtomicBoolean(false);
+-        coyoteResponse.action(ActionCode.NB_WRITE_INTEREST, isReady);
+-        return isReady.get();
++        return coyoteResponse.isReady();
+     }
+ 
+ 
+
+==================================================
+Response.java
+index 891e142d0d..dc36ddcdff 100644
+--- a/java/org/apache/coyote/ActionCode.java
++++ b/java/org/apache/coyote/ActionCode.java
+@@ -212,6 +212,12 @@ public enum ActionCode {
+      */
+     NB_WRITE_INTEREST,
+ 
++    /**
++     * Flush the lower level buffers and re-register the socket with the poller
++     * if the buffers cannot be completely flushed.
++     */
++    NB_WRITE_FLUSH,
++
+     /**
+      * Indicates if the request body has been fully read.
+      */
+
+==================================================
+AbstractHttp11Processor.java
+index a07323dd5d..65300491a9 100644
+--- a/java/org/apache/coyote/Response.java
++++ b/java/org/apache/coyote/Response.java
+@@ -548,6 +548,8 @@ public final class Response {
+     }
+ 
+     protected volatile WriteListener listener;
++    private boolean fireListener = false;
++    private final Object fireListenerLock = new Object();
+ 
+     public WriteListener getWriteListener() {
+         return listener;
+@@ -573,4 +575,45 @@ public final class Response {
+ 
+         this.listener = listener;
+     }
++
++    public boolean isReady() {
++        if (listener == null) {
++            // TODO i18n
++            throw new IllegalStateException("not in non blocking mode.");
++        }
++        // Assume write is not possible
++        AtomicBoolean isReady = new AtomicBoolean(false);
++        synchronized (fireListenerLock) {
++            if (fireListener) {
++                // isReady() has already returned false
++                return true;
++            }
++            action(ActionCode.NB_WRITE_INTEREST, isReady);
++            fireListener = !isReady.get();
++        }
++        return isReady.get();
++    }
++
++    public void onWritePossible() throws IOException {
++        // Flush the lower level buffers
++        // If data left in buffers wait for next onWritePossible. Socket will
++        // have been placed in poller if buffers weren't emptied.
++        AtomicBoolean isDataLeftInBuffers = new AtomicBoolean(true);
++        action(ActionCode.NB_WRITE_FLUSH, isDataLeftInBuffers);
++        if (isDataLeftInBuffers.get()) {
++            return;
++        }
++
++        // No data in lower level buffers. Ready for app to write more data.
++        boolean fire = false;
++        synchronized (fireListenerLock) {
++            if (fireListener) {
++                fireListener = false;
++                fire = true;
++            }
++        }
++        if (fire) {
++            listener.onWritePossible();
++        }
++    }
+ }
+
+==================================================
+AbstractOutputBuffer.java
+index cbfef970bd..57576e0184 100644
+--- a/java/org/apache/coyote/http11/AbstractHttp11Processor.java
++++ b/java/org/apache/coyote/http11/AbstractHttp11Processor.java
+@@ -815,7 +815,20 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+             request.setAvailable(inputBuffer.available());
+         } else if (actionCode == ActionCode.NB_WRITE_INTEREST) {
+             AtomicBoolean isReady = (AtomicBoolean)param;
+-            isReady.set(getOutputBuffer().isReady());
++            try {
++                isReady.set(getOutputBuffer().isReady());
++            } catch (IOException e) {
++                // TODO
++                throw new IllegalStateException();
++            }
++        } else if (actionCode == ActionCode.NB_WRITE_FLUSH) {
++            AtomicBoolean isDataLeftInBuffers = (AtomicBoolean)param;
++            try {
++                isDataLeftInBuffers.set(getOutputBuffer().flushBuffer(false));
++            } catch (IOException e) {
++                // TODO
++                throw new IllegalStateException();
++            }
+         } else if (actionCode == ActionCode.NB_READ_INTEREST) {
+             registerForEvent(true, false);
+         } else if (actionCode == ActionCode.UPGRADE) {
+
+==================================================
+InternalAprOutputBuffer.java
+index f33a35a340..49eb74fcb1 100644
+--- a/java/org/apache/coyote/http11/AbstractOutputBuffer.java
++++ b/java/org/apache/coyote/http11/AbstractOutputBuffer.java
+@@ -607,6 +607,7 @@ public abstract class AbstractOutputBuffer<S> implements OutputBuffer {
+     //------------------------------------------------------ Non-blocking writes
+ 
+     protected abstract boolean hasMoreDataToFlush();
++    protected abstract void registerWriteInterest() throws IOException;
+ 
+ 
+     /**
+@@ -628,8 +629,12 @@ public abstract class AbstractOutputBuffer<S> implements OutputBuffer {
+     }
+ 
+ 
+-    protected final boolean isReady() {
+-        return !hasDataToWrite();
++    protected final boolean isReady() throws IOException {
++        boolean result = !hasDataToWrite();
++        if (!result) {
++            registerWriteInterest();
++        }
++        return result;
+     }
+ 
+ 
+
+==================================================
+InternalNioOutputBuffer.java
+index 4b9429f6fd..925e14a65b 100644
+--- a/java/org/apache/coyote/http11/InternalAprOutputBuffer.java
++++ b/java/org/apache/coyote/http11/InternalAprOutputBuffer.java
+@@ -316,7 +316,7 @@ public class InternalAprOutputBuffer extends AbstractOutputBuffer<Long> {
+             bbuf.clear();
+             flipped = false;
+         } else {
+-            ((AprEndpoint) endpoint).getPoller().add(socket, -1, false, true);
++            registerWriteInterest();
+         }
+     }
+ 
+@@ -339,6 +339,12 @@ public class InternalAprOutputBuffer extends AbstractOutputBuffer<Long> {
+     }
+ 
+ 
++    @Override
++    protected void registerWriteInterest() {
++        ((AprEndpoint) endpoint).getPoller().add(socket, -1, false, true);
++    }
++
++
+     // ----------------------------------- OutputStreamOutputBuffer Inner Class
+ 
+     /**
+
+==================================================
+InternalOutputBuffer.java
+index 7da266da5a..3083345a50 100644
+--- a/java/org/apache/coyote/http11/InternalNioOutputBuffer.java
++++ b/java/org/apache/coyote/http11/InternalNioOutputBuffer.java
+@@ -155,7 +155,7 @@ public class InternalNioOutputBuffer extends AbstractOutputBuffer<NioChannel> {
+         }
+         if (flipped) {
+             // Still have data to write
+-            att.getPoller().add(socket, SelectionKey.OP_WRITE);
++            registerWriteInterest();
+         }
+         return written;
+     }
+@@ -274,18 +274,31 @@ public class InternalNioOutputBuffer extends AbstractOutputBuffer<NioChannel> {
+         return hasMoreDataToFlush();
+     }
+ 
++
+     @Override
+     protected boolean hasMoreDataToFlush() {
+         return (flipped && socket.getBufHandler().getWriteBuffer().remaining()>0) ||
+         (!flipped && socket.getBufHandler().getWriteBuffer().position() > 0);
+     }
+ 
++
++    @Override
++    protected void registerWriteInterest() throws IOException {
++        NioEndpoint.KeyAttachment att = (NioEndpoint.KeyAttachment)socket.getAttachment(false);
++        if (att == null) {
++            throw new IOException("Key must be cancelled");
++        }
++        att.getPoller().add(socket, SelectionKey.OP_WRITE);
++    }
++
++
+     private int transfer(byte[] from, int offset, int length, ByteBuffer to) {
+         int max = Math.min(length, to.remaining());
+         to.put(from, offset, max);
+         return max;
+     }
+ 
++
+     private void transfer(ByteBuffer from, ByteBuffer to) {
+         int max = Math.min(from.remaining(), to.remaining());
+         ByteBuffer tmp = from.duplicate ();
+
+==================================================

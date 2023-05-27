@@ -1,0 +1,171 @@
+ad0e7f8c6aa8319d9fca76fe52b96d5c5e2c5977
+==================================================
+Add in Linux special case for performance optimization around locking.
+==================================================
+Filip Hanik
+==================================================
+Fri Jul 24 15:24:52 2009 +0000
+==================================================
+ConnectionPool.java
+index 800d896040..45821c68f1 100644
+--- a/modules/jdbc-pool/doc/jdbc-pool.xml
++++ b/modules/jdbc-pool/doc/jdbc-pool.xml
+@@ -353,10 +353,16 @@
+     <attribute name="fairQueue" required="false">
+       <p>(boolean) Set to true if you wish that calls to getConnection should be treated
+          fairly in a true FIFO fashion. This uses the <code>org.apache.tomcat.jdbc.pool.FairBlockingQueue</code> 
+-         implementation for the list of the idle connections. The default value is <code>false</code>.
++         implementation for the list of the idle connections. The default value is <code>true</code>.
+          This flag is required when you want to use asynchronous connection retrieval.<br/>
+-         During performance tests, the fairQueue does very well on a multi core Solaris system,
+-         but performs terribly on a Linux Fedora 11 system. On Linux we recommend setting this to false. 
++         Setting this flag ensures that threads receive connections in the order they arrive.<br/>
++         During performance tests, there is a very large difference in how locks
++         and lock waiting is implemented. When <code>fairQueue=true></code>
++         there is a decision making process based on what operating system the system is running.
++         If the system is running on Linux (property <code>os.name=Linux</code>.
++         To disable this Linux specific behavior and still use the fair queue, simply add the property
++         <code>org.apache.tomcat.jdbc.pool.FairBlockingQueue.ignoreOS=true</code> to your system properties
++         before the connection pool classes are loaded.
+       </p>
+     </attribute>
+ 
+
+==================================================
+DataSourceProxy.java
+index 9250dac90f..948034eaae 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/ConnectionPool.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/ConnectionPool.java
+@@ -148,6 +148,9 @@ public class ConnectionPool {
+         if (idle instanceof FairBlockingQueue) {
+             Future<PooledConnection> pcf = ((FairBlockingQueue<PooledConnection>)idle).pollAsync();
+             return new ConnectionFuture(pcf);
++        } else if (idle instanceof MultiLockFairBlockingQueue) {
++                Future<PooledConnection> pcf = ((MultiLockFairBlockingQueue<PooledConnection>)idle).pollAsync();
++                return new ConnectionFuture(pcf);
+         } else {
+             throw new SQLException("Connection pool is misconfigured, doesn't support async retrieval. Set the 'fair' property to 'true'");
+         }
+@@ -305,21 +308,6 @@ public class ConnectionPool {
+         return proxyClassConstructor;
+     }
+ 
+-    /**
+-     * If the connection pool gets garbage collected, lets make sure we clean up
+-     * and close all the connections.
+-     * {@inheritDoc}
+-     */
+-    @Override
+-    protected void finalize() throws Throwable {
+-//        Runnable closer = new Runnable() {
+-//            public void run() {
+-//                close(true);
+-//            }
+-//        };
+-//        this.cancellator.execute(closer);
+-    }
+-
+     /**
+      * Closes the pool and all disconnects all idle connections
+      * Active connections will be closed upon the {@link java.sql.Connection#close close} method is called
+@@ -381,6 +369,7 @@ public class ConnectionPool {
+         //make space for 10 extra in case we flow over a bit
+         if (properties.isFairQueue()) {
+             idle = new FairBlockingQueue<PooledConnection>();
++            //idle = new MultiLockFairBlockingQueue<PooledConnection>();
+         } else {
+             idle = new ArrayBlockingQueue<PooledConnection>(properties.getMaxActive(),properties.isFairQueue());
+         }
+
+==================================================
+FairBlockingQueue.java
+index 12d94d5223..3c1934cb4d 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/DataSourceProxy.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/DataSourceProxy.java
+@@ -155,17 +155,6 @@ public class DataSourceProxy implements PoolConfiguration {
+         }
+     }
+ 
+-    protected void finalize() throws Throwable {
+-//        //terminate the pool?
+-//        ThreadPoolExecutor closer = new ThreadPoolExecutor(0,1,1000,TimeUnit.MILLISECONDS,new LinkedBlockingQueue<Runnable>());
+-//        final Runnable r = new Runnable() {
+-//            public void run(){ 
+-//                close(true);                
+-//            }
+-//        };
+-//        closer.execute(r);
+-    }
+-
+     public int getPoolSize() throws SQLException{
+         final ConnectionPool p = pool;
+         if (p == null) return 0;
+
+==================================================
+PoolConfiguration.java
+index 74a3ca2f26..992e80a05a 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/FairBlockingQueue.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/FairBlockingQueue.java
+@@ -42,6 +42,20 @@ import java.util.concurrent.locks.ReentrantLock;
+ 
+ public class FairBlockingQueue<E> implements BlockingQueue<E> {
+     
++    /**
++     * This little sucker is used to reorder the way to do 
++     * {@link java.util.concurrent.locks.Lock#lock()},
++     * {@link java.util.concurrent.locks.Lock#unlock()}
++     * and 
++     * {@link java.util.concurrent.CountDownLatch#countDown()}
++     * during the {@link #poll(long, TimeUnit)} operation.
++     * On Linux, it performs much better if we count down while we hold the global
++     * lock, on Solaris its the other way around.
++     * Until we have tested other platforms we only check for Linux.
++     */
++    final static boolean isLinux = "Linux".equals(System.getProperty("os.name")) &&
++                                   (!Boolean.getBoolean(FairBlockingQueue.class.getName()+".ignoreOS"));
++    
+     /**
+      * Phase one entry lock in order to give out 
+      * per-thread-locks for the waiting phase we have 
+@@ -86,6 +100,7 @@ public class FairBlockingQueue<E> implements BlockingQueue<E> {
+                 c = waiters.poll();
+                 //give the object to the thread instead of adding it to the pool
+                 c.setItem(e);
++                if (isLinux && c!=null) c.countDown();
+             } else {
+                 //we always add first, so that the most recently used object will be given out
+                 items.addFirst(e);
+@@ -94,7 +109,7 @@ public class FairBlockingQueue<E> implements BlockingQueue<E> {
+             lock.unlock();
+         }
+         //if we exchanged an object with another thread, wake it up.
+-        if (c!=null) c.countDown();
++        if (!isLinux && c!=null) c.countDown();
+         //we have an unbounded queue, so always return true
+         return true;
+     }
+@@ -261,6 +276,7 @@ public class FairBlockingQueue<E> implements BlockingQueue<E> {
+      * {@inheritDoc}
+      * @throws UnsupportedOperation - this operation is not supported
+      */
++    
+     public int drainTo(Collection<? super E> c) {
+         return drainTo(c,Integer.MAX_VALUE);
+     }
+
+==================================================
+PoolProperties.java
+index 967356256d..667ae627b3 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/PoolConfiguration.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/PoolConfiguration.java
+@@ -65,7 +65,7 @@ public interface PoolConfiguration {
+      * Set to true if you wish that calls to getConnection 
+      * should be treated fairly in a true FIFO fashion. 
+      * This uses the {@link FairBlockingQueue} implementation for the list of the idle connections. 
+-     * The default value is false. 
++     * The default value is true. 
+      * This flag is required when you want to use asynchronous connection retrieval.
+      * @param fairQueue
+      */
+
+==================================================

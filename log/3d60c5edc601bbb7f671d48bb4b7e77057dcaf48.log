@@ -1,0 +1,98 @@
+3d60c5edc601bbb7f671d48bb4b7e77057dcaf48
+==================================================
+Improve Connector stop performance - primarily to speed up tests
+==================================================
+Mark Thomas
+==================================================
+Mon Oct 11 13:51:05 2021 +0100
+==================================================
+AbstractEndpoint.java
+Improve Connector stop performance - primarily to speed up tests
+
+
+
+==================================================
+Acceptor.java
+index 29381359f4..832119aab9 100644
+--- a/java/org/apache/tomcat/util/net/AbstractEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AbstractEndpoint.java
+@@ -1032,12 +1032,17 @@ public abstract class AbstractEndpoint<S,U> {
+                     getLog().debug("Socket unlock completed for:" + unlockAddress);
+                 }
+             }
+-            // Wait for upto 1000ms acceptor threads to unlock
+-            long waitLeft = 1000;
+-            while (waitLeft > 0 &&
+-                    acceptor.getState() == AcceptorState.RUNNING) {
+-                Thread.sleep(5);
+-                waitLeft -= 5;
++            // Wait for up to 1000ms acceptor threads to unlock. Particularly
++            // for the unit tests, we want to exit this loop as quickly as
++            // possible. However, we also don't want to trigger excessive CPU
++            // usage if the unlock takes longer than expected. Therefore, we
++            // initially wait for the unlock in a tight loop but if that takes
++            // more than 1ms we start using short sleeps to reduce CPU usage.
++            long startTime = System.nanoTime();
++            while (startTime + 1_000_000_000 > System.nanoTime() && acceptor.getState() == AcceptorState.RUNNING) {
++                if (startTime + 1_000_000 < System.nanoTime()) {
++                    Thread.sleep(1);
++                }
+             }
+         } catch(Throwable t) {
+             ExceptionUtils.handleThrowable(t);
+
+==================================================
+Nio2Endpoint.java
+index c5261453e0..b1083b292a 100644
+--- a/java/org/apache/tomcat/util/net/Acceptor.java
++++ b/java/org/apache/tomcat/util/net/Acceptor.java
+@@ -68,18 +68,41 @@ public class Acceptor<U> implements Runnable {
+     public void run() {
+ 
+         int errorDelay = 0;
++        long pauseStart = 0;
+ 
+         try {
+             // Loop until we receive a shutdown command
+             while (!stopCalled) {
+ 
+-                // Loop if endpoint is paused
++                // Loop if endpoint is paused.
++                // There are two likely scenarios here.
++                // The first scenario is that Tomcat is shutting down. In this
++                // case - and particularly for the unit tests - we want to exit
++                // this loop as quickly as possible. The second scenario is a
++                // genuine pause of the connector. In this case we want to avoid
++                // excessive CPU usage.
++                // Therefore, we start with a tight loop but if there isn't a
++                // rapid transition to stop then sleeps are introduced.
++                // < 1ms       - tight loop
++                // 1ms to 10ms - 1ms sleep
++                // > 10ms      - 10ms sleep
+                 while (endpoint.isPaused() && !stopCalled) {
+-                    state = AcceptorState.PAUSED;
+-                    try {
+-                        Thread.sleep(50);
+-                    } catch (InterruptedException e) {
+-                        // Ignore
++                    if (state != AcceptorState.PAUSED) {
++                        pauseStart = System.nanoTime();
++                        // Entered pause state
++                        state = AcceptorState.PAUSED;
++                    }
++                    if ((System.nanoTime() - pauseStart) > 1_000_000) {
++                        // Paused for more than 1ms
++                        try {
++                            if ((System.nanoTime() - pauseStart) > 10_000_000) {
++                                Thread.sleep(10);
++                            } else {
++                                Thread.sleep(1);
++                            }
++                        } catch (InterruptedException e) {
++                            // Ignore
++                        }
+                     }
+                 }
+ 
+
+==================================================

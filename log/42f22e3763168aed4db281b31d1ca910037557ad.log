@@ -1,0 +1,743 @@
+42f22e3763168aed4db281b31d1ca910037557ad
+==================================================
+Improve handling for method invocation in EL, in particular the method used to identify the method to invoke. This reverts r953440 and implements a more comprehensive solution.
+==================================================
+Mark Emlyn
+==================================================
+Thu Jul 1 09:35:23 2010 +0000
+==================================================
+ExpressionFactoryImpl.java
+Improve handling for method invocation in EL, in particular the method used to identify the method to invoke. This reverts r953440 and implements a more comprehensive solution.
+The method identification code attempts to mimic how the Java compiler works. In a few cases it finds methods where the Java complier reports an ambiguous method. The EL spec is sufficiently vague on method selection that I don't think this will be an issue.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@959568 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+ExpressionBuilder.java
+index e9101e311c..bfd89faf5a 100644
+--- a/java/org/apache/el/Messages.properties
++++ b/java/org/apache/el/Messages.properties
+@@ -40,6 +40,7 @@ error.syntax.set=Illegal Syntax for Set Operation
+ 
+ # ReflectionUtil
+ error.method.notfound=Method not found: {0}.{1}({2})
++error.method.ambiguous=Unable to find unambiguous method: {0}.{1}({2})
+ error.property.notfound=Property ''{1}'' not found on {0}
+ 
+ # ValidatingVisitor
+
+==================================================
+AstValue.java
+index 6a18c9abb1..c72cf0c54a 100644
+--- a/java/org/apache/el/lang/ExpressionBuilder.java
++++ b/java/org/apache/el/lang/ExpressionBuilder.java
+@@ -197,6 +197,10 @@ public final class ExpressionBuilder implements NodeVisitor {
+     public MethodExpression createMethodExpression(Class<?> expectedReturnType,
+             Class<?>[] expectedParamTypes) throws ELException {
+         Node n = this.build();
++        if (!n.isParametersProvided() && expectedParamTypes == null) {
++            throw new NullPointerException(MessageFactory
++                    .get("error.method.nullParms"));
++        }
+         if (n instanceof AstValue || n instanceof AstIdentifier) {
+             return new MethodExpressionImpl(expression, n, this.fnMapper,
+                     this.varMapper, expectedReturnType, expectedParamTypes);
+
+==================================================
+ReflectionUtil.java
+index 7cd79784aa..da39db133a 100644
+--- a/java/org/apache/el/parser/AstValue.java
++++ b/java/org/apache/el/parser/AstValue.java
+@@ -18,6 +18,7 @@
+ 
+ package org.apache.el.parser;
+ 
++import java.lang.reflect.Array;
+ import java.lang.reflect.InvocationTargetException;
+ import java.lang.reflect.Method;
+ import java.security.AccessController;
+@@ -246,10 +247,16 @@ public final class AstValue extends SimpleNode {
+         if (isParametersProvided()) {
+             values = ((AstMethodParameters)
+                     this.jjtGetChild(2)).getParameters(ctx);
++            Class<?>[] types = getTypesFromValues(values);
++            m = ReflectionUtil.getMethod(t.base, t.property, types);
+         } else {
++            m = ReflectionUtil.getMethod(t.base, t.property, paramTypes);
+             values = paramValues;
+         }
+-        m = ReflectionUtil.getMethod(t.base, t.property, paramTypes);
++        if (m.isVarArgs()) {
++            // May need to convert values
++            values = toVarArgs(values, m);
++        }
+         Object result = null;
+         try {
+             result = m.invoke(t.base, values);
+@@ -263,6 +270,37 @@ public final class AstValue extends SimpleNode {
+         return result;
+     }
+ 
++    private Object[] toVarArgs(Object[] src, Method m) {
++        int paramCount = m.getParameterTypes().length;
++        
++        Object[] dest = new Object[paramCount];
++        Object[] varArgs = (Object[]) Array.newInstance(
++                m.getParameterTypes()[paramCount - 1].getComponentType(),
++                src.length - (paramCount - 1));
++        System.arraycopy(src, 0, dest, 0, paramCount - 1);
++        System.arraycopy(src, paramCount - 1, varArgs, 0,
++                src.length - (paramCount - 1));
++        dest[paramCount - 1] = varArgs;
++        return dest;
++    }
++    
++    private Class<?>[] getTypesFromValues(Object[] values) {
++        if (values == null) {
++            return null;
++        }
++        
++        Class<?> result[] = new Class<?>[values.length];
++        for (int i = 0; i < values.length; i++) {
++            if (values[i] == null) {
++                result[i] = null;
++            } else {
++                result[i] = values[i].getClass();
++            }
++        }
++        return result;
++    }
++
++    
+     /**
+      * @since EL 2.2
+      */
+
+==================================================
+TestMethodExpressionImpl.java
+index ce425c6a39..ca53f0e1b7 100644
+--- a/java/org/apache/el/util/ReflectionUtil.java
++++ b/java/org/apache/el/util/ReflectionUtil.java
+@@ -22,6 +22,9 @@ import java.beans.PropertyDescriptor;
+ import java.lang.reflect.Array;
+ import java.lang.reflect.Method;
+ import java.util.Arrays;
++import java.util.HashMap;
++import java.util.Map;
++import java.util.Set;
+ 
+ import javax.el.ELException;
+ import javax.el.MethodNotFoundException;
+@@ -120,6 +123,7 @@ public class ReflectionUtil {
+      * @return the method specified
+      * @throws MethodNotFoundException
+      */
++    @SuppressWarnings("null")
+     public static Method getMethod(Object base, Object property,
+             Class<?>[] paramTypes) throws MethodNotFoundException {
+         if (base == null || property == null) {
+@@ -130,16 +134,156 @@ public class ReflectionUtil {
+ 
+         String methodName = (property instanceof String) ? (String) property
+                 : property.toString();
++        
++        int paramCount;
++        if (paramTypes == null) {
++            paramCount = 0;
++        } else {
++            paramCount = paramTypes.length;
++        }
+ 
+-        Method method = null;
+-        try {
+-            method = base.getClass().getMethod(methodName, paramTypes);
+-        } catch (NoSuchMethodException nsme) {
++        Method[] methods = base.getClass().getMethods();
++        Map<Method,Integer> candidates = new HashMap<Method,Integer>();
++        
++        for (Method m : methods) {
++            if (!m.getName().equals(methodName)) {
++                // Method name doesn't match
++                continue;
++            }
++            
++            Class<?>[] mParamTypes = m.getParameterTypes();
++            int mParamCount;
++            if (mParamTypes == null) {
++                mParamCount = 0;
++            } else {
++                mParamCount = mParamTypes.length;
++            }
++            
++            // Check the number of parameters
++            if (!(paramCount == mParamCount ||
++                    (m.isVarArgs() && paramCount >= mParamCount))) {
++                // Method has wrong number of parameters
++                continue;
++            }
++            
++            // Check the parameters match
++            int exactMatch = 0;
++            boolean noMatch = false;
++            for (int i = 0; i < mParamCount; i++) {
++                // Can't be null
++                if (mParamTypes[i].equals(paramTypes[i])) {
++                    exactMatch++;
++                } else if (i == (mParamCount - 1) && m.isVarArgs()) {
++                    Class<?> varType = mParamTypes[i].getComponentType();
++                    for (int j = i; j < paramCount; j++) {
++                        if (!varType.isAssignableFrom(paramTypes[j])) {
++                            break;
++                        }
++                        // Don't treat a varArgs match as an exact match, it can
++                        // lead to a varArgs method matching when the result
++                        // should be ambiguous
++                    }
++                } else if (!mParamTypes[i].isAssignableFrom(paramTypes[i])) {
++                    noMatch = true;
++                    break;
++                }
++            }
++            if (noMatch) {
++                continue;
++            }
++            
++            // If a method is found where every parameter matches exactly,
++            // return it
++            if (exactMatch == paramCount) {
++                return m;
++            }
++            
++            candidates.put(m, Integer.valueOf(exactMatch));
++        }
++
++        // Look for the method that has the highest number of parameters where
++        // the type matches exactly
++        int bestMatch = 0;
++        Method match = null;
++        boolean multiple = false;
++        for (Map.Entry<Method, Integer> entry : candidates.entrySet()) {
++            if (entry.getValue().intValue() > bestMatch ||
++                    match == null) {
++                bestMatch = entry.getValue().intValue();
++                match = entry.getKey();
++                multiple = false;
++            } else if (entry.getValue().intValue() == bestMatch) {
++                multiple = true;
++            }
++        }
++        if (multiple) {
++            if (bestMatch == paramCount - 1) {
++                // Only one parameter is not an exact match - try using the
++                // super class
++                match = resolveAmbiguousMethod(candidates.keySet(), paramTypes);
++            } else {
++                match = null;
++            }
++            
++            if (match == null) {
++                // If multiple methods have the same matching number of parameters
++                // the match is ambiguous so throw an exception
++                throw new MethodNotFoundException(MessageFactory.get(
++                        "error.method.ambiguous", base, property,
++                        paramString(paramTypes)));
++                }
++        }
++        
++        // Handle case where no match at all was found
++        if (match == null) {
+             throw new MethodNotFoundException(MessageFactory.get(
+-                    "error.method.notfound", base, property,
+-                    paramString(paramTypes)));
++                        "error.method.notfound", base, property,
++                        paramString(paramTypes)));
++        }
++        
++        return match;
++    }
++
++    @SuppressWarnings("null")
++    private static Method resolveAmbiguousMethod(Set<Method> candidates,
++            Class<?>[] paramTypes) {
++        // Identify which parameter isn't an exact match
++        Method m = candidates.iterator().next();
++        
++        int nonMatchIndex = 0;
++        Class<?> nonMatchClass = null;
++        
++        for (int i = 0; i < paramTypes.length; i++) {
++            if (m.getParameterTypes()[i] != paramTypes[i]) {
++                nonMatchIndex = i;
++                nonMatchClass = paramTypes[i];
++                break;
++            }
+         }
+-        return method;
++        
++        for (Method c : candidates) {
++           if (c.getParameterTypes()[nonMatchIndex] ==
++                   paramTypes[nonMatchIndex]) {
++               // Methods have different non-matching parameters
++               // Result is ambiguous
++               return null;
++           }
++        }
++        
++        // Can't be null
++        nonMatchClass = nonMatchClass.getSuperclass();
++        while (nonMatchClass != null) {
++            for (Method c : candidates) {
++                if (c.getParameterTypes()[nonMatchIndex].equals(
++                        nonMatchClass)) {
++                    // Found a match
++                    return c;
++                }
++            }
++            nonMatchClass = nonMatchClass.getSuperclass();
++        }
++        
++        return null;
+     }
+ 
+     protected static final String paramString(Class<?>[] types) {
+
+==================================================
+TesterBeanA.java
+index c7c4682181..095d9f96fa 100644
+--- a/test/org/apache/el/TestMethodExpressionImpl.java
++++ b/test/org/apache/el/TestMethodExpressionImpl.java
+@@ -28,10 +28,50 @@ import junit.framework.TestCase;
+ 
+ public class TestMethodExpressionImpl extends TestCase {
+ 
+-    public void testIsParametersProvided() {
+-        ExpressionFactory factory = ExpressionFactory.newInstance();
+-        ELContext context = new ELContextImpl();
++    private ExpressionFactory factory;
++    ELContext context;
++    
++    @Override
++    public void setUp() {
++        factory = ExpressionFactory.newInstance();
++        context = new ELContextImpl();
+ 
++        TesterBeanA beanA = new TesterBeanA();
++        beanA.setName("A");
++        context.getVariableMapper().setVariable("beanA",
++                factory.createValueExpression(beanA, TesterBeanA.class));
++        
++        TesterBeanAA beanAA = new TesterBeanAA();
++        beanAA.setName("AA");
++        context.getVariableMapper().setVariable("beanAA",
++                factory.createValueExpression(beanAA, TesterBeanAA.class));
++        
++        TesterBeanAAA beanAAA = new TesterBeanAAA();
++        beanAAA.setName("AAA");
++        context.getVariableMapper().setVariable("beanAAA",
++                factory.createValueExpression(beanAAA, TesterBeanAAA.class));
++        
++        TesterBeanB beanB = new TesterBeanB();        
++        beanB.setName("B");
++        context.getVariableMapper().setVariable("beanB",
++                factory.createValueExpression(beanB, TesterBeanB.class));
++        
++        TesterBeanBB beanBB = new TesterBeanBB();        
++        beanBB.setName("BB");
++        context.getVariableMapper().setVariable("beanBB",
++                factory.createValueExpression(beanBB, TesterBeanBB.class));
++        
++        TesterBeanBBB beanBBB = new TesterBeanBBB();        
++        beanBBB.setName("BBB");
++        context.getVariableMapper().setVariable("beanBBB",
++                factory.createValueExpression(beanBBB, TesterBeanBBB.class));
++        
++        TesterBeanC beanC = new TesterBeanC();
++        context.getVariableMapper().setVariable("beanC",
++                factory.createValueExpression(beanC, TesterBeanC.class));
++    }
++    
++    public void testIsParametersProvided() {
+         TesterBeanB beanB = new TesterBeanB();
+         beanB.setName("Tomcat");
+         ValueExpression var =
+@@ -49,14 +89,11 @@ public class TestMethodExpressionImpl extends TestCase {
+     }
+ 
+     public void testInvoke() {
+-        ExpressionFactory factory = ExpressionFactory.newInstance();
+-        ELContext context = new ELContextImpl();
+-
+         TesterBeanB beanB = new TesterBeanB();
+-        beanB.setName("Tomcat");
+-        ValueExpression var =
+-            factory.createValueExpression(beanB, TesterBeanB.class);
+-        context.getVariableMapper().setVariable("beanB", var);
++        beanB.setName("B");
++
++        context.getVariableMapper().setVariable("beanB",
++                factory.createValueExpression(beanB, TesterBeanB.class));
+ 
+         MethodExpression me1 = factory.createMethodExpression(
+                 context, "${beanB.getName}", String.class, new Class<?>[] {});
+@@ -67,39 +104,211 @@ public class TestMethodExpressionImpl extends TestCase {
+                 context, "${beanB.sayHello}", String.class,
+                 new Class<?>[] { String.class });
+ 
+-        assertEquals("Tomcat", me1.invoke(context, null));
+-        assertEquals("Hello JUnit from Tomcat", me2.invoke(context, null));
+-        assertEquals("Hello JUnit from Tomcat",
++        assertEquals("B", me1.invoke(context, null));
++        assertEquals("Hello JUnit from B", me2.invoke(context, null));
++        assertEquals("Hello JUnit from B",
+                 me2.invoke(context, new Object[] { "JUnit2" }));
+-        assertEquals("Hello JUnit2 from Tomcat",
++        assertEquals("Hello JUnit2 from B",
+                 me3.invoke(context, new Object[] { "JUnit2" }));
+-        assertEquals("Hello JUnit from Tomcat",
++        assertEquals("Hello JUnit from B",
+                 me2.invoke(context, new Object[] { null }));
+-        assertEquals("Hello null from Tomcat",
++        assertEquals("Hello null from B",
+                 me3.invoke(context, new Object[] { null }));
+     }
+ 
+     public void testInvokeWithSuper() {
+-        ExpressionFactory factory = ExpressionFactory.newInstance();
+-        ELContext context = new ELContextImpl();
+-
+-        TesterBeanA beanA = new TesterBeanA();
+-        ValueExpression varA =
+-            factory.createValueExpression(beanA, TesterBeanA.class);
+-        context.getVariableMapper().setVariable("beanA", varA);
+-        
+-        TesterBeanBB beanC = new TesterBeanBB();        
+-        beanC.setName("Tomcat");
+-        ValueExpression varC =
+-            factory.createValueExpression(beanC, TesterBeanBB.class);
+-        context.getVariableMapper().setVariable("beanC", varC);
+-        
+-        MethodExpression me1 = factory.createMethodExpression(context,
+-                "${beanA.setBean(beanC)}", null ,
++        MethodExpression me = factory.createMethodExpression(context,
++                "${beanA.setBean(beanBB)}", null ,
+                 new Class<?>[] { TesterBeanB.class });
+-        
+-        me1.invoke(context, null);
+-        
+-        assertEquals(beanA.getBean(), beanC);
++        me.invoke(context, null);
++        ValueExpression ve = factory.createValueExpression(context,
++                "${beanA.bean.name}", String.class);
++        Object r = ve.getValue(context);
++        assertEquals("BB", r);
++    }
++    
++    public void testInvokeWithSuperABNoReturnTypeNoParamTypes() {
++        MethodExpression me2 = factory.createMethodExpression(context,
++                "${beanC.sayHello(beanA,beanB)}", null , null);
++        Object r2 = me2.invoke(context, null);
++        assertEquals("AB: Hello A from B", r2.toString());
++    }
++    
++    public void testInvokeWithSuperABReturnTypeNoParamTypes() {
++        MethodExpression me3 = factory.createMethodExpression(context,
++                "${beanC.sayHello(beanA,beanB)}", String.class , null);
++        Object r3 = me3.invoke(context, null);
++        assertEquals("AB: Hello A from B", r3.toString());
++    }
++    
++    public void testInvokeWithSuperABNoReturnTypeParamTypes() {
++        MethodExpression me4 = factory.createMethodExpression(context,
++                "${beanC.sayHello(beanA,beanB)}", null ,
++                new Class<?>[] {TesterBeanA.class, TesterBeanB.class});
++        Object r4 = me4.invoke(context, null);
++        assertEquals("AB: Hello A from B", r4.toString());
++    }
++    
++    public void testInvokeWithSuperABReturnTypeParamTypes() {
++        MethodExpression me5 = factory.createMethodExpression(context,
++                "${beanC.sayHello(beanA,beanB)}", String.class ,
++                new Class<?>[] {TesterBeanA.class, TesterBeanB.class});
++        Object r5 = me5.invoke(context, null);
++        assertEquals("AB: Hello A from B", r5.toString());
++    }
++    
++    public void testInvokeWithSuperABB() {
++        MethodExpression me6 = factory.createMethodExpression(context,
++                "${beanC.sayHello(beanA,beanBB)}", null , null);
++        Object r6 = me6.invoke(context, null);
++        assertEquals("ABB: Hello A from BB", r6.toString());
++    }
++    
++    public void testInvokeWithSuperABBB() {
++        MethodExpression me7 = factory.createMethodExpression(context,
++                "${beanC.sayHello(beanA,beanBBB)}", null , null);
++        Object r7 = me7.invoke(context, null);
++        assertEquals("ABB: Hello A from BBB", r7.toString());
++    }
++    
++    public void testInvokeWithSuperAAB() {
++        MethodExpression me8 = factory.createMethodExpression(context,
++                "${beanC.sayHello(beanAA,beanB)}", null , null);
++        Object r8 = me8.invoke(context, null);
++        assertEquals("AAB: Hello AA from B", r8.toString());
++    }
++    
++    public void testInvokeWithSuperAABB() {
++        MethodExpression me9 = factory.createMethodExpression(context,
++                "${beanC.sayHello(beanAA,beanBB)}", null , null);
++        Exception e = null;
++        try {
++            me9.invoke(context, null);
++        } catch (Exception e1) {
++            e = e1;
++        }
++        // Expected to fail
++        assertNotNull(e);
++    }
++    
++    public void testInvokeWithSuperAABBB() {
++        // The Java compiler reports this as ambiguous. Using the parameter that
++        // matches exactly seems reasonable to limit the scope of the method
++        // search so the EL will find a match.
++        MethodExpression me10 = factory.createMethodExpression(context,
++                "${beanC.sayHello(beanAA,beanBBB)}", null , null);
++        Object r10 = me10.invoke(context, null);
++        assertEquals("AAB: Hello AA from BBB", r10.toString());
++    }
++    
++    public void testInvokeWithSuperAAAB() {
++        MethodExpression me11 = factory.createMethodExpression(context,
++                "${beanC.sayHello(beanAAA,beanB)}", null , null);
++        Object r11 = me11.invoke(context, null);
++        assertEquals("AAB: Hello AAA from B", r11.toString());
++    }
++    
++    public void testInvokeWithSuperAAABB() {
++        // The Java compiler reports this as ambiguous. Using the parameter that
++        // matches exactly seems reasonable to limit the scope of the method
++        // search so the EL will find a match.
++        MethodExpression me12 = factory.createMethodExpression(context,
++                "${beanC.sayHello(beanAAA,beanBB)}", null , null);
++        Object r12 = me12.invoke(context, null);
++        assertEquals("ABB: Hello AAA from BB", r12.toString());
++    }
++    
++    public void testInvokeWithSuperAAABBB() {
++        MethodExpression me13 = factory.createMethodExpression(context,
++                "${beanC.sayHello(beanAAA,beanBBB)}", null , null);
++        Exception e = null;
++        try {
++            me13.invoke(context, null);
++        } catch (Exception e1) {
++            e = e1;
++        }
++        // Expected to fail
++        assertNotNull(e);
++    }
++    
++    public void testInvokeWithVarArgsAB() throws Exception {
++        MethodExpression me1 = factory.createMethodExpression(context,
++                "${beanC.sayHello(beanA,beanB,beanB)}", null , null);
++        Exception e = null;
++        try {
++            me1.invoke(context, null);
++        } catch (Exception e1) {
++            e = e1;
++        }
++        // Expected to fail
++        assertNotNull(e);
++    }
++    
++    public void testInvokeWithVarArgsABB() throws Exception {
++        MethodExpression me2 = factory.createMethodExpression(context,
++                "${beanC.sayHello(beanA,beanBB,beanBB)}", null , null);
++        Object r2 = me2.invoke(context, null);
++        assertEquals("ABB[]: Hello A from BB, BB", r2.toString());
++    }
++    
++    public void testInvokeWithVarArgsABBB() throws Exception {
++        MethodExpression me3 = factory.createMethodExpression(context,
++                "${beanC.sayHello(beanA,beanBBB,beanBBB)}", null , null);
++        Object r3 = me3.invoke(context, null);
++        assertEquals("ABB[]: Hello A from BBB, BBB", r3.toString());
++    }
++    
++    public void testInvokeWithVarArgsAAB() throws Exception {
++        MethodExpression me4 = factory.createMethodExpression(context,
++                "${beanC.sayHello(beanAA,beanB,beanB)}", null , null);
++        Exception e = null;
++        try {
++            me4.invoke(context, null);
++        } catch (Exception e1) {
++            e = e1;
++        }
++        // Expected to fail
++        assertNotNull(e);
++    }
++    
++    public void testInvokeWithVarArgsAABB() throws Exception {
++        MethodExpression me5 = factory.createMethodExpression(context,
++                "${beanC.sayHello(beanAA,beanBB,beanBB)}", null , null);
++        Object r5 = me5.invoke(context, null);
++        assertEquals("ABB[]: Hello AA from BB, BB", r5.toString());
++    }
++    
++    public void testInvokeWithVarArgsAABBB() throws Exception {
++        MethodExpression me6 = factory.createMethodExpression(context,
++                "${beanC.sayHello(beanAA,beanBBB,beanBBB)}", null , null);
++        Object r6 = me6.invoke(context, null);
++        assertEquals("ABB[]: Hello AA from BBB, BBB", r6.toString());
++    }
++    
++    public void testInvokeWithVarArgsAAAB() throws Exception {
++        MethodExpression me7 = factory.createMethodExpression(context,
++                "${beanC.sayHello(beanAAA,beanB,beanB)}", null , null);
++        Exception e = null;
++        try {
++            me7.invoke(context, null);
++        } catch (Exception e1) {
++            e = e1;
++        }
++        // Expected to fail
++        assertNotNull(e);
++    }
++    
++    public void testInvokeWithVarArgsAAABB() throws Exception {
++        MethodExpression me8 = factory.createMethodExpression(context,
++                "${beanC.sayHello(beanAAA,beanBB,beanBB)}", null , null);
++        Object r8 = me8.invoke(context, null);
++        assertEquals("ABB[]: Hello AAA from BB, BB", r8.toString());
++    }
++    
++    public void testInvokeWithVarArgsAAABBB() throws Exception {
++        MethodExpression me9 = factory.createMethodExpression(context,
++                "${beanC.sayHello(beanAAA,beanBBB,beanBBB)}", null , null);
++        Object r9 = me9.invoke(context, null);
++        assertEquals("ABB[]: Hello AAA from BBB, BBB", r9.toString());
+     }
+ }
+
+==================================================
+TesterBeanAA.java
+index b5d4b8d9a3..258145ff63 100644
+--- a/test/org/apache/el/TesterBeanA.java
++++ b/test/org/apache/el/TesterBeanA.java
+@@ -19,6 +19,7 @@ package org.apache.el;
+ 
+ public class TesterBeanA {
+     private TesterBeanB bean;
++    private String name;
+ 
+     public TesterBeanB getBean() {
+         return bean;
+@@ -27,4 +28,12 @@ public class TesterBeanA {
+     public void setBean(TesterBeanB bean) {
+         this.bean = bean;
+     }
++
++    public String getName() {
++        return name;
++    }
++
++    public void setName(String name) {
++        this.name = name;
++    }
+ }
+
+==================================================
+TesterBeanAAA.java
+new file mode 100644
+index 0000000000..9b20d269b9
+--- /dev/null
++++ b/test/org/apache/el/TesterBeanAA.java
+@@ -0,0 +1,23 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.el;
++
++public class TesterBeanAA extends TesterBeanA {
++    // No additional implementation - just need a class that extends A for
++    // testing EL methods calls
++}
+
+==================================================
+TesterBeanBBB.java
+new file mode 100644
+index 0000000000..b413e04c56
+--- /dev/null
++++ b/test/org/apache/el/TesterBeanAAA.java
+@@ -0,0 +1,23 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.el;
++
++public class TesterBeanAAA extends TesterBeanAA {
++    // No additional implementation - just need a class that extends AA for
++    // testing EL methods calls
++}
+
+==================================================
+TesterBeanC.java
+new file mode 100644
+index 0000000000..eb8e9bc634
+--- /dev/null
++++ b/test/org/apache/el/TesterBeanBBB.java
+@@ -0,0 +1,23 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.el;
++
++public class TesterBeanBBB extends TesterBeanBB {
++    // No additional implementation - just need a class that extends BB for
++    // testing EL methods calls
++}
+
+==================================================

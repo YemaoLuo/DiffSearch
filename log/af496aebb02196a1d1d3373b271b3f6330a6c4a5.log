@@ -1,0 +1,224 @@
+af496aebb02196a1d1d3373b271b3f6330a6c4a5
+==================================================
+Various fixes to timeout handling post the 9.0.x connector refactoring
+==================================================
+Mark Thomas
+==================================================
+Tue May 26 11:29:15 2015 +0000
+==================================================
+Http11AprProtocol.java
+Various fixes to timeout handling post the 9.0.x connector refactoring
+Highlights:
+ - use longs for timeouts in AprEndpoint
+ - APR read/write registration now uses current timeout
+ - move last[Read|Write] to NIO since only NIO uses it
+ - Simplify switching between keepAlive and So timeouts for HTTP
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1681742 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Http11InputBuffer.java
+index 6c4487914e..ef4ec85e3e 100644
+--- a/java/org/apache/coyote/http11/Http11AprProtocol.java
++++ b/java/org/apache/coyote/http11/Http11AprProtocol.java
+@@ -102,7 +102,6 @@ public class Http11AprProtocol extends AbstractHttp11Protocol<Long> {
+             processor.recycle();
+             recycledProcessors.push(processor);
+             if (addToPoller && getProtocol().getEndpoint().isRunning()) {
+-                socket.setReadTimeout(getProtocol().getEndpoint().getKeepAliveTimeout());
+                 socket.registerReadInterest();
+             }
+         }
+
+==================================================
+Http11Processor.java
+index 77f67a01c1..e1ca80aff5 100644
+--- a/java/org/apache/coyote/http11/Http11InputBuffer.java
++++ b/java/org/apache/coyote/http11/Http11InputBuffer.java
+@@ -381,7 +381,7 @@ public class Http11InputBuffer implements InputBuffer {
+      * @return true if data is properly fed; false if no data is available
+      * immediately and thread should be freed
+      */
+-    boolean parseRequestLine(boolean useAvailableDataOnly) throws IOException {
++    boolean parseRequestLine(boolean keptAlive) throws IOException {
+ 
+         //check state
+         if ( !parsingRequestLine ) return true;
+@@ -394,15 +394,19 @@ public class Http11InputBuffer implements InputBuffer {
+ 
+                 // Read new bytes if needed
+                 if (pos >= lastValid) {
+-                    if (useAvailableDataOnly) {
+-                        return false;
++                    if (keptAlive) {
++                        // Haven't read any request data yet so use the keep-alive
++                        // timeout.
++                        wrapper.setReadTimeout(wrapper.getEndpoint().getKeepAliveTimeout());
+                     }
+-                    // Do a simple read with a short timeout
+                     if (!fill(false)) {
+                         // A read is pending, so no longer in initial state
+                         parsingRequestLinePhase = 1;
+                         return false;
+                     }
++                    // At least one byte of the request has been received.
++                    // Switch to the socket timeout.
++                    wrapper.setReadTimeout(wrapper.getEndpoint().getSoTimeout());
+                 }
+                 // Set the start time once we start reading data (even if it is
+                 // just skipping blank lines)
+
+==================================================
+AprEndpoint.java
+index c9084d0bfb..253dccc80f 100644
+--- a/java/org/apache/coyote/http11/Http11Processor.java
++++ b/java/org/apache/coyote/http11/Http11Processor.java
+@@ -1148,13 +1148,7 @@ public class Http11Processor extends AbstractProcessor {
+         // open
+         openSocket = true;
+         // Check to see if we have read any of the request line yet
+-        if (inputBuffer.getParsingRequestLinePhase() < 1) {
+-            if (keptAlive) {
+-                // Haven't read the request line and have previously processed a
+-                // request. Must be keep-alive. Make sure poller uses keepAlive.
+-                socketWrapper.setReadTimeout(endpoint.getKeepAliveTimeout());
+-            }
+-        } else {
++        if (inputBuffer.getParsingRequestLinePhase() > 1) {
+             // Started to read request line.
+             if (request.getStartTime() < 0) {
+                 request.setStartTime(System.currentTimeMillis());
+@@ -1168,8 +1162,6 @@ public class Http11Processor extends AbstractProcessor {
+             } else {
+                 // Need to keep processor associated with socket
+                 readComplete = false;
+-                // Make sure poller uses soTimeout from here onwards
+-                socketWrapper.setReadTimeout(endpoint.getSoTimeout());
+             }
+         }
+         return true;
+
+==================================================
+NioEndpoint.java
+index cec9f43a5d..d25f1e13c4 100644
+--- a/java/org/apache/tomcat/util/net/AprEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AprEndpoint.java
+@@ -1068,7 +1068,7 @@ public class AprEndpoint extends AbstractEndpoint<Long> implements SNICallBack {
+ 
+     public static class SocketInfo {
+         public long socket;
+-        public int timeout;
++        public long timeout;
+         public int flags;
+         public boolean read() {
+             return (flags & Poll.APR_POLLIN) == Poll.APR_POLLIN;
+@@ -1162,7 +1162,7 @@ public class AprEndpoint extends AbstractEndpoint<Long> implements SNICallBack {
+         protected int pos;
+ 
+         protected long[] sockets;
+-        protected int[] timeouts;
++        protected long[] timeouts;
+         protected int[] flags;
+ 
+         protected SocketInfo info = new SocketInfo();
+@@ -1171,7 +1171,7 @@ public class AprEndpoint extends AbstractEndpoint<Long> implements SNICallBack {
+             this.size = 0;
+             pos = 0;
+             sockets = new long[size];
+-            timeouts = new int[size];
++            timeouts = new long[size];
+             flags = new int[size];
+         }
+ 
+@@ -1196,7 +1196,7 @@ public class AprEndpoint extends AbstractEndpoint<Long> implements SNICallBack {
+             pos = 0;
+         }
+ 
+-        public boolean add(long socket, int timeout, int flag) {
++        public boolean add(long socket, long timeout, int flag) {
+             if (size == sockets.length) {
+                 return false;
+             } else {
+@@ -1461,14 +1461,14 @@ public class AprEndpoint extends AbstractEndpoint<Long> implements SNICallBack {
+          * be removed from the poller.
+          *
+          * @param socket to add to the poller
+-         * @param timeout to use for this connection
++         * @param timeout to use for this connection in milliseconds
+          * @param flags Events to poll for (Poll.APR_POLLIN and/or
+          *              Poll.APR_POLLOUT)
+          */
+-        private void add(long socket, int timeout, int flags) {
++        private void add(long socket, long timeout, int flags) {
+             if (log.isDebugEnabled()) {
+                 String msg = sm.getString("endpoint.debug.pollerAdd",
+-                        Long.valueOf(socket), Integer.valueOf(timeout),
++                        Long.valueOf(socket), Long.valueOf(timeout),
+                         Integer.valueOf(flags));
+                 if (log.isTraceEnabled()) {
+                     log.trace(msg, new Exception());
+@@ -2685,7 +2685,7 @@ public class AprEndpoint extends AbstractEndpoint<Long> implements SNICallBack {
+                     return;
+                 }
+                 ((AprEndpoint) getEndpoint()).getPoller().add(
+-                        getSocket().longValue(), -1, Poll.APR_POLLIN);
++                        getSocket().longValue(), getReadTimeout(), Poll.APR_POLLIN);
+             }
+         }
+ 
+@@ -2698,7 +2698,7 @@ public class AprEndpoint extends AbstractEndpoint<Long> implements SNICallBack {
+                     return;
+                 }
+                 ((AprEndpoint) getEndpoint()).getPoller().add(
+-                        getSocket().longValue(), -1, Poll.APR_POLLOUT);
++                        getSocket().longValue(), getWriteTimeout(), Poll.APR_POLLOUT);
+             }
+         }
+ 
+
+==================================================
+SocketWrapperBase.java
+index 21c82435fd..83b4fd11c5 100644
+--- a/java/org/apache/tomcat/util/net/NioEndpoint.java
++++ b/java/org/apache/tomcat/util/net/NioEndpoint.java
+@@ -1119,6 +1119,8 @@ public class NioEndpoint extends AbstractJsseEndpoint<NioChannel> {
+         private CountDownLatch readLatch = null;
+         private CountDownLatch writeLatch = null;
+         private volatile SendfileData sendfileData = null;
++        private volatile long lastRead = System.currentTimeMillis();
++        private volatile long lastWrite = lastRead;
+ 
+         public NioSocketWrapper(NioChannel channel, NioEndpoint endpoint) {
+             super(channel, endpoint);
+@@ -1161,6 +1163,11 @@ public class NioEndpoint extends AbstractJsseEndpoint<NioChannel> {
+         public void setSendfileData(SendfileData sf) { this.sendfileData = sf;}
+         public SendfileData getSendfileData() { return this.sendfileData;}
+ 
++        public void updateLastWrite() { lastWrite = System.currentTimeMillis(); }
++        public long getLastWrite() { return lastWrite; }
++        public void updateLastRead() { lastRead = System.currentTimeMillis(); }
++        public long getLastRead() { return lastRead; }
++
+ 
+         @Override
+         public boolean isReadyForRead() throws IOException {
+@@ -1206,6 +1213,7 @@ public class NioEndpoint extends AbstractJsseEndpoint<NioChannel> {
+ 
+             // Fill the read buffer as best we can.
+             int nRead = fillReadBuffer(block);
++            lastRead = System.currentTimeMillis();
+ 
+             // Full as much of the remaining byte array as possible with the
+             // data that was just read
+@@ -1284,6 +1292,7 @@ public class NioEndpoint extends AbstractJsseEndpoint<NioChannel> {
+                         if (getSocket().flush(true, selector, writeTimeout)) break;
+                     } while (true);
+                 }
++                lastWrite = System.currentTimeMillis();
+             } finally {
+                 if (selector != null) {
+                     pool.put(selector);
+
+==================================================

@@ -1,0 +1,327 @@
+da628f708b5b934eb1e34b2a78c2b765a9881e05
+==================================================
+Refactor async timeout threads of the connectors using a scheduled executor.
+==================================================
+Remy Maucherat
+==================================================
+Thu Nov 8 10:51:37 2018 +0000
+==================================================
+Connector.java
+Refactor async timeout threads of the connectors using a scheduled executor.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1846122 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AbstractProtocol.java
+index 33ab6a09ce..98baec8fdd 100644
+--- a/java/org/apache/catalina/connector/Connector.java
++++ b/java/org/apache/catalina/connector/Connector.java
+@@ -948,6 +948,9 @@ public class Connector extends LifecycleMBeanBase  {
+         // Initialize adapter
+         adapter = new CoyoteAdapter(this);
+         protocolHandler.setAdapter(adapter);
++        if (service != null) {
++            protocolHandler.setUtilityExecutor(service.getUtilityExecutor());
++        }
+ 
+         // Make sure parseBodyMethodsSet has a default
+         if (null == parseBodyMethodsSet) {
+
+==================================================
+ProtocolHandler.java
+index 24d2c1ae2e..82bccb32b1 100644
+--- a/java/org/apache/coyote/AbstractProtocol.java
++++ b/java/org/apache/coyote/AbstractProtocol.java
+@@ -23,6 +23,9 @@ import java.util.Map;
+ import java.util.Set;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.Executor;
++import java.util.concurrent.ScheduledExecutorService;
++import java.util.concurrent.ScheduledFuture;
++import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.atomic.AtomicLong;
+ 
+@@ -90,12 +93,10 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+     private final Set<Processor> waitingProcessors =
+             Collections.newSetFromMap(new ConcurrentHashMap<Processor, Boolean>());
+ 
+-
+     /**
+-     * The async timeout thread.
++     * Controller for the async timeout scheduling.
+      */
+-    private AsyncTimeout asyncTimeout = null;
+-
++    private ScheduledFuture<?> asyncTimeoutFuture = null;
+ 
+     public AbstractProtocol(AbstractEndpoint<S,?> endpoint) {
+         this.endpoint = endpoint;
+@@ -201,20 +202,24 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+     }
+ 
+ 
+-    public AsyncTimeout getAsyncTimeout() {
+-        return asyncTimeout;
+-    }
+-
+-
+     // ---------------------- Properties that are passed through to the EndPoint
+ 
+     @Override
+     public Executor getExecutor() { return endpoint.getExecutor(); }
++    @Override
+     public void setExecutor(Executor executor) {
+         endpoint.setExecutor(executor);
+     }
+ 
+ 
++    @Override
++    public ScheduledExecutorService getUtilityExecutor() { return endpoint.getUtilityExecutor(); }
++    @Override
++    public void setUtilityExecutor(ScheduledExecutorService utilityExecutor) {
++        endpoint.setUtilityExecutor(utilityExecutor);
++    }
++
++
+     public int getMaxThreads() { return endpoint.getMaxThreads(); }
+     public void setMaxThreads(int maxThreads) {
+         endpoint.setMaxThreads(maxThreads);
+@@ -559,19 +564,36 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+         }
+ 
+         endpoint.start();
++        startAsyncTimeout();
++    }
++
+ 
+-        // Start async timeout thread
+-        asyncTimeout = new AsyncTimeout();
+-        Thread timeoutThread = new Thread(asyncTimeout, getNameInternal() + "-AsyncTimeout");
+-        int priority = endpoint.getThreadPriority();
+-        if (priority < Thread.MIN_PRIORITY || priority > Thread.MAX_PRIORITY) {
+-            priority = Thread.NORM_PRIORITY;
++    protected void startAsyncTimeout() {
++        if (asyncTimeoutFuture != null) {
++            return;
+         }
+-        timeoutThread.setPriority(priority);
+-        timeoutThread.setDaemon(true);
+-        timeoutThread.start();
++        asyncTimeoutFuture = getUtilityExecutor().scheduleWithFixedDelay(
++                new Runnable() {
++                    @Override
++                    public void run() {
++                        if (!endpoint.isPaused()) {
++                            long now = System.currentTimeMillis();
++                            for (Processor processor : waitingProcessors) {
++                                processor.timeoutAsync(now);
++                            }
++                        }
++                    }
++
++                }, 1, 1, TimeUnit.SECONDS);
+     }
+ 
++    protected void stopAsyncTimeout() {
++        if (asyncTimeoutFuture == null) {
++            return;
++        }
++        asyncTimeoutFuture.cancel(false);
++        asyncTimeoutFuture = null;
++    }
+ 
+     @Override
+     public void pause() throws Exception {
+@@ -579,6 +601,7 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+             getLog().info(sm.getString("abstractProtocolHandler.pause", getName()));
+         }
+ 
++        stopAsyncTimeout();
+         endpoint.pause();
+     }
+ 
+@@ -595,6 +618,7 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+         }
+ 
+         endpoint.resume();
++        startAsyncTimeout();
+     }
+ 
+ 
+@@ -605,8 +629,10 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+             logPortOffset();
+         }
+ 
+-        if (asyncTimeout != null) {
+-            asyncTimeout.stop();
++        stopAsyncTimeout();
++        // Timeout any pending async request
++        for (Processor processor : waitingProcessors) {
++            processor.timeoutAsync(-1);
+         }
+ 
+         endpoint.stop();
+@@ -1113,52 +1139,4 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+         }
+     }
+ 
+-
+-    /**
+-     * Async timeout thread
+-     */
+-    protected class AsyncTimeout implements Runnable {
+-
+-        private volatile boolean asyncTimeoutRunning = true;
+-
+-        /**
+-         * The background thread that checks async requests and fires the
+-         * timeout if there has been no activity.
+-         */
+-        @Override
+-        public void run() {
+-
+-            // Loop until we receive a shutdown command
+-            while (asyncTimeoutRunning) {
+-                try {
+-                    Thread.sleep(1000);
+-                } catch (InterruptedException e) {
+-                    // Ignore
+-                }
+-                long now = System.currentTimeMillis();
+-                for (Processor processor : waitingProcessors) {
+-                   processor.timeoutAsync(now);
+-                }
+-
+-                // Loop if endpoint is paused
+-                while (endpoint.isPaused() && asyncTimeoutRunning) {
+-                    try {
+-                        Thread.sleep(1000);
+-                    } catch (InterruptedException e) {
+-                        // Ignore
+-                    }
+-                }
+-            }
+-        }
+-
+-
+-        protected void stop() {
+-            asyncTimeoutRunning = false;
+-
+-            // Timeout any pending async request
+-            for (Processor processor : waitingProcessors) {
+-                processor.timeoutAsync(-1);
+-            }
+-        }
+-    }
+ }
+
+==================================================
+AbstractEndpoint.java
+index 6d3842cf1b..44d53595aa 100644
+--- a/java/org/apache/coyote/ProtocolHandler.java
++++ b/java/org/apache/coyote/ProtocolHandler.java
+@@ -17,15 +17,14 @@
+ package org.apache.coyote;
+ 
+ import java.util.concurrent.Executor;
++import java.util.concurrent.ScheduledExecutorService;
+ 
+ import org.apache.tomcat.util.net.SSLHostConfig;
+ 
+ /**
+  * Abstract the protocol implementation, including threading, etc.
+- * Processor is single threaded and specific to stream-based protocols,
+- * will not fit Jk protocols like JNI.
+  *
+- * This is the main interface to be implemented by a coyote connector.
++ * This is the main interface to be implemented by a coyote protocol.
+  * Adapter is the main interface to be implemented by a coyote servlet
+  * container.
+  *
+@@ -35,13 +34,19 @@ import org.apache.tomcat.util.net.SSLHostConfig;
+  */
+ public interface ProtocolHandler {
+ 
++    /**
++     * Return the adapter associated with the protocol handler.
++     * @return the adapter
++     */
++    public Adapter getAdapter();
++
++
+     /**
+      * The adapter, used to call the connector.
+      *
+      * @param adapter The adapter to associate
+      */
+     public void setAdapter(Adapter adapter);
+-    public Adapter getAdapter();
+ 
+ 
+     /**
+@@ -52,6 +57,27 @@ public interface ProtocolHandler {
+     public Executor getExecutor();
+ 
+ 
++    /**
++     * Set the optional executor that will be used by the connector.
++     * @param executor the executor
++     */
++    public void setExecutor(Executor executor);
++
++
++    /**
++     * Get the utility executor that should be used by the protocol handler.
++     * @return the executor
++     */
++    public ScheduledExecutorService getUtilityExecutor();
++
++
++    /**
++     * Set the utility executor that should be used by the protocol handler.
++     * @param utilityExecutor the executor
++     */
++    public void setUtilityExecutor(ScheduledExecutorService utilityExecutor);
++
++
+     /**
+      * Initialise the protocol.
+      *
+@@ -126,10 +152,32 @@ public interface ProtocolHandler {
+     public boolean isSendfileSupported();
+ 
+ 
++    /**
++     * Add a new SSL configuration for a virtual host.
++     * @param sslHostConfig the configuration
++     */
+     public void addSslHostConfig(SSLHostConfig sslHostConfig);
++
++
++    /**
++     * Find all configured SSL virtual host configurations which will be used
++     * by SNI.
++     * @return the configurations
++     */
+     public SSLHostConfig[] findSslHostConfigs();
+ 
+ 
++    /**
++     * Add a new protocol for used by HTTP/1.1 upgrade or ALPN.
++     * @param upgradeProtocol the protocol
++     */
+     public void addUpgradeProtocol(UpgradeProtocol upgradeProtocol);
++
++
++    /**
++     * Return all configured upgrade protocols.
++     * @return the protocols
++     */
+     public UpgradeProtocol[] findUpgradeProtocols();
++
+ }
+
+==================================================

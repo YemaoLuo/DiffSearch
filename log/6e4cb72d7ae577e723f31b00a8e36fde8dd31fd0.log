@@ -1,0 +1,324 @@
+6e4cb72d7ae577e723f31b00a8e36fde8dd31fd0
+==================================================
+More lambda expression implementation. Handle the case of an expression assigned to a variable.
+==================================================
+Mark Emlyn
+==================================================
+Mon Jul 15 10:00:59 2013 +0000
+==================================================
+LambdaExpression.java
+More lambda expression implementation. Handle the case of an expression assigned to a variable.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1503158 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+EvaluationContext.java
+index 5b10e5c178..b702e5cf9d 100644
+--- a/java/javax/el/LocalStrings.properties
++++ b/java/javax/el/LocalStrings.properties
+@@ -41,6 +41,8 @@ importHandler.invalidPackage=The package [{0}] could not be found
+ importHandler.invalidStaticName=Name of static method or field to import [{0}] must include a class
+ importHandler.staticNotFound=The static import [{0}] could not be found in class [{1}] for import [{2}]
+ 
++lambdaExpression.tooFewArgs=Only [{0}] arguments were provided for a lambda expression that requires at least [{1}]
++
+ staticFieldELResolver.methodNotFound=No matching public static method named [{0}] found on class [{1}]
+ staticFieldELResolver.notFound=No public static field named [{0}] was found on class [{1}]
+ staticFieldELResolver.notWriteable=Writing to static fields (in this case field [{0}] on class [{1}]) is not permitted
+\ No newline at end of file
+
+==================================================
+ExpressionBuilder.java
+index 657577d83c..2d51e2c0f4 100644
+--- a/java/org/apache/el/lang/EvaluationContext.java
++++ b/java/org/apache/el/lang/EvaluationContext.java
+@@ -17,11 +17,15 @@
+ 
+ package org.apache.el.lang;
+ 
++import java.util.List;
+ import java.util.Locale;
++import java.util.Map;
+ 
+ import javax.el.ELContext;
+ import javax.el.ELResolver;
++import javax.el.EvaluationListener;
+ import javax.el.FunctionMapper;
++import javax.el.ImportHandler;
+ import javax.el.VariableMapper;
+ 
+ public final class EvaluationContext extends ELContext {
+@@ -40,53 +44,113 @@ public final class EvaluationContext extends ELContext {
+     }
+ 
+     public ELContext getELContext() {
+-        return this.elContext;
++        return elContext;
+     }
+ 
+     @Override
+     public FunctionMapper getFunctionMapper() {
+-        return this.fnMapper;
++        return fnMapper;
+     }
+ 
+     @Override
+     public VariableMapper getVariableMapper() {
+-        return this.varMapper;
++        return varMapper;
+     }
+ 
+     @Override
+     // Can't use Class<?> because API needs to match specification in superclass
+     public Object getContext(Class key) {
+-        return this.elContext.getContext(key);
++        return elContext.getContext(key);
+     }
+ 
+     @Override
+     public ELResolver getELResolver() {
+-        return this.elContext.getELResolver();
++        return elContext.getELResolver();
+     }
+ 
+     @Override
+     public boolean isPropertyResolved() {
+-        return this.elContext.isPropertyResolved();
++        return elContext.isPropertyResolved();
+     }
+ 
+     @Override
+     // Can't use Class<?> because API needs to match specification in superclass
+     public void putContext(Class key, Object contextObject) {
+-        this.elContext.putContext(key, contextObject);
++        elContext.putContext(key, contextObject);
+     }
+ 
+     @Override
+     public void setPropertyResolved(boolean resolved) {
+-        this.elContext.setPropertyResolved(resolved);
++        elContext.setPropertyResolved(resolved);
+     }
+ 
+     @Override
+     public Locale getLocale() {
+-        return this.elContext.getLocale();
++        return elContext.getLocale();
+         }
+ 
+     @Override
+     public void setLocale(Locale locale) {
+-        this.elContext.setLocale(locale);
++        elContext.setLocale(locale);
++    }
++
++    @Override
++    public void setPropertyResolved(Object base, Object property) {
++        elContext.setPropertyResolved(base, property);
++    }
++
++    @Override
++    public ImportHandler getImportHandler() {
++        return elContext.getImportHandler();
++    }
++
++    @Override
++    public void addEvaluationListener(EvaluationListener listener) {
++        elContext.addEvaluationListener(listener);
++    }
++
++    @Override
++    public List<EvaluationListener> getEvaluationListeners() {
++        return elContext.getEvaluationListeners();
++    }
++
++    @Override
++    public void notifyBeforeEvaluation(String expression) {
++        elContext.notifyBeforeEvaluation(expression);
++    }
++
++    @Override
++    public void notifyAfterEvaluation(String expression) {
++        elContext.notifyAfterEvaluation(expression);
++    }
++
++    @Override
++    public void notifyPropertyResolved(Object base, Object property) {
++        elContext.notifyPropertyResolved(base, property);
++    }
++
++    @Override
++    public boolean isLambdaArgument(String name) {
++        return elContext.isLambdaArgument(name);
++    }
++
++    @Override
++    public Object getLambdaArgument(String name) {
++        return elContext.getLambdaArgument(name);
++    }
++
++    @Override
++    public void enterLambdaScope(Map<String, Object> arguments) {
++        elContext.enterLambdaScope(arguments);
++    }
++
++    @Override
++    public void exitLambdaScope() {
++        elContext.exitLambdaScope();
++    }
++
++    @Override
++    public Object convertToType(Object obj, Class<?> type) {
++        return elContext.convertToType(obj, type);
+     }
+ }
+
+==================================================
+AstFunction.java
+index 765d1a163b..1c707e094a 100644
+--- a/java/org/apache/el/lang/ExpressionBuilder.java
++++ b/java/org/apache/el/lang/ExpressionBuilder.java
+@@ -80,9 +80,6 @@ public final class ExpressionBuilder implements NodeVisitor {
+ 
+     private final String expression;
+ 
+-    /**
+-     *
+-     */
+     public ExpressionBuilder(String expression, ELContext ctx)
+             throws ELException {
+         this.expression = expression;
+@@ -189,15 +186,31 @@ public final class ExpressionBuilder implements NodeVisitor {
+ 
+             AstFunction funcNode = (AstFunction) node;
+ 
++            Method m = null;
++
++            if (this.fnMapper != null) {
++                m = fnMapper.resolveFunction(funcNode.getPrefix(), funcNode
++                        .getLocalName());
++            }
++
++            // References to variables that refer to lambda expressions will be
++            // parsed as functions. This is handled at runtime but at this point
++            // need to treat it as a variable rather than a function.
++            if (m == null && this.varMapper != null &&
++                    funcNode.getPrefix().length() == 0) {
++                this.varMapper.resolveVariable(funcNode.getLocalName());
++                return;
++            }
++
+             if (this.fnMapper == null) {
+                 throw new ELException(MessageFactory.get("error.fnMapper.null"));
+             }
+-            Method m = fnMapper.resolveFunction(funcNode.getPrefix(), funcNode
+-                    .getLocalName());
++
+             if (m == null) {
+                 throw new ELException(MessageFactory.get(
+                         "error.fnMapper.method", funcNode.getOutputName()));
+             }
++
+             int pcnt = m.getParameterTypes().length;
+             if (node.jjtGetNumChildren() != pcnt) {
+                 throw new ELException(MessageFactory.get(
+
+==================================================
+AstLambdaExpression.java
+index 3684576bfc..401e2ba08b 100644
+--- a/java/org/apache/el/parser/AstFunction.java
++++ b/java/org/apache/el/parser/AstFunction.java
+@@ -23,6 +23,7 @@ import java.lang.reflect.Method;
+ 
+ import javax.el.ELException;
+ import javax.el.FunctionMapper;
++import javax.el.LambdaExpression;
+ 
+ import org.apache.el.lang.EvaluationContext;
+ import org.apache.el.util.MessageFactory;
+@@ -87,6 +88,24 @@ public final class AstFunction extends SimpleNode {
+             throw new ELException(MessageFactory.get("error.fnMapper.null"));
+         }
+         Method m = fnMapper.resolveFunction(this.prefix, this.localName);
++
++        if (m == null && this.prefix.length() == 0) {
++            // Handle case of lambda expression being set to an EL variable for
++            // later use
++            Object obj =
++                    ctx.getELResolver().getValue(ctx, null, this.localName);
++            if (obj instanceof LambdaExpression) {
++                LambdaExpression le = (LambdaExpression) obj;
++                // Build arguments
++                int numArgs = this.jjtGetNumChildren();
++                Object[] args = new Object[numArgs];
++                for (int i = 0; i < numArgs; i++) {
++                    args[i] = children[i].getValue(ctx);
++                }
++                return le.invoke(ctx, args);
++            }
++        }
++
+         if (m == null) {
+             throw new ELException(MessageFactory.get("error.fnMapper.method",
+                     this.getOutputName()));
+
+==================================================
+AstLambdaExpressionOrInvocation.java
+index 5f464e6b65..6b339d64f2 100644
+--- a/java/org/apache/el/parser/AstLambdaExpression.java
++++ b/java/org/apache/el/parser/AstLambdaExpression.java
+@@ -17,11 +17,15 @@
+ /* Generated By:JJTree: Do not edit this line. AstLambdaExpression.java Version 4.3 */
+ package org.apache.el.parser;
+ 
++import java.util.ArrayList;
+ import java.util.HashMap;
++import java.util.List;
+ import java.util.Map;
+ 
+ import javax.el.ELException;
++import javax.el.LambdaExpression;
+ 
++import org.apache.el.ValueExpressionImpl;
+ import org.apache.el.lang.EvaluationContext;
+ import org.apache.el.util.MessageFactory;
+ 
+@@ -31,6 +35,34 @@ public class AstLambdaExpression extends SimpleNode {
+         super(id);
+     }
+ 
++    @Override
++    public Object getValue(EvaluationContext ctx) throws ELException {
++
++        // Two children - the formal parameters and the expression
++        AstLambdaParameters formalParametersNode =
++                (AstLambdaParameters) children[0];
++        Node[] formalParamNodes = formalParametersNode.children;
++
++        if (formalParamNodes == null || formalParamNodes.length == 0) {
++            // No formal parameters - should be able to simply invoke this
++            return invoke(ctx, null, null);
++        } else {
++            // Has parameters but they aren't provided so build a
++            // LambdaExpression
++            List<String> formalParameters =
++                    new ArrayList<>(formalParamNodes.length);
++            for (Node formalParamNode : formalParamNodes) {
++                formalParameters.add(formalParamNode.getImage());
++            }
++
++            ValueExpressionImpl ve = new ValueExpressionImpl("", children[1],
++                    ctx.getFunctionMapper(), ctx.getVariableMapper(), null);
++            LambdaExpression le = new LambdaExpression(formalParameters, ve);
++
++            return le;
++        }
++    }
++
+     @SuppressWarnings("null") // paramValues[i] can't be null due to checks
+     @Override
+     public Object invoke(EvaluationContext ctx, Class<?>[] paramTypes,
+
+==================================================

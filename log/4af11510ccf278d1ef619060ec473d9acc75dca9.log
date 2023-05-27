@@ -1,0 +1,333 @@
+4af11510ccf278d1ef619060ec473d9acc75dca9
+==================================================
+59421: Allow direct (plain text most likely) connection to HTTP/2. The performance cost of the preface matching at this stage should be minimal.
+==================================================
+Remy Maucherat
+==================================================
+Mon May 2 14:46:29 2016 +0000
+==================================================
+AbstractProtocol.java
+59421: Allow direct (plain text most likely) connection to HTTP/2. The performance cost of the preface matching at this stage should be minimal.
+Probably not polished enough, so no 8.5 port for now.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1741984 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AbstractAjpProtocol.java
+index bd1ce2af26..c0019b4224 100644
+--- a/java/org/apache/coyote/AbstractProtocol.java
++++ b/java/org/apache/coyote/AbstractProtocol.java
+@@ -423,6 +423,16 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+     protected abstract UpgradeProtocol getNegotiatedProtocol(String name);
+ 
+ 
++    /**
++     * Find a suitable handler for the protocol upgraded name specified. This
++     * is used for direct connection protocol selection.
++     * @param name The name of the requested negotiated protocol.
++     * @return The instance where {@link UpgradeProtocol#getAlpnName()} matches
++     *         the requested protocol
++     */
++    protected abstract UpgradeProtocol getUpgradeProtocol(String name);
++
++
+     /**
+      * Create and configure a new Processor instance for the current protocol
+      * implementation.
+@@ -433,7 +443,7 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+ 
+ 
+     protected abstract Processor createUpgradeProcessor(
+-            SocketWrapperBase<?> socket, ByteBuffer leftoverInput,
++            SocketWrapperBase<?> socket,
+             UpgradeToken upgradeToken);
+ 
+ 
+@@ -780,32 +790,44 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+                     if (state == SocketState.UPGRADING) {
+                         // Get the HTTP upgrade handler
+                         UpgradeToken upgradeToken = processor.getUpgradeToken();
+-                        HttpUpgradeHandler httpUpgradeHandler = upgradeToken.getHttpUpgradeHandler();
+                         // Retrieve leftover input
+-                        ByteBuffer leftoverInput = processor.getLeftoverInput();
+-                        // Release the Http11 processor to be re-used
+-                        release(processor);
+-                        // Create the upgrade processor
+-                        processor = getProtocol().createUpgradeProcessor(
+-                                wrapper, leftoverInput, upgradeToken);
+-                        // Mark the connection as upgraded
+-                        wrapper.setUpgraded(true);
+-                        // Associate with the processor with the connection
+-                        connections.put(socket, processor);
+-                        // Initialise the upgrade handler (which may trigger
+-                        // some IO using the new protocol which is why the lines
+-                        // above are necessary)
+-                        // This cast should be safe. If it fails the error
+-                        // handling for the surrounding try/catch will deal with
+-                        // it.
+-                        if (upgradeToken.getInstanceManager() == null) {
+-                            httpUpgradeHandler.init((WebConnection) processor);
++                        ByteBuffer leftOverInput = processor.getLeftoverInput();
++                        if (upgradeToken == null) {
++                            // Assume direct HTTP/2 connection
++                            UpgradeProtocol upgradeProtocol = getProtocol().getUpgradeProtocol("h2c");
++                            if (upgradeProtocol != null) {
++                                processor = upgradeProtocol.getProcessor(
++                                        wrapper, getProtocol().getAdapter());
++                                wrapper.unRead(leftOverInput);
++                                // Associate with the processor with the connection
++                                connections.put(socket, processor);
++                            }
+                         } else {
+-                            ClassLoader oldCL = upgradeToken.getContextBind().bind(false, null);
+-                            try {
++                            HttpUpgradeHandler httpUpgradeHandler = upgradeToken.getHttpUpgradeHandler();
++                            // Release the Http11 processor to be re-used
++                            release(processor);
++                            // Create the upgrade processor
++                            processor = getProtocol().createUpgradeProcessor(wrapper, upgradeToken);
++                            wrapper.unRead(leftOverInput);
++                            // Mark the connection as upgraded
++                            wrapper.setUpgraded(true);
++                            // Associate with the processor with the connection
++                            connections.put(socket, processor);
++                            // Initialise the upgrade handler (which may trigger
++                            // some IO using the new protocol which is why the lines
++                            // above are necessary)
++                            // This cast should be safe. If it fails the error
++                            // handling for the surrounding try/catch will deal with
++                            // it.
++                            if (upgradeToken.getInstanceManager() == null) {
+                                 httpUpgradeHandler.init((WebConnection) processor);
+-                            } finally {
+-                                upgradeToken.getContextBind().unbind(false, oldCL);
++                            } else {
++                                ClassLoader oldCL = upgradeToken.getContextBind().bind(false, null);
++                                try {
++                                    httpUpgradeHandler.init((WebConnection) processor);
++                                } finally {
++                                    upgradeToken.getContextBind().unbind(false, oldCL);
++                                }
+                             }
+                         }
+                     }
+
+==================================================
+AbstractHttp11Protocol.java
+index e45514bc76..8eac1b77ba 100644
+--- a/java/org/apache/coyote/ajp/AbstractAjpProtocol.java
++++ b/java/org/apache/coyote/ajp/AbstractAjpProtocol.java
+@@ -16,8 +16,6 @@
+  */
+ package org.apache.coyote.ajp;
+ 
+-import java.nio.ByteBuffer;
+-
+ import org.apache.coyote.AbstractProtocol;
+ import org.apache.coyote.Processor;
+ import org.apache.coyote.UpgradeProtocol;
+@@ -82,6 +80,16 @@ public abstract class AbstractAjpProtocol<S> extends AbstractProtocol<S> {
+     }
+ 
+ 
++    /**
++     * {@inheritDoc}
++     *
++     * AJP does not support protocol upgrade so this always returns null.
++     */
++    @Override
++    protected UpgradeProtocol getUpgradeProtocol(String name) {
++        return null;
++    }
++
+     // ------------------------------------------------- AJP specific properties
+     // ------------------------------------------ managed in the ProtocolHandler
+ 
+@@ -190,7 +198,7 @@ public abstract class AbstractAjpProtocol<S> extends AbstractProtocol<S> {
+ 
+     @Override
+     protected Processor createUpgradeProcessor(SocketWrapperBase<?> socket,
+-            ByteBuffer leftoverInput, UpgradeToken upgradeToken) {
++            UpgradeToken upgradeToken) {
+         throw new IllegalStateException(sm.getString("ajpprotocol.noUpgradeHandler",
+                 upgradeToken.getHttpUpgradeHandler().getClass().getName()));
+     }
+
+==================================================
+Http11InputBuffer.java
+index 0f24ea41f6..6cec3dfca4 100644
+--- a/java/org/apache/coyote/http11/AbstractHttp11Protocol.java
++++ b/java/org/apache/coyote/http11/AbstractHttp11Protocol.java
+@@ -16,7 +16,6 @@
+  */
+ package org.apache.coyote.http11;
+ 
+-import java.nio.ByteBuffer;
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.HashMap;
+@@ -351,6 +350,10 @@ public abstract class AbstractHttp11Protocol<S> extends AbstractProtocol<S> {
+     public UpgradeProtocol getNegotiatedProtocol(String negotiatedName) {
+         return negotiatedProtocols.get(negotiatedName);
+     }
++    @Override
++    public UpgradeProtocol getUpgradeProtocol(String upgradedName) {
++        return httpUpgradeProtocols.get(upgradedName);
++    }
+ 
+ 
+     // ------------------------------------------------ HTTP specific properties
+@@ -643,13 +646,13 @@ public abstract class AbstractHttp11Protocol<S> extends AbstractProtocol<S> {
+ 
+     @Override
+     protected Processor createUpgradeProcessor(
+-            SocketWrapperBase<?> socket, ByteBuffer leftoverInput,
++            SocketWrapperBase<?> socket,
+             UpgradeToken upgradeToken) {
+         HttpUpgradeHandler httpUpgradeHandler = upgradeToken.getHttpUpgradeHandler();
+         if (httpUpgradeHandler instanceof InternalHttpUpgradeHandler) {
+-            return new UpgradeProcessorInternal(socket, leftoverInput, upgradeToken);
++            return new UpgradeProcessorInternal(socket, upgradeToken);
+         } else {
+-            return new UpgradeProcessorExternal(socket, leftoverInput, upgradeToken);
++            return new UpgradeProcessorExternal(socket, upgradeToken);
+         }
+     }
+ }
+
+==================================================
+Http11Processor.java
+index 38978a6f28..b5abcc9960 100644
+--- a/java/org/apache/coyote/http11/Http11InputBuffer.java
++++ b/java/org/apache/coyote/http11/Http11InputBuffer.java
+@@ -97,6 +97,9 @@ public class Http11InputBuffer implements InputBuffer {
+     }
+ 
+ 
++    private static final byte[] CLIENT_PREFACE_START =
++            "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1);
++
+     /**
+      * Associated Coyote request.
+      */
+@@ -407,6 +410,25 @@ public class Http11InputBuffer implements InputBuffer {
+                     // Switch to the socket timeout.
+                     wrapper.setReadTimeout(wrapper.getEndpoint().getSoTimeout());
+                 }
++                if (!keptAlive) {
++                    for (int i = 0; i < CLIENT_PREFACE_START.length; i++) {
++                        if (i == lastValid) {
++                            // Need more data to know if this is HTTP/2
++                            if (!fill(false)) {
++                                // A read is pending, so no longer in initial state
++                                parsingRequestLinePhase = 1;
++                                return false;
++                            }
++                        }
++                        if (CLIENT_PREFACE_START[i] != buf[i]) {
++                            break;
++                        } else if (i == CLIENT_PREFACE_START.length - 1) {
++                            // HTTP/2 preface matched
++                            parsingRequestLinePhase = -1;
++                            return false;
++                        }
++                    }
++                }
+                 // Set the start time once we start reading data (even if it is
+                 // just skipping blank lines)
+                 if (request.getStartTime() < 0) {
+
+==================================================
+UpgradeProcessorBase.java
+index 8797efd333..ad097ef650 100644
+--- a/java/org/apache/coyote/http11/Http11Processor.java
++++ b/java/org/apache/coyote/http11/Http11Processor.java
+@@ -984,7 +984,9 @@ public class Http11Processor extends AbstractProcessor {
+             // Parsing the request header
+             try {
+                 if (!inputBuffer.parseRequestLine(keptAlive)) {
+-                    if (handleIncompleteRequestLineRead()) {
++                    if (inputBuffer.getParsingRequestLinePhase() == -1) {
++                        return SocketState.UPGRADING;
++                    } else if (handleIncompleteRequestLineRead()) {
+                         break;
+                     }
+                 }
+
+==================================================
+UpgradeProcessorExternal.java
+index d70b3bc84e..5db7c52c43 100644
+--- a/java/org/apache/coyote/http11/upgrade/UpgradeProcessorBase.java
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeProcessorBase.java
+@@ -33,10 +33,9 @@ public abstract class UpgradeProcessorBase extends AbstractProcessorLight implem
+ 
+     private final UpgradeToken upgradeToken;
+ 
+-    public UpgradeProcessorBase(SocketWrapperBase<?> wrapper, ByteBuffer leftOverInput,
++    public UpgradeProcessorBase(SocketWrapperBase<?> wrapper,
+             UpgradeToken upgradeToken) {
+         this.upgradeToken = upgradeToken;
+-        wrapper.unRead(leftOverInput);
+     }
+ 
+ 
+
+==================================================
+UpgradeProcessorInternal.java
+index 9ae620a6fc..a0d5155068 100644
+--- a/java/org/apache/coyote/http11/upgrade/UpgradeProcessorExternal.java
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeProcessorExternal.java
+@@ -17,7 +17,6 @@
+ package org.apache.coyote.http11.upgrade;
+ 
+ import java.io.IOException;
+-import java.nio.ByteBuffer;
+ 
+ import javax.servlet.ServletInputStream;
+ import javax.servlet.ServletOutputStream;
+@@ -40,13 +39,12 @@ public class UpgradeProcessorExternal extends UpgradeProcessorBase {
+     private final UpgradeServletOutputStream upgradeServletOutputStream;
+ 
+ 
+-    public UpgradeProcessorExternal(SocketWrapperBase<?> wrapper, ByteBuffer leftOverInput,
++    public UpgradeProcessorExternal(SocketWrapperBase<?> wrapper,
+             UpgradeToken upgradeToken) {
+-        super(wrapper, leftOverInput, upgradeToken);
++        super(wrapper, upgradeToken);
+         this.upgradeServletInputStream = new UpgradeServletInputStream(this, wrapper);
+         this.upgradeServletOutputStream = new UpgradeServletOutputStream(this, wrapper);
+ 
+-        wrapper.unRead(leftOverInput);
+         /*
+          * Leave timeouts in the hands of the upgraded protocol.
+          */
+
+==================================================
+Http2Protocol.java
+index f2a2e64030..cf1517c096 100644
+--- a/java/org/apache/coyote/http11/upgrade/UpgradeProcessorInternal.java
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeProcessorInternal.java
+@@ -17,7 +17,6 @@
+ package org.apache.coyote.http11.upgrade;
+ 
+ import java.io.IOException;
+-import java.nio.ByteBuffer;
+ 
+ import javax.servlet.ServletInputStream;
+ import javax.servlet.ServletOutputStream;
+@@ -36,9 +35,9 @@ public class UpgradeProcessorInternal extends UpgradeProcessorBase {
+ 
+     private final InternalHttpUpgradeHandler internalHttpUpgradeHandler;
+ 
+-    public UpgradeProcessorInternal(SocketWrapperBase<?> wrapper, ByteBuffer leftOverInput,
++    public UpgradeProcessorInternal(SocketWrapperBase<?> wrapper,
+             UpgradeToken upgradeToken) {
+-        super(wrapper, leftOverInput, upgradeToken);
++        super(wrapper, upgradeToken);
+         this.internalHttpUpgradeHandler = (InternalHttpUpgradeHandler) upgradeToken.getHttpUpgradeHandler();
+         /*
+          * Leave timeouts in the hands of the upgraded protocol.
+
+==================================================

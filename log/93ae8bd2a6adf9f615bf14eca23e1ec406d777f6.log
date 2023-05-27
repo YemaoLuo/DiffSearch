@@ -1,0 +1,741 @@
+93ae8bd2a6adf9f615bf14eca23e1ec406d777f6
+==================================================
+Fix https://bz.apache.org/bugzilla/show_bug.cgi?id=49176
+==================================================
+Mark Thomas
+==================================================
+Wed Jun 28 20:02:32 2017 +0000
+==================================================
+JspC.java
+Fix https://bz.apache.org/bugzilla/show_bug.cgi?id=49176
+When generating JSP runtime error messages that quote the relevant JSP source code, switch from using the results of the JSP page parsing process to using the JSR 045 source map data to identify the correct part of the JSP source from the stack trace. This significantly reduces the memory footprint of Jasper in development mode, provides a small performance improvement for error page generation and enables source quotes to continue to be provided after a Tomcat restart.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1800201 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+JspCompilationContext.java
+index 6248221ca2..83d761ca0f 100644
+--- a/java/org/apache/jasper/JspC.java
++++ b/java/org/apache/jasper/JspC.java
+@@ -1252,7 +1252,7 @@ public class JspC extends Task implements Options {
+                 targetClassName = null;
+             }
+             if (targetPackage != null) {
+-                clctxt.setServletPackageName(targetPackage);
++                clctxt.setBasePackageName(targetPackage);
+             }
+ 
+             originalClassLoader = Thread.currentThread().getContextClassLoader();
+
+==================================================
+AntCompiler.java
+index 0322bab760..4b25400c98 100644
+--- a/java/org/apache/jasper/JspCompilationContext.java
++++ b/java/org/apache/jasper/JspCompilationContext.java
+@@ -445,7 +445,7 @@ public class JspCompilationContext {
+     }
+ 
+     /**
+-     * Package name for the generated class is make up of the base package
++     * Package name for the generated class is made up of the base package
+      * name, which is user settable, and the derived package name.  The
+      * derived package name directly mirrors the file hierarchy of the JSP page.
+      * @return the package name
+@@ -477,12 +477,20 @@ public class JspCompilationContext {
+         return derivedPackageName;
+     }
+ 
++    /**
++     * @return The base package name into which all servlet and associated code
++     *         is generated
++     */
++    public String getBasePackageName() {
++        return basePackageName;
++    }
++
+     /**
+      * The package name into which the servlet class is generated.
+-     * @param servletPackageName The package name to use
++     * @param basePackageName The package name to use
+      */
+-    public void setServletPackageName(String servletPackageName) {
+-        this.basePackageName = servletPackageName;
++    public void setBasePackageName(String basePackageName) {
++        this.basePackageName = basePackageName;
+     }
+ 
+     /**
+
+==================================================
+Compiler.java
+index a4a8a0ec42..637f36f5d2 100644
+--- a/java/org/apache/jasper/compiler/AntCompiler.java
++++ b/java/org/apache/jasper/compiler/AntCompiler.java
+@@ -21,6 +21,7 @@ import java.io.File;
+ import java.io.FileNotFoundException;
+ import java.io.IOException;
+ import java.io.PrintStream;
++import java.util.Map;
+ import java.util.StringTokenizer;
+ 
+ import org.apache.jasper.Constants;
+@@ -117,7 +118,7 @@ public class AntCompiler extends Compiler {
+      * Compile the servlet from .java file to .class file
+      */
+     @Override
+-    protected void generateClass(String[] smap)
++    protected void generateClass(Map<String,SmapStratum> smaps)
+         throws FileNotFoundException, JasperException, Exception {
+ 
+         long t1 = 0;
+@@ -279,7 +280,7 @@ public class AntCompiler extends Compiler {
+ 
+         // JSR45 Support
+         if (!options.isSmapSuppressed()) {
+-            SmapUtil.installSmap(smap);
++            SmapUtil.installSmap(smaps);
+         }
+     }
+ 
+
+==================================================
+JDTCompiler.java
+index bf5d621dca..d7fdc55417 100644
+--- a/java/org/apache/jasper/compiler/Compiler.java
++++ b/java/org/apache/jasper/compiler/Compiler.java
+@@ -80,29 +80,30 @@ public abstract class Compiler {
+ 
+     // --------------------------------------------------------- Public Methods
+ 
+-    /**
+-     * <p>
+-     * Retrieves the parsed nodes of the JSP page, if they are available. May
+-     * return null. Used in development mode for generating detailed error
+-     * messages. http://bz.apache.org/bugzilla/show_bug.cgi?id=37062.
+-     * </p>
+-     * @return the page nodes
+-     */
+-    public Node.Nodes getPageNodes() {
+-        return this.pageNodes;
++    public SmapStratum getSmap(String className) {
++
++        Map<String,SmapStratum> smaps = ctxt.getRuntimeContext().getSmaps();
++        SmapStratum smap = smaps.get(className);
++
++        if (smap == null && !options.isSmapSuppressed()) {
++            // Tomcat was restarted so cached SMAP has been lost. However, it
++            // was written to the class file so it can be recovered.
++            smap = SmapUtil.loadSmap(className, ctxt.getJspLoader());
++            if (smap != null) {
++                smaps.put(className, smap);
++            }
++        }
++
++        return smap;
+     }
+ 
+ 
+     /**
+      * Compile the jsp file into equivalent servlet in .java file
+      *
+-     * @return a smap for the current JSP page, if one is generated, null
+-     *         otherwise
+      * @throws Exception Error generating Java source
+      */
+-    protected String[] generateJava() throws Exception {
+-
+-        String[] smapStr = null;
++    protected Map<String,SmapStratum> generateJava() throws Exception {
+ 
+         long t1, t2, t3, t4;
+ 
+@@ -212,7 +213,6 @@ public abstract class Compiler {
+                 // generate prototype .java file for the tag file
+                 try (ServletWriter writer = setupContextWriter(javaFileName)) {
+                     Generator.generate(writer, this, pageNodes);
+-                    return null;
+                 }
+             }
+ 
+@@ -278,9 +278,14 @@ public abstract class Compiler {
+             throw e;
+         }
+ 
++        Map<String,SmapStratum> smaps = null;
++
+         // JSR45 Support
+         if (!options.isSmapSuppressed()) {
+-            smapStr = SmapUtil.generateSmap(ctxt, pageNodes);
++            smaps = SmapUtil.generateSmap(ctxt, pageNodes);
++            // Add them to the web application wide cache for future lookup in
++            // error handling etc.
++            ctxt.getRuntimeContext().getSmaps().putAll(smaps);
+         }
+ 
+         // If any proto type .java and .class files was generated,
+@@ -290,7 +295,7 @@ public abstract class Compiler {
+         // generate .class again from the new .java file just generated.
+         tfp.removeProtoTypeFiles(ctxt.getClassFileName());
+ 
+-        return smapStr;
++        return smaps;
+     }
+ 
+     private ServletWriter setupContextWriter(String javaFileName)
+@@ -316,12 +321,15 @@ public abstract class Compiler {
+     /**
+      * Servlet compilation. This compiles the generated sources into
+      * Servlets.
+-     * @param smap The SMAP files for source debugging
++     *
++     * @param smaps The source maps for the class(es) generated from the source
++     *              file
++     *
+      * @throws FileNotFoundException Source files not found
+      * @throws JasperException Compilation error
+      * @throws Exception Some other error
+      */
+-    protected abstract void generateClass(String[] smap)
++    protected abstract void generateClass(Map<String,SmapStratum> smaps)
+             throws FileNotFoundException, JasperException, Exception;
+ 
+     /**
+@@ -371,12 +379,12 @@ public abstract class Compiler {
+         }
+ 
+         try {
+-            String[] smap = generateJava();
++            Map<String,SmapStratum> smaps = generateJava();
+             File javaFile = new File(ctxt.getServletJavaFileName());
+             Long jspLastModified = ctxt.getLastModified(ctxt.getJspFile());
+             javaFile.setLastModified(jspLastModified.longValue());
+             if (compileClass) {
+-                generateClass(smap);
++                generateClass(smaps);
+                 // Fix for bugzilla 41606
+                 // Set JspServletWrapper.servletClassLastModifiedTime after successful compile
+                 File targetFile = new File(ctxt.getClassFileName());
+@@ -399,14 +407,7 @@ public abstract class Compiler {
+             tfp = null;
+             errDispatcher = null;
+             pageInfo = null;
+-
+-            // Only get rid of the pageNodes if in production.
+-            // In development mode, they are used for detailed
+-            // error messages.
+-            // http://bz.apache.org/bugzilla/show_bug.cgi?id=37062
+-            if (!this.options.getDevelopment()) {
+-                pageNodes = null;
+-            }
++            pageNodes = null;
+ 
+             if (ctxt.getWriter() != null) {
+                 ctxt.getWriter().close();
+
+==================================================
+JspRuntimeContext.java
+index ce0f53f44a..d470b97857 100644
+--- a/java/org/apache/jasper/compiler/JDTCompiler.java
++++ b/java/org/apache/jasper/compiler/JDTCompiler.java
+@@ -69,7 +69,7 @@ public class JDTCompiler extends org.apache.jasper.compiler.Compiler {
+      * Compile the servlet from .java file to .class file
+      */
+     @Override
+-    protected void generateClass(String[] smap)
++    protected void generateClass(Map<String,SmapStratum> smaps)
+         throws FileNotFoundException, JasperException, Exception {
+ 
+         long t1 = 0;
+@@ -470,7 +470,7 @@ public class JDTCompiler extends org.apache.jasper.compiler.Compiler {
+ 
+         // JSR45 Support
+         if (! options.isSmapSuppressed()) {
+-            SmapUtil.installSmap(smap);
++            SmapUtil.installSmap(smaps);
+         }
+     }
+ }
+
+==================================================
+SmapGenerator.java
+index d01c5a1a17..9bce564d92 100644
+--- a/java/org/apache/jasper/compiler/JspRuntimeContext.java
++++ b/java/org/apache/jasper/compiler/JspRuntimeContext.java
+@@ -169,6 +169,14 @@ public final class JspRuntimeContext {
+      */
+     private FastRemovalDequeue<JspServletWrapper> jspQueue = null;
+ 
++    /**
++     * Map of class name to associated source map. This is maintained here as
++     * multiple JSPs can depend on the same file (included JSP, tag file, etc.)
++     * so a web application scoped Map is required.
++     */
++    private final Map<String,SmapStratum> smaps = new ConcurrentHashMap<>();
++
++
+     // ------------------------------------------------------ Public Methods
+ 
+     /**
+@@ -389,9 +397,13 @@ public final class JspRuntimeContext {
+     }
+ 
+ 
+-    // -------------------------------------------------------- Private Methods
++    public Map<String,SmapStratum> getSmaps() {
++        return smaps;
++    }
+ 
+ 
++    // -------------------------------------------------------- Private Methods
++
+     /**
+      * Method used to initialize classpath for compiles.
+      * @return the compilation classpath
+
+==================================================
+SmapInput.java
+deleted file mode 100644
+index a20e7bb1ab..0000000000
+--- a/java/org/apache/jasper/compiler/SmapGenerator.java
++++ /dev/null
+@@ -1,102 +0,0 @@
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.jasper.compiler;
+-
+-/**
+- * Represents a source map (SMAP), which serves to associate lines
+- * of the input JSP file(s) to lines in the generated servlet in the
+- * final .class file, according to the JSR-045 spec.
+- *
+- * @author Shawn Bayern
+- */
+-public class SmapGenerator {
+-
+-    //*********************************************************************
+-    // Overview
+-
+-    /*
+-     * The SMAP syntax is reasonably straightforward.  The purpose of this
+-     * class is currently twofold:
+-     *  - to provide a simple but low-level Java interface to build
+-     *    a logical SMAP
+-     *  - to serialize this logical SMAP for eventual inclusion directly
+-     *    into a .class file.
+-     *
+-     * There are aspects of the SMAP syntax that this class does not support.
+-     * It provides all the features required for JSP and associated files but no
+-     * more.
+-     */
+-
+-
+-    //*********************************************************************
+-    // Private state
+-
+-    private String outputFileName;
+-    private SmapStratum stratum;
+-
+-    //*********************************************************************
+-    // Methods for adding mapping data
+-
+-    /**
+-     * Sets the filename (without path information) for the generated
+-     * source file.  E.g., "foo$jsp.java".
+-     * @param x The file name
+-     */
+-    public synchronized void setOutputFileName(String x) {
+-        outputFileName = x;
+-    }
+-
+-
+-    /**
+-     * Sets the default and only stratum for the smap.
+-     *
+-     * @param stratum the SmapStratum object to add
+-     */
+-    public synchronized void setStratum(SmapStratum stratum) {
+-        this.stratum = stratum;
+-    }
+-
+-
+-    //*********************************************************************
+-    // Methods for serializing the logical SMAP
+-
+-    public synchronized String getString() {
+-        // check state and initialize buffer
+-        if (outputFileName == null) {
+-            throw new IllegalStateException();
+-        }
+-
+-        StringBuilder out = new StringBuilder();
+-
+-        // start the SMAP
+-        out.append("SMAP\n");
+-        out.append(outputFileName + '\n');
+-        out.append("JSP\n");
+-
+-        // print our StratumSection, FileSection, and LineSections
+-        out.append(stratum.getString());
+-
+-        // end the SMAP
+-        out.append("*E\n");
+-
+-        return out.toString();
+-    }
+-
+-    @Override
+-    public String toString() { return getString(); }
+-}
+
+==================================================
+SmapStratum.java
+new file mode 100644
+index 0000000000..858c0522ce
+--- /dev/null
++++ b/java/org/apache/jasper/compiler/SmapInput.java
+@@ -0,0 +1,39 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.jasper.compiler;
++
++public class SmapInput {
++
++    private final String fileName;
++    private final int lineNumber;
++
++
++    public SmapInput(String fileName, int lineNumber) {
++        this.fileName = fileName;
++        this.lineNumber = lineNumber;
++    }
++
++
++    public String getFileName() {
++        return fileName;
++    }
++
++
++    public int getLineNumber() {
++        return lineNumber;
++    }
++}
+
+==================================================
+SmapUtil.java
+index e4245de0a9..e9b52a1268 100644
+--- a/java/org/apache/jasper/compiler/SmapStratum.java
++++ b/java/org/apache/jasper/compiler/SmapStratum.java
+@@ -36,7 +36,7 @@ public class SmapStratum {
+      * Represents a single LineSection in an SMAP, associated with
+      * a particular stratum.
+      */
+-    private static class LineInfo {
++    static class LineInfo {
+         private int inputStartLine = -1;
+         private int outputStartLine = -1;
+         private int lineFileID = 0;
+@@ -83,6 +83,10 @@ public class SmapStratum {
+             this.outputLineIncrement = outputLineIncrement;
+         }
+ 
++        public int getMaxOutputLineNumber() {
++            return outputStartLine + inputLineCount * outputLineIncrement;
++        }
++
+         /**
+          * @return the current LineInfo as a String, print all values only when
+          *         appropriate (but LineInfoID if and only if it's been
+@@ -113,23 +117,14 @@ public class SmapStratum {
+     //*********************************************************************
+     // Private state
+ 
+-    private final List<String> fileNameList;
+-    private final List<String> filePathList;
+-    private final List<LineInfo> lineData;
++    private final List<String> fileNameList = new ArrayList<>();
++    private final List<String> filePathList = new ArrayList<>();
++    private final List<LineInfo> lineData = new ArrayList<>();
+     private int lastFileID;
+-
+-    //*********************************************************************
+-    // Constructor
+-
+-    /**
+-     * Constructs a new SmapStratum object with the stratum name JSP.
+-     */
+-    public SmapStratum() {
+-        fileNameList = new ArrayList<>();
+-        filePathList = new ArrayList<>();
+-        lineData = new ArrayList<>();
+-        lastFileID = 0;
+-    }
++    // .java file
++    private String outputFileName;
++    // .class file
++    private String classFileName;
+ 
+     //*********************************************************************
+     // Methods to add mapping information
+@@ -270,20 +265,59 @@ public class SmapStratum {
+         lineData.add(li);
+     }
+ 
++
++    public void addLineInfo(LineInfo li) {
++        lineData.add(li);
++    }
++
++
++    public void setOutputFileName(String outputFileName) {
++        this.outputFileName = outputFileName;
++    }
++
++
++    public void setClassFileName(String classFileName) {
++        this.classFileName = classFileName;
++    }
++
++
++    public String getClassFileName() {
++        return classFileName;
++    }
++
++
+     //*********************************************************************
+     // Methods to retrieve information
+ 
+-    /**
+-     * @return the given stratum as a String:  a StratumSection,
+-     * followed by at least one FileSection and at least one LineSection.
+-     */
+-    public String getString() {
+-        // check state and initialize buffer
+-        if (fileNameList.size() == 0 || lineData.size() == 0)
+-            return null;
++    @Override
++    public String toString() {
++        return getSmapStringInternal();
++    }
++
++
++    public String getSmapString() {
++
++        if (outputFileName == null) {
++            throw new IllegalStateException();
++        }
++
++        return getSmapStringInternal();
++    }
+ 
++
++    private String getSmapStringInternal() {
+         StringBuilder out = new StringBuilder();
+ 
++        // start the SMAP
++        out.append("SMAP\n");
++        out.append(outputFileName + '\n');
++        out.append("JSP\n");
++
++        // print our StratumSection, FileSection, and LineSections
++        if (fileNameList.size() == 0 || lineData.size() == 0) {
++            throw new IllegalStateException();
++        }
++
+         // print StratumSection
+         out.append("*S JSP\n");
+ 
+@@ -313,12 +347,40 @@ public class SmapStratum {
+             out.append(li.getString());
+         }
+ 
++        // end the SMAP
++        out.append("*E\n");
++
+         return out.toString();
+     }
+ 
+-    @Override
+-    public String toString() {
+-        return getString();
+-    }
+ 
++    public SmapInput getInputLineNumber(int outputLineNumber) {
++        // For a given Java line number, provide the associated line number
++        // in the JSP/tag source
++        int inputLineNumber = -1;
++        int fileId = 0;
++
++        for (LineInfo lineInfo : lineData) {
++            if (lineInfo.lineFileIDSet) {
++                fileId = lineInfo.lineFileID;
++            }
++            if (lineInfo.outputStartLine > outputLineNumber) {
++                // Didn't find match
++                break;
++            }
++
++            if (lineInfo.getMaxOutputLineNumber() < outputLineNumber) {
++                // Too early
++                continue;
++            }
++
++            // This is the match
++            int inputOffset =
++                    (outputLineNumber - lineInfo.outputStartLine) / lineInfo.outputLineIncrement;
++
++            inputLineNumber = lineInfo.inputStartLine + inputOffset;
++        }
++
++        return new SmapInput(filePathList.get(fileId), inputLineNumber);
++    }
+ }
+
+==================================================
+JspServletWrapper.java
+index 5afef80418..fa6938633b 100644
+--- a/java/org/apache/jasper/resources/LocalStrings.properties
++++ b/java/org/apache/jasper/resources/LocalStrings.properties
+@@ -119,6 +119,7 @@ jsp.warning.recompileOnFail=Warning: Invalid value for the initParam recompileOn
+ jsp.warning.development=Warning: Invalid value for the initParam development. Will use the default value of "true"
+ jsp.warning.fork=Warning: Invalid value for the initParam fork. Will use the default value of "true"
+ jsp.warning.dumpSmap=Warning: Invalid value for the initParam dumpSmap. Will use the default value of "false"
++jsp.warning.loadSmap=Unable to load SMAP data for class [{0}]
+ jsp.warning.genchararray=Warning: Invalid value for the initParam genStringAsCharArray. Will use the default value of "false"
+ jsp.warning.suppressSmap=Warning: Invalid value for the initParam suppressSmap. Will use the default value of "false"
+ jsp.warning.displaySourceFragment=Warning: Invalid value for the initParam displaySourceFragment. Will use the default value of "true"
+@@ -361,7 +362,7 @@ jsp.error.prefix.use_before_dcl=The prefix [{0}] specified in this tag directive
+ jsp.error.lastModified=Unable to determine last modified date for file [{0}]
+ jsp.info.ignoreSetting=Ignored setting for [{0}] of [{1}] because a SecurityManager was enabled
+ 
+-jsp.exception=An exception occurred processing JSP page [{0}] at line [{1}]
++jsp.exception=An exception occurred processing [{0}] at line [{1}]
+ 
+ # JSP 2.1
+ jsp.error.el.template.deferred=#{...} is not allowed in template text
+
+==================================================
+TestSmapStratum.java
+index 7c6c6b1851..d158507925 100644
+--- a/java/org/apache/jasper/servlet/JspServletWrapper.java
++++ b/java/org/apache/jasper/servlet/JspServletWrapper.java
+@@ -36,10 +36,11 @@ import javax.servlet.jsp.tagext.TagInfo;
+ import org.apache.jasper.JasperException;
+ import org.apache.jasper.JspCompilationContext;
+ import org.apache.jasper.Options;
+-import org.apache.jasper.compiler.ErrorDispatcher;
+ import org.apache.jasper.compiler.JavacErrorDetail;
+ import org.apache.jasper.compiler.JspRuntimeContext;
+ import org.apache.jasper.compiler.Localizer;
++import org.apache.jasper.compiler.SmapInput;
++import org.apache.jasper.compiler.SmapStratum;
+ import org.apache.jasper.runtime.ExceptionUtils;
+ import org.apache.jasper.runtime.InstanceManagerFactory;
+ import org.apache.jasper.runtime.JspSourceDependent;
+@@ -545,45 +546,49 @@ public class JspServletWrapper {
+                 realException = ((ServletException) ex).getRootCause();
+             }
+ 
+-            // First identify the stack frame in the trace that represents the JSP
++            // Find the first stack frame that represents code generated by
++            // Jasper
+             StackTraceElement[] frames = realException.getStackTrace();
+             StackTraceElement jspFrame = null;
+ 
+-            for (int i=0; i<frames.length; ++i) {
+-                if ( frames[i].getClassName().equals(this.getServlet().getClass().getName()) ) {
+-                    jspFrame = frames[i];
++            String servletPackageName = ctxt.getBasePackageName();
++            for (StackTraceElement frame : frames) {
++                if (frame.getClassName().startsWith(servletPackageName)) {
++                    jspFrame = frame;
+                     break;
+                 }
+             }
+ 
++            SmapStratum smap = null;
+ 
+-            if (jspFrame == null ||
+-                    this.ctxt.getCompiler().getPageNodes() == null) {
++            if (jspFrame != null) {
++                smap = ctxt.getCompiler().getSmap(jspFrame.getClassName());
++            }
++
++            if (smap == null) {
+                 // If we couldn't find a frame in the stack trace corresponding
+                 // to the generated servlet class or we don't have a copy of the
+-                // parsed JSP to hand, we can't really add anything
++                // smap to hand, we can't really add anything
+                 return new JasperException(ex);
+             }
+ 
++            @SuppressWarnings("null")
+             int javaLineNumber = jspFrame.getLineNumber();
+-            JavacErrorDetail detail = ErrorDispatcher.createJavacError(
+-                    jspFrame.getMethodName(),
+-                    this.ctxt.getCompiler().getPageNodes(),
+-                    null,
+-                    javaLineNumber,
+-                    ctxt);
++            SmapInput source = smap.getInputLineNumber(javaLineNumber);
+ 
+             // If the line number is less than one we couldn't find out
+             // where in the JSP things went wrong
+-            int jspLineNumber = detail.getJspBeginLineNumber();
+-            if (jspLineNumber < 1) {
++            if (source.getLineNumber() < 1) {
+                 throw new JasperException(ex);
+             }
+ 
++            JavacErrorDetail detail = new JavacErrorDetail(jspFrame.getMethodName(), javaLineNumber,
++                    source.getFileName(), source.getLineNumber(), null, ctxt);
++
+             if (options.getDisplaySourceFragment()) {
+                 return new JasperException(Localizer.getMessage
+                         ("jsp.exception", detail.getJspFileName(),
+-                                "" + jspLineNumber) + System.lineSeparator() +
++                                "" + source.getLineNumber()) + System.lineSeparator() +
+                                 System.lineSeparator() + detail.getJspExtract() +
+                                 System.lineSeparator() + System.lineSeparator() +
+                                 "Stacktrace:", ex);
+@@ -592,7 +597,7 @@ public class JspServletWrapper {
+ 
+             return new JasperException(Localizer.getMessage
+                     ("jsp.exception", detail.getJspFileName(),
+-                            "" + jspLineNumber), ex);
++                            "" + source.getLineNumber()), ex);
+         } catch (Exception je) {
+             // If anything goes wrong, just revert to the original behaviour
+             if (ex instanceof JasperException) {
+
+==================================================

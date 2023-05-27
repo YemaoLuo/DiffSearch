@@ -1,0 +1,716 @@
+a915ed99eca67cab13d3ed0d1269bf1594a0f605
+==================================================
+Fix BZ 65358 - Improve EL matching of varargs methods.
+==================================================
+Mark Thomas
+==================================================
+Mon Jun 7 14:37:49 2021 +0100
+==================================================
+Util.java
+Fix BZ 65358 - Improve EL matching of varargs methods.
+
+https://bz.apache.org/bugzilla/show_bug.cgi?id=65358
+
+
+==================================================
+ReflectionUtil.java
+index 66a1ca5bfa..03a687afc8 100644
+--- a/java/jakarta/el/Util.java
++++ b/java/jakarta/el/Util.java
+@@ -269,19 +269,22 @@ class Util {
+             int exactMatch = 0;
+             int assignableMatch = 0;
+             int coercibleMatch = 0;
++            int varArgsMatch = 0;
+             boolean noMatch = false;
+             for (int i = 0; i < mParamCount; i++) {
+                 // Can't be null
+                 if (w.isVarArgs() && i == (mParamCount - 1)) {
+                     if (i == paramCount || (paramValues != null && paramValues.length == i)) {
+-                        // Nothing is passed as varargs
+-                        assignableMatch++;
++                        // Var args defined but nothing is passed as varargs
++                        // Use MAX_VALUE so this matches only if nothing else does
++                        varArgsMatch = Integer.MAX_VALUE;
+                         break;
+                     }
+                     Class<?> varType = mParamTypes[i].getComponentType();
+                     for (int j = i; j < paramCount; j++) {
+                         if (isAssignableFrom(paramTypes[j], varType)) {
+                             assignableMatch++;
++                            varArgsMatch++;
+                         } else {
+                             if (paramValues == null) {
+                                 noMatch = true;
+@@ -289,6 +292,7 @@ class Util {
+                             } else {
+                                 if (isCoercibleFrom(paramValues[j], varType)) {
+                                     coercibleMatch++;
++                                    varArgsMatch++;
+                                 } else {
+                                     noMatch = true;
+                                     break;
+@@ -324,18 +328,17 @@ class Util {
+             }
+ 
+             // If a method is found where every parameter matches exactly,
+-            // return it
+-            if (exactMatch == paramCount) {
++            // and no vars args are present, return it
++            if (exactMatch == paramCount && varArgsMatch == 0) {
+                 return w;
+             }
+ 
+-            candidates.put(w, new MatchResult(
+-                    exactMatch, assignableMatch, coercibleMatch, w.isBridge()));
++            candidates.put(w, new MatchResult(exactMatch, assignableMatch, coercibleMatch, varArgsMatch, w.isBridge()));
+         }
+ 
+         // Look for the method that has the highest number of parameters where
+         // the type matches exactly
+-        MatchResult bestMatch = new MatchResult(0, 0, 0, false);
++        MatchResult bestMatch = new MatchResult(0, 0, 0, 0, false);
+         Wrapper<T> match = null;
+         boolean multiple = false;
+         for (Map.Entry<Wrapper<T>, MatchResult> entry : candidates.entrySet()) {
+@@ -753,12 +756,14 @@ class Util {
+         private final int exact;
+         private final int assignable;
+         private final int coercible;
++        private final int varArgs;
+         private final boolean bridge;
+ 
+-        public MatchResult(int exact, int assignable, int coercible, boolean bridge) {
++        public MatchResult(int exact, int assignable, int coercible, int varArgs, boolean bridge) {
+             this.exact = exact;
+             this.assignable = assignable;
+             this.coercible = coercible;
++            this.varArgs = varArgs;
+             this.bridge = bridge;
+         }
+ 
+@@ -774,6 +779,10 @@ class Util {
+             return coercible;
+         }
+ 
++        public int getVarArgs() {
++            return varArgs;
++        }
++
+         public boolean isBridge() {
+             return bridge;
+         }
+@@ -786,11 +795,15 @@ class Util {
+                 if (cmp == 0) {
+                     cmp = Integer.compare(this.getCoercible(), o.getCoercible());
+                     if (cmp == 0) {
+-                        // The nature of bridge methods is such that it actually
+-                        // doesn't matter which one we pick as long as we pick
+-                        // one. That said, pick the 'right' one (the non-bridge
+-                        // one) anyway.
+-                        cmp = Boolean.compare(o.isBridge(), this.isBridge());
++                        // Fewer var args matches are better
++                        cmp = Integer.compare(o.getVarArgs(), this.getVarArgs());
++                        if (cmp == 0) {
++                            // The nature of bridge methods is such that it actually
++                            // doesn't matter which one we pick as long as we pick
++                            // one. That said, pick the 'right' one (the non-bridge
++                            // one) anyway.
++                            cmp = Boolean.compare(o.isBridge(), this.isBridge());
++                        }
+                     }
+                 }
+             }
+@@ -798,23 +811,26 @@ class Util {
+         }
+ 
+         @Override
+-        public boolean equals(Object o)
+-        {
++        public boolean equals(Object o) {
+             return o == this || (null != o &&
+                     this.getClass().equals(o.getClass()) &&
+                     ((MatchResult)o).getExact() == this.getExact() &&
+                     ((MatchResult)o).getAssignable() == this.getAssignable() &&
+                     ((MatchResult)o).getCoercible() == this.getCoercible() &&
++                    ((MatchResult)o).getVarArgs() == this.getVarArgs() &&
+                     ((MatchResult)o).isBridge() == this.isBridge());
+         }
+ 
+         @Override
+-        public int hashCode()
+-        {
+-            return (this.isBridge() ? 1 << 24 : 0) ^
+-                    this.getExact() << 16 ^
+-                    this.getAssignable() << 8 ^
+-                    this.getCoercible();
++        public int hashCode() {
++            final int prime = 31;
++            int result = 1;
++            result = prime * result + assignable;
++            result = prime * result + (bridge ? 1231 : 1237);
++            result = prime * result + coercible;
++            result = prime * result + exact;
++            result = prime * result + varArgs;
++            return result;
+         }
+     }
+ 
+
+==================================================
+TestBeanELResolver.java
+index 8e6cf9f483..cadc773bbd 100644
+--- a/java/org/apache/el/util/ReflectionUtil.java
++++ b/java/org/apache/el/util/ReflectionUtil.java
+@@ -191,19 +191,22 @@ public class ReflectionUtil {
+             int exactMatch = 0;
+             int assignableMatch = 0;
+             int coercibleMatch = 0;
++            int varArgsMatch = 0;
+             boolean noMatch = false;
+             for (int i = 0; i < mParamCount; i++) {
+                 // Can't be null
+                 if (m.isVarArgs() && i == (mParamCount - 1)) {
+                     if (i == paramCount || (paramValues != null && paramValues.length == i)) {
+-                        // Nothing is passed as varargs
+-                        assignableMatch++;
++                        // Var args defined but nothing is passed as varargs
++                        // Use MAX_VALUE so this matches only if nothing else does
++                        varArgsMatch = Integer.MAX_VALUE;
+                         break;
+                     }
+                     Class<?> varType = mParamTypes[i].getComponentType();
+                     for (int j = i; j < paramCount; j++) {
+                         if (isAssignableFrom(paramTypes[j], varType)) {
+                             assignableMatch++;
++                            varArgsMatch++;
+                         } else {
+                             if (paramValues == null) {
+                                 noMatch = true;
+@@ -211,6 +214,7 @@ public class ReflectionUtil {
+                             } else {
+                                 if (isCoercibleFrom(ctx, paramValues[j], varType)) {
+                                     coercibleMatch++;
++                                    varArgsMatch++;
+                                 } else {
+                                     noMatch = true;
+                                     break;
+@@ -246,18 +250,17 @@ public class ReflectionUtil {
+             }
+ 
+             // If a method is found where every parameter matches exactly,
+-            // return it
+-            if (exactMatch == paramCount) {
++            // and no vars args are present, return it
++            if (exactMatch == paramCount && varArgsMatch == 0) {
+                 return getMethod(base.getClass(), base, m);
+             }
+ 
+-            candidates.put(m, new MatchResult(
+-                    exactMatch, assignableMatch, coercibleMatch, m.isBridge()));
++            candidates.put(m, new MatchResult(exactMatch, assignableMatch, coercibleMatch, varArgsMatch, m.isBridge()));
+         }
+ 
+         // Look for the method that has the highest number of parameters where
+         // the type matches exactly
+-        MatchResult bestMatch = new MatchResult(0, 0, 0, false);
++        MatchResult bestMatch = new MatchResult(0, 0, 0, 0, false);
+         Method match = null;
+         boolean multiple = false;
+         for (Map.Entry<Method, MatchResult> entry : candidates.entrySet()) {
+@@ -511,12 +514,14 @@ public class ReflectionUtil {
+         private final int exact;
+         private final int assignable;
+         private final int coercible;
++        private final int varArgs;
+         private final boolean bridge;
+ 
+-        public MatchResult(int exact, int assignable, int coercible, boolean bridge) {
++        public MatchResult(int exact, int assignable, int coercible, int varArgs, boolean bridge) {
+             this.exact = exact;
+             this.assignable = assignable;
+             this.coercible = coercible;
++            this.varArgs = varArgs;
+             this.bridge = bridge;
+         }
+ 
+@@ -532,6 +537,10 @@ public class ReflectionUtil {
+             return coercible;
+         }
+ 
++        public int getVarArgs() {
++            return varArgs;
++        }
++
+         public boolean isBridge() {
+             return bridge;
+         }
+@@ -544,11 +553,15 @@ public class ReflectionUtil {
+                 if (cmp == 0) {
+                     cmp = Integer.compare(this.getCoercible(), o.getCoercible());
+                     if (cmp == 0) {
+-                        // The nature of bridge methods is such that it actually
+-                        // doesn't matter which one we pick as long as we pick
+-                        // one. That said, pick the 'right' one (the non-bridge
+-                        // one) anyway.
+-                        cmp = Boolean.compare(o.isBridge(), this.isBridge());
++                        // Fewer var args matches are better
++                        cmp = Integer.compare(o.getVarArgs(), this.getVarArgs());
++                        if (cmp == 0) {
++                            // The nature of bridge methods is such that it actually
++                            // doesn't matter which one we pick as long as we pick
++                            // one. That said, pick the 'right' one (the non-bridge
++                            // one) anyway.
++                            cmp = Boolean.compare(o.isBridge(), this.isBridge());
++                        }
+                     }
+                 }
+             }
+@@ -556,27 +569,26 @@ public class ReflectionUtil {
+         }
+ 
+         @Override
+-        public boolean equals(Object o)
+-        {
+-            return o == this
+-                    || (null != o
+-                    && this.getClass().equals(o.getClass())
+-                    && ((MatchResult)o).getExact() == this.getExact()
+-                    && ((MatchResult)o).getAssignable() == this.getAssignable()
+-                    && ((MatchResult)o).getCoercible() == this.getCoercible()
+-                    && ((MatchResult)o).isBridge() == this.isBridge()
+-                    )
+-                    ;
++        public boolean equals(Object o) {
++            return o == this || (null != o &&
++                    this.getClass().equals(o.getClass()) &&
++                    ((MatchResult)o).getExact() == this.getExact() &&
++                    ((MatchResult)o).getAssignable() == this.getAssignable() &&
++                    ((MatchResult)o).getCoercible() == this.getCoercible() &&
++                    ((MatchResult)o).getVarArgs() == this.getVarArgs() &&
++                    ((MatchResult)o).isBridge() == this.isBridge());
+         }
+ 
+         @Override
+-        public int hashCode()
+-        {
+-            return (this.isBridge() ? 1 << 24 : 0)
+-                    ^ this.getExact() << 16
+-                    ^ this.getAssignable() << 8
+-                    ^ this.getCoercible()
+-                    ;
++        public int hashCode() {
++            final int prime = 31;
++            int result = 1;
++            result = prime * result + assignable;
++            result = prime * result + (bridge ? 1231 : 1237);
++            result = prime * result + coercible;
++            result = prime * result + exact;
++            result = prime * result + varArgs;
++            return result;
+         }
+     }
+ }
+
+==================================================
+TestMethodExpressionImpl.java
+index 312a5a4371..29078aeefc 100644
+--- a/test/jakarta/el/TestBeanELResolver.java
++++ b/test/jakarta/el/TestBeanELResolver.java
+@@ -593,9 +593,7 @@ public class TestBeanELResolver {
+         Assert.assertEquals(BEAN_NAME, result);
+     }
+ 
+-    // Ambiguous because the Strings coerce to both Boolean and Integer hence
+-    // both varargs methods match.
+-    @Test(expected=MethodNotFoundException.class)
++    @Test
+     public void testInvokeVarargsCoerce13() {
+         BeanELResolver resolver = new BeanELResolver();
+         ELContext context = new StandardELContext(ELManager.getExpressionFactory());
+@@ -628,9 +626,7 @@ public class TestBeanELResolver {
+         Assert.assertEquals(BEAN_NAME, result);
+     }
+ 
+-    // Ambiguous because the Strings coerce to both Boolean and Integer hence
+-    // both varargs methods match.
+-    @Test(expected=MethodNotFoundException.class)
++    @Test
+     public void testInvokeVarargsCoerce16() {
+         BeanELResolver resolver = new BeanELResolver();
+         ELContext context = new StandardELContext(ELManager.getExpressionFactory());
+
+==================================================
+TesterBeanF.java
+index e63cc4d09d..103f400295 100644
+--- a/test/org/apache/el/TestMethodExpressionImpl.java
++++ b/test/org/apache/el/TestMethodExpressionImpl.java
+@@ -16,7 +16,10 @@
+  */
+ package org.apache.el;
+ 
++import java.util.function.Function;
++
+ import jakarta.el.ELContext;
++import jakarta.el.ELProcessor;
+ import jakarta.el.ExpressionFactory;
+ import jakarta.el.MethodExpression;
+ import jakarta.el.MethodNotFoundException;
+@@ -535,4 +538,215 @@ public class TestMethodExpressionImpl {
+                 "${beanC.sayHello}", null , new Class[]{ TesterBeanA.class, TesterBeanB.class});
+         me2.invoke(context, new Object[] { new Object() });
+     }
++
++
++    @Test
++    public void testVarArgsBeanFEnum() {
++        doTestVarArgsBeanF("beanF.doTest(apple)", (a) -> a.doTest(TesterEnum.APPLE));
++    }
++
++
++    @Test
++    public void testVarArgsBeanFEnumEnum() {
++        doTestVarArgsBeanF("beanF.doTest(apple,apple)", (a) -> a.doTest(TesterEnum.APPLE, TesterEnum.APPLE));
++    }
++
++
++    @Test
++    public void testVarArgsBeanFEnumString() {
++        doTestVarArgsBeanF("beanF.doTest(apple,'apple')", (a) -> a.doTest(TesterEnum.APPLE, "apple"));
++    }
++
++
++    @Test
++    public void testVarArgsBeanFEnumVEnum() {
++        doTestVarArgsBeanF("beanF.doTest(apple,apple,apple)",
++                (a) -> a.doTest(TesterEnum.APPLE, TesterEnum.APPLE, TesterEnum.APPLE));
++    }
++
++
++    @Test
++    public void testVarArgsBeanFEnumVString() {
++        doTestVarArgsBeanF("beanF.doTest(apple,'apple','apple')", (a) -> a.doTest(TesterEnum.APPLE, "apple", "apple"));
++    }
++
++
++    @Test
++    public void testVarArgsBeanFString() {
++        doTestVarArgsBeanF("beanF.doTest('apple')", (a) -> a.doTest("apple"));
++    }
++
++
++    @Test
++    public void testVarArgsBeanFStringEnum() {
++        doTestVarArgsBeanF("beanF.doTest('apple',apple)", (a) -> a.doTest("apple", TesterEnum.APPLE));
++    }
++
++
++    @Test
++    public void testVarArgsBeanFStringString() {
++        doTestVarArgsBeanF("beanF.doTest('apple','apple')", (a) -> a.doTest("apple", "apple"));
++    }
++
++
++    @Test
++    public void testVarArgsBeanFStringVEnum() {
++        doTestVarArgsBeanF("beanF.doTest('apple',apple,apple)",
++                (a) -> a.doTest("apple", TesterEnum.APPLE, TesterEnum.APPLE));
++    }
++
++
++    @Test
++    public void testVarArgsBeanFStringVString() {
++        doTestVarArgsBeanF("beanF.doTest('apple','apple','apple')", (a) -> a.doTest("apple", "apple", "apple"));
++    }
++
++
++    private void doTestVarArgsBeanF(String expression, Function<TesterBeanF,String> func) {
++        ELProcessor elp = new ELProcessor();
++        elp.defineBean("apple", TesterEnum.APPLE);
++        elp.defineBean("beanF", new TesterBeanF());
++        String elResult = (String) elp.eval(expression);
++        String javaResult = func.apply(new TesterBeanF());
++        Assert.assertEquals(javaResult, elResult);
++    }
++
++
++    @Test
++    public void testVarArgsBeanGEnum() {
++        doTestVarArgsBeanG("beanG.doTest(apple)", (a) -> a.doTest("apple"));
++    }
++
++
++    @Test
++    public void testVarArgsBeanGEnumEnum() {
++        doTestVarArgsBeanG("beanG.doTest(apple,apple)", (a) -> a.doTest("apple", "apple"));
++    }
++
++
++    @Test
++    public void testVarArgsBeanGEnumString() {
++        doTestVarArgsBeanG("beanG.doTest(apple,'apple')", (a) -> a.doTest("apple", "apple"));
++    }
++
++
++    @Test
++    public void testVarArgsBeanGEnumVEnum() {
++        doTestVarArgsBeanG("beanG.doTest(apple,apple,apple)", (a) -> a.doTest("apple", "apple", "apple"));
++    }
++
++
++    @Test
++    public void testVarArgsBeanGEnumVString() {
++        doTestVarArgsBeanG("beanG.doTest(apple,'apple','apple')", (a) -> a.doTest("apple", "apple", "apple"));
++    }
++
++
++    @Test
++    public void testVarArgsBeanGString() {
++        doTestVarArgsBeanG("beanG.doTest('apple')", (a) -> a.doTest("apple"));
++    }
++
++
++    @Test
++    public void testVarArgsBeanGStringEnum() {
++        doTestVarArgsBeanG("beanG.doTest('apple',apple)", (a) -> a.doTest("apple", "apple"));
++    }
++
++
++    @Test
++    public void testVarArgsBeanGStringString() {
++        doTestVarArgsBeanG("beanG.doTest('apple','apple')", (a) -> a.doTest("apple", "apple"));
++    }
++
++
++    @Test
++    public void testVarArgsBeanGStringVEnum() {
++        doTestVarArgsBeanG("beanG.doTest('apple',apple,apple)", (a) -> a.doTest("apple", "apple", "apple"));
++    }
++
++
++    @Test
++    public void testVarArgsBeanGStringVString() {
++        doTestVarArgsBeanG("beanG.doTest('apple','apple','apple')", (a) -> a.doTest("apple", "apple", "apple"));
++    }
++
++
++    private void doTestVarArgsBeanG(String expression, Function<TesterBeanG,String> func) {
++        ELProcessor elp = new ELProcessor();
++        elp.defineBean("apple", TesterEnum.APPLE);
++        elp.defineBean("beanG", new TesterBeanG());
++        String elResult = (String) elp.eval(expression);
++        String javaResult = func.apply(new TesterBeanG());
++        Assert.assertEquals(javaResult, elResult);
++    }
++
++    @Test
++    public void testVarArgsBeanHEnum() {
++        doTestVarArgsBeanH("beanH.doTest(apple)", (a) -> a.doTest("apple"));
++    }
++
++
++    @Test
++    public void testVarArgsBeanHEnumEnum() {
++        doTestVarArgsBeanH("beanH.doTest(apple,apple)", (a) -> a.doTest("apple", "apple"));
++    }
++
++
++    @Test
++    public void testVarArgsBeanHEnumString() {
++        doTestVarArgsBeanH("beanH.doTest(apple,'apple')", (a) -> a.doTest("apple", "apple"));
++    }
++
++
++    @Test
++    public void testVarArgsBeanHEnumVEnum() {
++        doTestVarArgsBeanH("beanH.doTest(apple,apple,apple)", (a) -> a.doTest("apple", "apple", "apple"));
++    }
++
++
++    @Test
++    public void testVarArgsBeanHEnumVString() {
++        doTestVarArgsBeanH("beanH.doTest(apple,'apple','apple')", (a) -> a.doTest("apple", "apple", "apple"));
++    }
++
++
++    @Test
++    public void testVarArgsBeanHString() {
++        doTestVarArgsBeanH("beanH.doTest('apple')", (a) -> a.doTest("apple"));
++    }
++
++
++    @Test
++    public void testVarArgsBeanHStringEnum() {
++        doTestVarArgsBeanH("beanH.doTest('apple',apple)", (a) -> a.doTest("apple", "apple"));
++    }
++
++
++    @Test
++    public void testVarArgsBeanHStringString() {
++        doTestVarArgsBeanH("beanH.doTest('apple','apple')", (a) -> a.doTest("apple", "apple"));
++    }
++
++
++    @Test
++    public void testVarArgsBeanHStringVEnum() {
++        doTestVarArgsBeanH("beanH.doTest('apple',apple,apple)", (a) -> a.doTest("apple", "apple", "apple"));
++    }
++
++
++    @Test
++    public void testVarArgsBeanHStringVString() {
++        doTestVarArgsBeanH("beanH.doTest('apple','apple','apple')", (a) -> a.doTest("apple", "apple", "apple"));
++    }
++
++
++    private void doTestVarArgsBeanH(String expression, Function<TesterBeanH,String> func) {
++        ELProcessor elp = new ELProcessor();
++        elp.defineBean("apple", TesterEnum.APPLE);
++        elp.defineBean("beanH", new TesterBeanH());
++        String elResult = (String) elp.eval(expression);
++        String javaResult = func.apply(new TesterBeanH());
++        Assert.assertEquals(javaResult, elResult);
++    }
+ }
+
+==================================================
+TesterBeanG.java
+new file mode 100644
+index 0000000000..242cab0af7
+--- /dev/null
++++ b/test/org/apache/el/TesterBeanF.java
+@@ -0,0 +1,82 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.el;
++
++/**
++ * Test cases based on https://bz.apache.org/bugzilla/show_bug.cgi?id=65358
++ */
++public class TesterBeanF {
++
++    @SuppressWarnings("unused")
++    public String doTest(TesterEnum param1) {
++        return "Enum";
++    }
++
++
++    @SuppressWarnings("unused")
++    public String doTest(TesterEnum param1, TesterEnum param2) {
++        return "Enum-Enum";
++    }
++
++
++    @SuppressWarnings("unused")
++    public String doTest(TesterEnum param1, String param2) {
++        return "Enum-String";
++    }
++
++
++    @SuppressWarnings("unused")
++    public String doTest(TesterEnum param1, TesterEnum... param2 ) {
++        return "Enum-VEnum";
++    }
++
++
++    @SuppressWarnings("unused")
++    public String doTest(TesterEnum param1, String... param2 ) {
++        return "Enum-VString";
++    }
++
++
++    @SuppressWarnings("unused")
++    public String doTest(String param1) {
++        return "String";
++    }
++
++
++    @SuppressWarnings("unused")
++    public String doTest(String param1, TesterEnum param2) {
++        return "String-Enum";
++    }
++
++
++    @SuppressWarnings("unused")
++    public String doTest(String param1, String param2) {
++        return "String-String";
++    }
++
++
++    @SuppressWarnings("unused")
++    public String doTest(String param1, TesterEnum... param2 ) {
++        return "String-VEnum";
++    }
++
++
++    @SuppressWarnings("unused")
++    public String doTest(String param1, String... param2 ) {
++        return "String-VString";
++    }
++}
+
+==================================================
+TesterBeanH.java
+new file mode 100644
+index 0000000000..4872781637
+--- /dev/null
++++ b/test/org/apache/el/TesterBeanG.java
+@@ -0,0 +1,42 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.el;
++
++/**
++ * Test cases based on https://bz.apache.org/bugzilla/show_bug.cgi?id=65358
++ * BeanG is BeanF with all the methods that use Enum parameters removed so that
++ * the EL caller always has to coerce the Enum to String.
++ */
++public class TesterBeanG {
++
++    @SuppressWarnings("unused")
++    public String doTest(String param1) {
++        return "String";
++    }
++
++
++    @SuppressWarnings("unused")
++    public String doTest(String param1, String param2) {
++        return "String-String";
++    }
++
++
++    @SuppressWarnings("unused")
++    public String doTest(String param1, String... param2 ) {
++        return "String-VString";
++    }
++}
+
+==================================================

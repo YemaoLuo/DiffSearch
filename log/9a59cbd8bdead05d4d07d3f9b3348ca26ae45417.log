@@ -1,0 +1,360 @@
+9a59cbd8bdead05d4d07d3f9b3348ca26ae45417
+==================================================
+Complete the fix for https://bz.apache.org/bugzilla/show_bug.cgi?id=53737
+==================================================
+Mark Thomas
+==================================================
+Tue Nov 20 16:54:28 2018 +0000
+==================================================
+JspC.java
+Complete the fix for https://bz.apache.org/bugzilla/show_bug.cgi?id=53737
+Extend JspC to include support for resource JARs 
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1847028 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+JspCServletContext.java
+index bbfeffd242..a3413e70a5 100644
+--- a/java/org/apache/jasper/JspC.java
++++ b/java/org/apache/jasper/JspC.java
+@@ -37,7 +37,6 @@ import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+-import java.util.Stack;
+ import java.util.StringTokenizer;
+ import java.util.Vector;
+ import java.util.concurrent.Callable;
+@@ -1398,41 +1397,48 @@ public class JspC extends Task implements Options {
+      * Locate all jsp files in the webapp. Used if no explicit
+      * jsps are specified.
+      * @param base Base path
++     *
++     * @deprecated This will be removed in Tomcat 10. Use {@link #scanFiles()}
+      */
+-    public void scanFiles( File base ) {
+-        Stack<String> dirs = new Stack<>();
+-        dirs.push(base.toString());
++    @Deprecated
++    public void scanFiles(File base) {
++        scanFiles();
++    }
+ 
++
++    /**
++     * Locate all jsp files in the webapp. Used if no explicit jsps are
++     * specified. Scan is performed via the ServletContext and will include any
++     * JSPs located in resource JARs.
++     */
++    public void scanFiles() {
+         // Make sure default extensions are always included
+         if ((getExtensions() == null) || (getExtensions().size() < 2)) {
+             addExtension("jsp");
+             addExtension("jspx");
+         }
+ 
+-        while (!dirs.isEmpty()) {
+-            String s = dirs.pop();
+-            File f = new File(s);
+-            if (f.exists() && f.isDirectory()) {
+-                String[] files = f.list();
+-                String ext;
+-                for (int i = 0; (files != null) && i < files.length; i++) {
+-                    File f2 = new File(s, files[i]);
+-                    if (f2.isDirectory()) {
+-                        dirs.push(f2.getPath());
+-                    } else {
+-                        String path = f2.getPath();
+-                        String uri = path.substring(uriRoot.length());
+-                        ext = files[i].substring(files[i].lastIndexOf('.') +1);
+-                        if (getExtensions().contains(ext) ||
+-                            jspConfig.isJspPage(uri)) {
+-                            pages.add(path);
+-                        }
+-                    }
++        scanFilesInternal("/");
++    }
++
++
++    private void scanFilesInternal(String input) {
++        Set<String> paths = context.getResourcePaths(input);
++        for (String path : paths) {
++            if (path.endsWith("/")) {
++                scanFilesInternal(input.substring(0, input.length() -1) + path);
++            } else if (jspConfig.isJspPage(input + path)) {
++                pages.add(path);
++            } else {
++                String ext = path.substring(path.lastIndexOf('.') + 1);
++                if (extensions.contains(ext)) {
++                    pages.add(input + path.substring(1));
+                 }
+             }
+         }
+     }
+ 
++
+     /**
+      * Executes the compilation.
+      */
+@@ -1474,20 +1480,15 @@ public class JspC extends Task implements Options {
+ 
+             // No explicit pages, we'll process all .jsp in the webapp
+             if (pages.size() == 0) {
+-                scanFiles(uriRootF);
+-            }
+-
+-            initWebXml();
+-
+-            int errorCount = 0;
+-            long start = System.currentTimeMillis();
+-
+-            ExecutorService threadPool = Executors.newFixedThreadPool(threadCount);
+-            ExecutorCompletionService<Void> service = new ExecutorCompletionService<>(threadPool);
+-            try {
+-                int pageCount = pages.size();
++                scanFiles();
++            } else {
++                // Ensure pages are all relative to the uriRoot.
++                // Those that are not will trigger an error later. The error
++                // could be detected earlier but isn't to support the use case
++                // when failFast is not used.
++                for (int i = 0; i < pages.size(); i++) {
++                    String nextjsp = pages.get(i);
+ 
+-                for (String nextjsp : pages) {
+                     File fjsp = new File(nextjsp);
+                     if (!fjsp.isAbsolute()) {
+                         fjsp = new File(uriRootF, nextjsp);
+@@ -1506,6 +1507,20 @@ public class JspC extends Task implements Options {
+                     if (nextjsp.startsWith("." + File.separatorChar)) {
+                         nextjsp = nextjsp.substring(2);
+                     }
++                    pages.set(i, nextjsp);
++                }
++            }
++
++            initWebXml();
++
++            int errorCount = 0;
++            long start = System.currentTimeMillis();
++
++            ExecutorService threadPool = Executors.newFixedThreadPool(threadCount);
++            ExecutorCompletionService<Void> service = new ExecutorCompletionService<>(threadPool);
++            try {
++                int pageCount = pages.size();
++                for (String nextjsp : pages) {
+                     service.submit(new ProcessFile(nextjsp));
+                 }
+                 JasperException reportableError = null;
+
+==================================================
+TestJspCServletContext.java
+index 95bd751aa6..5f958fb18b 100644
+--- a/java/org/apache/jasper/servlet/JspCServletContext.java
++++ b/java/org/apache/jasper/servlet/JspCServletContext.java
+@@ -22,12 +22,16 @@ import java.io.InputStream;
+ import java.io.PrintWriter;
+ import java.net.MalformedURLException;
+ import java.net.URL;
++import java.util.ArrayList;
++import java.util.Collection;
+ import java.util.Collections;
+ import java.util.EnumSet;
+ import java.util.Enumeration;
+ import java.util.EventListener;
+ import java.util.HashMap;
+ import java.util.HashSet;
++import java.util.LinkedHashSet;
++import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+ import java.util.Vector;
+@@ -49,10 +53,12 @@ import org.apache.jasper.Constants;
+ import org.apache.jasper.JasperException;
+ import org.apache.jasper.compiler.Localizer;
+ import org.apache.jasper.runtime.ExceptionUtils;
++import org.apache.tomcat.Jar;
+ import org.apache.tomcat.JarScanType;
+ import org.apache.tomcat.util.descriptor.web.FragmentJarScannerCallback;
+ import org.apache.tomcat.util.descriptor.web.WebXml;
+ import org.apache.tomcat.util.descriptor.web.WebXmlParser;
++import org.apache.tomcat.util.scan.JarFactory;
+ import org.apache.tomcat.util.scan.StandardJarScanFilter;
+ import org.apache.tomcat.util.scan.StandardJarScanner;
+ 
+@@ -100,8 +106,12 @@ public class JspCServletContext implements ServletContext {
+     private WebXml webXml;
+ 
+ 
++    private List<URL> resourceJARs;
++
++
+     private JspConfigDescriptor jspConfigDescriptor;
+ 
++
+     /**
+      * Web application class loader.
+      */
+@@ -167,11 +177,45 @@ public class JspCServletContext implements ServletContext {
+         Map<String, WebXml> fragments = scanForFragments(webXmlParser);
+         Set<WebXml> orderedFragments = WebXml.orderWebFragments(webXml, fragments, this);
+ 
++        // Find resource JARs
++        this.resourceJARs = scanForResourceJARs(orderedFragments, fragments.values());
++
+         // JspC is not affected by annotations so skip that processing, proceed to merge
+         webXml.merge(orderedFragments);
+         return webXml;
+     }
+ 
++
++    private List<URL> scanForResourceJARs(Set<WebXml> orderedFragments, Collection<WebXml> fragments)
++            throws JasperException {
++        List<URL> resourceJars = new ArrayList<>();
++        // Build list of potential resource JARs. Use same ordering as ContextConfig
++        Set<WebXml> resourceFragments = new LinkedHashSet<>();
++        for (WebXml fragment : orderedFragments) {
++            resourceFragments.add(fragment);
++        }
++        for (WebXml fragment : fragments) {
++            if (!resourceFragments.contains(fragment)) {
++                resourceFragments.add(fragment);
++            }
++        }
++
++        for (WebXml resourceFragment : resourceFragments) {
++            try (Jar jar = JarFactory.newInstance(resourceFragment.getURL())) {
++                if (jar.exists("META-INF/resources/")) {
++                    // This is a resource JAR
++                    resourceJars.add(resourceFragment.getURL());
++                }
++                jar.close();
++            } catch (IOException ioe) {
++                throw new JasperException(ioe);
++            }
++        }
++
++        return resourceJars;
++    }
++
++
+     private Map<String, WebXml> scanForFragments(WebXmlParser webXmlParser) throws JasperException {
+         StandardJarScanner scanner = new StandardJarScanner();
+         // TODO - enabling this means initializing the classloader first in JspC
+@@ -337,15 +381,34 @@ public class JspCServletContext implements ServletContext {
+     @Override
+     public URL getResource(String path) throws MalformedURLException {
+ 
+-        if (!path.startsWith("/"))
+-            throw new MalformedURLException("Path '" + path +
+-                                            "' does not start with '/'");
+-        URL url = new URL(myResourceBaseURL, path.substring(1));
++        if (!path.startsWith("/")) {
++            throw new MalformedURLException("Path '" + path + "' does not start with '/'");
++        }
++
++        // Strip leading '/'
++        path = path.substring(1);
++
++        URL url = new URL(myResourceBaseURL, path);
+         try (InputStream is = url.openStream()) {
+         } catch (Throwable t) {
+             ExceptionUtils.handleThrowable(t);
+             url = null;
+         }
++
++        // During initialisation, getResource() is called before resourceJARs is
++        // initialised
++        if (url == null && resourceJARs != null) {
++            String jarPath = "META-INF/resources/" + path;
++            for (URL jarUrl : resourceJARs) {
++                try (Jar jar = JarFactory.newInstance(jarUrl)) {
++                    if (jar.exists(jarPath)) {
++                        return new URL(jar.getURL(jarPath));
++                    }
++                } catch (IOException ioe) {
++                    // Ignore
++                }
++            }
++        }
+         return url;
+     }
+ 
+@@ -377,27 +440,57 @@ public class JspCServletContext implements ServletContext {
+     public Set<String> getResourcePaths(String path) {
+ 
+         Set<String> thePaths = new HashSet<>();
+-        if (!path.endsWith("/"))
++        if (!path.endsWith("/")) {
+             path += "/";
++        }
+         String basePath = getRealPath(path);
+-        if (basePath == null)
+-            return thePaths;
+-        File theBaseDir = new File(basePath);
+-        if (!theBaseDir.exists() || !theBaseDir.isDirectory())
+-            return thePaths;
+-        String theFiles[] = theBaseDir.list();
+-        if (theFiles == null) {
+-            return thePaths;
++        if (basePath != null) {
++            File theBaseDir = new File(basePath);
++            if (theBaseDir.isDirectory()) {
++                String theFiles[] = theBaseDir.list();
++                if (theFiles != null) {
++                    for (int i = 0; i < theFiles.length; i++) {
++                        File testFile = new File(basePath + File.separator + theFiles[i]);
++                        if (testFile.isFile()) {
++                            thePaths.add(path + theFiles[i]);
++                        } else if (testFile.isDirectory()) {
++                            thePaths.add(path + theFiles[i] + "/");
++                        }
++                    }
++                }
++            }
+         }
+-        for (int i = 0; i < theFiles.length; i++) {
+-            File testFile = new File(basePath + File.separator + theFiles[i]);
+-            if (testFile.isFile())
+-                thePaths.add(path + theFiles[i]);
+-            else if (testFile.isDirectory())
+-                thePaths.add(path + theFiles[i] + "/");
++
++        // During initialisation, getResourcePaths() is called before
++        // resourceJARs is initialised
++        if (resourceJARs != null) {
++            String jarPath = "META-INF/resources" + path;
++            for (URL jarUrl : resourceJARs) {
++                try (Jar jar = JarFactory.newInstance(jarUrl)) {
++                    jar.nextEntry();
++                    for (String entryName = jar.getEntryName();
++                            entryName != null;
++                            jar.nextEntry(), entryName = jar.getEntryName()) {
++                        if (entryName.startsWith(jarPath) &&
++                                entryName.length() > jarPath.length()) {
++                            // Let the Set implementation handle duplicates
++                            int sep = entryName.indexOf("/", jarPath.length());
++                            if (sep < 0) {
++                                // This is a file
++                                thePaths.add(entryName.substring(jarPath.length() - 1));
++                            } else {
++                                // This is a directory
++                                thePaths.add(entryName.substring(jarPath.length() - 1, sep + 1));
++                            }
++                        }
++                    }
++                } catch (IOException e) {
++                    log(e.getMessage(), e);
++                }
++            }
+         }
+-        return thePaths;
+ 
++        return thePaths;
+     }
+ 
+ 
+
+==================================================

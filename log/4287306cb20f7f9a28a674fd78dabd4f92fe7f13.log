@@ -1,0 +1,895 @@
+4287306cb20f7f9a28a674fd78dabd4f92fe7f13
+==================================================
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=56518
+==================================================
+Mark Emlyn
+==================================================
+Thu Jun 12 15:10:46 2014 +0000
+==================================================
+CoyoteAdapter.java
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=56518
+Do not attempt an NIO write if a thread has been interrupted as it can lead to a connection limit leak
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1602198 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AbstractProcessor.java
+index 1439f72912..0c77d84f07 100644
+--- a/java/org/apache/catalina/connector/CoyoteAdapter.java
++++ b/java/org/apache/catalina/connector/CoyoteAdapter.java
+@@ -599,6 +599,35 @@ public class CoyoteAdapter implements Adapter {
+     }
+ 
+ 
++
++    @Override
++    public void errorDispatch(org.apache.coyote.Request req,
++            org.apache.coyote.Response res) {
++        Request request = (Request) req.getNote(ADAPTER_NOTES);
++        Response response = (Response) res.getNote(ADAPTER_NOTES);
++
++        if (request != null && request.getMappingData().context != null) {
++            request.getMappingData().context.logAccess(
++                    request, response,
++                    System.currentTimeMillis() - req.getStartTime(),
++                    false);
++        } else {
++            log(req, res, System.currentTimeMillis() - req.getStartTime());
++        }
++
++        if (request != null) {
++            request.recycle();
++        }
++
++        if (response != null) {
++            response.recycle();
++        }
++
++        res.recycle();
++        res.recycle();
++    }
++
++
+     @Override
+     public void log(org.apache.coyote.Request req,
+             org.apache.coyote.Response res, long time) {
+
+==================================================
+AbstractProtocol.java
+index 01fd2a882e..709c93aa7f 100644
+--- a/java/org/apache/coyote/AbstractProcessor.java
++++ b/java/org/apache/coyote/AbstractProcessor.java
+@@ -74,8 +74,20 @@ public abstract class AbstractProcessor<S> implements ActionHook, Processor<S> {
+      * Update the current error state to the new error state if the new error
+      * state is more severe than the current error state.
+      */
+-    protected void setErrorState(ErrorState errorState) {
++    protected void setErrorState(ErrorState errorState, Throwable t) {
++        boolean blockIo = this.errorState.isIoAllowed() && !errorState.isIoAllowed();
+         this.errorState = this.errorState.getMostSevere(errorState);
++        if (blockIo && !ContainerThreadMarker.isContainerThread()) {
++            // The error occurred on a non-container thread which means not all
++            // of the necessary clean-up will have been completed. Dispatch to
++            // a container thread to do the clean-up. Need to do it this way to
++            // ensure that all the necessary clean-up is performed.
++            if (response.getStatus() < 400) {
++                response.setStatus(500);
++            }
++            getLog().info(sm.getString("abstractProcessor.nonContainerThreadError"), t);
++            getEndpoint().processSocket(socketWrapper, SocketStatus.CLOSE_NOW, true);
++        }
+     }
+ 
+ 
+@@ -161,6 +173,11 @@ public abstract class AbstractProcessor<S> implements ActionHook, Processor<S> {
+         return asyncStateMachine.asyncPostProcess();
+     }
+ 
++    @Override
++    public void errorDispatch() {
++        getAdapter().errorDispatch(request, response);
++    }
++
+     @Override
+     public abstract boolean isComet();
+ 
+
+==================================================
+Adapter.java
+index 74acfc67ea..ffd86c4d0c 100644
+--- a/java/org/apache/coyote/AbstractProtocol.java
++++ b/java/org/apache/coyote/AbstractProtocol.java
+@@ -624,7 +624,10 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+                 SocketState state = SocketState.CLOSED;
+                 Iterator<DispatchType> dispatches = null;
+                 do {
+-                    if (dispatches != null) {
++                    if (status == SocketStatus.CLOSE_NOW) {
++                        processor.errorDispatch();
++                        state = SocketState.CLOSED;
++                    } else if (dispatches != null) {
+                         // Associate the processor with the connection as
+                         // these calls may result in a nested call to process()
+                         connections.put(socket, processor);
+
+==================================================
+Processor.java
+index e4027bfea2..6fbdb21a1f 100644
+--- a/java/org/apache/coyote/LocalStrings.properties
++++ b/java/org/apache/coyote/LocalStrings.properties
+@@ -16,6 +16,8 @@ abstractConnectionHandler.error=Error reading request, ignored
+ abstractConnectionHandler.ioexception.debug=IOExceptions are normal, ignored
+ abstractConnectionHandler.socketexception.debug=SocketExceptions are normal, ignored
+ 
++abstractProcessor.nonContainerThreadError=An error occurred in processing while on a non-container thread. The connection will be closed immediately
++
+ abstractProtocol.mbeanDeregistrationFailed=Failed to deregister MBean named [{0}] from MBean server [{1}]
+ 
+ abstractProtocolHandler.getAttribute=Get attribute [{0}] with value [{1}]
+
+==================================================
+AbstractAjpProcessor.java
+index d6618ea8d4..dcf0513ccd 100644
+--- a/java/org/apache/coyote/Processor.java
++++ b/java/org/apache/coyote/Processor.java
+@@ -43,6 +43,8 @@ public interface Processor<S> {
+     HttpUpgradeHandler getHttpUpgradeHandler();
+     SocketState upgradeDispatch(SocketStatus status) throws IOException;
+ 
++    void errorDispatch();
++
+     boolean isComet();
+     boolean isAsync();
+     boolean isUpgrade();
+
+==================================================
+AbstractHttp11Processor.java
+index 6c3ea04456..68b47997c5 100644
+--- a/java/org/apache/coyote/ajp/AbstractAjpProcessor.java
++++ b/java/org/apache/coyote/ajp/AbstractAjpProcessor.java
+@@ -359,7 +359,7 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+             try {
+                 finish();
+             } catch (IOException e) {
+-                setErrorState(ErrorState.CLOSE_NOW);
++                setErrorState(ErrorState.CLOSE_NOW, e);
+             }
+             break;
+         }
+@@ -371,13 +371,13 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+             try {
+                 prepareResponse();
+             } catch (IOException e) {
+-                setErrorState(ErrorState.CLOSE_NOW);
++                setErrorState(ErrorState.CLOSE_NOW, e);
+             }
+ 
+             try {
+                 flush(false);
+             } catch (IOException e) {
+-                setErrorState(ErrorState.CLOSE_NOW);
++                setErrorState(ErrorState.CLOSE_NOW, e);
+             }
+             break;
+         }
+@@ -391,7 +391,7 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+                 try {
+                     prepareResponse();
+                 } catch (IOException e) {
+-                    setErrorState(ErrorState.CLOSE_NOW);
++                    setErrorState(ErrorState.CLOSE_NOW, e);
+                     return;
+                 }
+             }
+@@ -399,7 +399,7 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+             try {
+                 flush(true);
+             } catch (IOException e) {
+-                setErrorState(ErrorState.CLOSE_NOW);
++                setErrorState(ErrorState.CLOSE_NOW, e);
+             }
+             break;
+         }
+@@ -410,7 +410,7 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+         case DISABLE_SWALLOW_INPUT: {
+             // TODO: Do not swallow request input but
+             // make sure we are closing the connection
+-            setErrorState(ErrorState.CLOSE_CLEAN);
++            setErrorState(ErrorState.CLOSE_CLEAN, null);
+             break;
+         }
+         case RESET: {
+@@ -642,7 +642,7 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+         case CLOSE_NOW: {
+             // Prevent further writes to the response
+             swallowResponse = true;
+-            setErrorState(ErrorState.CLOSE_NOW);
++            setErrorState(ErrorState.CLOSE_NOW, null);
+             break;
+         }
+         }
+@@ -690,14 +690,14 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+         try {
+             rp.setStage(org.apache.coyote.Constants.STAGE_SERVICE);
+             if(!getAdapter().asyncDispatch(request, response, status)) {
+-                setErrorState(ErrorState.CLOSE_NOW);
++                setErrorState(ErrorState.CLOSE_NOW, null);
+             }
+             resetTimeouts();
+         } catch (InterruptedIOException e) {
+-            setErrorState(ErrorState.CLOSE_NOW);
++            setErrorState(ErrorState.CLOSE_NOW, e);
+         } catch (Throwable t) {
+             ExceptionUtils.handleThrowable(t);
+-            setErrorState(ErrorState.CLOSE_NOW);
++            setErrorState(ErrorState.CLOSE_NOW, t);
+             getLog().error(sm.getString("http11processor.request.process"), t);
+         }
+ 
+@@ -766,7 +766,7 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+                     try {
+                         output(pongMessageArray, 0, pongMessageArray.length, true);
+                     } catch (IOException e) {
+-                        setErrorState(ErrorState.CLOSE_NOW);
++                        setErrorState(ErrorState.CLOSE_NOW, e);
+                     }
+                     recycle(false);
+                     continue;
+@@ -776,20 +776,20 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+                     if (getLog().isDebugEnabled()) {
+                         getLog().debug("Unexpected message: " + type);
+                     }
+-                    setErrorState(ErrorState.CLOSE_NOW);
++                    setErrorState(ErrorState.CLOSE_NOW, null);
+                     break;
+                 }
+                 keptAlive = true;
+                 request.setStartTime(System.currentTimeMillis());
+             } catch (IOException e) {
+-                setErrorState(ErrorState.CLOSE_NOW);
++                setErrorState(ErrorState.CLOSE_NOW, e);
+                 break;
+             } catch (Throwable t) {
+                 ExceptionUtils.handleThrowable(t);
+                 getLog().debug(sm.getString("ajpprocessor.header.error"), t);
+                 // 400 - Bad Request
+                 response.setStatus(400);
+-                setErrorState(ErrorState.CLOSE_CLEAN);
++                setErrorState(ErrorState.CLOSE_CLEAN, t);
+                 getAdapter().log(request, response, 0);
+             }
+ 
+@@ -803,7 +803,7 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+                     getLog().debug(sm.getString("ajpprocessor.request.prepare"), t);
+                     // 500 - Internal Server Error
+                     response.setStatus(500);
+-                    setErrorState(ErrorState.CLOSE_CLEAN);
++                    setErrorState(ErrorState.CLOSE_CLEAN, t);
+                     getAdapter().log(request, response, 0);
+                 }
+             }
+@@ -811,7 +811,7 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+             if (!getErrorState().isError() && !cping && endpoint.isPaused()) {
+                 // 503 - Service unavailable
+                 response.setStatus(503);
+-                setErrorState(ErrorState.CLOSE_CLEAN);
++                setErrorState(ErrorState.CLOSE_CLEAN, null);
+                 getAdapter().log(request, response, 0);
+             }
+             cping = false;
+@@ -822,13 +822,13 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+                     rp.setStage(org.apache.coyote.Constants.STAGE_SERVICE);
+                     getAdapter().service(request, response);
+                 } catch (InterruptedIOException e) {
+-                    setErrorState(ErrorState.CLOSE_NOW);
++                    setErrorState(ErrorState.CLOSE_NOW, e);
+                 } catch (Throwable t) {
+                     ExceptionUtils.handleThrowable(t);
+                     getLog().error(sm.getString("ajpprocessor.request.process"), t);
+                     // 500 - Internal Server Error
+                     response.setStatus(500);
+-                    setErrorState(ErrorState.CLOSE_CLEAN);
++                    setErrorState(ErrorState.CLOSE_CLEAN, t);
+                     getAdapter().log(request, response, 0);
+                 }
+             }
+@@ -843,7 +843,7 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+                     finish();
+                 } catch (Throwable t) {
+                     ExceptionUtils.handleThrowable(t);
+-                    setErrorState(ErrorState.CLOSE_NOW);
++                    setErrorState(ErrorState.CLOSE_NOW, t);
+                 }
+             }
+ 
+@@ -1191,7 +1191,7 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+                 long cl = vMB.getLong();
+                 if (contentLengthSet) {
+                     response.setStatus(HttpServletResponse.SC_BAD_REQUEST);
+-                    setErrorState(ErrorState.CLOSE_CLEAN);
++                    setErrorState(ErrorState.CLOSE_CLEAN, null);
+                 } else {
+                     contentLengthSet = true;
+                     // Set the content-length header for the request
+@@ -1306,7 +1306,7 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+                     secret = true;
+                     if (!tmpMB.equals(requiredSecret)) {
+                         response.setStatus(403);
+-                        setErrorState(ErrorState.CLOSE_CLEAN);
++                        setErrorState(ErrorState.CLOSE_CLEAN, null);
+                     }
+                 }
+                 break;
+@@ -1322,7 +1322,7 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+         // Check if secret was submitted if required
+         if ((requiredSecret != null) && !secret) {
+             response.setStatus(403);
+-            setErrorState(ErrorState.CLOSE_CLEAN);
++            setErrorState(ErrorState.CLOSE_CLEAN, null);
+         }
+ 
+         // Check for a full URI (including protocol://host:port/)
+@@ -1373,7 +1373,7 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+                 request.serverName().duplicate(request.localName());
+             } catch (IOException e) {
+                 response.setStatus(400);
+-                setErrorState(ErrorState.CLOSE_CLEAN);
++                setErrorState(ErrorState.CLOSE_CLEAN, e);
+             }
+             return;
+         }
+@@ -1423,7 +1423,7 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+                     // Invalid character
+                     // 400 - Bad request
+                     response.setStatus(400);
+-                    setErrorState(ErrorState.CLOSE_CLEAN);
++                    setErrorState(ErrorState.CLOSE_CLEAN, null);
+                     break;
+                 }
+                 port = port + (charValue * mult);
+@@ -1542,7 +1542,7 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+             try {
+                 prepareResponse();
+             } catch (IOException e) {
+-                setErrorState(ErrorState.CLOSE_NOW);
++                setErrorState(ErrorState.CLOSE_NOW, e);
+                 return;
+             }
+         }
+@@ -1748,7 +1748,7 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+                 try {
+                     prepareResponse();
+                 } catch (IOException e) {
+-                    setErrorState(ErrorState.CLOSE_NOW);
++                    setErrorState(ErrorState.CLOSE_NOW, e);
+                 }
+             }
+ 
+
+==================================================
+Http11AprProcessor.java
+index 2ee7878c5f..14eefa0058 100644
+--- a/java/org/apache/coyote/http11/AbstractHttp11Processor.java
++++ b/java/org/apache/coyote/http11/AbstractHttp11Processor.java
+@@ -698,7 +698,7 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+             // Unsupported transfer encoding
+             // 501 - Unimplemented
+             response.setStatus(501);
+-            setErrorState(ErrorState.CLOSE_CLEAN);
++            setErrorState(ErrorState.CLOSE_CLEAN, null);
+             if (getLog().isDebugEnabled()) {
+                 getLog().debug(sm.getString("http11processor.request.prepare") +
+                           " Unsupported transfer encoding [" + encodingName + "]");
+@@ -722,7 +722,7 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+             try {
+                 getOutputBuffer().endRequest();
+             } catch (IOException e) {
+-                setErrorState(ErrorState.CLOSE_NOW);
++                setErrorState(ErrorState.CLOSE_NOW, e);
+             }
+             break;
+         }
+@@ -737,7 +737,7 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+                 prepareResponse();
+                 getOutputBuffer().commit();
+             } catch (IOException e) {
+-                setErrorState(ErrorState.CLOSE_NOW);
++                setErrorState(ErrorState.CLOSE_NOW, e);
+             }
+             break;
+         }
+@@ -753,7 +753,7 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+             try {
+                 getOutputBuffer().sendAck();
+             } catch (IOException e) {
+-                setErrorState(ErrorState.CLOSE_NOW);
++                setErrorState(ErrorState.CLOSE_NOW, e);
+             }
+             break;
+         }
+@@ -761,7 +761,7 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+             try {
+                 getOutputBuffer().flush();
+             } catch (IOException e) {
+-                setErrorState(ErrorState.CLOSE_NOW);
++                setErrorState(ErrorState.CLOSE_NOW, e);
+                 response.setErrorException(e);
+             }
+             break;
+@@ -773,7 +773,7 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+         case DISABLE_SWALLOW_INPUT: {
+             // Do not swallow request input and make sure we are closing the
+             // connection
+-            setErrorState(ErrorState.CLOSE_CLEAN);
++            setErrorState(ErrorState.CLOSE_CLEAN, null);
+             getInputBuffer().setSwallowInput(false);
+             break;
+         }
+@@ -875,7 +875,7 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+                 isReady.set(getOutputBuffer().isReady());
+             } catch (IOException e) {
+                 getLog().debug("isReady() failed", e);
+-                setErrorState(ErrorState.CLOSE_NOW);
++                setErrorState(ErrorState.CLOSE_NOW, e);
+             }
+             break;
+         }
+@@ -903,7 +903,7 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+         case CLOSE_NOW: {
+             // Block further output
+             getOutputBuffer().finished = true;
+-            setErrorState(ErrorState.CLOSE_NOW);
++            setErrorState(ErrorState.CLOSE_NOW, null);
+             break;
+         }
+         default: {
+@@ -997,7 +997,7 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+                 if (endpoint.isPaused()) {
+                     // 503 - Service unavailable
+                     response.setStatus(503);
+-                    setErrorState(ErrorState.CLOSE_CLEAN);
++                    setErrorState(ErrorState.CLOSE_CLEAN, null);
+                 } else {
+                     // Make sure that connectors that are non-blocking during
+                     // header processing (NIO) only set the start time the first
+@@ -1025,7 +1025,7 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+                     getLog().debug(
+                             sm.getString("http11processor.header.parse"), e);
+                 }
+-                setErrorState(ErrorState.CLOSE_NOW);
++                setErrorState(ErrorState.CLOSE_NOW, e);
+                 break;
+             } catch (Throwable t) {
+                 ExceptionUtils.handleThrowable(t);
+@@ -1047,7 +1047,7 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+                 }
+                 // 400 - Bad Request
+                 response.setStatus(400);
+-                setErrorState(ErrorState.CLOSE_CLEAN);
++                setErrorState(ErrorState.CLOSE_CLEAN, t);
+                 getAdapter().log(request, response, 0);
+             }
+ 
+@@ -1064,7 +1064,7 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+                     }
+                     // 500 - Internal Server Error
+                     response.setStatus(500);
+-                    setErrorState(ErrorState.CLOSE_CLEAN);
++                    setErrorState(ErrorState.CLOSE_CLEAN, t);
+                     getAdapter().log(request, response, 0);
+                 }
+             }
+@@ -1090,20 +1090,20 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+                             response.getErrorException() != null ||
+                                     (!isAsync() &&
+                                     statusDropsConnection(response.getStatus())))) {
+-                        setErrorState(ErrorState.CLOSE_CLEAN);
++                        setErrorState(ErrorState.CLOSE_CLEAN, null);
+                     }
+                     setCometTimeouts(socketWrapper);
+                 } catch (InterruptedIOException e) {
+-                    setErrorState(ErrorState.CLOSE_NOW);
++                    setErrorState(ErrorState.CLOSE_NOW, e);
+                 } catch (HeadersTooLargeException e) {
+                     // The response should not have been committed but check it
+                     // anyway to be safe
+                     if (response.isCommitted()) {
+-                        setErrorState(ErrorState.CLOSE_NOW);
++                        setErrorState(ErrorState.CLOSE_NOW, e);
+                     } else {
+                         response.reset();
+                         response.setStatus(500);
+-                        setErrorState(ErrorState.CLOSE_CLEAN);
++                        setErrorState(ErrorState.CLOSE_CLEAN, e);
+                         response.setHeader("Connection", "close"); // TODO: Remove
+                     }
+                 } catch (Throwable t) {
+@@ -1112,7 +1112,7 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+                             "http11processor.request.process"), t);
+                     // 500 - Internal Server Error
+                     response.setStatus(500);
+-                    setErrorState(ErrorState.CLOSE_CLEAN);
++                    setErrorState(ErrorState.CLOSE_CLEAN, t);
+                     getAdapter().log(request, response, 0);
+                 }
+             }
+@@ -1230,7 +1230,7 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+             http11 = false;
+             // Send 505; Unsupported HTTP version
+             response.setStatus(505);
+-            setErrorState(ErrorState.CLOSE_CLEAN);
++            setErrorState(ErrorState.CLOSE_CLEAN, null);
+             if (getLog().isDebugEnabled()) {
+                 getLog().debug(sm.getString("http11processor.request.prepare")+
+                           " Unsupported HTTP version \""+protocolMB+"\"");
+@@ -1268,7 +1268,7 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+                 expectation = true;
+             } else {
+                 response.setStatus(HttpServletResponse.SC_EXPECTATION_FAILED);
+-                setErrorState(ErrorState.CLOSE_CLEAN);
++                setErrorState(ErrorState.CLOSE_CLEAN, null);
+             }
+         }
+ 
+@@ -1362,7 +1362,7 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+         if (http11 && (valueMB == null)) {
+             // 400 - Bad request
+             response.setStatus(400);
+-            setErrorState(ErrorState.CLOSE_CLEAN);
++            setErrorState(ErrorState.CLOSE_CLEAN, null);
+             if (getLog().isDebugEnabled()) {
+                 getLog().debug(sm.getString("http11processor.request.prepare")+
+                           " host header missing");
+@@ -1623,7 +1623,7 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+                     // Invalid character
+                     // 400 - Bad request
+                     response.setStatus(400);
+-                    setErrorState(ErrorState.CLOSE_CLEAN);
++                    setErrorState(ErrorState.CLOSE_CLEAN, null);
+                     break;
+                 }
+                 port = port + (charValue * mult);
+@@ -1675,14 +1675,14 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+         try {
+             rp.setStage(org.apache.coyote.Constants.STAGE_SERVICE);
+             if (!getAdapter().asyncDispatch(request, response, status)) {
+-                setErrorState(ErrorState.CLOSE_NOW);
++                setErrorState(ErrorState.CLOSE_NOW, null);
+             }
+             resetTimeouts();
+         } catch (InterruptedIOException e) {
+-            setErrorState(ErrorState.CLOSE_NOW);
++            setErrorState(ErrorState.CLOSE_NOW, e);
+         } catch (Throwable t) {
+             ExceptionUtils.handleThrowable(t);
+-            setErrorState(ErrorState.CLOSE_NOW);
++            setErrorState(ErrorState.CLOSE_NOW, t);
+             getLog().error(sm.getString("http11processor.request.process"), t);
+         }
+ 
+@@ -1752,14 +1752,14 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+             try {
+                 getInputBuffer().endRequest();
+             } catch (IOException e) {
+-                setErrorState(ErrorState.CLOSE_NOW);
++                setErrorState(ErrorState.CLOSE_NOW, e);
+             } catch (Throwable t) {
+                 ExceptionUtils.handleThrowable(t);
+                 // 500 - Internal Server Error
+                 // Can't add a 500 to the access log since that has already been
+                 // written in the Adapter.service method.
+                 response.setStatus(500);
+-                setErrorState(ErrorState.CLOSE_NOW);
++                setErrorState(ErrorState.CLOSE_NOW, t);
+                 getLog().error(sm.getString("http11processor.request.finish"), t);
+             }
+         }
+@@ -1767,10 +1767,10 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+             try {
+                 getOutputBuffer().endRequest();
+             } catch (IOException e) {
+-                setErrorState(ErrorState.CLOSE_NOW);
++                setErrorState(ErrorState.CLOSE_NOW, e);
+             } catch (Throwable t) {
+                 ExceptionUtils.handleThrowable(t);
+-                setErrorState(ErrorState.CLOSE_NOW);
++                setErrorState(ErrorState.CLOSE_NOW, t);
+                 getLog().error(sm.getString("http11processor.response.finish"), t);
+             }
+         }
+
+==================================================
+Http11Nio2Processor.java
+index 159ab81db2..4b6f8d9093 100644
+--- a/java/org/apache/coyote/http11/Http11AprProcessor.java
++++ b/java/org/apache/coyote/http11/Http11AprProcessor.java
+@@ -113,15 +113,15 @@ public class Http11AprProcessor extends AbstractHttp11Processor<Long> {
+         try {
+             rp.setStage(org.apache.coyote.Constants.STAGE_SERVICE);
+             if (!getAdapter().event(request, response, status)) {
+-                setErrorState(ErrorState.CLOSE_NOW);
++                setErrorState(ErrorState.CLOSE_NOW, null);
+             }
+         } catch (InterruptedIOException e) {
+-            setErrorState(ErrorState.CLOSE_NOW);
++            setErrorState(ErrorState.CLOSE_NOW, e);
+         } catch (Throwable t) {
+             ExceptionUtils.handleThrowable(t);
+             // 500 - Internal Server Error
+             response.setStatus(500);
+-            setErrorState(ErrorState.CLOSE_NOW);
++            setErrorState(ErrorState.CLOSE_NOW, t);
+             getAdapter().log(request, response, 0);
+             log.error(sm.getString("http11processor.request.process"), t);
+         }
+@@ -178,7 +178,7 @@ public class Http11AprProcessor extends AbstractHttp11Processor<Long> {
+         if (endpoint.isPaused()) {
+             // 503 - Service unavailable
+             response.setStatus(503);
+-            setErrorState(ErrorState.CLOSE_CLEAN);
++            setErrorState(ErrorState.CLOSE_CLEAN, null);
+             getAdapter().log(request, response, 0);
+         } else {
+             return true;
+@@ -215,7 +215,7 @@ public class Http11AprProcessor extends AbstractHttp11Processor<Long> {
+                         log.debug(sm.getString(
+                                 "http11processor.sendfile.error"));
+                     }
+-                    setErrorState(ErrorState.CLOSE_NOW);
++                    setErrorState(ErrorState.CLOSE_NOW, null);
+                 } else {
+                     // The sendfile Poller will add the socket to the main
+                     // Poller once sendfile processing is complete
+
+==================================================
+Http11NioProcessor.java
+index a340bcf59e..1e149558f6 100644
+--- a/java/org/apache/coyote/http11/Http11Nio2Processor.java
++++ b/java/org/apache/coyote/http11/Http11Nio2Processor.java
+@@ -94,7 +94,7 @@ public class Http11Nio2Processor extends AbstractHttp11Processor<Nio2Channel> {
+         try {
+             rp.setStage(org.apache.coyote.Constants.STAGE_SERVICE);
+             if (!getAdapter().event(request, response, status)) {
+-                setErrorState(ErrorState.CLOSE_NOW);
++                setErrorState(ErrorState.CLOSE_NOW, null);
+             }
+             if (!getErrorState().isError()) {
+                 if (socketWrapper != null) {
+@@ -117,12 +117,12 @@ public class Http11Nio2Processor extends AbstractHttp11Processor<Nio2Channel> {
+                 }
+             }
+         } catch (InterruptedIOException e) {
+-            setErrorState(ErrorState.CLOSE_NOW);
++            setErrorState(ErrorState.CLOSE_NOW, e);
+         } catch (Throwable t) {
+             ExceptionUtils.handleThrowable(t);
+             // 500 - Internal Server Error
+             response.setStatus(500);
+-            setErrorState(ErrorState.CLOSE_NOW);
++            setErrorState(ErrorState.CLOSE_NOW, t);
+             getAdapter().log(request, response, 0);
+             log.error(sm.getString("http11processor.request.process"), t);
+         }
+@@ -239,7 +239,7 @@ public class Http11Nio2Processor extends AbstractHttp11Processor<Nio2Channel> {
+         if (endpoint.isPaused()) {
+             // 503 - Service unavailable
+             response.setStatus(503);
+-            setErrorState(ErrorState.CLOSE_CLEAN);
++            setErrorState(ErrorState.CLOSE_CLEAN, null);
+             getAdapter().log(request, response, 0);
+         } else {
+             return true;
+@@ -285,7 +285,7 @@ public class Http11Nio2Processor extends AbstractHttp11Processor<Nio2Channel> {
+                 if (log.isDebugEnabled()) {
+                     log.debug(sm.getString("http11processor.sendfile.error"));
+                 }
+-                setErrorState(ErrorState.CLOSE_NOW);
++                setErrorState(ErrorState.CLOSE_NOW, null);
+             }
+             return true;
+         }
+
+==================================================
+AbstractProcessor.java
+index 2e16431d9f..fc7c5bc991 100644
+--- a/java/org/apache/coyote/http11/Http11NioProcessor.java
++++ b/java/org/apache/coyote/http11/Http11NioProcessor.java
+@@ -103,7 +103,7 @@ public class Http11NioProcessor extends AbstractHttp11Processor<NioChannel> {
+         try {
+             rp.setStage(org.apache.coyote.Constants.STAGE_SERVICE);
+             if (!getAdapter().event(request, response, status)) {
+-                setErrorState(ErrorState.CLOSE_NOW);
++                setErrorState(ErrorState.CLOSE_NOW, null);
+             }
+             if (!getErrorState().isError()) {
+                 if (attach != null) {
+@@ -126,12 +126,12 @@ public class Http11NioProcessor extends AbstractHttp11Processor<NioChannel> {
+                 }
+             }
+         } catch (InterruptedIOException e) {
+-            setErrorState(ErrorState.CLOSE_NOW);
++            setErrorState(ErrorState.CLOSE_NOW, e);
+         } catch (Throwable t) {
+             ExceptionUtils.handleThrowable(t);
+             // 500 - Internal Server Error
+             response.setStatus(500);
+-            setErrorState(ErrorState.CLOSE_NOW);
++            setErrorState(ErrorState.CLOSE_NOW, t);
+             log.error(sm.getString("http11processor.request.process"), t);
+             getAdapter().log(request, response, 0);
+         }
+@@ -236,7 +236,7 @@ public class Http11NioProcessor extends AbstractHttp11Processor<NioChannel> {
+         if (endpoint.isPaused()) {
+             // 503 - Service unavailable
+             response.setStatus(503);
+-            setErrorState(ErrorState.CLOSE_CLEAN);
++            setErrorState(ErrorState.CLOSE_CLEAN, null);
+             getAdapter().log(request, response, 0);
+         } else {
+             return true;
+@@ -290,7 +290,7 @@ public class Http11NioProcessor extends AbstractHttp11Processor<NioChannel> {
+                 if (log.isDebugEnabled()) {
+                     log.debug(sm.getString("http11processor.sendfile.error"));
+                 }
+-                setErrorState(ErrorState.CLOSE_NOW);
++                setErrorState(ErrorState.CLOSE_NOW, null);
+             }
+             return true;
+         }
+
+==================================================
+SpdyProcessor.java
+index 2c5e4ee6c1..9419243ad6 100644
+--- a/java/org/apache/coyote/http11/upgrade/AbstractProcessor.java
++++ b/java/org/apache/coyote/http11/upgrade/AbstractProcessor.java
+@@ -149,6 +149,11 @@ public abstract class AbstractProcessor<S>
+         return null;
+     }
+ 
++    @Override
++    public void errorDispatch() {
++        // NO-OP
++    }
++
+     @Override
+     public final SocketState asyncPostProcess() {
+         return null;
+
+==================================================
+NioChannel.java
+index 43e6dce35a..1b559f399b 100644
+--- a/java/org/apache/coyote/spdy/SpdyProcessor.java
++++ b/java/org/apache/coyote/spdy/SpdyProcessor.java
+@@ -160,7 +160,7 @@ public class SpdyProcessor<S> extends AbstractProcessor<S> implements Runnable {
+             rp.setStage(org.apache.coyote.Constants.STAGE_SERVICE);
+             getAdapter().service(request, response);
+         } catch (InterruptedIOException e) {
+-            setErrorState(ErrorState.CLOSE_NOW);
++            setErrorState(ErrorState.CLOSE_NOW, e);
+         } catch (Throwable t) {
+             ExceptionUtils.handleThrowable(t);
+             // log.error(sm.getString("ajpprocessor.request.process"), t);
+@@ -169,7 +169,7 @@ public class SpdyProcessor<S> extends AbstractProcessor<S> implements Runnable {
+             t.printStackTrace();
+             response.setStatus(500);
+             getAdapter().log(request, response, 0);
+-            setErrorState(ErrorState.CLOSE_NOW);
++            setErrorState(ErrorState.CLOSE_NOW, t);
+         }
+ 
+         // TODO: async, etc ( detached mode - use a special light protocol)
+@@ -180,7 +180,7 @@ public class SpdyProcessor<S> extends AbstractProcessor<S> implements Runnable {
+                 finish();
+             } catch (Throwable t) {
+                 ExceptionUtils.handleThrowable(t);
+-                setErrorState(ErrorState.CLOSE_NOW);
++                setErrorState(ErrorState.CLOSE_NOW, t);
+             }
+         }
+ 
+@@ -251,7 +251,7 @@ public class SpdyProcessor<S> extends AbstractProcessor<S> implements Runnable {
+         case DISABLE_SWALLOW_INPUT: {
+             // TODO: Do not swallow request input but
+             // make sure we are closing the connection
+-            setErrorState(ErrorState.CLOSE_CLEAN);
++            setErrorState(ErrorState.CLOSE_CLEAN, null);
+             break;
+         }
+         case CLOSE: {
+@@ -414,7 +414,7 @@ public class SpdyProcessor<S> extends AbstractProcessor<S> implements Runnable {
+             break;
+         }
+         case CLOSE_NOW: {
+-            setErrorState(ErrorState.CLOSE_NOW);
++            setErrorState(ErrorState.CLOSE_NOW, null);
+             break;
+         }
+         default: {
+
+==================================================
+SecureNioChannel.java
+index 4e31ea1c0e..655b64cd5b 100644
+--- a/java/org/apache/tomcat/util/net/NioChannel.java
++++ b/java/org/apache/tomcat/util/net/NioChannel.java
+@@ -25,6 +25,7 @@ import java.nio.channels.SocketChannel;
+ 
+ import org.apache.tomcat.util.net.NioEndpoint.Poller;
+ import org.apache.tomcat.util.net.SecureNioChannel.ApplicationBufferHandler;
++import org.apache.tomcat.util.res.StringManager;
+ 
+ /**
+  *
+@@ -36,6 +37,9 @@ import org.apache.tomcat.util.net.SecureNioChannel.ApplicationBufferHandler;
+  */
+ public class NioChannel implements ByteChannel {
+ 
++    protected static final StringManager sm =
++            StringManager.getManager("org.apache.tomcat.util.net.res");
++
+     protected static ByteBuffer emptyBuf = ByteBuffer.allocate(0);
+ 
+     protected SocketChannel sc = null;
+@@ -119,6 +123,7 @@ public class NioChannel implements ByteChannel {
+      */
+     @Override
+     public int write(ByteBuffer src) throws IOException {
++        checkInterruptStatus();
+         return sc.write(src);
+     }
+ 
+@@ -211,4 +216,19 @@ public class NioChannel implements ByteChannel {
+     }
+ 
+ 
++    /**
++     * This method should be used to check the interrupt status before
++     * attempting a write.
++     *
++     * If a thread has been interrupted and the interrupt has not been cleared
++     * then an attempt to write to the socket will fail. When this happens the
++     * socket is removed from the poller without the socket being selected. This
++     * results in a connection limit leak for NIO as the endpoint expects the
++     * socket to be selected even in error conditions.
++     */
++    protected void checkInterruptStatus() throws IOException {
++        if (Thread.interrupted()) {
++            throw new IOException(sm.getString("channel.nio.interrupted"));
++        }
++    }
+ }
+
+==================================================
+SocketStatus.java
+index 42f18032ce..00ee8cbde5 100644
+--- a/java/org/apache/tomcat/util/net/SecureNioChannel.java
++++ b/java/org/apache/tomcat/util/net/SecureNioChannel.java
+@@ -29,8 +29,6 @@ import javax.net.ssl.SSLEngineResult;
+ import javax.net.ssl.SSLEngineResult.HandshakeStatus;
+ import javax.net.ssl.SSLEngineResult.Status;
+ 
+-import org.apache.tomcat.util.res.StringManager;
+-
+ /**
+  *
+  * Implementation of a secure socket channel
+@@ -39,8 +37,6 @@ import org.apache.tomcat.util.res.StringManager;
+ 
+ public class SecureNioChannel extends NioChannel  {
+ 
+-    protected static final StringManager sm = StringManager.getManager("org.apache.tomcat.util.net.res");
+-
+     protected ByteBuffer netInBuffer;
+     protected ByteBuffer netOutBuffer;
+ 
+@@ -475,6 +471,7 @@ public class SecureNioChannel extends NioChannel  {
+      */
+     @Override
+     public int write(ByteBuffer src) throws IOException {
++        checkInterruptStatus();
+         if ( src == this.netOutBuffer ) {
+             //we can get here through a recursive call
+             //by using the NioBlockingSelector
+
+==================================================

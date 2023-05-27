@@ -1,0 +1,207 @@
+2880cc44e16d1c3d47b74f6089cc9509d90a2b6d
+==================================================
+Re-factor Valves to use LifecycleMBeanBase
+==================================================
+Mark Emlyn
+==================================================
+Tue May 4 10:59:52 2010 +0000
+==================================================
+ContainerBase.java
+Re-factor Valves to use LifecycleMBeanBase
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@940802 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+StandardPipeline.java
+index d6dff03e9b..83d7391955 100644
+--- a/java/org/apache/catalina/core/ContainerBase.java
++++ b/java/org/apache/catalina/core/ContainerBase.java
+@@ -1089,6 +1089,11 @@ public abstract class ContainerBase extends LifecycleBase
+     @Override
+     protected void destroyInternal() throws LifecycleException {
+ 
++        // Stop the Valves in our pipeline (including the basic), if any
++        if (pipeline instanceof Lifecycle) {
++            ((Lifecycle) pipeline).destroy();
++        }
++
+         // Remove children now this container is being destroyed
+         for (Container child : findChildren()) {
+             child.destroy();
+
+==================================================
+StandardWrapperValve.java
+index 7fdc3bf0a4..d1af28befb 100644
+--- a/java/org/apache/catalina/core/StandardPipeline.java
++++ b/java/org/apache/catalina/core/StandardPipeline.java
+@@ -35,7 +35,6 @@ import org.apache.catalina.valves.ValveBase;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.ExceptionUtils;
+-import org.apache.tomcat.util.modeler.Registry;
+ 
+ 
+ /**
+@@ -181,7 +180,6 @@ public class StandardPipeline extends LifecycleBase
+         while (current != null) {
+             if (current instanceof Lifecycle)
+                 ((Lifecycle) current).start();
+-            registerValve(current);
+         	current = current.getNext();
+         }
+ 
+@@ -209,7 +207,6 @@ public class StandardPipeline extends LifecycleBase
+         while (current != null) {
+             if (current instanceof Lifecycle)
+                 ((Lifecycle) current).stop();
+-            unregisterValve(current);
+         	current = current.getNext();
+         }
+     }
+@@ -217,7 +214,10 @@ public class StandardPipeline extends LifecycleBase
+     
+     @Override
+     protected void destroyInternal() {
+-        // NOOP
++        Valve[] valves = getValves();
++        for (Valve valve : valves) {
++            removeValve(valve);
++        }
+     }
+ 
+     
+@@ -233,55 +233,7 @@ public class StandardPipeline extends LifecycleBase
+     }
+     
+     
+-    private void registerValve(Valve valve) {
+-
+-        if( valve instanceof ValveBase &&
+-                ((ValveBase)valve).getObjectName()==null ) {
+-            try {
+-                
+-                String domain=((ContainerBase)container).getDomain();
+-                if( container instanceof StandardContext ) {
+-                    domain=((StandardContext)container).getEngineName();
+-                }
+-                if( container instanceof StandardWrapper) {
+-                    Container ctx=((StandardWrapper)container).getParent();
+-                    domain=((StandardContext)ctx).getEngineName();
+-                }
+-                ObjectName vname=((ValveBase)valve).createObjectName(
+-                        domain,
+-                        ((ContainerBase)container).getJmxName());
+-                if( vname != null ) {
+-                    ((ValveBase)valve).setObjectName(vname);
+-                    Registry.getRegistry(null, null).registerComponent
+-                        (valve, vname, valve.getClass().getName());
+-                    ((ValveBase)valve).setController
+-                        (((ContainerBase)container).getJmxName());
+-                }
+-            } catch( Throwable t ) {
+-                log.info( "Can't register valve " + valve , t );
+-            }
+-        }
+-    }
+     
+-    private void unregisterValve(Valve valve) {
+-        if( valve instanceof ValveBase ) {
+-            try {
+-                ValveBase vb=(ValveBase)valve;
+-                if( vb.getController()!=null &&
+-                        vb.getController() == 
+-                        ((ContainerBase)container).getJmxName() ) {
+-                    
+-                    ObjectName vname=vb.getObjectName();
+-                    Registry.getRegistry(null, null).getMBeanServer()
+-                        .unregisterMBean(vname);
+-                    ((ValveBase)valve).setObjectName(null);
+-                }
+-            } catch( Throwable t ) {
+-                log.info( "Can't unregister valve " + valve , t );
+-            }
+-        }
+-    }    
+-
+     // ------------------------------------------------------- Pipeline Methods
+ 
+ 
+@@ -346,8 +298,6 @@ public class StandardPipeline extends LifecycleBase
+                 log.error("StandardPipeline.setBasic: start", e);
+                 return;
+             }
+-            // Register the newly added valve
+-            registerValve(valve);
+         }
+ 
+         // Update the pipeline
+@@ -399,8 +349,6 @@ public class StandardPipeline extends LifecycleBase
+                     log.error("StandardPipeline.addValve: start: ", e);
+                 }
+             }
+-            // Register the newly added valve
+-            registerValve(valve);
+         }
+ 
+         // Add this Valve to the set associated with this Pipeline
+@@ -501,10 +449,13 @@ public class StandardPipeline extends LifecycleBase
+                     log.error("StandardPipeline.removeValve: stop: ", e);
+                 }
+             }
+-            // Unregister the removed valve
+-            unregisterValve(valve);
+         }
+-    
++        try {
++            ((Lifecycle) valve).destroy();
++        } catch (LifecycleException e) {
++            log.error("StandardPipeline.removeValve: destroy: ", e);
++        }
++        
+         container.fireContainerEvent(Container.REMOVE_VALVE_EVENT, valve);
+     }
+ 
+
+==================================================
+ValveBase.java
+index 991e39ec55..e847dc8847 100644
+--- a/java/org/apache/catalina/core/StandardWrapperValve.java
++++ b/java/org/apache/catalina/core/StandardWrapperValve.java
+@@ -21,8 +21,6 @@ package org.apache.catalina.core;
+ 
+ import java.io.IOException;
+ 
+-import javax.management.MalformedObjectNameException;
+-import javax.management.ObjectName;
+ import javax.servlet.DispatcherType;
+ import javax.servlet.Servlet;
+ import javax.servlet.ServletException;
+@@ -31,6 +29,7 @@ import javax.servlet.http.HttpServletResponse;
+ 
+ import org.apache.catalina.Context;
+ import org.apache.catalina.Globals;
++import org.apache.catalina.LifecycleException;
+ import org.apache.catalina.comet.CometEvent;
+ import org.apache.catalina.comet.CometProcessor;
+ import org.apache.catalina.connector.ClientAbortException;
+@@ -570,13 +569,9 @@ final class StandardWrapperValve
+     public void setErrorCount(int errorCount) {
+         this.errorCount = errorCount;
+     }
+-
+-    // Don't register in JMX
+-
++    
+     @Override
+-    public ObjectName createObjectName(String domain, ObjectName parent)
+-            throws MalformedObjectNameException
+-    {
+-        return null;
++    protected void initInternal() throws LifecycleException {
++        // NOOP - Don't register this Valve in JMX
+     }
+ }
+
+==================================================

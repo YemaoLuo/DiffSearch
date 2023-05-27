@@ -1,0 +1,271 @@
+b9c7f748872be38b27324fc5e676d67a9a9651c0
+==================================================
+SPNEGP part 3 - the final part for 7.0.12
+==================================================
+Mark Emlyn
+==================================================
+Fri Apr 1 00:34:45 2011 +0000
+==================================================
+SpnegoAuthenticator.java
+SPNEGP part 3 - the final part for 7.0.12
+Integrate with JNDI realm so delegated credentials are used by default.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1087524 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+JNDIRealm.java
+index 8dc05faac4..e862864ba5 100644
+--- a/java/org/apache/catalina/authenticator/SpnegoAuthenticator.java
++++ b/java/org/apache/catalina/authenticator/SpnegoAuthenticator.java
+@@ -46,24 +46,6 @@ import org.ietf.jgss.Oid;
+  * multiple components. If the configuration is invalid, the error messages are
+  * often cryptic although a Google search will usually point you in the right
+  * direction.
+- * <p>
+- * TODO:
+- * <ul>
+- * <li>Add support for delegating credentials? Need this if we want to
+- *     authenticate to a realm as the user. This is likely to result in a fair
+- *     amount of internal refactoring.</li>
+- * </ul>
+- * <p>
+- * TBDs:
+- * <ul>
+- * <li>Does the domain name have to be in upper case?</li>
+- * <li>Does the SPN have to start with HTTP/...?</li>
+- * <li>Can a port number be appended to the end of the host in the SPN?</li>
+- * <li>Can the domain be left off the user in the ktpass command?</li>
+- * <li>What are the limitations on the account that Tomcat can run as? SPN
+- *     associated account works, domain admin works, local admin doesn't
+- *     work</li>
+- * </ul>
+  */
+ public class SpnegoAuthenticator extends AuthenticatorBase {
+ 
+
+==================================================
+RealmBase.java
+index 430ad48111..a65802af40 100644
+--- a/java/org/apache/catalina/realm/JNDIRealm.java
++++ b/java/org/apache/catalina/realm/JNDIRealm.java
+@@ -56,6 +56,7 @@ import org.apache.catalina.LifecycleException;
+ import org.apache.catalina.util.Base64;
+ import org.apache.tomcat.util.buf.ByteChunk;
+ import org.apache.tomcat.util.buf.CharChunk;
++import org.ietf.jgss.GSSCredential;
+ 
+ /**
+  * <p>Implementation of <strong>Realm</strong> that works with a directory
+@@ -415,6 +416,14 @@ public class JNDIRealm extends RealmBase {
+      */
+     protected int timeLimit = 0;
+ 
++    
++    /**
++     * Should delegated credentials from the SPNEGO authenticator be used if
++     * available
++     */
++    protected boolean useDelegatedCredential = true;
++
++
+     // ------------------------------------------------------------- Properties
+ 
+     /**
+@@ -950,6 +959,15 @@ public class JNDIRealm extends RealmBase {
+     }
+ 
+ 
++    
++    public boolean isUseDelegatedCredential() {
++        return useDelegatedCredential;
++    }
++
++    public void setUseDelegatedCredential(boolean useDelegatedCredential) {
++        this.useDelegatedCredential = useDelegatedCredential;
++    }
++
+     /**
+      * Return descriptive information about this Realm implementation and
+      * the corresponding version number, in the format
+@@ -1935,6 +1953,12 @@ public class JNDIRealm extends RealmBase {
+      */
+     @Override
+     protected Principal getPrincipal(String username) {
++        return getPrincipal(username, null);
++    }
++    
++    @Override
++    protected Principal getPrincipal(String username,
++            GSSCredential gssCredential) {
+ 
+         DirContext context = null;
+         Principal principal = null;
+@@ -1949,7 +1973,7 @@ public class JNDIRealm extends RealmBase {
+             try {
+ 
+                 // Authenticate the specified username if possible
+-                principal = getPrincipal(context, username);
++                principal = getPrincipal(context, username, gssCredential);
+ 
+             } catch (CommunicationException e) {
+ 
+@@ -1964,7 +1988,7 @@ public class JNDIRealm extends RealmBase {
+                 context = open();
+ 
+                 // Try the authentication again.
+-                principal = getPrincipal(context, username);
++                principal = getPrincipal(context, username, gssCredential);
+ 
+             } catch (ServiceUnavailableException e) {
+ 
+@@ -1979,7 +2003,7 @@ public class JNDIRealm extends RealmBase {
+                 context = open();
+ 
+                 // Try the authentication again.
+-                principal = getPrincipal(context, username);
++                principal = getPrincipal(context, username, gssCredential);
+ 
+             }
+ 
+@@ -2012,14 +2036,52 @@ public class JNDIRealm extends RealmBase {
+      * Return the Principal associated with the given user name.
+      */
+     protected synchronized Principal getPrincipal(DirContext context,
+-                                                  String username)
++            String username, GSSCredential gssCredential)
+         throws NamingException {
+ 
+-        User user = getUser(context, username);
++        User user = null;
++        List<String> roles = null;
++
++        try {
++            if (gssCredential != null && isUseDelegatedCredential()) {
++                // Set up context
++                context.addToEnvironment(
++                        Context.SECURITY_AUTHENTICATION, "GSSAPI");
++                context.addToEnvironment(
++                        "javax.security.sasl.server.authentication", "true");
++                context.addToEnvironment(
++                        "javax.security.sasl.qop", "auth-conf");
++                // Note: Subject already set in SPNEGO authenticator so no need
++                //       for Subject.doAs() here
++            }
++            user = getUser(context, username);
++            if (user != null) {
++                roles = getRoles(context, user);
++            }
++        } finally {
++            try {
++                context.removeFromEnvironment(
++                        Context.SECURITY_AUTHENTICATION);
++            } catch (NamingException e) {
++                // Ignore
++            }
++            try {
++                context.removeFromEnvironment(
++                        "javax.security.sasl.server.authentication");
++            } catch (NamingException e) {
++                // Ignore
++            }
++            try {
++                context.removeFromEnvironment(
++                        "javax.security.sasl.qop");
++            } catch (NamingException e) {
++                // Ignore
++            }
++        }
+ 
+         if (user != null) {
+             return new GenericPrincipal(user.getUserName(), user.getPassword(),
+-                    getRoles(context, user));
++                    roles, null, null, gssCredential);
+         }
+         
+         return null;
+@@ -2303,45 +2365,45 @@ public class JNDIRealm extends RealmBase {
+     }
+ 
+ 
+-     // ------------------------------------------------------ Private Classes
+-    
+-     /**
+-      * A protected class representing a User
+-      */
+-     protected static class User {
++    // ------------------------------------------------------ Private Classes
++
++    /**
++     * A protected class representing a User
++     */
++    protected static class User {
+          
+-         private final String username;
+-         private final String dn;
+-         private final String password;
+-         private final List<String> roles;
+-
+-         public User(String username, String dn, String password,
+-                 List<String> roles) {
+-             this.username = username;
+-             this.dn = dn;
+-             this.password = password;
+-             if (roles == null) {
+-                 this.roles = Collections.emptyList();
+-             } else {
+-                 this.roles = Collections.unmodifiableList(roles);
+-             }
+-         }
++        private final String username;
++        private final String dn;
++        private final String password;
++        private final List<String> roles;
++
++        public User(String username, String dn, String password,
++                List<String> roles) {
++            this.username = username;
++            this.dn = dn;
++            this.password = password;
++            if (roles == null) {
++                this.roles = Collections.emptyList();
++            } else {
++                this.roles = Collections.unmodifiableList(roles);
++            }
++        }
+     
+-         public String getUserName() {
+-             return username;
+-         }
+-         
+-         public String getDN() {
+-             return dn;
+-         }
++        public String getUserName() {
++            return username;
++        }
+          
+-         public String getPassword() {
+-             return password;
+-         }
++        public String getDN() {
++            return dn;
++        }
++        
++        public String getPassword() {
++            return password;
++        }
+          
+-         public List<String> getRoles() {
+-             return roles;
+-         }
+-     }
++        public List<String> getRoles() {
++            return roles;
++        }
++    }
+ }
+ 
+
+==================================================

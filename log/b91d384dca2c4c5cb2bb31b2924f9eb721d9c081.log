@@ -1,0 +1,333 @@
+b91d384dca2c4c5cb2bb31b2924f9eb721d9c081
+==================================================
+Update configurations options, this new feature allows a specific <Context> to overwrite what cluster manager is used by specifying a <Manager> element inside the context element and the cluster will be notified of it.
+==================================================
+Filip Hanik
+==================================================
+Fri Sep 29 16:32:32 2006 +0000
+==================================================
+Cluster.java
+index 6d3d9cd716..50caa85c03 100644
+--- a/conf/server.xml
++++ b/conf/server.xml
+@@ -192,11 +192,11 @@
+         -->
+         
+         <!--
+-        <Cluster className="org.apache.catalina.ha.tcp.SimpleTcpCluster"
+-	         managerClassName="org.apache.catalina.cluster.session.DeltaManager"
+-                 expireSessionsOnShutdown="false"
+-                 useDirtyFlag="true"
+-                 notifyListenersOnReplication="true">
++        <Cluster className="org.apache.catalina.ha.tcp.SimpleTcpCluster">
++          <Manager className="org.apache.catalina.ha.session.DeltaManager"
++                   expireSessionsOnShutdown="false"
++                   notifyListenersOnReplication="true"/>
++        
+           <Channel className="org.apache.catalina.tribes.group.GroupChannel">
+             <Membership className="org.apache.catalina.tribes.membership.McastService"
+                         mcastAddr="228.0.0.4"
+@@ -215,7 +215,7 @@
+             <Interceptor className="org.apache.catalina.tribes.group.interceptors.TcpFailureDetector"/>
+             <Interceptor className="org.apache.catalina.tribes.group.interceptors.MessageDispatch15Interceptor"/>
+             <Interceptor className="org.apache.catalina.tribes.group.interceptors.ThroughputInterceptor"/>
+-	  </Channel>
++          </Channel>
+ 
+           <Valve className="org.apache.catalina.ha.tcp.ReplicationValve"
+                  filter=".*\.gif;.*\.js;.*\.jpg;.*\.png;.*\.htm;.*\.html;.*\.css;.*\.txt;"/>
+
+==================================================
+StandardContext.java
+index bb4ef144a2..b860e01b48 100644
+--- a/java/org/apache/catalina/Cluster.java
++++ b/java/org/apache/catalina/Cluster.java
+@@ -100,6 +100,14 @@ public interface Cluster {
+      * associated
+      */
+     public Manager createManager(String name);
++    
++    /**
++     * Register a manager with the cluster. If the cluster is not responsible 
++     * for creating a manager, then the container will at least notify the 
++     * cluster that this mananger is participating in the cluster.
++     * @param manager Manager
++     */
++    public void registerManager(Manager manager);
+ 
+     // --------------------------------------------------------- Cluster Wide Deployments
+     
+
+==================================================
+ClusterManager.java
+index 4c77d82a34..3110f2c2c1 100644
+--- a/java/org/apache/catalina/core/StandardContext.java
++++ b/java/org/apache/catalina/core/StandardContext.java
+@@ -4193,6 +4193,10 @@ public class StandardContext
+         	} else {
+         		contextManager = new StandardManager();
+         	}
++        } else if ((getCluster() != null) && distributable) {
++            //let the cluster know that there is a context that is distributable
++            //and that it has its own manager
++            getCluster().registerManager(manager);
+         }
+         
+         
+
+==================================================
+ClusterRuleSet.java
+index 67e662d794..3f69cf13f6 100644
+--- a/java/org/apache/catalina/ha/ClusterManager.java
++++ b/java/org/apache/catalina/ha/ClusterManager.java
+@@ -107,4 +107,5 @@ public interface ClusterManager extends Manager {
+    
+    public boolean isNotifyListenersOnReplication();
+ 
++   public ClusterManager cloneFromTemplate();
+ }
+
+==================================================
+BackupManager.java
+index 1c23183ea1..dc94f7a204 100644
+--- a/java/org/apache/catalina/ha/ClusterRuleSet.java
++++ b/java/org/apache/catalina/ha/ClusterRuleSet.java
+@@ -85,7 +85,16 @@ public class ClusterRuleSet extends RuleSetBase {
+      */
+     public void addRuleInstances(Digester digester) {
+         //Cluster configuration start
++        digester.addObjectCreate(prefix + "Manager",
++                                 null, // MUST be specified in the element
++                                 "className");
++        digester.addSetProperties(prefix + "Manager");
++        digester.addSetNext(prefix + "Manager",
++                            "setManagerTemplate",
++                            "org.apache.catalina.ha.ClusterManager");
+         
++
++
+         digester.addObjectCreate(prefix + "Channel",
+                                  null, // MUST be specified in the element
+                                  "className");
+
+==================================================
+DeltaManager.java
+index fcaa1cf688..c360d74b20 100644
+--- a/java/org/apache/catalina/ha/session/BackupManager.java
++++ b/java/org/apache/catalina/ha/session/BackupManager.java
+@@ -19,16 +19,14 @@ import java.io.ByteArrayInputStream;
+ import java.io.IOException;
+ 
+ import org.apache.catalina.LifecycleException;
+-import org.apache.catalina.Loader;
+ import org.apache.catalina.Session;
+ import org.apache.catalina.ha.CatalinaCluster;
+ import org.apache.catalina.ha.ClusterManager;
+ import org.apache.catalina.ha.ClusterMessage;
+ import org.apache.catalina.session.StandardManager;
+-import org.apache.catalina.tribes.Member;
++import org.apache.catalina.tribes.Channel;
+ import org.apache.catalina.tribes.io.ReplicationStream;
+ import org.apache.catalina.tribes.tipis.LazyReplicatedMap;
+-import org.apache.catalina.tribes.Channel;
+ 
+ /**
+  *@author Filip Hanik
+@@ -267,5 +265,15 @@ public class BackupManager extends StandardManager implements ClusterManager
+     public String[] getInvalidatedSessions() {
+         return new String[0];
+     }
++    
++    public ClusterManager cloneFromTemplate() {
++        BackupManager result = new BackupManager();
++        result.mExpireSessionsOnShutdown = mExpireSessionsOnShutdown;
++        result.name = "Clone-from-"+name;
++        result.cluster = cluster;
++        result.notifyListenersOnReplication = notifyListenersOnReplication;
++        result.mapSendOptions = mapSendOptions;
++        return result;
++    }
+ 
+ }
+
+==================================================
+SimpleTcpReplicationManager.java
+index 545b637bc8..d5a2bc8d0f 100644
+--- a/java/org/apache/catalina/ha/session/DeltaManager.java
++++ b/java/org/apache/catalina/ha/session/DeltaManager.java
+@@ -43,6 +43,7 @@ import org.apache.catalina.tribes.Member;
+ import org.apache.catalina.tribes.io.ReplicationStream;
+ import org.apache.catalina.util.LifecycleSupport;
+ import org.apache.catalina.util.StringManager;
++import org.apache.catalina.ha.ClusterManager;
+ 
+ /**
+  * The DeltaManager manages replicated sessions by only replicating the deltas
+@@ -1496,4 +1497,23 @@ public class DeltaManager extends ClusterManagerBase{
+         cluster.send(newmsg, sender);
+     }
+ 
++    public ClusterManager cloneFromTemplate() {
++        DeltaManager result = new DeltaManager();
++        result.name = "Clone-from-"+name;
++        result.cluster = cluster;
++        result.replicationValve = replicationValve;
++        result.maxActiveSessions = maxActiveSessions;
++        result.expireSessionsOnShutdown = expireSessionsOnShutdown;
++        result.notifyListenersOnReplication = notifyListenersOnReplication;
++        result.notifySessionListenersOnReplication = notifySessionListenersOnReplication;
++        result.stateTransferTimeout = stateTransferTimeout;
++        result.sendAllSessions = sendAllSessions;
++        result.sendClusterDomainOnly = sendClusterDomainOnly ;
++        result.sendAllSessionsSize = sendAllSessionsSize;
++        result.sendAllSessionsWaitTime = sendAllSessionsWaitTime ; 
++        result.receiverQueue = receiverQueue ;
++        result.stateTimestampDrop = stateTimestampDrop ;
++        result.stateTransferCreateSendTime = stateTransferCreateSendTime; 
++        return result;
++    }
+ }
+
+==================================================
+SimpleTcpCluster.java
+index 6dfb769780..d5f83c3332 100644
+--- a/java/org/apache/catalina/ha/session/SimpleTcpReplicationManager.java
++++ b/java/org/apache/catalina/ha/session/SimpleTcpReplicationManager.java
+@@ -687,4 +687,8 @@ public class SimpleTcpReplicationManager extends StandardManager implements Clus
+         return cluster;
+     }
+ 
++    public ClusterManager cloneFromTemplate() {
++        throw new UnsupportedOperationException();
++    }
++
+ }
+
+==================================================
+MembershipListener.java
+index 3e6a58981a..4f9f8806ff 100644
+--- a/java/org/apache/catalina/ha/tcp/SimpleTcpCluster.java
++++ b/java/org/apache/catalina/ha/tcp/SimpleTcpCluster.java
+@@ -37,18 +37,17 @@ import org.apache.catalina.LifecycleListener;
+ import org.apache.catalina.Manager;
+ import org.apache.catalina.Valve;
+ import org.apache.catalina.ha.CatalinaCluster;
+-import org.apache.catalina.tribes.Channel;
+-import org.apache.catalina.tribes.ChannelListener;
+ import org.apache.catalina.ha.ClusterListener;
+ import org.apache.catalina.ha.ClusterManager;
+ import org.apache.catalina.ha.ClusterMessage;
+ import org.apache.catalina.ha.ClusterValve;
++import org.apache.catalina.ha.session.DeltaManager;
++import org.apache.catalina.ha.util.IDynamicProperty;
++import org.apache.catalina.tribes.Channel;
++import org.apache.catalina.tribes.ChannelListener;
+ import org.apache.catalina.tribes.Member;
+ import org.apache.catalina.tribes.MembershipListener;
+ import org.apache.catalina.tribes.group.GroupChannel;
+-
+-import org.apache.catalina.ha.session.DeltaManager;
+-import org.apache.catalina.ha.util.IDynamicProperty;
+ import org.apache.catalina.util.LifecycleSupport;
+ import org.apache.catalina.util.StringManager;
+ import org.apache.commons.logging.Log;
+@@ -147,8 +146,7 @@ public class SimpleTcpCluster
+      */
+     protected Map managers = new HashMap();
+ 
+-    private String managerClassName = "org.apache.catalina.ha.session.DeltaManager";
+-
++    protected ClusterManager managerTemplate = new DeltaManager();
+ 
+     private List valves = new ArrayList();
+ 
+@@ -252,14 +250,20 @@ public class SimpleTcpCluster
+                 this.notifyLifecycleListenerOnFailure);
+     }
+ 
++    /**
++     * @deprecated use getManagerTemplate().getClass().getName() instead.
++     * @return String
++     */
+     public String getManagerClassName() {
+-        if(managerClassName != null)
+-            return managerClassName;
+-        return (String)getProperty("manager.className");
++        return managerTemplate.getClass().getName();
+     }
+ 
++    /**
++     * @deprecated use nested &lt;Manager&gt; element inside the cluster config instead.
++     * @param managerClassName String
++     */
+     public void setManagerClassName(String managerClassName) {
+-        this.managerClassName = managerClassName;
++        log.warn("setManagerClassName is deprecated, use nested <Manager> element inside the <Cluster> element instead, this request will be ignored.");
+     }
+ 
+     /**
+@@ -337,6 +341,10 @@ public class SimpleTcpCluster
+         this.channel = channel;
+     }
+ 
++    public void setManagerTemplate(ClusterManager managerTemplate) {
++        this.managerTemplate = managerTemplate;
++    }
++
+     /**
+      * has members
+      */
+@@ -465,6 +473,10 @@ public class SimpleTcpCluster
+         return channel;
+     }
+ 
++    public ClusterManager getManagerTemplate() {
++        return managerTemplate;
++    }
++
+     /**
+      * Create new Manager without add to cluster (comes with start the manager)
+      * 
+@@ -477,27 +489,26 @@ public class SimpleTcpCluster
+     public synchronized Manager createManager(String name) {
+         if (log.isDebugEnabled()) log.debug("Creating ClusterManager for context " + name + " using class " + getManagerClassName());
+         Manager manager = null;
+-        ClassLoader oldCtxLoader = Thread.currentThread().getContextClassLoader();
+         try {
+-            Thread.currentThread().setContextClassLoader(SimpleTcpCluster.class.getClassLoader());
+-            manager = (Manager) getClass().getClassLoader().loadClass(getManagerClassName()).newInstance();
++            manager = managerTemplate.cloneFromTemplate();
+         } catch (Exception x) {
+-            log.error("Unable to load class for replication manager", x);
++            log.error("Unable to clone cluster manager, defaulting to org.apache.catalina.ha.session.DeltaManager", x);
+             manager = new org.apache.catalina.ha.session.DeltaManager();
+         } finally {
+-            Thread.currentThread().setContextClassLoader(oldCtxLoader);
+-            if(manager != null) {
+-                manager.setDistributable(true);
+-                if (manager instanceof ClusterManager) {
+-                    ClusterManager cmanager = (ClusterManager) manager ;
+-                    cmanager.setDefaultMode(true);
+-                    cmanager.setName(getManagerName(name,manager));
+-                    cmanager.setCluster(this);
+-                }
+-            }
++            if(manager != null) registerManager(manager);
+         }
+         return manager;
+     }
++    
++    public void registerManager(Manager manager) {
++        manager.setDistributable(true);
++        if (manager instanceof ClusterManager) {
++            ClusterManager cmanager = (ClusterManager) manager ;
++            cmanager.setDefaultMode(true);
++            cmanager.setName(getManagerName(((ClusterManager)manager).getName(),manager));
++            cmanager.setCluster(this);
++        }
++    }
+ 
+     /**
+      * remove an application form cluster replication bus
+
+==================================================

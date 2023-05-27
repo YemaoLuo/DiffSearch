@@ -1,0 +1,805 @@
+3037ad9b4c1c7dfb36e7149262b929960a42bd03
+==================================================
+Do the code generation tooling for context.xml files
+==================================================
+remm remm@apache.org
+==================================================
+Mon Jun 22 17:20:24 2020 +0200
+==================================================
+Catalina.java
+Do the code generation tooling for context.xml files
+
+Drop the hack that used the hash code to create variable names since it
+does not work, instead a list of objects used had to be kept. The names
+are more readable so it's not a bad move anyway.
+Using the generated code (beyond looking for a Tomcat embedded example)
+during load will be done only when using an explicit flag.
+I will document this tooling.
+Most likely some additional escaping and fixes are needed.
+
+
+==================================================
+ContextConfig.java
+index 0b23219fe5..272d4287d4 100644
+--- a/java/org/apache/catalina/startup/Catalina.java
++++ b/java/org/apache/catalina/startup/Catalina.java
+@@ -142,11 +142,17 @@ public class Catalina {
+ 
+ 
+     /**
+-     * Generate Tomcat embedded code from server.xml.
++     * Generate Tomcat embedded code from configuration files.
+      */
+     protected boolean generateCode = false;
+ 
+ 
++    /**
++     * Use generated code as a replacement for configuration files.
++     */
++    protected boolean useGeneratedCode = false;
++
++
+     // ----------------------------------------------------------- Constructors
+ 
+     public Catalina() {
+@@ -177,6 +183,26 @@ public class Catalina {
+     }
+ 
+ 
++    public boolean getGenerateCode() {
++        return this.generateCode;
++    }
++
++
++    public void setGenerateCode(boolean generateCode) {
++        this.generateCode = generateCode;
++    }
++
++
++    public boolean getUseGeneratedCode() {
++        return this.useGeneratedCode;
++    }
++
++
++    public void setUseGeneratedCode(boolean useGeneratedCode) {
++        this.useGeneratedCode = useGeneratedCode;
++    }
++
++
+     /**
+      * @return <code>true</code> if an exception should be thrown if an error
+      * occurs during server init
+@@ -272,6 +298,8 @@ public class Catalina {
+                 isConfig = true;
+             } else if (arg.equals("-generateCode")) {
+                 generateCode = true;
++            } else if (arg.equals("-useGeneratedCode")) {
++                useGeneratedCode = true;
+             } else if (arg.equals("-nonaming")) {
+                 setUseNaming(false);
+             } else if (arg.equals("-help")) {
+@@ -581,50 +609,49 @@ public class Catalina {
+         ConfigFileLoader.setSource(new CatalinaBaseConfigurationSource(Bootstrap.getCatalinaBaseFile(), getConfigFile()));
+         File file = configFile();
+ 
+-        try (ConfigurationSource.Resource resource = ConfigFileLoader.getSource().getServerXml()) {
+-            String serverXmlId = String.valueOf(resource.getLastModified());
+-            String serverXmlClassName = "catalina.ServerXml_" + serverXmlId;
+-            ServerXml serverXml = null;
++        ServerXml serverXml = null;
++        if (useGeneratedCode) {
++            String xmlClassName = "catalina.ServerXml";
+             try {
+-                serverXml = (ServerXml) Catalina.class.getClassLoader().loadClass(serverXmlClassName).newInstance();
+-            } catch (ClassNotFoundException e) {
++                serverXml = (ServerXml) Catalina.class.getClassLoader().loadClass(xmlClassName).newInstance();
++            } catch (Exception e) {
+                 // Ignore, no generated code found
+             }
+-            if (serverXml != null) {
+-                serverXml.load(this);
+-            } else {
++        }
++
++        if (serverXml != null) {
++            serverXml.load(this);
++        } else {
++            try (ConfigurationSource.Resource resource = ConfigFileLoader.getSource().getServerXml()) {
+                 // Create and execute our Digester
+                 Digester digester = createStartDigester();
+-
+                 InputStream inputStream = resource.getInputStream();
+                 InputSource inputSource = new InputSource(resource.getURI().toURL().toString());
+                 inputSource.setByteStream(inputStream);
+                 digester.push(this);
+                 if (generateCode) {
+                     digester.startGeneratingCode();
+-                    generateClassHeader(digester, String.valueOf(resource.getLastModified()));
++                    generateClassHeader(digester);
+                 }
+                 digester.parse(inputSource);
+                 if (generateCode) {
+                     generateClassFooter(digester);
+                     File generatedSourceFolder = new File(new File(Bootstrap.getCatalinaHomeFile(), "work"), "catalina");
+                     if (generatedSourceFolder.isDirectory() || generatedSourceFolder.mkdirs()) {
+-                        File generatedSourceFile = new File(generatedSourceFolder,
+-                                "ServerXml_" + serverXmlId + ".java");
+-                        if (!generatedSourceFile.exists()) {
+-                            try (FileWriter writer = new FileWriter(generatedSourceFile)) {
+-                                writer.write(digester.getGeneratedCode().toString());
+-                            }
++                        File generatedSourceFile = new File(generatedSourceFolder, "ServerXml.java");
++                        try (FileWriter writer = new FileWriter(generatedSourceFile)) {
++                            writer.write(digester.getGeneratedCode().toString());
+                         }
+                     }
++                    digester.endGeneratingCode();
+                 }
++            } catch (Exception e) {
++                log.warn(sm.getString("catalina.configFail", file.getAbsolutePath()), e);
++                if (file.exists() && !file.canRead()) {
++                    log.warn(sm.getString("catalina.incorrectPermissions"));
++                }
++                return;
+             }
+-        } catch (Exception e) {
+-            log.warn(sm.getString("catalina.configFail", file.getAbsolutePath()), e);
+-            if (file.exists() && !file.canRead()) {
+-                log.warn(sm.getString("catalina.incorrectPermissions"));
+-            }
+-            return;
+         }
+ 
+         getServer().setCatalina(this);
+@@ -695,9 +722,8 @@ public class Catalina {
+             return;
+         }
+ 
+-        long t2 = System.nanoTime();
+-        if(log.isInfoEnabled()) {
+-            log.info(sm.getString("catalina.startup", Long.valueOf((t2 - t1) / 1000000)));
++        if (log.isInfoEnabled()) {
++            log.info(sm.getString("catalina.startup", TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t1)));
+         }
+ 
+         // Register shutdown hook
+@@ -834,10 +860,10 @@ public class Catalina {
+     }
+ 
+ 
+-    protected void generateClassHeader(Digester digester, String time) {
++    protected void generateClassHeader(Digester digester) {
+         StringBuilder code = digester.getGeneratedCode();
+         code.append("package catalina;").append(System.lineSeparator());
+-        code.append("public class ServerXml_").append(time).append(" implements ");
++        code.append("public class ServerXml implements ");
+         code.append(ServerXml.class.getName().replace('$', '.')).append(" {").append(System.lineSeparator());
+         code.append("public void load(").append(Catalina.class.getName());
+         code.append(" ").append(digester.toVariableName(this)).append(") {").append(System.lineSeparator());
+
+==================================================
+ListenerCreateRule.java
+index 09eb1fd904..ffae86ec99 100644
+--- a/java/org/apache/catalina/startup/ContextConfig.java
++++ b/java/org/apache/catalina/startup/ContextConfig.java
+@@ -19,6 +19,7 @@ package org.apache.catalina.startup;
+ import java.io.File;
+ import java.io.FileInputStream;
+ import java.io.FileNotFoundException;
++import java.io.FileWriter;
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.net.MalformedURLException;
+@@ -442,6 +443,98 @@ public class ContextConfig implements LifecycleListener {
+     }
+ 
+ 
++    protected boolean getGenerateCode() {
++        Catalina catalina = Container.getService(context).getServer().getCatalina();
++        if (catalina != null) {
++            return catalina.getGenerateCode();
++        } else {
++            return false;
++        }
++    }
++
++
++    protected boolean getUseGeneratedCode() {
++        Catalina catalina = Container.getService(context).getServer().getCatalina();
++        if (catalina != null) {
++            return catalina.getUseGeneratedCode();
++        } else {
++            return false;
++        }
++    }
++
++
++    protected static String getContextXmlPackageName(Container container) {
++        StringBuffer result = new StringBuffer();
++        Container host = null;
++        Container engine = null;
++        while (container != null) {
++            if (container instanceof Host) {
++                host = container;
++            } else if (container instanceof Engine) {
++                engine = container;
++            }
++            container = container.getParent();
++        }
++        result.append("catalina");
++        if (engine != null) {
++            result.append('.');
++        }
++        if (engine != null) {
++            result.append(engine.getName());
++            if (host != null) {
++                result.append('.');
++            }
++        }
++        if (host != null) {
++            result.append(host.getName());
++        }
++        return result.toString();
++    }
++
++
++    protected static File getContextXmlJavaSource(String contextXmlPackageName, String contextXmlSimpleClassName) {
++        File generatedSourceFolder = new File(Bootstrap.getCatalinaHomeFile(), "work");
++        if (generatedSourceFolder.isDirectory() || generatedSourceFolder.mkdirs()) {
++            String path = contextXmlPackageName.replace('.', File.separatorChar);
++            File packageFolder = new File(generatedSourceFolder, path);
++            if (packageFolder.isDirectory() || packageFolder.mkdirs()) {
++                return new File(packageFolder, contextXmlSimpleClassName + ".java");
++            }
++        }
++        return null;
++    }
++
++
++    protected void generateClassHeader(Digester digester, String packageName, String resourceName) {
++        StringBuilder code = digester.getGeneratedCode();
++        code.append("package ").append(packageName).append(";").append(System.lineSeparator());
++        code.append("public class ").append(resourceName).append(" implements ");
++        code.append(ContextXml.class.getName().replace('$', '.'));
++        code.append(" {").append(System.lineSeparator());
++        code.append("public void load(");
++        code.append(Context.class.getName());
++        String contextArgument = digester.toVariableName(context);
++        code.append(" ").append(contextArgument).append(") {").append(System.lineSeparator());
++        // Create a new variable with the concrete type
++        digester.setKnown(context);
++        code.append(context.getClass().getName()).append(" ").append(digester.toVariableName(context));
++        code.append(" = (").append(context.getClass().getName()).append(") ").append(contextArgument);
++        code.append(";").append(System.lineSeparator());
++    }
++
++
++    protected void generateClassFooter(Digester digester) {
++        StringBuilder code = digester.getGeneratedCode();
++        code.append("}").append(System.lineSeparator());
++        code.append("}").append(System.lineSeparator());
++    }
++
++
++    public interface ContextXml {
++        public void load(Context context);
++    }
++
++
+     /**
+      * Process the default configuration file, if it exists.
+      * @param digester The digester that will be used for XML parsing
+@@ -450,6 +543,14 @@ public class ContextConfig implements LifecycleListener {
+ 
+         String defaultContextXml = null;
+ 
++        boolean generateCode = getGenerateCode();
++        boolean useGeneratedCode = getUseGeneratedCode();
++
++        String contextXmlPackageName = null;
++        String contextXmlSimpleClassName = null;
++        String contextXmlClassName = null;
++        File contextXmlJavaSource = null;
++
+         // Open the default context.xml file, if it exists
+         if (context instanceof StandardContext) {
+             defaultContextXml = ((StandardContext)context).getDefaultContextXml();
+@@ -459,30 +560,123 @@ public class ContextConfig implements LifecycleListener {
+             defaultContextXml = Constants.DefaultContextXml;
+         }
+ 
++        ContextXml contextXml = null;
++
+         if (!context.getOverride()) {
+-            try (ConfigurationSource.Resource contextXmlResource =
+-                    ConfigFileLoader.getSource().getResource(defaultContextXml)) {
+-                URL defaultContextUrl = contextXmlResource.getURI().toURL();
+-                processContextConfig(digester, defaultContextUrl, contextXmlResource.getInputStream());
+-            } catch (MalformedURLException e) {
+-                log.error(sm.getString("contextConfig.badUrl", defaultContextXml), e);
+-            } catch (IOException e) {
+-                // Not found
++
++            if (useGeneratedCode || generateCode) {
++                contextXmlPackageName = "catalina";
++                contextXmlSimpleClassName = "ContextXmlDefault";
++                contextXmlClassName = contextXmlPackageName + "." + contextXmlSimpleClassName;
++            }
++            if (useGeneratedCode) {
++                try {
++                    contextXml = (ContextXml) Catalina.class.getClassLoader().loadClass(contextXmlClassName).newInstance();
++                } catch (Exception e) {
++                    // Ignore, no generated code found
++                }
++            }
++            if (contextXml != null) {
++                contextXml.load(context);
++                contextXml = null;
++            } else {
++                try (ConfigurationSource.Resource contextXmlResource =
++                        ConfigFileLoader.getSource().getResource(defaultContextXml)) {
++                    if (generateCode) {
++                        contextXmlJavaSource = getContextXmlJavaSource(contextXmlPackageName, contextXmlSimpleClassName);
++                        digester.startGeneratingCode();
++                        generateClassHeader(digester, contextXmlPackageName, contextXmlSimpleClassName);
++                    }
++                    URL defaultContextUrl = contextXmlResource.getURI().toURL();
++                    processContextConfig(digester, defaultContextUrl, contextXmlResource.getInputStream());
++                    if (generateCode) {
++                        generateClassFooter(digester);
++                        try (FileWriter writer = new FileWriter(contextXmlJavaSource)) {
++                            writer.write(digester.getGeneratedCode().toString());
++                        }
++                        digester.endGeneratingCode();
++                    }
++                } catch (MalformedURLException e) {
++                    log.error(sm.getString("contextConfig.badUrl", defaultContextXml), e);
++                } catch (IOException e) {
++                    // Not found
++                }
+             }
+ 
+-            String hostContextFile = Container.getConfigPath(context, Constants.HostContextXml);
+-            try (ConfigurationSource.Resource contextXmlResource =
+-                    ConfigFileLoader.getSource().getResource(hostContextFile)) {
+-                URL defaultContextUrl = contextXmlResource.getURI().toURL();
+-                processContextConfig(digester, defaultContextUrl, contextXmlResource.getInputStream());
+-            } catch (MalformedURLException e) {
+-                log.error(sm.getString("contextConfig.badUrl", hostContextFile), e);
+-            } catch (IOException e) {
+-                // Not found
++            if (useGeneratedCode || generateCode) {
++                contextXmlPackageName = getContextXmlPackageName(context);
++                contextXmlSimpleClassName = "ContextXmlDefault";
++                contextXmlClassName = contextXmlPackageName + "." + contextXmlSimpleClassName;
++            }
++            if (useGeneratedCode) {
++                try {
++                    contextXml = (ContextXml) Catalina.class.getClassLoader().loadClass(contextXmlClassName).newInstance();
++                } catch (Exception e) {
++                    // Ignore, no generated code found
++                }
++            }
++            if (contextXml != null) {
++                contextXml.load(context);
++                contextXml = null;
++            } else {
++                String hostContextFile = Container.getConfigPath(context, Constants.HostContextXml);
++                try (ConfigurationSource.Resource contextXmlResource =
++                        ConfigFileLoader.getSource().getResource(hostContextFile)) {
++                    if (generateCode) {
++                        contextXmlJavaSource = getContextXmlJavaSource(contextXmlPackageName, contextXmlSimpleClassName);
++                        digester.startGeneratingCode();
++                        generateClassHeader(digester, contextXmlPackageName, contextXmlSimpleClassName);
++                    }
++                    URL defaultContextUrl = contextXmlResource.getURI().toURL();
++                    processContextConfig(digester, defaultContextUrl, contextXmlResource.getInputStream());
++                    if (generateCode) {
++                        generateClassFooter(digester);
++                        try (FileWriter writer = new FileWriter(contextXmlJavaSource)) {
++                            writer.write(digester.getGeneratedCode().toString());
++                        }
++                        digester.endGeneratingCode();
++                    }
++                } catch (MalformedURLException e) {
++                    log.error(sm.getString("contextConfig.badUrl", hostContextFile), e);
++                } catch (IOException e) {
++                    // Not found
++                }
+             }
+         }
++
+         if (context.getConfigFile() != null) {
+-            processContextConfig(digester, context.getConfigFile(), null);
++            if (useGeneratedCode || generateCode) {
++                contextXmlPackageName = getContextXmlPackageName(context);
++                contextXmlSimpleClassName = "ContextXml_" + context.getName().replace('/', '_').replace("-", "__");
++                contextXmlClassName = contextXmlPackageName + "." + contextXmlSimpleClassName;
++            }
++            if (useGeneratedCode) {
++                try {
++                    contextXml = (ContextXml) Catalina.class.getClassLoader().loadClass(contextXmlClassName).newInstance();
++                } catch (Exception e) {
++                    // Ignore, no generated code found
++                }
++            }
++            if (contextXml != null) {
++                contextXml.load(context);
++                contextXml = null;
++            } else {
++                if (generateCode) {
++                    contextXmlJavaSource = getContextXmlJavaSource(contextXmlPackageName, contextXmlSimpleClassName);
++                    digester.startGeneratingCode();
++                    generateClassHeader(digester, contextXmlPackageName, contextXmlSimpleClassName);
++                }
++                processContextConfig(digester, context.getConfigFile(), null);
++                if (generateCode) {
++                    generateClassFooter(digester);
++                    try (FileWriter writer = new FileWriter(contextXmlJavaSource)) {
++                        writer.write(digester.getGeneratedCode().toString());
++                    } catch (IOException e) {
++                        // Ignore
++                    }
++                    digester.endGeneratingCode();
++                }
++            }
+         }
+ 
+     }
+@@ -728,6 +922,7 @@ public class ContextConfig implements LifecycleListener {
+     protected synchronized void init() {
+         // Called from StandardContext.init()
+ 
++        // FIXME: Try to avoid creation of the parser if not needed due to code generation
+         Digester contextDigester = createContextDigester();
+         contextDigester.getParser();
+ 
+
+==================================================
+SetNextNamingRule.java
+index 4a63952224..9f1d5e1c10 100644
+--- a/java/org/apache/catalina/startup/ListenerCreateRule.java
++++ b/java/org/apache/catalina/startup/ListenerCreateRule.java
+@@ -56,14 +56,22 @@ public class ListenerCreateRule extends ObjectCreateRule {
+                 } else {
+                     log.info(sm.getString("listener.createFailed", className));
+                 }
+-                digester.push(new OptionalListener(className));
++                Object instance = new OptionalListener(className);
++                digester.push(instance);
++                StringBuilder code = digester.getGeneratedCode();
++                if (code != null) {
++                    code.append(OptionalListener.class.getName().replace('$', '.')).append(" ");
++                    code.append(digester.toVariableName(instance)).append(" = new ");
++                    code.append(OptionalListener.class.getName().replace('$', '.')).append("(\"").append(className).append("\");");
++                    code.append(System.lineSeparator());
++                }
+             }
+         } else {
+             super.begin(namespace, name, attributes);
+         }
+     }
+ 
+-    public class OptionalListener implements LifecycleListener {
++    public static class OptionalListener implements LifecycleListener {
+         protected final String className;
+         protected final HashMap<String, String> properties = new HashMap<>();
+         public OptionalListener(String className) {
+
+==================================================
+IntrospectionUtils.java
+index cf94b7ca9f..20d7e3c4c1 100644
+--- a/java/org/apache/catalina/startup/SetNextNamingRule.java
++++ b/java/org/apache/catalina/startup/SetNextNamingRule.java
+@@ -21,7 +21,6 @@ package org.apache.catalina.startup;
+ import org.apache.catalina.Context;
+ import org.apache.catalina.deploy.NamingResourcesImpl;
+ import org.apache.tomcat.util.IntrospectionUtils;
+-import org.apache.tomcat.util.descriptor.web.ResourceBase;
+ import org.apache.tomcat.util.digester.Rule;
+ 
+ 
+@@ -93,10 +92,12 @@ public class SetNextNamingRule extends Rule {
+         // Identify the objects to be used
+         Object child = digester.peek(0);
+         Object parent = digester.peek(1);
++        boolean context = false;
+ 
+         NamingResourcesImpl namingResources = null;
+         if (parent instanceof Context) {
+             namingResources = ((Context) parent).getNamingResources();
++            context = true;
+         } else {
+             namingResources = (NamingResourcesImpl) parent;
+         }
+@@ -107,8 +108,13 @@ public class SetNextNamingRule extends Rule {
+ 
+         StringBuilder code = digester.getGeneratedCode();
+         if (code != null) {
+-            code.append(digester.toVariableName(namingResources)).append(".").append(methodName).append("(");
+-            code.append(digester.toVariableName(child, ((ResourceBase) child).getInitialHashCode())).append(");");
++            if (context) {
++                code.append(digester.toVariableName(parent)).append(".getNamingResources()");
++            } else {
++                code.append(digester.toVariableName(namingResources));
++            }
++            code.append(".").append(methodName).append("(");
++            code.append(digester.toVariableName(child)).append(");");
+             code.append(System.lineSeparator());
+         }
+     }
+
+==================================================
+ContextEjb.java
+index 71ad86fa4c..78ab66fae8 100644
+--- a/java/org/apache/tomcat/util/IntrospectionUtils.java
++++ b/java/org/apache/tomcat/util/IntrospectionUtils.java
+@@ -74,7 +74,7 @@ public final class IntrospectionUtils {
+                         && "java.lang.String".equals(paramT[0].getName())) {
+                     item.invoke(o, new Object[]{value});
+                     if (actualMethod != null) {
+-                        actualMethod.append(item.getName()).append("(\"").append(value).append("\")");
++                        actualMethod.append(item.getName()).append("(\"").append(escape(value)).append("\")");
+                     }
+                     return true;
+                 }
+@@ -160,7 +160,7 @@ public final class IntrospectionUtils {
+             if (invokeSetProperty && (setPropertyMethodBool != null ||
+                     setPropertyMethodVoid != null)) {
+                 if (actualMethod != null) {
+-                    actualMethod.append("setProperty(\"").append(name).append("\", \"").append(value).append("\")");
++                    actualMethod.append("setProperty(\"").append(name).append("\", \"").append(escape(value)).append("\")");
+                 }
+                 Object params[] = new Object[2];
+                 params[0] = name;
+@@ -194,6 +194,33 @@ public final class IntrospectionUtils {
+         return false;
+     }
+ 
++    /**
++     * @param s
++     *            the input string
++     * @return escaped string, per Java rule
++     */
++    public static String escape(String s) {
++
++        if (s == null)
++            return "";
++
++        StringBuilder b = new StringBuilder();
++        for (int i = 0; i < s.length(); i++) {
++            char c = s.charAt(i);
++            if (c == '"')
++                b.append('\\').append('"');
++            else if (c == '\\')
++                b.append('\\').append('\\');
++            else if (c == '\n')
++                b.append('\\').append('n');
++            else if (c == '\r')
++                b.append('\\').append('r');
++            else
++                b.append(c);
++        }
++        return b.toString();
++    }
++
+     public static Object getProperty(Object o, String name) {
+         String getter = "get" + capitalize(name);
+         String isGetter = "is" + capitalize(name);
+
+==================================================
+ContextEnvironment.java
+index 8e2b177b75..a650afe7fd 100644
+--- a/java/org/apache/tomcat/util/descriptor/web/ContextEjb.java
++++ b/java/org/apache/tomcat/util/descriptor/web/ContextEjb.java
+@@ -30,14 +30,9 @@ public class ContextEjb extends ResourceBase {
+ 
+     private static final long serialVersionUID = 1L;
+ 
+-    public ContextEjb() {
+-        initialHashCode = hashCode();
+-    }
+-
+     // ------------------------------------------------------------- Properties
+ 
+ 
+-
+     /**
+      * The name of the EJB home implementation class.
+      */
+
+==================================================
+ContextHandler.java
+index b6069614f8..43d110c1e7 100644
+--- a/java/org/apache/tomcat/util/descriptor/web/ContextEnvironment.java
++++ b/java/org/apache/tomcat/util/descriptor/web/ContextEnvironment.java
+@@ -28,9 +28,6 @@ public class ContextEnvironment extends ResourceBase {
+ 
+     private static final long serialVersionUID = 1L;
+ 
+-    public ContextEnvironment() {
+-        initialHashCode = hashCode();
+-    }
+ 
+     // ------------------------------------------------------------- Properties
+ 
+
+==================================================
+ContextLocalEjb.java
+index 7b124aac95..c0ee25c865 100644
+--- a/java/org/apache/tomcat/util/descriptor/web/ContextHandler.java
++++ b/java/org/apache/tomcat/util/descriptor/web/ContextHandler.java
+@@ -34,10 +34,6 @@ public class ContextHandler extends ResourceBase {
+ 
+     private static final long serialVersionUID = 1L;
+ 
+-    public ContextHandler() {
+-        initialHashCode = hashCode();
+-    }
+-
+     // ------------------------------------------------------------- Properties
+ 
+ 
+
+==================================================
+ContextResource.java
+index ecfc1e3bf9..29e8d5e3e9 100644
+--- a/java/org/apache/tomcat/util/descriptor/web/ContextLocalEjb.java
++++ b/java/org/apache/tomcat/util/descriptor/web/ContextLocalEjb.java
+@@ -30,10 +30,6 @@ public class ContextLocalEjb extends ResourceBase {
+ 
+     private static final long serialVersionUID = 1L;
+ 
+-    public ContextLocalEjb() {
+-        initialHashCode = hashCode();
+-    }
+-
+     // ------------------------------------------------------------- Properties
+ 
+     /**
+
+==================================================
+ContextResourceEnvRef.java
+index b4115bde1f..dd3de3076d 100644
+--- a/java/org/apache/tomcat/util/descriptor/web/ContextResource.java
++++ b/java/org/apache/tomcat/util/descriptor/web/ContextResource.java
+@@ -30,10 +30,6 @@ public class ContextResource extends ResourceBase {
+ 
+     private static final long serialVersionUID = 1L;
+ 
+-    public ContextResource() {
+-        initialHashCode = hashCode();
+-    }
+-
+     // ------------------------------------------------------------- Properties
+ 
+ 
+
+==================================================
+ContextResourceLink.java
+index 81b6aa6839..ba3169c8d1 100644
+--- a/java/org/apache/tomcat/util/descriptor/web/ContextResourceEnvRef.java
++++ b/java/org/apache/tomcat/util/descriptor/web/ContextResourceEnvRef.java
+@@ -29,10 +29,6 @@ public class ContextResourceEnvRef extends ResourceBase {
+ 
+     private static final long serialVersionUID = 1L;
+ 
+-    public ContextResourceEnvRef() {
+-        initialHashCode = hashCode();
+-    }
+-
+     // ------------------------------------------------------------- Properties
+ 
+     /**
+
+==================================================
+ContextService.java
+index 6b88c07725..e50dcf9d7e 100644
+--- a/java/org/apache/tomcat/util/descriptor/web/ContextResourceLink.java
++++ b/java/org/apache/tomcat/util/descriptor/web/ContextResourceLink.java
+@@ -30,10 +30,6 @@ public class ContextResourceLink extends ResourceBase {
+ 
+     private static final long serialVersionUID = 1L;
+ 
+-    public ContextResourceLink() {
+-        initialHashCode = hashCode();
+-    }
+-
+     // ------------------------------------------------------------- Properties
+ 
+    /**
+
+==================================================
+MessageDestination.java
+index a8e2331e01..cefdc5633c 100644
+--- a/java/org/apache/tomcat/util/descriptor/web/ContextService.java
++++ b/java/org/apache/tomcat/util/descriptor/web/ContextService.java
+@@ -33,10 +33,6 @@ public class ContextService extends ResourceBase {
+ 
+     private static final long serialVersionUID = 1L;
+ 
+-    public ContextService() {
+-        initialHashCode = hashCode();
+-    }
+-
+     // ------------------------------------------------------------- Properties
+ 
+ 
+
+==================================================
+MessageDestinationRef.java
+index b4a97f2959..be9fcfbb4c 100644
+--- a/java/org/apache/tomcat/util/descriptor/web/MessageDestination.java
++++ b/java/org/apache/tomcat/util/descriptor/web/MessageDestination.java
+@@ -29,10 +29,6 @@ public class MessageDestination extends ResourceBase {
+ 
+     private static final long serialVersionUID = 1L;
+ 
+-    public MessageDestination() {
+-        initialHashCode = hashCode();
+-    }
+-
+     // ------------------------------------------------------------- Properties
+ 
+ 
+
+==================================================
+ResourceBase.java
+index be8b44fe7f..25d9f67674 100644
+--- a/java/org/apache/tomcat/util/descriptor/web/MessageDestinationRef.java
++++ b/java/org/apache/tomcat/util/descriptor/web/MessageDestinationRef.java
+@@ -29,10 +29,6 @@ public class MessageDestinationRef extends ResourceBase {
+ 
+     private static final long serialVersionUID = 1L;
+ 
+-    public MessageDestinationRef() {
+-        initialHashCode = hashCode();
+-    }
+-
+     // ------------------------------------------------------------- Properties
+ 
+ 
+
+==================================================
+CallMethodRule.java
+index e191b46167..37ec8fba97 100644
+--- a/java/org/apache/tomcat/util/descriptor/web/ResourceBase.java
++++ b/java/org/apache/tomcat/util/descriptor/web/ResourceBase.java
+@@ -95,16 +95,6 @@ public class ResourceBase implements Serializable, Injectable {
+     }
+ 
+ 
+-    /**
+-     * Store the initial hash code of the object, as the override
+-     * can mess some operations.
+-     */
+-    protected int initialHashCode = 0;
+-
+-    public int getInitialHashCode() {
+-        return initialHashCode;
+-    }
+-
+     /**
+      * Holder for our configured properties.
+      */
+
+==================================================
+Digester.java
+index 0d8c468027..83aaf57957 100644
+--- a/java/org/apache/tomcat/util/digester/CallMethodRule.java
++++ b/java/org/apache/tomcat/util/digester/CallMethodRule.java
+@@ -392,7 +392,11 @@ public class CallMethodRule extends Rule {
+                 if (i > 0) {
+                     code.append(",");
+                 }
+-                code.append(digester.toVariableName(paramValues[i]));
++                if (bodyText != null) {
++                    code.append("\"").append(bodyText).append("\"");
++                } else {
++                    code.append(digester.toVariableName(paramValues[i]));
++                }
+             }
+             code.append(");");
+             code.append(System.lineSeparator());
+
+==================================================

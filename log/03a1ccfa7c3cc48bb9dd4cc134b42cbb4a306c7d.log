@@ -1,0 +1,176 @@
+03a1ccfa7c3cc48bb9dd4cc134b42cbb4a306c7d
+==================================================
+Send WINDOW_UPDATE frames correctly when a DATA frame includes padding
+==================================================
+Mark Thomas
+==================================================
+Fri Aug 28 13:04:43 2020 +0100
+==================================================
+Http2AsyncUpgradeHandler.java
+Send WINDOW_UPDATE frames correctly when a DATA frame includes padding
+
+When a Stream was closed the window update frame was not sent for the
+connection. When zero length padding was used, an update frame was not
+sent. In both cases the result would be a smaller flow control window
+than intended.
+
+Bugs detected by Travis CI
+
+
+==================================================
+Http2Parser.java
+index 3d17d9800a..ff58a7e994 100644
+--- a/java/org/apache/coyote/http2/Http2AsyncUpgradeHandler.java
++++ b/java/org/apache/coyote/http2/Http2AsyncUpgradeHandler.java
+@@ -229,23 +229,26 @@ public class Http2AsyncUpgradeHandler extends Http2UpgradeHandler {
+     @Override
+     void writeWindowUpdate(Stream stream, int increment, boolean applicationInitiated)
+             throws IOException {
+-        if (!stream.canWrite()) {
+-            return;
+-        }
+         // Build window update frame for stream 0
+         byte[] frame = new byte[13];
+         ByteUtil.setThreeBytes(frame, 0,  4);
+         frame[3] = FrameType.WINDOW_UPDATE.getIdByte();
+         ByteUtil.set31Bits(frame, 9, increment);
+-        // Change stream Id
+-        byte[] frame2 = new byte[13];
+-        ByteUtil.setThreeBytes(frame2, 0,  4);
+-        frame2[3] = FrameType.WINDOW_UPDATE.getIdByte();
+-        ByteUtil.set31Bits(frame2, 9, increment);
+-        ByteUtil.set31Bits(frame2, 5, stream.getIdAsInt());
+-        socketWrapper.write(BlockingMode.SEMI_BLOCK, protocol.getWriteTimeout(),
+-                TimeUnit.MILLISECONDS, null, SocketWrapperBase.COMPLETE_WRITE, errorCompletion,
+-                ByteBuffer.wrap(frame), ByteBuffer.wrap(frame2));
++        if (stream.canWrite()) {
++            // Change stream Id
++            byte[] frame2 = new byte[13];
++            ByteUtil.setThreeBytes(frame2, 0,  4);
++            frame2[3] = FrameType.WINDOW_UPDATE.getIdByte();
++            ByteUtil.set31Bits(frame2, 9, increment);
++            ByteUtil.set31Bits(frame2, 5, stream.getIdAsInt());
++            socketWrapper.write(BlockingMode.SEMI_BLOCK, protocol.getWriteTimeout(),
++                    TimeUnit.MILLISECONDS, null, SocketWrapperBase.COMPLETE_WRITE, errorCompletion,
++                    ByteBuffer.wrap(frame), ByteBuffer.wrap(frame2));
++        } else {
++            socketWrapper.write(BlockingMode.SEMI_BLOCK, protocol.getWriteTimeout(),
++                    TimeUnit.MILLISECONDS, null, SocketWrapperBase.COMPLETE_WRITE, errorCompletion,
++                    ByteBuffer.wrap(frame));
++        }
+         handleAsyncException();
+     }
+ 
+
+==================================================
+Http2UpgradeHandler.java
+index fa828c93a6..6b2369bdfc 100644
+--- a/java/org/apache/coyote/http2/Http2Parser.java
++++ b/java/org/apache/coyote/http2/Http2Parser.java
+@@ -207,7 +207,7 @@ class Http2Parser {
+                 output.endRequestBodyFrame(streamId);
+             }
+         }
+-        if (padLength > 0) {
++        if (Flags.hasPadding(flags)) {
+             output.swallowedPadding(streamId, padLength);
+         }
+     }
+
+==================================================
+Http2TestBase.java
+index bb5e0386c7..99792dc98c 100644
+--- a/java/org/apache/coyote/http2/Http2UpgradeHandler.java
++++ b/java/org/apache/coyote/http2/Http2UpgradeHandler.java
+@@ -795,9 +795,6 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
+      */
+     void writeWindowUpdate(Stream stream, int increment, boolean applicationInitiated)
+             throws IOException {
+-        if (!stream.canWrite()) {
+-            return;
+-        }
+         synchronized (socketWrapper) {
+             // Build window update frame for stream 0
+             byte[] frame = new byte[13];
+@@ -805,17 +802,21 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
+             frame[3] = FrameType.WINDOW_UPDATE.getIdByte();
+             ByteUtil.set31Bits(frame, 9, increment);
+             socketWrapper.write(true, frame, 0, frame.length);
+-            // Change stream Id and re-use
+-            ByteUtil.set31Bits(frame, 5, stream.getIdAsInt());
+-            try {
+-                socketWrapper.write(true, frame, 0, frame.length);
+-                socketWrapper.flush(true);
+-            } catch (IOException ioe) {
+-                if (applicationInitiated) {
+-                    handleAppInitiatedIOException(ioe);
+-                } else {
+-                    throw ioe;
++            if  (stream.canWrite()) {
++                // Change stream Id and re-use
++                ByteUtil.set31Bits(frame, 5, stream.getIdAsInt());
++                try {
++                    socketWrapper.write(true, frame, 0, frame.length);
++                    socketWrapper.flush(true);
++                } catch (IOException ioe) {
++                    if (applicationInitiated) {
++                        handleAppInitiatedIOException(ioe);
++                    } else {
++                        throw ioe;
++                    }
+                 }
++            } else {
++                socketWrapper.flush(true);
+             }
+         }
+     }
+
+==================================================
+TestHttp2Section_6_1.java
+index 90785f35b9..167fd94c63 100644
+--- a/test/org/apache/coyote/http2/Http2TestBase.java
++++ b/test/org/apache/coyote/http2/Http2TestBase.java
+@@ -468,19 +468,35 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+ 
+ 
+     protected void readSimplePostResponse(boolean padding) throws Http2Exception, IOException {
+-        if (padding) {
+-            // Window updates for padding
+-            parser.readFrame(true);
+-            parser.readFrame(true);
+-        }
++        /*
++         * If there is padding there will always be a window update for the
++         * connection and, depending on timing, there may be an update for the
++         * stream. The Window updates for padding (if present) may appear at any
++         * time. The comments in the code below are only indicative of what the
++         * frames are likely to contain. Actual frame order with padding may be
++         * different.
++         */
++
+         // Connection window update after reading request body
+         parser.readFrame(true);
+         // Stream window update after reading request body
+         parser.readFrame(true);
+         // Headers
+         parser.readFrame(true);
+-        // Body
++        // Body (includes end of stream)
+         parser.readFrame(true);
++
++        if (padding) {
++            // Connection window update for padding
++            parser.readFrame(true);
++
++            // If EndOfStream has not been received then the stream window
++            // update must have been received so a further frame needs to be
++            // read for EndOfStream.
++            if (!output.getTrace().contains("EndOfStream")) {
++                parser.readFrame(true);
++            }
++        }
+     }
+ 
+ 
+
+==================================================

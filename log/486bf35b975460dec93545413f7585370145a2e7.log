@@ -1,0 +1,615 @@
+486bf35b975460dec93545413f7585370145a2e7
+==================================================
+Fix https://bz.apache.org/bugzilla/show_bug.cgi?id=59233
+==================================================
+Mark Thomas
+==================================================
+Thu Jun 23 19:11:56 2016 +0000
+==================================================
+AbstractEndpoint.java
+Fix https://bz.apache.org/bugzilla/show_bug.cgi?id=59233
+Add the ability to add TLS virtual hosts dynamically
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1749978 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AbstractJsseEndpoint.java
+index d534bd13ba..b50df15651 100644
+--- a/java/org/apache/tomcat/util/net/AbstractEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AbstractEndpoint.java
+@@ -22,9 +22,9 @@ import java.net.InetSocketAddress;
+ import java.util.ArrayList;
+ import java.util.HashMap;
+ import java.util.List;
+-import java.util.Map;
+ import java.util.Set;
+ import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ConcurrentMap;
+ import java.util.concurrent.Executor;
+ import java.util.concurrent.RejectedExecutionException;
+ import java.util.concurrent.TimeUnit;
+@@ -197,23 +197,48 @@ public abstract class AbstractEndpoint<S> {
+     }
+ 
+ 
+-    protected Map<String,SSLHostConfig> sslHostConfigs = new ConcurrentHashMap<>();
+-    public void addSslHostConfig(SSLHostConfig sslHostConfig) {
++    protected ConcurrentMap<String,SSLHostConfig> sslHostConfigs = new ConcurrentHashMap<>();
++    public void addSslHostConfig(SSLHostConfig sslHostConfig) throws IllegalArgumentException {
+         String key = sslHostConfig.getHostName();
+         if (key == null || key.length() == 0) {
+             throw new IllegalArgumentException(sm.getString("endpoint.noSslHostName"));
+         }
+-        SSLHostConfig duplicate = sslHostConfigs.put(key, sslHostConfig);
++        sslHostConfig.setConfigType(getSslConfigType());
++        if (bindState != BindState.UNBOUND) {
++            try {
++                createSSLContext(sslHostConfig);
++            } catch (Exception e) {
++                throw new IllegalArgumentException(e);
++            }
++        }
++        SSLHostConfig duplicate = sslHostConfigs.putIfAbsent(key, sslHostConfig);
+         if (duplicate != null) {
++            releaseSSLContext(sslHostConfig);
+             throw new IllegalArgumentException(sm.getString("endpoint.duplicateSslHostName", key));
+         }
+-        sslHostConfig.setConfigType(getSslConfigType());
+     }
+     public SSLHostConfig[] findSslHostConfigs() {
+         return sslHostConfigs.values().toArray(new SSLHostConfig[0]);
+     }
++
+     protected abstract SSLHostConfig.Type getSslConfigType();
+ 
++    /**
++     * Create the SSLContextfor the the given SSLHostConfig.
++     *
++     * @param sslHostConfig The SSLHostConfig for which the SSLContext should be
++     *                      created
++     */
++    protected abstract void createSSLContext(SSLHostConfig sslHostConfig) throws Exception;
++
++    /**
++     * Release the SSLContext, if any, associated with the SSLHostConfig.
++     *
++     * @param sslHostConfig The SSLHostConfig for which the SSLContext should be
++     *                      released
++     */
++    protected abstract void releaseSSLContext(SSLHostConfig sslHostConfig);
++
+     protected SSLHostConfig getSSLHostConfig(String sniHostName) {
+         SSLHostConfig result = null;
+ 
+@@ -376,7 +401,7 @@ public abstract class AbstractEndpoint<S> {
+     private boolean bindOnInit = true;
+     public boolean getBindOnInit() { return bindOnInit; }
+     public void setBindOnInit(boolean b) { this.bindOnInit = b; }
+-    private BindState bindState = BindState.UNBOUND;
++    private volatile BindState bindState = BindState.UNBOUND;
+ 
+     /**
+      * Keepalive timeout, if not set the soTimeout is used.
+
+==================================================
+AprEndpoint.java
+index 0a6de01568..7d737c3f67 100644
+--- a/java/org/apache/tomcat/util/net/AbstractJsseEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AbstractJsseEndpoint.java
+@@ -77,26 +77,36 @@ public abstract class AbstractJsseEndpoint<S> extends AbstractEndpoint<S> {
+             sslImplementation = SSLImplementation.getInstance(getSslImplementationName());
+ 
+             for (SSLHostConfig sslHostConfig : sslHostConfigs.values()) {
+-                boolean firstCertificate = true;
+-                for (SSLHostConfigCertificate certificate : sslHostConfig.getCertificates(true)) {
+-                    SSLUtil sslUtil = sslImplementation.getSSLUtil(certificate);
+-                    if (firstCertificate) {
+-                        firstCertificate = false;
+-                        sslHostConfig.setEnabledProtocols(sslUtil.getEnabledProtocols());
+-                        sslHostConfig.setEnabledCiphers(sslUtil.getEnabledCiphers());
+-                    }
+-
+-                    SSLContext sslContext = sslUtil.createSSLContext(negotiableProtocols);
+-                    sslContext.init(sslUtil.getKeyManagers(), sslUtil.getTrustManagers(), null);
+-
+-                    SSLSessionContext sessionContext = sslContext.getServerSessionContext();
+-                    if (sessionContext != null) {
+-                        sslUtil.configureSessionContext(sessionContext);
+-                    }
+-                    certificate.setSslContext(sslContext);
+-                }
++                createSSLContext(sslHostConfig);
++            }
++        }
++    }
++
++
++    @Override
++    protected void createSSLContext(SSLHostConfig sslHostConfig) throws IllegalArgumentException {
++        boolean firstCertificate = true;
++        for (SSLHostConfigCertificate certificate : sslHostConfig.getCertificates(true)) {
++            SSLUtil sslUtil = sslImplementation.getSSLUtil(certificate);
++            if (firstCertificate) {
++                firstCertificate = false;
++                sslHostConfig.setEnabledProtocols(sslUtil.getEnabledProtocols());
++                sslHostConfig.setEnabledCiphers(sslUtil.getEnabledCiphers());
++            }
++
++            SSLContext sslContext;
++            try {
++                sslContext = sslUtil.createSSLContext(negotiableProtocols);
++                sslContext.init(sslUtil.getKeyManagers(), sslUtil.getTrustManagers(), null);
++            } catch (Exception e) {
++                throw new IllegalArgumentException(e);
+             }
+ 
++            SSLSessionContext sessionContext = sslContext.getServerSessionContext();
++            if (sessionContext != null) {
++                sslUtil.configureSessionContext(sessionContext);
++            }
++            certificate.setSslContext(sslContext);
+         }
+     }
+ 
+@@ -104,18 +114,25 @@ public abstract class AbstractJsseEndpoint<S> extends AbstractEndpoint<S> {
+     protected void destroySsl() throws Exception {
+         if (isSSLEnabled()) {
+             for (SSLHostConfig sslHostConfig : sslHostConfigs.values()) {
+-                for (SSLHostConfigCertificate certificate : sslHostConfig.getCertificates(true)) {
+-                    if (certificate.getSslContext() != null) {
+-                        SSLContext sslContext = certificate.getSslContext();
+-                        if (sslContext != null) {
+-                            sslContext.destroy();
+-                        }
+-                    }
++                releaseSSLContext(sslHostConfig);
++            }
++        }
++    }
++
++
++    @Override
++    protected void releaseSSLContext(SSLHostConfig sslHostConfig) {
++        for (SSLHostConfigCertificate certificate : sslHostConfig.getCertificates(true)) {
++            if (certificate.getSslContext() != null) {
++                SSLContext sslContext = certificate.getSslContext();
++                if (sslContext != null) {
++                    sslContext.destroy();
+                 }
+             }
+         }
+     }
+ 
++
+     protected SSLEngine createSSLEngine(String sniHostName, List<Cipher> clientRequestedCiphers) {
+         SSLHostConfig sslHostConfig = getSSLHostConfig(sniHostName);
+ 
+
+==================================================
+SSLHostConfig.java
+index 589e071df2..f6cf6409de 100644
+--- a/java/org/apache/tomcat/util/net/AprEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AprEndpoint.java
+@@ -347,167 +347,182 @@ public class AprEndpoint extends AbstractEndpoint<Long> implements SNICallBack {
+         // Initialize SSL if needed
+         if (isSSLEnabled()) {
+             for (SSLHostConfig sslHostConfig : sslHostConfigs.values()) {
++                createSSLContext(sslHostConfig);
++            }
++            SSLHostConfig defaultSSLHostConfig = sslHostConfigs.get(getDefaultSSLHostConfigName());
++            Long defaultSSLContext = defaultSSLHostConfig.getOpenSslContext();
++            sslContext = defaultSSLContext.longValue();
++            SSLContext.registerDefault(defaultSSLContext, this);
++        }
++    }
+ 
+-                Set<SSLHostConfigCertificate> certificates = sslHostConfig.getCertificates(true);
+-                boolean firstCertificate = true;
+-                for (SSLHostConfigCertificate certificate : certificates) {
+-                    if (SSLHostConfig.adjustRelativePath(certificate.getCertificateFile()) == null) {
+-                        // This is required
+-                        throw new Exception(sm.getString("endpoint.apr.noSslCertFile"));
+-                    }
+-                    if (firstCertificate) {
+-                        // TODO: Duplicates code in SSLUtilBase. Consider
+-                        //       refactoring to reduce duplication
+-                        firstCertificate = false;
+-                        // Configure the enabled protocols
+-                        List<String> enabledProtocols = SSLUtilBase.getEnabled("protocols", log,
+-                                true, sslHostConfig.getProtocols(),
+-                                OpenSSLEngine.IMPLEMENTED_PROTOCOLS_SET);
+-                        sslHostConfig.setEnabledProtocols(
+-                                enabledProtocols.toArray(new String[enabledProtocols.size()]));
+-                        // Configure the enabled ciphers
+-                        List<String> enabledCiphers = SSLUtilBase.getEnabled("ciphers", log,
+-                                false, sslHostConfig.getJsseCipherNames(),
+-                                OpenSSLEngine.AVAILABLE_CIPHER_SUITES);
+-                        sslHostConfig.setEnabledCiphers(
+-                                enabledCiphers.toArray(new String[enabledCiphers.size()]));
+-                    }
+-                }
+-                if (certificates.size() > 2) {
+-                    // TODO: Can this limitation be removed?
+-                    throw new Exception(sm.getString("endpoint.apr.tooManyCertFiles"));
+-                }
+-
+-                // SSL protocol
+-                int value = SSL.SSL_PROTOCOL_NONE;
+-                if (sslHostConfig.getProtocols().size() == 0) {
+-                    // Native fallback used if protocols=""
+-                    value = SSL.SSL_PROTOCOL_ALL;
+-                } else {
+-                    for (String protocol : sslHostConfig.getEnabledProtocols()) {
+-                        if (Constants.SSL_PROTO_SSLv2Hello.equalsIgnoreCase(protocol)) {
+-                            // NO-OP. OpenSSL always supports SSLv2Hello
+-                        } else if (Constants.SSL_PROTO_SSLv2.equalsIgnoreCase(protocol)) {
+-                            value |= SSL.SSL_PROTOCOL_SSLV2;
+-                        } else if (Constants.SSL_PROTO_SSLv3.equalsIgnoreCase(protocol)) {
+-                            value |= SSL.SSL_PROTOCOL_SSLV3;
+-                        } else if (Constants.SSL_PROTO_TLSv1.equalsIgnoreCase(protocol)) {
+-                            value |= SSL.SSL_PROTOCOL_TLSV1;
+-                        } else if (Constants.SSL_PROTO_TLSv1_1.equalsIgnoreCase(protocol)) {
+-                            value |= SSL.SSL_PROTOCOL_TLSV1_1;
+-                        } else if (Constants.SSL_PROTO_TLSv1_2.equalsIgnoreCase(protocol)) {
+-                            value |= SSL.SSL_PROTOCOL_TLSV1_2;
+-                        } else {
+-                            // Should not happen since filtering to build
+-                            // enabled protocols removes invalid values.
+-                            throw new Exception(sm.getString(
+-                                    "endpoint.apr.invalidSslProtocol", protocol));
+-                        }
+-                    }
+-                }
+ 
+-                // Create SSL Context
+-                long ctx = 0;
+-                try {
+-                    ctx = SSLContext.make(rootPool, value, SSL.SSL_MODE_SERVER);
+-                } catch (Exception e) {
+-                    // If the sslEngine is disabled on the AprLifecycleListener
+-                    // there will be an Exception here but there is no way to check
+-                    // the AprLifecycleListener settings from here
+-                    throw new Exception(
+-                            sm.getString("endpoint.apr.failSslContextMake"), e);
+-                }
+ 
+-                if (sslHostConfig.getInsecureRenegotiation()) {
+-                    SSLContext.setOptions(ctx, SSL.SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION);
++    @Override
++    protected void createSSLContext(SSLHostConfig sslHostConfig) throws Exception {
++        Set<SSLHostConfigCertificate> certificates = sslHostConfig.getCertificates(true);
++        boolean firstCertificate = true;
++        for (SSLHostConfigCertificate certificate : certificates) {
++            if (SSLHostConfig.adjustRelativePath(certificate.getCertificateFile()) == null) {
++                // This is required
++                throw new Exception(sm.getString("endpoint.apr.noSslCertFile"));
++            }
++            if (firstCertificate) {
++                // TODO: Duplicates code in SSLUtilBase. Consider
++                //       refactoring to reduce duplication
++                firstCertificate = false;
++                // Configure the enabled protocols
++                List<String> enabledProtocols = SSLUtilBase.getEnabled("protocols", log,
++                        true, sslHostConfig.getProtocols(),
++                        OpenSSLEngine.IMPLEMENTED_PROTOCOLS_SET);
++                sslHostConfig.setEnabledProtocols(
++                        enabledProtocols.toArray(new String[enabledProtocols.size()]));
++                // Configure the enabled ciphers
++                List<String> enabledCiphers = SSLUtilBase.getEnabled("ciphers", log,
++                        false, sslHostConfig.getJsseCipherNames(),
++                        OpenSSLEngine.AVAILABLE_CIPHER_SUITES);
++                sslHostConfig.setEnabledCiphers(
++                        enabledCiphers.toArray(new String[enabledCiphers.size()]));
++            }
++        }
++        if (certificates.size() > 2) {
++            // TODO: Can this limitation be removed?
++            throw new Exception(sm.getString("endpoint.apr.tooManyCertFiles"));
++        }
++
++        // SSL protocol
++        int value = SSL.SSL_PROTOCOL_NONE;
++        if (sslHostConfig.getProtocols().size() == 0) {
++            // Native fallback used if protocols=""
++            value = SSL.SSL_PROTOCOL_ALL;
++        } else {
++            for (String protocol : sslHostConfig.getEnabledProtocols()) {
++                if (Constants.SSL_PROTO_SSLv2Hello.equalsIgnoreCase(protocol)) {
++                    // NO-OP. OpenSSL always supports SSLv2Hello
++                } else if (Constants.SSL_PROTO_SSLv2.equalsIgnoreCase(protocol)) {
++                    value |= SSL.SSL_PROTOCOL_SSLV2;
++                } else if (Constants.SSL_PROTO_SSLv3.equalsIgnoreCase(protocol)) {
++                    value |= SSL.SSL_PROTOCOL_SSLV3;
++                } else if (Constants.SSL_PROTO_TLSv1.equalsIgnoreCase(protocol)) {
++                    value |= SSL.SSL_PROTOCOL_TLSV1;
++                } else if (Constants.SSL_PROTO_TLSv1_1.equalsIgnoreCase(protocol)) {
++                    value |= SSL.SSL_PROTOCOL_TLSV1_1;
++                } else if (Constants.SSL_PROTO_TLSv1_2.equalsIgnoreCase(protocol)) {
++                    value |= SSL.SSL_PROTOCOL_TLSV1_2;
+                 } else {
+-                    SSLContext.clearOptions(ctx, SSL.SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION);
++                    // Should not happen since filtering to build
++                    // enabled protocols removes invalid values.
++                    throw new Exception(sm.getString(
++                            "endpoint.apr.invalidSslProtocol", protocol));
+                 }
++            }
++        }
+ 
+-                // Use server's preference order for ciphers (rather than
+-                // client's)
+-                if (sslHostConfig.getHonorCipherOrder()) {
+-                    SSLContext.setOptions(ctx, SSL.SSL_OP_CIPHER_SERVER_PREFERENCE);
+-                } else {
+-                    SSLContext.clearOptions(ctx, SSL.SSL_OP_CIPHER_SERVER_PREFERENCE);
+-                }
++        // Create SSL Context
++        long ctx = 0;
++        try {
++            ctx = SSLContext.make(rootPool, value, SSL.SSL_MODE_SERVER);
++        } catch (Exception e) {
++            // If the sslEngine is disabled on the AprLifecycleListener
++            // there will be an Exception here but there is no way to check
++            // the AprLifecycleListener settings from here
++            throw new Exception(
++                    sm.getString("endpoint.apr.failSslContextMake"), e);
++        }
+ 
+-                // Disable compression if requested
+-                if (sslHostConfig.getDisableCompression()) {
+-                    SSLContext.setOptions(ctx, SSL.SSL_OP_NO_COMPRESSION);
+-                } else {
+-                    SSLContext.clearOptions(ctx, SSL.SSL_OP_NO_COMPRESSION);
+-                }
++        if (sslHostConfig.getInsecureRenegotiation()) {
++            SSLContext.setOptions(ctx, SSL.SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION);
++        } else {
++            SSLContext.clearOptions(ctx, SSL.SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION);
++        }
+ 
+-                // Disable TLS Session Tickets (RFC4507) to protect perfect forward secrecy
+-                if (sslHostConfig.getDisableSessionTickets()) {
+-                    SSLContext.setOptions(ctx, SSL.SSL_OP_NO_TICKET);
+-                } else {
+-                    SSLContext.clearOptions(ctx, SSL.SSL_OP_NO_TICKET);
+-                }
++        // Use server's preference order for ciphers (rather than client's)
++        if (sslHostConfig.getHonorCipherOrder()) {
++            SSLContext.setOptions(ctx, SSL.SSL_OP_CIPHER_SERVER_PREFERENCE);
++        } else {
++            SSLContext.clearOptions(ctx, SSL.SSL_OP_CIPHER_SERVER_PREFERENCE);
++        }
+ 
+-                // List the ciphers that the client is permitted to negotiate
+-                SSLContext.setCipherSuite(ctx, sslHostConfig.getCiphers());
+-                // Load Server key and certificate
+-                // TODO: Confirm assumption that idx is not specific to
+-                //       key/certificate type
+-                int idx = 0;
+-                for (SSLHostConfigCertificate certificate : sslHostConfig.getCertificates(true)) {
+-                    SSLContext.setCertificate(ctx,
+-                            SSLHostConfig.adjustRelativePath(certificate.getCertificateFile()),
+-                            SSLHostConfig.adjustRelativePath(certificate.getCertificateKeyFile()),
+-                            certificate.getCertificateKeyPassword(), idx++);
+-                    // Set certificate chain file
+-                    SSLContext.setCertificateChainFile(ctx,
+-                            SSLHostConfig.adjustRelativePath(certificate.getCertificateChainFile()), false);
+-                }
+-                // Support Client Certificates
+-                SSLContext.setCACertificate(ctx,
+-                        SSLHostConfig.adjustRelativePath(sslHostConfig.getCaCertificateFile()),
+-                        SSLHostConfig.adjustRelativePath(sslHostConfig.getCaCertificatePath()));
+-                // Set revocation
+-                SSLContext.setCARevocation(ctx,
+-                        SSLHostConfig.adjustRelativePath(
+-                                sslHostConfig.getCertificateRevocationListFile()),
+-                        SSLHostConfig.adjustRelativePath(
+-                                sslHostConfig.getCertificateRevocationListPath()));
+-                // Client certificate verification
+-                switch (sslHostConfig.getCertificateVerification()) {
+-                case NONE:
+-                    value = SSL.SSL_CVERIFY_NONE;
+-                    break;
+-                case OPTIONAL:
+-                    value = SSL.SSL_CVERIFY_OPTIONAL;
+-                    break;
+-                case OPTIONAL_NO_CA:
+-                    value = SSL.SSL_CVERIFY_OPTIONAL_NO_CA;
+-                    break;
+-                case REQUIRED:
+-                    value = SSL.SSL_CVERIFY_REQUIRE;
+-                    break;
+-                }
+-                SSLContext.setVerify(ctx, value, sslHostConfig.getCertificateVerificationDepth());
+-                // For now, sendfile is not supported with SSL
+-                if (getUseSendfile()) {
+-                    setUseSendfileInternal(false);
+-                    if (useSendFileSet) {
+-                        log.warn(sm.getString("endpoint.apr.noSendfileWithSSL"));
+-                    }
+-                }
++        // Disable compression if requested
++        if (sslHostConfig.getDisableCompression()) {
++            SSLContext.setOptions(ctx, SSL.SSL_OP_NO_COMPRESSION);
++        } else {
++            SSLContext.clearOptions(ctx, SSL.SSL_OP_NO_COMPRESSION);
++        }
+ 
+-                if (negotiableProtocols.size() > 0) {
+-                    ArrayList<String> protocols = new ArrayList<>();
+-                    protocols.addAll(negotiableProtocols);
+-                    protocols.add("http/1.1");
+-                    String[] protocolsArray = protocols.toArray(new String[0]);
+-                    SSLContext.setAlpnProtos(ctx, protocolsArray, SSL.SSL_SELECTOR_FAILURE_NO_ADVERTISE);
+-                }
+-                sslHostConfig.setOpenSslContext(Long.valueOf(ctx));
++        // Disable TLS Session Tickets (RFC4507) to protect perfect forward secrecy
++        if (sslHostConfig.getDisableSessionTickets()) {
++            SSLContext.setOptions(ctx, SSL.SSL_OP_NO_TICKET);
++        } else {
++            SSLContext.clearOptions(ctx, SSL.SSL_OP_NO_TICKET);
++        }
++
++        // List the ciphers that the client is permitted to negotiate
++        SSLContext.setCipherSuite(ctx, sslHostConfig.getCiphers());
++        // Load Server key and certificate
++        // TODO: Confirm assumption that idx is not specific to
++        //       key/certificate type
++        int idx = 0;
++        for (SSLHostConfigCertificate certificate : sslHostConfig.getCertificates(true)) {
++            SSLContext.setCertificate(ctx,
++                    SSLHostConfig.adjustRelativePath(certificate.getCertificateFile()),
++                    SSLHostConfig.adjustRelativePath(certificate.getCertificateKeyFile()),
++                    certificate.getCertificateKeyPassword(), idx++);
++            // Set certificate chain file
++            SSLContext.setCertificateChainFile(ctx,
++                    SSLHostConfig.adjustRelativePath(certificate.getCertificateChainFile()), false);
++        }
++        // Support Client Certificates
++        SSLContext.setCACertificate(ctx,
++                SSLHostConfig.adjustRelativePath(sslHostConfig.getCaCertificateFile()),
++                SSLHostConfig.adjustRelativePath(sslHostConfig.getCaCertificatePath()));
++        // Set revocation
++        SSLContext.setCARevocation(ctx,
++                SSLHostConfig.adjustRelativePath(
++                        sslHostConfig.getCertificateRevocationListFile()),
++                SSLHostConfig.adjustRelativePath(
++                        sslHostConfig.getCertificateRevocationListPath()));
++        // Client certificate verification
++        switch (sslHostConfig.getCertificateVerification()) {
++        case NONE:
++            value = SSL.SSL_CVERIFY_NONE;
++            break;
++        case OPTIONAL:
++            value = SSL.SSL_CVERIFY_OPTIONAL;
++            break;
++        case OPTIONAL_NO_CA:
++            value = SSL.SSL_CVERIFY_OPTIONAL_NO_CA;
++            break;
++        case REQUIRED:
++            value = SSL.SSL_CVERIFY_REQUIRE;
++            break;
++        }
++        SSLContext.setVerify(ctx, value, sslHostConfig.getCertificateVerificationDepth());
++        // For now, sendfile is not supported with SSL
++        if (getUseSendfile()) {
++            setUseSendfileInternal(false);
++            if (useSendFileSet) {
++                log.warn(sm.getString("endpoint.apr.noSendfileWithSSL"));
+             }
+-            SSLHostConfig defaultSSLHostConfig = sslHostConfigs.get(getDefaultSSLHostConfigName());
+-            Long defaultSSLContext = defaultSSLHostConfig.getOpenSslContext();
+-            sslContext = defaultSSLContext.longValue();
+-            SSLContext.registerDefault(defaultSSLContext, this);
++        }
++
++        if (negotiableProtocols.size() > 0) {
++            ArrayList<String> protocols = new ArrayList<>();
++            protocols.addAll(negotiableProtocols);
++            protocols.add("http/1.1");
++            String[] protocolsArray = protocols.toArray(new String[0]);
++            SSLContext.setAlpnProtos(ctx, protocolsArray, SSL.SSL_SELECTOR_FAILURE_NO_ADVERTISE);
++        }
++        sslHostConfig.setOpenSslContext(Long.valueOf(ctx));
++    }
++
++
++    @Override
++    protected void releaseSSLContext(SSLHostConfig sslHostConfig) {
++        Long ctx = sslHostConfig.getOpenSslContext();
++        if (ctx != null) {
++            SSLContext.free(ctx.longValue());
++            sslHostConfig.setOpenSslContext(null);
+         }
+     }
+ 
+
+==================================================
+SSLHostConfigCertificate.java
+index 3e3c30fd8e..0d344d5645 100644
+--- a/java/org/apache/tomcat/util/net/SSLHostConfig.java
++++ b/java/org/apache/tomcat/util/net/SSLHostConfig.java
+@@ -18,6 +18,7 @@ package org.apache.tomcat.util.net;
+ 
+ import java.io.File;
+ import java.io.IOException;
++import java.io.Serializable;
+ import java.security.KeyStore;
+ import java.security.UnrecoverableKeyException;
+ import java.util.HashMap;
+@@ -39,7 +40,9 @@ import org.apache.tomcat.util.res.StringManager;
+ /**
+  * Represents the TLS configuration for a virtual host.
+  */
+-public class SSLHostConfig {
++public class SSLHostConfig implements Serializable {
++
++    private static final long serialVersionUID = 1L;
+ 
+     private static final Log log = LogFactory.getLog(SSLHostConfig.class);
+     private static final StringManager sm = StringManager.getManager(SSLHostConfig.class);
+@@ -69,7 +72,7 @@ public class SSLHostConfig {
+     // OpenSSL can handle multiple certs in a single config so the reference to
+     // the context is here at the virtual host level. JSSE can't so the
+     // reference is held on the certificate.
+-    private Long openSslContext;
++    private transient Long openSslContext;
+ 
+     // Configuration properties
+ 
+@@ -99,7 +102,7 @@ public class SSLHostConfig {
+     private String truststorePassword = System.getProperty("javax.net.ssl.trustStorePassword");
+     private String truststoreProvider = System.getProperty("javax.net.ssl.trustStoreProvider");
+     private String truststoreType = System.getProperty("javax.net.ssl.trustStoreType");
+-    private KeyStore truststore = null;
++    private transient KeyStore truststore = null;
+     // OpenSSL
+     private String certificateRevocationListPath;
+     private String caCertificateFile;
+
+==================================================
+TestSSLHostConfigIntegration.java
+index fd2c59b0eb..1166edb1a9 100644
+--- a/java/org/apache/tomcat/util/net/SSLHostConfigCertificate.java
++++ b/java/org/apache/tomcat/util/net/SSLHostConfigCertificate.java
+@@ -17,6 +17,7 @@
+ package org.apache.tomcat.util.net;
+ 
+ import java.io.IOException;
++import java.io.Serializable;
+ import java.security.KeyStore;
+ import java.util.HashSet;
+ import java.util.Set;
+@@ -26,8 +27,9 @@ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.net.openssl.ciphers.Authentication;
+ import org.apache.tomcat.util.res.StringManager;
+ 
++public class SSLHostConfigCertificate implements Serializable {
+ 
+-public class SSLHostConfigCertificate {
++    private static final long serialVersionUID = 1L;
+ 
+     private static final Log log = LogFactory.getLog(SSLHostConfigCertificate.class);
+     private static final StringManager sm = StringManager.getManager(SSLHostConfigCertificate.class);
+@@ -42,7 +44,7 @@ public class SSLHostConfigCertificate {
+     // OpenSSL can handle multiple certs in a single config so the reference to
+     // the context is at the virtual host level. JSSE can't so the reference is
+     // held here on the certificate.
+-    private SSLContext sslContext;
++    private transient SSLContext sslContext;
+ 
+     // Common
+     private final SSLHostConfig sslHostConfig;
+@@ -55,7 +57,7 @@ public class SSLHostConfigCertificate {
+     private String certificateKeystoreFile = System.getProperty("user.home")+"/.keystore";
+     private String certificateKeystoreProvider = DEFAULT_KEYSTORE_PROVIDER;
+     private String certificateKeystoreType = DEFAULT_KEYSTORE_TYPE;
+-    private KeyStore certificateKeystore = null;
++    private transient KeyStore certificateKeystore = null;
+ 
+     // OpenSSL
+     private String certificateChainFile;
+
+==================================================

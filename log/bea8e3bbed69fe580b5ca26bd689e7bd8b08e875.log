@@ -1,0 +1,258 @@
+bea8e3bbed69fe580b5ca26bd689e7bd8b08e875
+==================================================
+Improve error handling for an unhandled exception after the response has been committed. Tomcat will now attempt to:
+==================================================
+Mark Emlyn
+==================================================
+Wed Jun 4 19:18:57 2014 +0000
+==================================================
+ErrorReportValve.java
+Improve error handling for an unhandled exception after the response has been committed. Tomcat will now attempt to:
+- flush any unwritten response data to the client
+- prevent further writes to the response
+- close the connection
+
+This means that the client should experience an unclean close that will enable them to differentiate (when chunked encoding is used) between an incomplete response that encountered an error and a complete response that did not (prior to this commit, Tomcat completed the request normally and - depending on the response data written to that point - it may not have been visible to the client that the response was incomplete at that point.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1600449 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+ActionCode.java
+index a575e3dc6e..87f134254f 100644
+--- a/java/org/apache/catalina/valves/ErrorReportValve.java
++++ b/java/org/apache/catalina/valves/ErrorReportValve.java
+@@ -28,6 +28,7 @@ import org.apache.catalina.connector.Request;
+ import org.apache.catalina.connector.Response;
+ import org.apache.catalina.util.RequestUtil;
+ import org.apache.catalina.util.ServerInfo;
++import org.apache.coyote.ActionCode;
+ import org.apache.tomcat.util.ExceptionUtils;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+@@ -77,10 +78,7 @@ public class ErrorReportValve extends ValveBase {
+         // Perform the request
+         getNext().invoke(request, response);
+ 
+-        if (response.isCommitted()) {
+-            return;
+-        }
+-
++        // Check the response for an error
+         Throwable throwable = (Throwable) request.getAttribute(RequestDispatcher.ERROR_EXCEPTION);
+ 
+         if (request.isAsyncStarted() && ((response.getStatus() < 400 &&
+@@ -88,20 +86,33 @@ public class ErrorReportValve extends ValveBase {
+             return;
+         }
+ 
+-        if (throwable != null) {
+-            // The response is an error
+-            response.setError();
++        // If we get this far then there has been an error
+ 
+-            // Reset the response (if possible)
+-            try {
+-                response.reset();
+-            } catch (IllegalStateException e) {
+-                // Ignore
+-            }
++        if (response.isCommitted()) {
++            // Flush any data that is still to be written to the client
++            response.flushBuffer();
++            // Mark the response as in error
++            response.setError();
++            response.getCoyoteResponse().setStatus(HttpServletResponse.SC_INTERNAL_SERVER_ERROR);
++            // Close immediately to signal to the client that something went
++            // wrong
++            response.getCoyoteResponse().action(ActionCode.CLOSE_NOW, null);
++            return;
++        }
+ 
++        if (throwable != null) {
++            // Make sure that the necessary methods have been called on the
++            // response. (It is possible a component may just have set the
++            // Throwable. Tomcat won't do that but other components might.)
++            // These are safe to call at this point as we know that the response
++            // has not been committed.
++            response.reset();
+             response.sendError(HttpServletResponse.SC_INTERNAL_SERVER_ERROR);
+         }
+ 
++        // One way or another, response.sendError() will have been called before
++        // execution reaches this point and suspended the response. Need to
++        // reverse that so this valve can write to the response.
+         response.setSuspended(false);
+ 
+         try {
+
+==================================================
+AbstractAjpProcessor.java
+index 5ae885a540..263771ad01 100644
+--- a/java/org/apache/coyote/ActionCode.java
++++ b/java/org/apache/coyote/ActionCode.java
+@@ -31,6 +31,15 @@ public enum ActionCode {
+     CLOSE,
+     COMMIT,
+ 
++    /**
++     * A serious error occurred from which it is not possible to recover safely.
++     * Further attempts to write to the response should be ignored and the
++     * connection needs to be closed as soon as possible. This can also be used
++     * to forcibly close a connection if an error occurs after the response has
++     * been committed.
++     */
++    CLOSE_NOW,
++
+     /**
+      * A flush() operation originated by the client ( i.e. a flush() on the
+      * servlet output stream or writer, called by a servlet ). Argument is the
+
+==================================================
+AbstractHttp11Processor.java
+index 82d96b67b6..c160f32d7d 100644
+--- a/java/org/apache/coyote/ajp/AbstractAjpProcessor.java
++++ b/java/org/apache/coyote/ajp/AbstractAjpProcessor.java
+@@ -643,6 +643,12 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+             getEndpoint().executeNonBlockingDispatches(socketWrapper);
+             break;
+         }
++        case CLOSE_NOW: {
++            // Prevent further writes to the response
++            swallowResponse = true;
++            setErrorState(ErrorState.CLOSE_NOW);
++            break;
++        }
+         }
+     }
+ 
+@@ -836,7 +842,7 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+             }
+ 
+             // Finish the response if not done yet
+-            if (!finished) {
++            if (!finished && getErrorState().isIoAllowed()) {
+                 try {
+                     finish();
+                 } catch (Throwable t) {
+@@ -1541,6 +1547,7 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+                 prepareResponse();
+             } catch (IOException e) {
+                 setErrorState(ErrorState.CLOSE_NOW);
++                return;
+             }
+         }
+ 
+
+==================================================
+SpdyProcessor.java
+index 1a66166438..54d84d8262 100644
+--- a/java/org/apache/coyote/http11/AbstractHttp11Processor.java
++++ b/java/org/apache/coyote/http11/AbstractHttp11Processor.java
+@@ -902,6 +902,12 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+             getEndpoint().executeNonBlockingDispatches(socketWrapper);
+             break;
+         }
++        case CLOSE_NOW: {
++            // Block further output
++            getOutputBuffer().finished = true;
++            setErrorState(ErrorState.CLOSE_NOW);
++            break;
++        }
+         default: {
+             actionInternal(actionCode, param);
+             break;
+@@ -1146,8 +1152,10 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+             request.updateCounters();
+ 
+             if (!isAsync() && !comet || getErrorState().isError()) {
+-                getInputBuffer().nextRequest();
+-                getOutputBuffer().nextRequest();
++                if (getErrorState().isIoAllowed()) {
++                    getInputBuffer().nextRequest();
++                    getOutputBuffer().nextRequest();
++                }
+             }
+ 
+             if (!disableUploadTimeout) {
+@@ -1668,7 +1676,7 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+         RequestInfo rp = request.getRequestProcessor();
+         try {
+             rp.setStage(org.apache.coyote.Constants.STAGE_SERVICE);
+-            if(!getAdapter().asyncDispatch(request, response, status)) {
++            if (!getAdapter().asyncDispatch(request, response, status)) {
+                 setErrorState(ErrorState.CLOSE_NOW);
+             }
+             resetTimeouts();
+@@ -1742,27 +1750,31 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+     public void endRequest() {
+ 
+         // Finish the handling of the request
+-        try {
+-            getInputBuffer().endRequest();
+-        } catch (IOException e) {
+-            setErrorState(ErrorState.CLOSE_NOW);
+-        } catch (Throwable t) {
+-            ExceptionUtils.handleThrowable(t);
+-            // 500 - Internal Server Error
+-            // Can't add a 500 to the access log since that has already been
+-            // written in the Adapter.service method.
+-            response.setStatus(500);
+-            setErrorState(ErrorState.CLOSE_NOW);
+-            getLog().error(sm.getString("http11processor.request.finish"), t);
++        if (getErrorState().isIoAllowed()) {
++            try {
++                getInputBuffer().endRequest();
++            } catch (IOException e) {
++                setErrorState(ErrorState.CLOSE_NOW);
++            } catch (Throwable t) {
++                ExceptionUtils.handleThrowable(t);
++                // 500 - Internal Server Error
++                // Can't add a 500 to the access log since that has already been
++                // written in the Adapter.service method.
++                response.setStatus(500);
++                setErrorState(ErrorState.CLOSE_NOW);
++                getLog().error(sm.getString("http11processor.request.finish"), t);
++            }
+         }
+-        try {
+-            getOutputBuffer().endRequest();
+-        } catch (IOException e) {
+-            setErrorState(ErrorState.CLOSE_NOW);
+-        } catch (Throwable t) {
+-            ExceptionUtils.handleThrowable(t);
+-            setErrorState(ErrorState.CLOSE_NOW);
+-            getLog().error(sm.getString("http11processor.response.finish"), t);
++        if (getErrorState().isIoAllowed()) {
++            try {
++                getOutputBuffer().endRequest();
++            } catch (IOException e) {
++                setErrorState(ErrorState.CLOSE_NOW);
++            } catch (Throwable t) {
++                ExceptionUtils.handleThrowable(t);
++                setErrorState(ErrorState.CLOSE_NOW);
++                getLog().error(sm.getString("http11processor.response.finish"), t);
++            }
+         }
+     }
+ 
+
+==================================================
+TestAbstractHttp11Processor.java
+index c1833da0a7..fe652b7697 100644
+--- a/java/org/apache/coyote/spdy/SpdyProcessor.java
++++ b/java/org/apache/coyote/spdy/SpdyProcessor.java
+@@ -409,6 +409,10 @@ public class SpdyProcessor<S> extends AbstractProcessor<S> implements Runnable {
+             ((AtomicBoolean) param).set(asyncStateMachine.isAsyncError());
+             break;
+         }
++        case CLOSE_NOW: {
++            setErrorState(ErrorState.CLOSE_NOW);
++            break;
++        }
+         default: {
+             // TODO:
+             // actionInternal(actionCode, param);
+
+==================================================

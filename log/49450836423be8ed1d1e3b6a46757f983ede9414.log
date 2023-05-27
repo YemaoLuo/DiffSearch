@@ -1,0 +1,167 @@
+49450836423be8ed1d1e3b6a46757f983ede9414
+==================================================
+Remove connections map from APR endpoint
+==================================================
+remm remm@apache.org
+==================================================
+Wed Nov 6 11:01:43 2019 +0100
+==================================================
+AbstractEndpoint.java
+Remove connections map from APR endpoint
+
+The connections map from AbstractEndpoint can be used by APR as well,
+after refactoring using a key on the socket. Once (if) APR is removed,
+this can go back to using the socket wrapper as a key (and value).
+AbstractEndpoint.getConnections becomes more costly but it is only used
+on pause or destroy.
+Also make sure close attempts a full cleanup using a finally to remove
+from the connection map and call doClose.
+
+
+==================================================
+AprEndpoint.java
+index f3f10a4eff..c900006b22 100644
+--- a/java/org/apache/tomcat/util/net/AbstractEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AbstractEndpoint.java
+@@ -25,6 +25,7 @@ import java.net.SocketException;
+ import java.util.ArrayList;
+ import java.util.Enumeration;
+ import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+@@ -188,12 +189,16 @@ public abstract class AbstractEndpoint<S,U> {
+     private ObjectName oname = null;
+ 
+     /**
+-     * Connection structure holding all current connections.
++     * Map holding all current connections keyed with the sockets (for APR).
+      */
+-    protected Map<SocketWrapperBase<S>, SocketWrapperBase<S>> connections = new ConcurrentHashMap<>();
++    protected Map<S, SocketWrapperBase<S>> connections = new ConcurrentHashMap<>();
+ 
++    /**
++     * Get a set with the current open connections.
++     * @return A set with the open socket wrappers
++     */
+     public Set<SocketWrapperBase<S>> getConnections() {
+-        return connections.keySet();
++        return new HashSet<SocketWrapperBase<S>>(connections.values());
+     }
+ 
+     // ----------------------------------------------------------------- Properties
+
+==================================================
+Nio2Endpoint.java
+index 5629154923..1fefe85242 100644
+--- a/java/org/apache/tomcat/util/net/AprEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AprEndpoint.java
+@@ -27,7 +27,6 @@ import java.util.ArrayList;
+ import java.util.HashMap;
+ import java.util.Map;
+ import java.util.Set;
+-import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.RejectedExecutionException;
+ import java.util.concurrent.Semaphore;
+ import java.util.concurrent.TimeUnit;
+@@ -109,9 +108,6 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
+     protected long sslContext = 0;
+ 
+ 
+-    private final Map<Long,AprSocketWrapper> connections = new ConcurrentHashMap<>();
+-
+-
+     // ------------------------------------------------------------ Constructor
+ 
+     public AprEndpoint() {
+@@ -684,7 +680,7 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
+                 log.debug(sm.getString("endpoint.debug.socket", socket));
+             }
+             AprSocketWrapper wrapper = new AprSocketWrapper(socket, this);
+-            super.connections.put(wrapper, wrapper);
++            connections.put(socket, wrapper);
+             wrapper.setKeepAliveLeft(getMaxKeepAliveRequests());
+             wrapper.setSecure(isSSLEnabled());
+             wrapper.setReadTimeout(getConnectionTimeout());
+@@ -729,7 +725,7 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
+      *         socket should be closed
+      */
+     protected boolean processSocket(long socket, SocketEvent event) {
+-        AprSocketWrapper socketWrapper = connections.get(Long.valueOf(socket));
++        SocketWrapperBase<Long> socketWrapper = connections.get(Long.valueOf(socket));
+         if (event == SocketEvent.OPEN_READ && socketWrapper.readOperation != null) {
+             return socketWrapper.readOperation.process();
+         } else if (event == SocketEvent.OPEN_WRITE && socketWrapper.writeOperation != null) {
+@@ -780,7 +776,7 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
+      * this directly from a known error condition.
+      */
+     private void destroySocket(long socket) {
+-        connections.remove(Long.valueOf(socket));
++        closeSocket(socket);
+         if (log.isDebugEnabled()) {
+             String msg = sm.getString("endpoint.debug.destroySocket",
+                     Long.valueOf(socket));
+@@ -1252,7 +1248,7 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
+                     log.debug(sm.getString("endpoint.debug.socketTimeout",
+                             Long.valueOf(socket)));
+                 }
+-                AprSocketWrapper socketWrapper = connections.get(Long.valueOf(socket));
++                SocketWrapperBase<Long> socketWrapper = connections.get(Long.valueOf(socket));
+                 if (socketWrapper != null) {
+                     socketWrapper.setError(new SocketTimeoutException());
+                     if (socketWrapper.readOperation != null || socketWrapper.writeOperation != null) {
+@@ -1377,8 +1373,8 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
+                                         Long.valueOf(info.socket)));
+                             }
+                             timeouts.remove(info.socket);
+-                            AprSocketWrapper wrapper = connections.get(
+-                                    Long.valueOf(info.socket));
++                            AprSocketWrapper wrapper =
++                                    (AprSocketWrapper) connections.get(Long.valueOf(info.socket));
+                             if (wrapper != null) {
+                                 if (info.read() || info.write()) {
+                                     wrapper.pollerFlags = wrapper.pollerFlags |
+@@ -1423,8 +1419,8 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
+                                         Long.valueOf(desc[n*2])));
+                             }
+                             long timeout = timeouts.remove(desc[n*2+1]);
+-                            AprSocketWrapper wrapper = connections.get(
+-                                    Long.valueOf(desc[n*2+1]));
++                            AprSocketWrapper wrapper = (AprSocketWrapper)
++                                    connections.get(Long.valueOf(desc[n*2+1]));
+                             if (wrapper == null) {
+                                 // Socket was closed in another thread while still in
+                                 // the Poller but wasn't removed from the Poller before
+
+==================================================
+NioEndpoint.java
+index 1ac7025f43..afb875706d 100644
+--- a/java/org/apache/tomcat/util/net/Nio2Endpoint.java
++++ b/java/org/apache/tomcat/util/net/Nio2Endpoint.java
+@@ -320,7 +320,7 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel,AsynchronousS
+                 }
+             }
+             Nio2SocketWrapper socketWrapper = new Nio2SocketWrapper(channel, this);
+-            connections.put(socketWrapper, socketWrapper);
++            connections.put(channel, socketWrapper);
+             channel.reset(socket, socketWrapper);
+             socketWrapper.setReadTimeout(getConnectionTimeout());
+             socketWrapper.setWriteTimeout(getConnectionTimeout());
+
+==================================================
+SocketWrapperBase.java
+index 9ba8262714..0cb33f6857 100644
+--- a/java/org/apache/tomcat/util/net/NioEndpoint.java
++++ b/java/org/apache/tomcat/util/net/NioEndpoint.java
+@@ -417,7 +417,7 @@ public class NioEndpoint extends AbstractJsseEndpoint<NioChannel,SocketChannel>
+             } else {
+             }
+             NioSocketWrapper socketWrapper = new NioSocketWrapper(channel, this);
+-            connections.put(socketWrapper, socketWrapper);
++            connections.put(channel, socketWrapper);
+             channel.reset(socket, socketWrapper);
+             socketWrapper.setReadTimeout(getConnectionTimeout());
+             socketWrapper.setWriteTimeout(getConnectionTimeout());
+
+==================================================

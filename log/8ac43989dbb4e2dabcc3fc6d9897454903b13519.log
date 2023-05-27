@@ -1,0 +1,293 @@
+8ac43989dbb4e2dabcc3fc6d9897454903b13519
+==================================================
+Implement suspectTimeout to allow JMX notifications and log events to take place if a connection is checked out for too long. But don't abandon/close the connection.
+==================================================
+Filip Hanik
+==================================================
+Fri Nov 13 21:53:13 2009 +0000
+==================================================
+ConnectionPool.java
+index c692de9a20..83e99b70cd 100644
+--- a/modules/jdbc-pool/doc/jdbc-pool.xml
++++ b/modules/jdbc-pool/doc/jdbc-pool.xml
+@@ -78,13 +78,16 @@
+       <li>Asynchronous connection retrieval - you can queue your request for a connection and receive a Future&lt;Connection&gt; back.</li>    
+       <li>Better idle connection handling. Instead of closing connections directly, it can still pool connections and sizes the idle pool with a smarter algorithm.</li>    
+       <li>You can decide at what moment connections are considered abandoned, is it when the pool is full, or directly at a timeout
+-          by specifying a threshold.
++          by specifying a pool usage threshold.
+       </li>    
+       <li>The abandon connection timer will reset upon a statement/query activity. Allowing a connections that is in use for a long time to not timeout.
+           This is achieved using the ResetAbandonedTimer
+       </li>    
+       <li>Close connections after they have been connected for a certain time. Age based close upon return to the pool.
+-      </li>    
++      </li>   
++      <li>Get JMX notifications and log entries when connections are suspected for being abandoned. This is similar to
++          the <code>removeAbandonedTimeout</code> but it doesn't take any action, only reports the information. 
++          This is achieved using the <code>suspectTimeout</code> attribute.</li> 
+     </ol>
+   </p>
+ 
+@@ -388,6 +391,16 @@
+          The default value is <code>true</code>.
+       </p> 
+     </attribute>    
++    <attribute name="suspectTimeout" required="false">
++      <p>(int) Timeout value in seconds. Default value is <code>0</code>.<br/>
++           Similar to to the <code>removeAbandonedTimeout</code> value but instead of treating the connection
++           as abandoned, and potentially closing the connection, this simply logs the warning if 
++           <code>logAbandoned</code> is set to true. If this value is equal or less than 0, no suspect 
++           checking will be performed. Suspect checking only takes place if the timeout value is larger than 0 and
++           the connection was not abandoned or if abandon check is disabled. If a connection is suspect a WARN message gets
++           logged and a JMX notification gets sent once. 
++      </p>
++    </attribute>
+   </attributes>  
+   </subsection>
+ </section>
+
+==================================================
+DataSourceProxy.java
+index 1e25d926e3..f44c0a5e96 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/ConnectionPool.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/ConnectionPool.java
+@@ -475,6 +475,32 @@ public class ConnectionPool {
+             con.unlock();
+         }
+     }
++    
++    /**
++     * thread safe way to abandon a connection
++     * signals a connection to be abandoned.
++     * this will disconnect the connection, and log the stack trace if logAbanded=true
++     * @param con PooledConnection
++     */
++    protected void suspect(PooledConnection con) {
++        if (con == null)
++            return;
++        if (con.isSuspect())
++            return;
++        try {
++            con.lock();
++            String trace = con.getStackTrace();
++            if (getPoolProperties().isLogAbandoned()) {
++                log.warn("Connection has been marked suspect, possibly abandoned " + con + "["+(System.currentTimeMillis()-con.getTimestamp())+" ms.]:" + trace);
++            }
++            if (jmxPool!=null) {
++                jmxPool.notify(org.apache.tomcat.jdbc.pool.jmx.ConnectionPool.SUSPECT_ABANDONED_NOTIFICATION, trace);
++            }
++            con.setSuspect(true);
++        } finally {
++            con.unlock();
++        }
++    }
+ 
+     /**
+      * thread safe way to release a connection
+@@ -786,8 +812,8 @@ public class ConnectionPool {
+     public void checkAbandoned() {
+         try {
+             if (busy.size()==0) return;
+-            if (!shouldAbandon()) return;
+             Iterator<PooledConnection> locked = busy.iterator();
++            int sto = getPoolProperties().getSuspectTimeout();
+             while (locked.hasNext()) {
+                 PooledConnection con = locked.next();
+                 boolean setToNull = false;
+@@ -799,10 +825,12 @@ public class ConnectionPool {
+                         continue;
+                     long time = con.getTimestamp();
+                     long now = System.currentTimeMillis();
+-                    if ((now - time) > con.getAbandonTimeout()) {
++                    if (shouldAbandon() && (now - time) > con.getAbandonTimeout()) {
+                         busy.remove(con);
+                         abandon(con);
+                         setToNull = true;
++                    } else if (sto > 0 && (now - time) > (sto*1000)) {
++                        suspect(con);
+                     } else {
+                         //do nothing
+                     } //end if
+
+==================================================
+PoolConfiguration.java
+index 093dd707a2..1db507d29e 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/DataSourceProxy.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/DataSourceProxy.java
+@@ -516,6 +516,23 @@ public class DataSourceProxy implements PoolConfiguration {
+ 
+     }    
+     
++    
++    /**
++     * {@inheritDoc}
++     */
++    @Override
++    public int getSuspectTimeout() {
++        return getPoolProperties().getSuspectTimeout(); 
++    }
++
++    /**
++     * {@inheritDoc}
++     */
++    @Override
++    public void setSuspectTimeout(int seconds) {
++        getPoolProperties().setSuspectTimeout(seconds);
++    }
++    
+   //===============================================================================
+ //  Expose JMX attributes through Tomcat's dynamic reflection
+ //===============================================================================
+
+==================================================
+PoolProperties.java
+index 667ae627b3..d325323f04 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/PoolConfiguration.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/PoolConfiguration.java
+@@ -698,5 +698,24 @@ public interface PoolConfiguration {
+      * @param useLock set to true if a lock should be used on connection operations
+      */
+     public void setUseLock(boolean useLock);
++    
++    /**
++     * Similar to {@link #setRemoveAbandonedTimeout(int)} but instead of treating the connection
++     * as abandoned, and potentially closing the connection, this simply logs the warning if 
++     * {@link #isLogAbandoned()} returns true. If this value is equal or less than 0, no suspect 
++     * checking will be performed. Suspect checking only takes place if the timeout value is larger than 0 and
++     * the connection was not abandoned or if abandon check is disabled. If a connection is suspect a WARN message gets
++     * logged and a JMX notification gets sent once. 
++     * @param seconds - the amount of time in seconds that has to pass before a connection is marked suspect. 
++     */
++    public void setSuspectTimeout(int seconds);
++    
++    /**
++     * Returns the time in seconds to pass before a connection is marked an abanoned suspect.
++     * Any value lesser than or equal to 0 means the check is disabled. 
++     * @return Returns the time in seconds to pass before a connection is marked an abanoned suspect.
++     */
++    public int getSuspectTimeout();
++    
+ 
+ }
+\ No newline at end of file
+
+==================================================
+PooledConnection.java
+index 0f56617052..62b31c5566 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/PoolProperties.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/PoolProperties.java
+@@ -74,6 +74,8 @@ public class PoolProperties implements PoolConfiguration {
+     protected long maxAge = 0;
+     protected boolean useLock = false;
+     private InterceptorDefinition[] interceptors = null;
++    protected int suspectTimeout = 0;
++    
+     
+     /** 
+      * {@inheritDoc}
+@@ -718,14 +720,32 @@ public class PoolProperties implements PoolConfiguration {
+         return defaultReadOnly;
+     }
+     
++    
++    /**
++     * {@inheritDoc}
++     */
++    @Override
++    public int getSuspectTimeout() {
++        return this.suspectTimeout;
++    }
++
++    /**
++     * {@inheritDoc}
++     */
++    @Override
++    public void setSuspectTimeout(int seconds) {
++        this.suspectTimeout = seconds;
++    }
++
+     /** 
+      * {@inheritDoc}
+      */
+     @Override
+     public boolean isPoolSweeperEnabled() {
+-        boolean result = getTimeBetweenEvictionRunsMillis()>0;
+-        result = result && (isRemoveAbandoned() && getRemoveAbandonedTimeout()>0);
+-        result = result || (isTestWhileIdle() && getValidationQuery()!=null);
++        boolean timer = getTimeBetweenEvictionRunsMillis()>0;
++        boolean result = timer && (isRemoveAbandoned() && getRemoveAbandonedTimeout()>0);
++        result = result || (timer && getSuspectTimeout()>0); 
++        result = result || (timer && isTestWhileIdle() && getValidationQuery()!=null);
+         return result;
+     }
+     
+
+==================================================
+AbstractQueryReport.java
+index ba8edbf218..eff788dcdb 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/PooledConnection.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/PooledConnection.java
+@@ -111,6 +111,8 @@ public class PooledConnection {
+     
+     private AtomicBoolean released = new AtomicBoolean(false);
+     
++    private volatile boolean suspect = false;
++    
+     /**
+      * Constructor
+      * @param prop - pool properties
+@@ -390,6 +392,18 @@ public class PooledConnection {
+      */
+     public void setTimestamp(long timestamp) {
+         this.timestamp = timestamp;
++        setSuspect(false);
++    }
++    
++    
++    
++
++    public boolean isSuspect() {
++        return suspect;
++    }
++
++    public void setSuspect(boolean suspect) {
++        this.suspect = suspect;
+     }
+ 
+     /**
+
+==================================================
+ConnectionPool.java
+index 412885e019..31b7ed2d34 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/interceptor/AbstractQueryReport.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/interceptor/AbstractQueryReport.java
+@@ -73,7 +73,7 @@ public abstract class AbstractQueryReport extends AbstractCreateStatementInterce
+      * Invoked when a query execution, a call to execute/executeQuery or executeBatch failed.
+      * @param query the query that was executed and failed
+      * @param args the arguments to the execution
+-     * @param name the name of the method used to execute {@link AbstractCreateStatementInterceptor#executes}
++     * @param name the name of the method used to execute {@link AbstractCreateStatementInterceptor#isExecute(Method, boolean)}
+      * @param start the time the query execution started
+      * @param t the exception that happened
+      * @return - the SQL that was executed or the string &quot;batch&quot; if it was a batch execution 
+@@ -92,7 +92,7 @@ public abstract class AbstractQueryReport extends AbstractCreateStatementInterce
+      * Invoked when a query execution, a call to execute/executeQuery or executeBatch succeeded and was within the timing threshold
+      * @param query the query that was executed and failed
+      * @param args the arguments to the execution
+-     * @param name the name of the method used to execute {@link AbstractCreateStatementInterceptor#executes}
++     * @param name the name of the method used to execute {@link AbstractCreateStatementInterceptor#isExecute(Method, boolean)}
+      * @param start the time the query execution started
+      * @param delta the time the execution took
+      * @return - the SQL that was executed or the string &quot;batch&quot; if it was a batch execution 
+@@ -111,7 +111,7 @@ public abstract class AbstractQueryReport extends AbstractCreateStatementInterce
+      * Invoked when a query execution, a call to execute/executeQuery or executeBatch succeeded and was exceeded the timing threshold
+      * @param query the query that was executed and failed
+      * @param args the arguments to the execution
+-     * @param name the name of the method used to execute {@link AbstractCreateStatementInterceptor#executes}
++     * @param name the name of the method used to execute {@link AbstractCreateStatementInterceptor#isExecute(Method, boolean)}
+      * @param start the time the query execution started
+      * @param delta the time the execution took
+      * @return - the SQL that was executed or the string &quot;batch&quot; if it was a batch execution 
+
+==================================================

@@ -1,0 +1,1210 @@
+4a2830c5ba1765d10aa8c1c0bc6aab722d655f64
+==================================================
+With the benefit of some sleep, refactor the MBean support for Lifecycle (still some components to convert)
+==================================================
+Mark Emlyn
+==================================================
+Mon May 3 21:40:52 2010 +0000
+==================================================
+LifecycleMBeanRegistration.java
+With the benefit of some sleep, refactor the MBean support for Lifecycle (still some components to convert)
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=49134
+Thanks to Marc Guillemot whose test case for 49134 provided the basis of o.a.c.mbeans.TestRegistration
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@940634 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Connector.java
+deleted file mode 100644
+index 7f648b91ed..0000000000
+--- a/java/org/apache/catalina/LifecycleMBeanRegistration.java
++++ /dev/null
+@@ -1,50 +0,0 @@
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- * 
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- * 
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.catalina;
+-
+-import javax.management.MBeanRegistration;
+-import javax.management.ObjectName;
+-
+-/**
+- * This interface extends the {@link MBeanRegistration} interface and adds
+- * methods for obtaining the domain and object name used to register this
+- * component. This interface is intended to be implemented by components that
+- * already implement {@link Lifecycle} to indicate that they require
+- * registration during {@link Lifecycle#init()} and de-registration during
+- * {@link Lifecycle#destroy()}. 
+- */
+-public interface LifecycleMBeanRegistration extends MBeanRegistration {
+-
+-    /**
+-     * Obtain the {@link ObjectName} under which this component will be / has
+-     * been registered.
+-     */
+-    public ObjectName getObjectName();
+-
+-
+-    /**
+-     * Obtain the domain under which this component will be / has been
+-     * registered.
+-     */
+-    public String getDomain();
+-
+-    /**
+-     * Specify the domain under which this component should be registered.
+-     */
+-    public void setDomain(String domain);
+-}
+
+==================================================
+StandardContext.java
+index 624ab9d5fe..0083f93dbc 100644
+--- a/java/org/apache/catalina/connector/Connector.java
++++ b/java/org/apache/catalina/connector/Connector.java
+@@ -20,16 +20,14 @@ package org.apache.catalina.connector;
+ 
+ import java.util.HashMap;
+ 
+-import javax.management.MBeanRegistration;
+-import javax.management.MBeanServer;
+-import javax.management.MalformedObjectNameException;
+ import javax.management.ObjectName;
+ 
+ import org.apache.catalina.LifecycleException;
+ import org.apache.catalina.LifecycleState;
+ import org.apache.catalina.Service;
+ import org.apache.catalina.core.AprLifecycleListener;
+-import org.apache.catalina.util.LifecycleBase;
++import org.apache.catalina.mbeans.MBeanUtils;
++import org.apache.catalina.util.LifecycleMBeanBase;
+ import org.apache.tomcat.util.res.StringManager;
+ import org.apache.coyote.Adapter;
+ import org.apache.coyote.ProtocolHandler;
+@@ -37,7 +35,6 @@ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.IntrospectionUtils;
+ import org.apache.tomcat.util.http.mapper.Mapper;
+-import org.apache.tomcat.util.modeler.Registry;
+ 
+ 
+ /**
+@@ -49,7 +46,7 @@ import org.apache.tomcat.util.modeler.Registry;
+  */
+ 
+ 
+-public class Connector extends LifecycleBase implements MBeanRegistration {
++public class Connector extends LifecycleMBeanBase  {
+ 
+     private static final Log log = LogFactory.getLog(Connector.class);
+ 
+@@ -796,12 +793,11 @@ public class Connector extends LifecycleBase implements MBeanRegistration {
+     }
+ 
+ 
+-    protected ObjectName createObjectName(String domain, String type)
+-            throws MalformedObjectNameException {
++    protected String createObjectNameKeyProperties(String type) {
++        
+         Object addressObj = getProperty("address");
+ 
+-        StringBuilder sb = new StringBuilder(domain);
+-        sb.append(":type=");
++        StringBuilder sb = new StringBuilder("type=");
+         sb.append(type);
+         sb.append(",port=");
+         sb.append(getPort());
+@@ -812,8 +808,7 @@ public class Connector extends LifecycleBase implements MBeanRegistration {
+                 sb.append(ObjectName.quote(address));
+             }
+         }
+-        ObjectName _oname = new ObjectName(sb.toString());
+-        return _oname;
++        return sb.toString();
+     }
+ 
+ 
+@@ -843,6 +838,37 @@ public class Connector extends LifecycleBase implements MBeanRegistration {
+     }
+ 
+ 
++    @Override
++    protected void initInternal() throws LifecycleException {
++
++        super.initInternal();
++        
++        // Initialize adapter
++        adapter = new CoyoteAdapter(this);
++        protocolHandler.setAdapter(adapter);
++
++        IntrospectionUtils.setProperty(protocolHandler, "jkHome",
++                                       System.getProperty("catalina.base"));
++
++        try {
++            protocolHandler.init();
++        } catch (Exception e) {
++            throw new LifecycleException
++                (sm.getString
++                 ("coyoteConnector.protocolHandlerInitializationFailed", e));
++        }
++
++        onameProtocolHandler = register(protocolHandler,
++                createObjectNameKeyProperties("ProtocolHandler"));
++        
++        mapperListener.setDomain(getDomain());
++        mapperListener.init();
++
++        onameMapper = register(mapperListener,
++                createObjectNameKeyProperties("Mapper"));
++    }
++
++
+     /**
+      * Begin processing requests via this Connector.
+      *
+@@ -853,23 +879,6 @@ public class Connector extends LifecycleBase implements MBeanRegistration {
+ 
+         setState(LifecycleState.STARTING);
+ 
+-        // We can't register earlier - the JMX registration of this happens
+-        // in Server.start callback
+-        if ( this.oname != null ) {
+-            // We are registred - register the adapter as well.
+-            try {
+-                Registry.getRegistry(null, null).registerComponent
+-                    (protocolHandler, createObjectName(this.domain,"ProtocolHandler"), null);
+-            } catch (Exception ex) {
+-                log.error(sm.getString
+-                          ("coyoteConnector.protocolRegistrationFailed"), ex);
+-            }
+-        } else {
+-            if(log.isInfoEnabled())
+-                log.info(sm.getString
+-                     ("coyoteConnector.cannotRegisterProtocol"));
+-        }
+-
+         try {
+             protocolHandler.start();
+         } catch (Exception e) {
+@@ -882,23 +891,6 @@ public class Connector extends LifecycleBase implements MBeanRegistration {
+                 (errPrefix + " " + sm.getString
+                  ("coyoteConnector.protocolHandlerStartFailed", e));
+         }
+-
+-        if( this.domain != null ) {
+-            mapperListener.setDomain( domain );
+-            //mapperListener.setEngine( service.getContainer().getName() );
+-            mapperListener.init();
+-            try {
+-                ObjectName mapperOname = createObjectName(this.domain,"Mapper");
+-                if (log.isDebugEnabled())
+-                    log.debug(sm.getString(
+-                            "coyoteConnector.MapperRegistration", mapperOname));
+-                Registry.getRegistry(null, null).registerComponent
+-                    (mapper, mapperOname, "Mapper");
+-            } catch (Exception ex) {
+-                log.error(sm.getString
+-                        ("coyoteConnector.protocolRegistrationFailed"), ex);
+-            }
+-        }
+     }
+ 
+ 
+@@ -912,16 +904,15 @@ public class Connector extends LifecycleBase implements MBeanRegistration {
+ 
+         setState(LifecycleState.STOPPING);
+ 
+-        try {
+-            mapperListener.destroy();
+-            Registry.getRegistry(null, null).unregisterComponent
+-                (createObjectName(this.domain,"Mapper"));
+-            Registry.getRegistry(null, null).unregisterComponent
+-                (createObjectName(this.domain,"ProtocolHandler"));
+-        } catch (MalformedObjectNameException e) {
+-            log.error( sm.getString
+-                    ("coyoteConnector.protocolUnregistrationFailed"), e);
+-        }
++    }
++
++
++    @Override
++    protected void destroyInternal() throws LifecycleException {
++        mapperListener.destroy();
++        unregister(onameMapper);
++        unregister(onameProtocolHandler);
++        
+         try {
+             protocolHandler.destroy();
+         } catch (Exception e) {
+@@ -930,6 +921,11 @@ public class Connector extends LifecycleBase implements MBeanRegistration {
+                  ("coyoteConnector.protocolHandlerDestroyFailed", e));
+         }
+ 
++        if (getService() != null) {
++            getService().removeConnector(this);
++        }
++        
++        super.destroyInternal();
+     }
+ 
+ 
+@@ -948,92 +944,19 @@ public class Connector extends LifecycleBase implements MBeanRegistration {
+         return sb.toString();
+     }
+ 
+-
+     // -------------------- JMX registration  --------------------
+-    protected String domain;
+-    protected ObjectName oname;
+-    protected MBeanServer mserver;
+-
+-    public ObjectName getObjectName() {
+-        return oname;
+-    }
+-
+-    public String getDomain() {
+-        return domain;
+-    }
+-
+-    public ObjectName preRegister(MBeanServer server,
+-                                  ObjectName name) throws Exception {
+-        oname=name;
+-        mserver=server;
+-        domain=name.getDomain();
+-        return name;
+-    }
+-
+-    public void postRegister(Boolean registrationDone) {
+-        // NOOP
+-    }
+-
+-    public void preDeregister() throws Exception {
+-        // NOOP
+-    }
+-
+-    public void postDeregister() {
+-        try {
+-            if(getState().isAvailable()) {
+-                stop();
+-            }
+-        } catch( Throwable t ) {
+-            log.error( "Unregistering - can't stop", t);
+-        }
+-    }
+-
+ 
++    private ObjectName onameProtocolHandler;
++    private ObjectName onameMapper;
++    
+     @Override
+-    protected void initInternal() throws LifecycleException {
+-
+-        if (oname == null) {
+-            try {
+-                // we are loaded directly, via API - and no name was given to us
+-                // Engine name is used as domain name for MBeans
+-                oname = createObjectName(
+-                        getService().getContainer().getName(), "Connector");
+-                Registry.getRegistry(null, null)
+-                    .registerComponent(this, oname, null);
+-            } catch (Exception e) {
+-                log.error( "Error registering connector ", e);
+-            }
+-            if(log.isDebugEnabled())
+-                log.debug("Creating name for connector " + oname);
+-        }
+-
+-        // Initializa adapter
+-        adapter = new CoyoteAdapter(this);
+-        protocolHandler.setAdapter(adapter);
+-
+-        IntrospectionUtils.setProperty(protocolHandler, "jkHome",
+-                                       System.getProperty("catalina.base"));
+-
+-        try {
+-            protocolHandler.init();
+-        } catch (Exception e) {
+-            throw new LifecycleException
+-                (sm.getString
+-                 ("coyoteConnector.protocolHandlerInitializationFailed", e));
+-        }
+-
++    protected String getDomainInternal() {
++        return MBeanUtils.getDomain(getService());
+     }
+ 
+     @Override
+-    protected void destroyInternal() {
+-        if (oname!=null) {
+-            if(log.isDebugEnabled())
+-                 log.debug("Unregister itself " + oname );
+-            Registry.getRegistry(null, null).unregisterComponent(oname);
+-        }
+-        if( getService() == null)
+-            return;
+-        getService().removeConnector(this);
++    protected String getObjectNameKeyProperties() {
++        return createObjectNameKeyProperties("Connector");
+     }
+ 
+ }
+
+==================================================
+StandardServer.java
+index 0629e847ae..57941aa556 100644
+--- a/java/org/apache/catalina/core/StandardContext.java
++++ b/java/org/apache/catalina/core/StandardContext.java
+@@ -5014,6 +5014,23 @@ public class StandardContext
+      */ 
+     @Override
+     protected void destroyInternal() throws LifecycleException {
++        
++        if ((manager != null) && (manager instanceof Lifecycle)) {
++            ((Lifecycle) manager).destroy();
++        }
++        if ((realm != null) && (realm instanceof Lifecycle)) {
++            ((Lifecycle) realm).destroy();
++        }
++        if ((cluster != null) && (cluster instanceof Lifecycle)) {
++            ((Lifecycle) cluster).destroy();
++        }
++        if ((logger != null) && (logger instanceof Lifecycle)) {
++            ((Lifecycle) logger).destroy();
++        }
++        if ((loader != null) && (loader instanceof Lifecycle)) {
++            ((Lifecycle) loader).destroy();
++        }
++
+         if( oname != null ) { 
+             // Send j2ee.object.deleted notification 
+             Notification notification = 
+@@ -5029,7 +5046,6 @@ public class StandardContext
+         synchronized (instanceListenersLock) {
+             instanceListeners = new String[0];
+         }
+-
+     }
+     
+     private void resetContext() throws Exception {
+
+==================================================
+StandardService.java
+index f928ff7015..a1aa7c94c5 100644
+--- a/java/org/apache/catalina/core/StandardServer.java
++++ b/java/org/apache/catalina/core/StandardServer.java
+@@ -29,27 +29,24 @@ import java.net.Socket;
+ import java.security.AccessControlException;
+ import java.util.Random;
+ 
+-import javax.management.MBeanServer;
+-import javax.management.MalformedObjectNameException;
+ import javax.management.ObjectName;
+ 
+ import org.apache.catalina.Container;
+ import org.apache.catalina.Context;
+-import org.apache.catalina.Globals;
+ import org.apache.catalina.LifecycleException;
+-import org.apache.catalina.LifecycleMBeanRegistration;
+ import org.apache.catalina.LifecycleState;
+ import org.apache.catalina.Server;
+ import org.apache.catalina.Service;
+ import org.apache.catalina.deploy.NamingResources;
+ import org.apache.catalina.mbeans.MBeanFactory;
++import org.apache.catalina.mbeans.MBeanUtils;
+ import org.apache.catalina.util.LifecycleBase;
++import org.apache.catalina.util.LifecycleMBeanBase;
+ import org.apache.tomcat.util.res.StringManager;
+ import org.apache.catalina.util.ServerInfo;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.buf.StringCache;
+-import org.apache.tomcat.util.modeler.Registry;
+ 
+ 
+ /**
+@@ -59,8 +56,8 @@ import org.apache.tomcat.util.modeler.Registry;
+  * @author Craig R. McClanahan
+  * @version $Id$
+  */
+-public final class StandardServer extends LifecycleBase
+-        implements Server, LifecycleMBeanRegistration {
++public final class StandardServer extends LifecycleMBeanBase
++        implements Server {
+ 
+     private static final Log log = LogFactory.getLog(StandardServer.class);
+    
+@@ -684,29 +681,17 @@ public final class StandardServer extends LifecycleBase
+      */
+     @Override
+     protected void initInternal() throws LifecycleException {
++        
++        super.initInternal();
+ 
+         // Register global String cache
+         // Note although the cache is global, if there are multiple Servers
+         // present in the JVM (may happen when embedding) then the same cache
+         // will be registered under multiple names
+-        try {
+-            onameStringCache = 
+-                new ObjectName(oname.getDomain() + ":type=StringCache");
+-            Registry.getRegistry(null, null)
+-                .registerComponent(new StringCache(), onameStringCache, null);
+-        } catch (Exception e) {
+-            log.error("Error registering ",e);
+-        }
++        onameStringCache = register(new StringCache(), "type=StringCache");
+ 
+         // Register the MBeanFactory
+-        try {
+-            onameMBeanFactory = 
+-                new ObjectName(oname.getDomain() + ":type=MBeanFactory");
+-            Registry.getRegistry(null, null)
+-                .registerComponent(new MBeanFactory(), onameMBeanFactory, null);
+-        } catch (Exception e) {
+-            log.error("Error registering ",e);
+-        }
++        onameMBeanFactory = register(new MBeanFactory(), "type=MBeanFactory");
+         
+         // Initialize our defined Services
+         for (int i = 0; i < services.length; i++) {
+@@ -716,24 +701,18 @@ public final class StandardServer extends LifecycleBase
+     
+     @Override
+     protected void destroyInternal() throws LifecycleException {
+-        Registry registry = Registry.getRegistry(null, null);
+-        
+-        if (onameStringCache != null) {
+-            registry.unregisterComponent(onameStringCache);
+-        }
+-        if (onameMBeanFactory != null) {
+-            registry.unregisterComponent(onameMBeanFactory);
+-        }
+-        
+         // Destroy our defined Services
+         for (int i = 0; i < services.length; i++) {
+             services[i].destroy();
+         }
++
++        unregister(onameMBeanFactory);
++        
++        unregister(onameStringCache);
++        
++        super.destroyInternal();
+     }
+ 
+-    protected volatile String domain;
+-    protected volatile ObjectName oname;
+-    protected MBeanServer mserver;
+     private ObjectName onameStringCache;
+     private ObjectName onameMBeanFactory;
+     
+@@ -743,72 +722,27 @@ public final class StandardServer extends LifecycleBase
+      * <ol>
+      * <li>Name of first {@link Engine}.</li>
+      * <li>Name of first {@link Service}.</li>
+-     * <li>Global default defined by {@link Globals#DEFAULT_MBEAN_DOMAIN}</li>
+      * </ol>
+      */
+-    public String getDomain() {
+-        if (domain == null) {
+-            Service[] services = findServices();
+-            if (services.length > 0) {
+-                Service service = services[0];
+-                if (service != null) {
+-                    Container container = service.getContainer();
+-                    if (container != null) {
+-                        domain = container.getName();
+-                    } else {
+-                        domain = service.getName();
+-                    }
+-                }
+-            }
+-            if (domain == null) {
+-                domain = Globals.DEFAULT_MBEAN_DOMAIN;
++    @Override
++    protected String getDomainInternal() {
++        
++        String domain = null;
++        
++        Service[] services = findServices();
++        if (services.length > 0) {
++            Service service = services[0];
++            if (service != null) {
++                domain = MBeanUtils.getDomain(service);
+             }
+         }
+         return domain;
+     }
+ 
+     
+-    public void setDomain(String domain) {
+-        this.domain = domain;
+-    }
+-    
+-    
+-    public ObjectName getObjectName() {
+-        if (oname == null) {
+-            StringBuilder name = new StringBuilder(getDomain());
+-            name.append(":type=Server");
+-            
+-            try {
+-                oname = new ObjectName(name.toString());
+-            } catch (MalformedObjectNameException e) {
+-                log.warn(sm.getString("standardServer.onameFail", name), e);
+-            } catch (NullPointerException e) {
+-                // Never going to happen
+-            }
+-        }
+-        
+-        return oname;
+-    }
+-
+-
+-    public ObjectName preRegister(MBeanServer server,
+-                                  ObjectName name) throws Exception {
+-        oname = name;
+-        mserver = server;
+-        domain = name.getDomain();
+-        return name;
+-    }
+-
+-    public void postRegister(Boolean registrationDone) {
+-        // NOOP
+-    }
+-
+-    public void preDeregister() throws Exception {
+-        // NOOP
++    @Override
++    protected final String getObjectNameKeyProperties() {
++        return "type=Server";
+     }
+ 
+-    public void postDeregister() {
+-        // NOOP
+-    }
+-    
+ }
+
+==================================================
+StandardThreadExecutor.java
+index aad1dea9b5..737c630a55 100644
+--- a/java/org/apache/catalina/core/StandardService.java
++++ b/java/org/apache/catalina/core/StandardService.java
+@@ -21,24 +21,21 @@ package org.apache.catalina.core;
+ 
+ import java.beans.PropertyChangeListener;
+ import java.beans.PropertyChangeSupport;
+-import javax.management.MBeanServer;
+-import javax.management.MalformedObjectNameException;
+ import javax.management.ObjectName;
+ import org.apache.catalina.Container;
+ import org.apache.catalina.Engine;
+-import org.apache.catalina.Globals;
+ import org.apache.catalina.Lifecycle;
+ import org.apache.catalina.LifecycleException;
+-import org.apache.catalina.LifecycleMBeanRegistration;
+ import org.apache.catalina.LifecycleState;
+ import org.apache.catalina.Server;
+ import org.apache.catalina.Service;
+ import org.apache.catalina.connector.Connector;
++import org.apache.catalina.mbeans.MBeanUtils;
+ import org.apache.catalina.util.LifecycleBase;
++import org.apache.catalina.util.LifecycleMBeanBase;
+ import org.apache.tomcat.util.res.StringManager;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+-import org.apache.tomcat.util.modeler.Registry;
+ import java.util.ArrayList;
+ import org.apache.catalina.Executor;
+ 
+@@ -51,8 +48,7 @@ import org.apache.catalina.Executor;
+  * @author Craig R. McClanahan
+  */
+ 
+-public class StandardService extends LifecycleBase
+-        implements Service, LifecycleMBeanRegistration {
++public class StandardService extends LifecycleMBeanBase implements Service {
+ 
+     private static final Log log = LogFactory.getLog(StandardService.class);
+    
+@@ -509,14 +505,16 @@ public class StandardService extends LifecycleBase
+     @Override
+     protected void initInternal() throws LifecycleException {
+ 
++        super.initInternal();
++        
+         if (container != null) {
+             container.init();
+         }
+ 
+         // Initialize any Executors
+         for (Executor executor : findExecutors()) {
+-            if (executor instanceof LifecycleMBeanRegistration) {
+-                ((LifecycleMBeanRegistration) executor).setDomain(getDomain());
++            if (executor instanceof LifecycleMBeanBase) {
++                ((LifecycleMBeanBase) executor).setDomain(getDomain());
+             }
+             executor.init();
+         }
+@@ -537,8 +535,6 @@ public class StandardService extends LifecycleBase
+     
+     @Override
+     protected void destroyInternal() throws LifecycleException {
+-        Registry.getRegistry(null, null).unregisterComponent(oname);
+-        
+         // Destroy our defined Connectors
+         synchronized (connectors) {
+             for (Connector connector : connectors) {
+@@ -561,72 +557,17 @@ public class StandardService extends LifecycleBase
+             container.destroy();
+         }
+ 
++        super.destroyInternal();
+     }
+ 
+-    protected volatile String domain;
+-    protected volatile ObjectName oname;
+-
+-    /**
+-     * Obtain the MBean domain for this server. The domain is obtained using
+-     * the following search order:
+-     * <ol>
+-     * <li>Name of the {@link Engine}.</li>
+-     * <li>Name of the {@link Service}.</li>
+-     * <li>Global default defined by {@link Globals#DEFAULT_MBEAN_DOMAIN}</li>
+-     * </ol>
+-     */
+-    public String getDomain() {
+-        if (domain == null) {
+-            Container container = getContainer();
+-            if (container != null) {
+-                domain = container.getName();
+-            } else {
+-                domain = getName();
+-            }
+-            if (domain == null) {
+-                domain = Globals.DEFAULT_MBEAN_DOMAIN;
+-            }
+-        }
+-        return domain;
+-    }
+-
+-    public void setDomain(String domain) {
+-        this.domain = domain;
+-    }
+-    
+-    public ObjectName getObjectName() {
+-        if (oname == null) {
+-            StringBuilder name = new StringBuilder(getDomain());
+-            name.append(":type=Service");
+-            
+-            try {
+-                oname = new ObjectName(name.toString());
+-            } catch (MalformedObjectNameException e) {
+-                log.warn(sm.getString("standardService.onameFail", name), e);
+-            } catch (NullPointerException e) {
+-                // Never going to happen
+-            }
+-        }
++    @Override
++    protected String getDomainInternal() {
+         
+-        return oname;
+-    }
+-    public ObjectName preRegister(MBeanServer server,
+-                                  ObjectName name) throws Exception {
+-        oname=name;
+-        domain=name.getDomain();
+-        return name;
++        return MBeanUtils.getDomain(this);
+     }
+ 
+-    public void postRegister(Boolean registrationDone) {
+-        // NOOP
+-    }
+-
+-    public void preDeregister() throws Exception {
+-        // NOOP
+-    }
+-
+-    public void postDeregister() {
+-        // NOOP
++    @Override
++    public final String getObjectNameKeyProperties() {
++        return "type=Service";
+     }
+-
+ }
+
+==================================================
+WebappLoader.java
+index 9d24ca12be..28f77545b6 100644
+--- a/java/org/apache/catalina/core/StandardThreadExecutor.java
++++ b/java/org/apache/catalina/core/StandardThreadExecutor.java
+@@ -20,35 +20,19 @@ package org.apache.catalina.core;
+ import java.util.concurrent.RejectedExecutionException;
+ import java.util.concurrent.TimeUnit;
+ 
+-import javax.management.MBeanServer;
+-import javax.management.MalformedObjectNameException;
+-import javax.management.ObjectName;
+-
+ import org.apache.catalina.Executor;
+ import org.apache.catalina.LifecycleException;
+-import org.apache.catalina.LifecycleMBeanRegistration;
+ import org.apache.catalina.LifecycleState;
+ import org.apache.catalina.util.LifecycleBase;
+-import org.apache.juli.logging.Log;
+-import org.apache.juli.logging.LogFactory;
+-import org.apache.tomcat.util.res.StringManager;
++import org.apache.catalina.util.LifecycleMBeanBase;
+ import org.apache.tomcat.util.threads.ResizableExecutor;
+ import org.apache.tomcat.util.threads.TaskQueue;
+ import org.apache.tomcat.util.threads.TaskThreadFactory;
+ import org.apache.tomcat.util.threads.ThreadPoolExecutor;
+ 
+-public class StandardThreadExecutor extends LifecycleBase
+-        implements Executor, ResizableExecutor, LifecycleMBeanRegistration {
+-    
+-    private static final Log log =
+-        LogFactory.getLog(StandardThreadExecutor.class);
++public class StandardThreadExecutor extends LifecycleMBeanBase
++        implements Executor, ResizableExecutor {
+     
+-    /**
+-     * The string manager for this package.
+-     */
+-    private static final StringManager sm =
+-        StringManager.getManager(Constants.Package);
+-
+     // ---------------------------------------------- Properties
+     /**
+      * Default thread priority
+@@ -308,57 +292,16 @@ public class StandardThreadExecutor extends LifecycleBase
+     }
+     
+ 
+-    protected volatile String domain;
+-    protected volatile ObjectName oname;
+-
+-    /**
+-     * Obtain the MBean domain for this server. The domain is set by the
+-     * containing Service.
+-     */
+-    public String getDomain() {
+-        return domain;
+-    }
+-
+-    public void setDomain(String domain) {
+-        this.domain = domain;
+-    }
+-    
+-    public ObjectName getObjectName() {
+-        if (oname == null) {
+-            StringBuilder name = new StringBuilder(getDomain());
+-            name.append(":type=Executor,name=");
+-            name.append(getName());
+-            
+-            try {
+-                oname = new ObjectName(name.toString());
+-            } catch (MalformedObjectNameException e) {
+-                log.warn(sm.getString(
+-                        "standardThreadExecutor.onameFail", name), e);
+-            } catch (NullPointerException e) {
+-                // Never going to happen
+-            }
+-        }
+-        
+-        return oname;
+-    }
+-    
+-    public ObjectName preRegister(MBeanServer server,
+-                                  ObjectName name) throws Exception {
+-        oname=name;
+-        domain=name.getDomain();
+-        return name;
+-    }
+-
+-    public void postRegister(Boolean registrationDone) {
+-        // NOOP
+-    }
+-
+-    public void preDeregister() throws Exception {
+-        // NOOP
++    @Override
++    protected String getDomainInternal() {
++        // No way to navigate to Engine. Needs to have domain set.
++        return null;
+     }
+ 
+-    public void postDeregister() {
+-        // NOOP
++    @Override
++    protected String getObjectNameKeyProperties() {
++        StringBuilder name = new StringBuilder("type=Executor,name=");
++        name.append(getName());
++        return name.toString();
+     }
+-    
+ }
+
+==================================================
+MBeanFactory.java
+index 006a1dc49d..fb2a114813 100644
+--- a/java/org/apache/catalina/loader/WebappLoader.java
++++ b/java/org/apache/catalina/loader/WebappLoader.java
+@@ -37,8 +37,6 @@ import java.net.URLStreamHandlerFactory;
+ import java.util.ArrayList;
+ import java.util.jar.JarFile;
+ 
+-import javax.management.MBeanRegistration;
+-import javax.management.MBeanServer;
+ import javax.management.ObjectName;
+ import javax.naming.NameClassPair;
+ import javax.naming.NamingEnumeration;
+@@ -54,7 +52,9 @@ import org.apache.catalina.LifecycleException;
+ import org.apache.catalina.LifecycleState;
+ import org.apache.catalina.Loader;
+ import org.apache.catalina.core.StandardContext;
++import org.apache.catalina.mbeans.MBeanUtils;
+ import org.apache.catalina.util.LifecycleBase;
++import org.apache.catalina.util.LifecycleMBeanBase;
+ import org.apache.tomcat.util.res.StringManager;
+ import org.apache.naming.resources.DirContextURLStreamHandler;
+ import org.apache.naming.resources.DirContextURLStreamHandlerFactory;
+@@ -80,8 +80,8 @@ import org.apache.tomcat.util.modeler.Registry;
+  * @version $Id$
+  */
+ 
+-public class WebappLoader extends LifecycleBase
+-    implements Loader, PropertyChangeListener, MBeanRegistration  {
++public class WebappLoader extends LifecycleMBeanBase
++    implements Loader, PropertyChangeListener {
+ 
+     // ----------------------------------------------------------- Constructors
+ 
+@@ -526,41 +526,6 @@ public class WebappLoader extends LifecycleBase
+     }
+ 
+ 
+-    @Override
+-    protected void initInternal() {
+-
+-        if( oname==null ) {
+-            // not registered yet - standalone or API
+-            if( container instanceof StandardContext) {
+-                // Register ourself. The container must be a webapp
+-                try {
+-                    StandardContext ctx=(StandardContext)container;
+-                    String path = ctx.getPath();
+-                    if (path.equals("")) {
+-                        path = "/";
+-                    }   
+-                    oname=new ObjectName(ctx.getEngineName() + ":type=Loader,path=" +
+-                                path + ",host=" + ctx.getParent().getName());
+-                    Registry.getRegistry(null, null).registerComponent(this, oname, null);
+-                } catch (Exception e) {
+-                    log.error("Error registering loader", e );
+-                }
+-            }
+-        }
+-
+-        if( container == null ) {
+-            // JMX created the loader
+-            // TODO
+-
+-        }
+-    }
+-
+-    @Override
+-    protected void destroyInternal() {
+-        Registry.getRegistry(null, null).unregisterComponent(oname);
+-        oname = null;
+-    }
+-
+     /**
+      * Start associated {@link ClassLoader} and implement the requirements
+      * of {@link LifecycleBase#startInternal()}.
+@@ -1188,23 +1153,37 @@ public class WebappLoader extends LifecycleBase
+     private static final org.apache.juli.logging.Log log=
+         org.apache.juli.logging.LogFactory.getLog( WebappLoader.class );
+ 
+-    private ObjectName oname;
+ 
+-    public ObjectName preRegister(MBeanServer server,
+-                                  ObjectName name) throws Exception {
+-        oname=name;
+-        return name;
++    @Override
++    protected String getDomainInternal() {
++        return MBeanUtils.getDomain(container);
+     }
+ 
+-    public void postRegister(Boolean registrationDone) {
+-        // NOOP
+-    }
+ 
+-    public void preDeregister() throws Exception {
+-        // NOOP
++    @Override
++    protected String getObjectNameKeyProperties() {
++        
++        StringBuilder name = new StringBuilder("type=Loader");
++        
++        if (container instanceof Context) {
++            name.append(",path=");
++            Context context = (Context) container;
++            
++            String path = context.getPath();
++            if (path.equals("")) {
++                path = "/";
++            }   
++            name.append(path);
++            
++            name.append(",host=");
++            name.append(context.getParent().getName());
++        } else {
++            // Unlikely / impossible? Handle it to be safe
++            name.append(",container=");
++            name.append(container.getName());
++        }
++        
++        return name.toString();
+     }
+ 
+-    public void postDeregister() {
+-        // NOOP
+-    }
+ }
+
+==================================================
+MBeanUtils.java
+index 53196e36bb..f2cc3198c3 100644
+--- a/java/org/apache/catalina/mbeans/MBeanFactory.java
++++ b/java/org/apache/catalina/mbeans/MBeanFactory.java
+@@ -83,11 +83,10 @@ public class MBeanFactory {
+      * @exception RuntimeOperationsException if an IllegalArgumentException
+      *  occurs
+      */
+-    public MBeanFactory()
+-        throws MBeanException, RuntimeOperationsException {
++    public MBeanFactory() {
+ 
+         super();
+-
++        
+     }
+ 
+ 
+
+==================================================
+Tomcat.java
+index 54fce0fbe7..84d6e8f7ab 100644
+--- a/java/org/apache/catalina/mbeans/MBeanUtils.java
++++ b/java/org/apache/catalina/mbeans/MBeanUtils.java
+@@ -1616,4 +1616,62 @@ public class MBeanUtils {
+ 
+     }
+ 
++    
++    /**
++     * Determine the name of the domain to register MBeans for from a given
++     * Service.
++     * 
++     * @param service 
++     * @return
++     */
++    public static String getDomain(Service service) {
++        
++        // Null service -> return null
++        if (service == null) {
++            return null;
++        }
++        
++        String domain = null;
++        
++        Container engine = service.getContainer();
++        
++        // Use the engine name first
++        if (engine != null) {
++            domain = engine.getName();
++        }
++        
++        // No engine or no engine name, use the service name 
++        if (domain == null) {
++            domain = service.getName();
++        }
++        
++        // No service name, use null
++        return domain;
++    }
++    
++
++    /**
++     * Determine the name of the domain to register MBeans for from a given
++     * Container.
++     * 
++     * @param container 
++     * @return
++     */
++    public static String getDomain(Container container) {
++        
++        String domain = null;
++        
++        Container c = container;
++        
++        while (!(c instanceof Engine)) {
++            c = c.getParent();
++        }
++        
++        if (c instanceof Engine) {
++            domain = c.getName();
++        }
++        
++        return domain;
++    }
++
+ }
+
+==================================================
+LifecycleBase.java
+index c3d0e40d62..84e6583f0a 100644
+--- a/java/org/apache/catalina/startup/Tomcat.java
++++ b/java/org/apache/catalina/startup/Tomcat.java
+@@ -320,7 +320,7 @@ public class Tomcat {
+     public void destroy() throws LifecycleException {
+         getServer();
+         server.destroy();
+-        // Could null out obejcts here
++        // Could null out objects here
+     }
+     
+     /** 
+
+==================================================
+LifecycleMBeanBase.java
+index 34c7b91892..670cf0226f 100644
+--- a/java/org/apache/catalina/util/LifecycleBase.java
++++ b/java/org/apache/catalina/util/LifecycleBase.java
+@@ -17,16 +17,12 @@
+ 
+ package org.apache.catalina.util;
+ 
+-import javax.management.ObjectName;
+-
+ import org.apache.catalina.Lifecycle;
+ import org.apache.catalina.LifecycleException;
+ import org.apache.catalina.LifecycleListener;
+-import org.apache.catalina.LifecycleMBeanRegistration;
+ import org.apache.catalina.LifecycleState;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+-import org.apache.tomcat.util.modeler.Registry;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+ 
+@@ -99,20 +95,6 @@ public abstract class LifecycleBase implements Lifecycle {
+             invalidTransition(Lifecycle.INIT_EVENT);
+         }
+ 
+-        // Register MBean if required
+-        if (this instanceof LifecycleMBeanRegistration) {
+-            ObjectName oname =
+-                ((LifecycleMBeanRegistration) this).getObjectName();
+-            
+-            try {
+-                Registry.getRegistry(null, null).registerComponent(
+-                        this, oname, null);
+-            } catch (Exception e) {
+-                log.warn(sm.getString("lifecycleBase.initMBeanFail", toString(),
+-                        oname), e);
+-            }
+-        }
+-        
+         initInternal();
+         
+         setState(LifecycleState.INITIALIZED);
+@@ -279,13 +261,6 @@ public abstract class LifecycleBase implements Lifecycle {
+ 
+         destroyInternal();
+         
+-        // De-register MBean if required
+-        if (this instanceof LifecycleMBeanRegistration) {
+-            ObjectName oname =
+-                ((LifecycleMBeanRegistration) this).getObjectName();
+-            Registry.getRegistry(null, null).unregisterComponent(oname);
+-        }
+-
+         setState(LifecycleState.DESTROYED);
+     }
+     
+
+==================================================
+Http11Protocol.java
+index 606df75ca6..2e7c80c089 100644
+--- a/java/org/apache/catalina/util/LocalStrings.properties
++++ b/java/org/apache/catalina/util/LocalStrings.properties
+@@ -27,6 +27,9 @@ lifecycleBase.alreadyStarted=The start() method was called on component [{0}] af
+ lifecycleBase.alreadyStopped=The stop() method was called on component [{0}] after stop() had already been called. The second call will be ignored.
+ lifecycleBase.alreadyDestroyed=The destroy() method was called on component [{0}] after destroy() had already been called. The second call will be ignored.
+ lifecycleBase.invalidTransition=An invalid Lifecycle transition was attempted ([{0}]) for component [{1}] in state [{2}]
++lifecycleMBeanBase.registerFail=Failed to register object [{0}] with name [{0}] during component initialisation
++lifecycleMBeanBase.unregisterFail=Failed to unregister MBean with name [{0}] during component destruction
++lifecycleMBeanBase.unregisterNoServer=No MBean server was available to unregister the MBean [{0}]
+ requestUtil.convertHexDigit.notHex=[{0}] is not a hexadecimal digit
+ requestUtil.parseParameters.uee=Unable to parse the parameters since the encoding [{0}] is not supported.
+ requestUtil.urlDecode.missingDigit=The % character must be followed by two hexademical digits
+
+==================================================
+TestRegistration.java
+index eb4b1b01cf..d394e08307 100644
+--- a/java/org/apache/coyote/http11/Http11Protocol.java
++++ b/java/org/apache/coyote/http11/Http11Protocol.java
+@@ -160,6 +160,11 @@ public class Http11Protocol extends AbstractHttp11Protocol {
+     }
+ 
+ 
++    @Override
++    public void destroy() throws Exception {
++        cHandler.recycledProcessors.clear();
++        super.destroy();
++    }
+     // ------------------------------------------------------------- Properties
+ 
+     
+
+==================================================
+TomcatBaseTest.java
+similarity index 98%
+rename from test/org/apache/catalina/mbeans/RegistrationTest.java
+rename to test/org/apache/catalina/mbeans/TestRegistration.java
+index 0060e94cac..914bff9483 100644
+--- a/test/org/apache/catalina/mbeans/RegistrationTest.java
++++ b/test/org/apache/catalina/mbeans/TestRegistration.java
+@@ -32,7 +32,7 @@ import org.apache.tomcat.util.modeler.Registry;
+  * don't necessarily apply to one specific Tomcat class.
+  *
+  */
+-public class RegistrationTest extends TomcatBaseTest {
++public class TestRegistration extends TomcatBaseTest {
+ 
+     /**
+      * Test verifying that Tomcat correctly de-registers the MBeans it has
+
+==================================================

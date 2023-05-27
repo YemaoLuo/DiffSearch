@@ -1,0 +1,840 @@
+0cdfed561db144b0b6c0dadc10d1408d5683ffef
+==================================================
+Apply patch 12 from jboynes to improve cookie handling.
+==================================================
+Mark Emlyn
+==================================================
+Thu May 22 14:21:38 2014 +0000
+==================================================
+DigestAuthenticator.java
+Apply patch 12 from jboynes to improve cookie handling.
+Move header-specific parsing code into a separate class associated with that header type. This is in anticipation of adding new header parsers, starting with Cookie
+The patch should be safe since the logic is unchanged.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1596888 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Response.java
+index f7744cb806..ecbaffe5ca 100644
+--- a/java/org/apache/catalina/authenticator/DigestAuthenticator.java
++++ b/java/org/apache/catalina/authenticator/DigestAuthenticator.java
+@@ -35,7 +35,7 @@ import org.apache.catalina.util.ConcurrentMessageDigest;
+ import org.apache.catalina.util.MD5Encoder;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+-import org.apache.tomcat.util.http.parser.HttpParser;
++import org.apache.tomcat.util.http.parser.Authorization;
+ 
+ 
+ /**
+@@ -493,7 +493,7 @@ public class DigestAuthenticator extends AuthenticatorBase {
+ 
+             Map<String,String> directives;
+             try {
+-                directives = HttpParser.parseAuthorizationDigest(
++                directives = Authorization.parseAuthorizationDigest(
+                         new StringReader(authorization));
+             } catch (IOException e) {
+                 return false;
+
+==================================================
+Authorization.java
+index 3093f15763..3167267670 100644
+--- a/java/org/apache/coyote/Response.java
++++ b/java/org/apache/coyote/Response.java
+@@ -25,7 +25,6 @@ import javax.servlet.WriteListener;
+ 
+ import org.apache.tomcat.util.buf.ByteChunk;
+ import org.apache.tomcat.util.http.MimeHeaders;
+-import org.apache.tomcat.util.http.parser.HttpParser;
+ import org.apache.tomcat.util.http.parser.MediaType;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+@@ -451,7 +450,7 @@ public final class Response {
+ 
+         MediaType m = null;
+         try {
+-             m = HttpParser.parseMediaType(new StringReader(type));
++             m = MediaType.parseMediaType(new StringReader(type));
+         } catch (IOException e) {
+             // Ignore - null test below handles this
+         }
+
+==================================================
+HttpParser.java
+new file mode 100644
+index 0000000000..1a4d2e96ba
+--- /dev/null
++++ b/java/org/apache/tomcat/util/http/parser/Authorization.java
+@@ -0,0 +1,141 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.tomcat.util.http.parser;
++
++import java.io.IOException;
++import java.io.StringReader;
++import java.util.HashMap;
++import java.util.Locale;
++import java.util.Map;
++
++/**
++ * Parser for an "Authorization" header.
++ */
++public class Authorization {
++
++    @SuppressWarnings("unused")  // Unused due to buggy client implementations
++    private static final Integer FIELD_TYPE_TOKEN = Integer.valueOf(0);
++    private static final Integer FIELD_TYPE_QUOTED_STRING = Integer.valueOf(1);
++    private static final Integer FIELD_TYPE_TOKEN_OR_QUOTED_STRING = Integer.valueOf(2);
++    private static final Integer FIELD_TYPE_LHEX = Integer.valueOf(3);
++    private static final Integer FIELD_TYPE_QUOTED_TOKEN = Integer.valueOf(4);
++
++    private static final Map<String,Integer> fieldTypes = new HashMap<>();
++
++    static {
++        // Digest field types.
++        // Note: These are more relaxed than RFC2617. This adheres to the
++        //       recommendation of RFC2616 that servers are tolerant of buggy
++        //       clients when they can be so without ambiguity.
++        fieldTypes.put("username", FIELD_TYPE_QUOTED_STRING);
++        fieldTypes.put("realm", FIELD_TYPE_QUOTED_STRING);
++        fieldTypes.put("nonce", FIELD_TYPE_QUOTED_STRING);
++        fieldTypes.put("digest-uri", FIELD_TYPE_QUOTED_STRING);
++        // RFC2617 says response is <">32LHEX<">. 32LHEX will also be accepted
++        fieldTypes.put("response", FIELD_TYPE_LHEX);
++        // RFC2617 says algorithm is token. <">token<"> will also be accepted
++        fieldTypes.put("algorithm", FIELD_TYPE_QUOTED_TOKEN);
++        fieldTypes.put("cnonce", FIELD_TYPE_QUOTED_STRING);
++        fieldTypes.put("opaque", FIELD_TYPE_QUOTED_STRING);
++        // RFC2617 says qop is token. <">token<"> will also be accepted
++        fieldTypes.put("qop", FIELD_TYPE_QUOTED_TOKEN);
++        // RFC2617 says nc is 8LHEX. <">8LHEX<"> will also be accepted
++        fieldTypes.put("nc", FIELD_TYPE_LHEX);
++
++    }
++
++    /**
++     * Parses an HTTP Authorization header for DIGEST authentication as per RFC
++     * 2617 section 3.2.2.
++     *
++     * @param input The header value to parse
++     *
++     * @return  A map of directives and values as {@link String}s or
++     *          <code>null</code> if a parsing error occurs. Although the
++     *          values returned are {@link String}s they will have been
++     *          validated to ensure that they conform to RFC 2617.
++     *
++     * @throws IllegalArgumentException If the header does not conform to RFC
++     *                                  2617
++     * @throws java.io.IOException If an error occurs while reading the input
++     */
++    public static Map<String,String> parseAuthorizationDigest (StringReader input)
++            throws IllegalArgumentException, IOException {
++
++        Map<String,String> result = new HashMap<>();
++
++        if (HttpParser.skipConstant(input, "Digest") != HttpParser.SkipConstantResult.FOUND) {
++            return null;
++        }
++        // All field names are valid tokens
++        String field = HttpParser.readToken(input);
++        if (field == null) {
++            return null;
++        }
++        while (!field.equals("")) {
++            if (HttpParser.skipConstant(input, "=") != HttpParser.SkipConstantResult.FOUND) {
++                return null;
++            }
++            String value;
++            Integer type = fieldTypes.get(field.toLowerCase(Locale.ENGLISH));
++            if (type == null) {
++                // auth-param = token "=" ( token | quoted-string )
++                type = FIELD_TYPE_TOKEN_OR_QUOTED_STRING;
++            }
++            switch (type.intValue()) {
++                case 0:
++                    // FIELD_TYPE_TOKEN
++                    value = HttpParser.readToken(input);
++                    break;
++                case 1:
++                    // FIELD_TYPE_QUOTED_STRING
++                    value = HttpParser.readQuotedString(input, false);
++                    break;
++                case 2:
++                    // FIELD_TYPE_TOKEN_OR_QUOTED_STRING
++                    value = HttpParser.readTokenOrQuotedString(input, false);
++                    break;
++                case 3:
++                    // FIELD_TYPE_LHEX
++                    value = HttpParser.readLhex(input);
++                    break;
++                case 4:
++                    // FIELD_TYPE_QUOTED_TOKEN
++                    value = HttpParser.readQuotedToken(input);
++                    break;
++                default:
++                    // Error
++                    throw new IllegalArgumentException("TODO i18n: Unsupported type");
++            }
++
++            if (value == null) {
++                return null;
++            }
++            result.put(field, value);
++
++            if (HttpParser.skipConstant(input, ",") == HttpParser.SkipConstantResult.NOT_FOUND) {
++                return null;
++            }
++            field = HttpParser.readToken(input);
++            if (field == null) {
++                return null;
++            }
++        }
++
++        return result;
++    }
++}
+
+==================================================
+MediaType.java
+index 6965404806..ef077264f2 100644
+--- a/java/org/apache/tomcat/util/http/parser/HttpParser.java
++++ b/java/org/apache/tomcat/util/http/parser/HttpParser.java
+@@ -18,10 +18,6 @@ package org.apache.tomcat.util.http.parser;
+ 
+ import java.io.IOException;
+ import java.io.StringReader;
+-import java.util.HashMap;
+-import java.util.LinkedHashMap;
+-import java.util.Locale;
+-import java.util.Map;
+ 
+ /**
+  * HTTP header value parser implementation. Parsing HTTP headers as per RFC2616
+@@ -35,47 +31,14 @@ import java.util.Map;
+  * assuming that wrapped header lines have already been unwrapped. (The Tomcat
+  * header processing code does the unwrapping.)
+  *
+- * Provides parsing of the following HTTP header values as per RFC 2616:
+- * - Authorization for DIGEST authentication
+- * - MediaType (used for Content-Type header)
+- *
+- * Support for additional headers will be provided as required.
+  */
+ public class HttpParser {
+ 
+-    @SuppressWarnings("unused")  // Unused due to buggy client implementations
+-    private static final Integer FIELD_TYPE_TOKEN = Integer.valueOf(0);
+-    private static final Integer FIELD_TYPE_QUOTED_STRING = Integer.valueOf(1);
+-    private static final Integer FIELD_TYPE_TOKEN_OR_QUOTED_STRING = Integer.valueOf(2);
+-    private static final Integer FIELD_TYPE_LHEX = Integer.valueOf(3);
+-    private static final Integer FIELD_TYPE_QUOTED_TOKEN = Integer.valueOf(4);
+-
+-    private static final Map<String,Integer> fieldTypes = new HashMap<>();
+-
+     // Arrays used by isToken(), isHex()
+     private static final boolean isToken[] = new boolean[128];
+     private static final boolean isHex[] = new boolean[128];
+ 
+     static {
+-        // Digest field types.
+-        // Note: These are more relaxed than RFC2617. This adheres to the
+-        //       recommendation of RFC2616 that servers are tolerant of buggy
+-        //       clients when they can be so without ambiguity.
+-        fieldTypes.put("username", FIELD_TYPE_QUOTED_STRING);
+-        fieldTypes.put("realm", FIELD_TYPE_QUOTED_STRING);
+-        fieldTypes.put("nonce", FIELD_TYPE_QUOTED_STRING);
+-        fieldTypes.put("digest-uri", FIELD_TYPE_QUOTED_STRING);
+-        // RFC2617 says response is <">32LHEX<">. 32LHEX will also be accepted
+-        fieldTypes.put("response", FIELD_TYPE_LHEX);
+-        // RFC2617 says algorithm is token. <">token<"> will also be accepted
+-        fieldTypes.put("algorithm", FIELD_TYPE_QUOTED_TOKEN);
+-        fieldTypes.put("cnonce", FIELD_TYPE_QUOTED_STRING);
+-        fieldTypes.put("opaque", FIELD_TYPE_QUOTED_STRING);
+-        // RFC2617 says qop is token. <">token<"> will also be accepted
+-        fieldTypes.put("qop", FIELD_TYPE_QUOTED_TOKEN);
+-        // RFC2617 says nc is 8LHEX. <">8LHEX<"> will also be accepted
+-        fieldTypes.put("nc", FIELD_TYPE_LHEX);
+-
+         // Setup the flag arrays
+         for (int i = 0; i < 128; i++) {
+             if (i < 32) {
+@@ -98,134 +61,6 @@ public class HttpParser {
+         }
+     }
+ 
+-    /**
+-     * Parses an HTTP Authorization header for DIGEST authentication as per RFC
+-     * 2617 section 3.2.2.
+-     *
+-     * @param input The header value to parse
+-     *
+-     * @return  A map of directives and values as {@link String}s or
+-     *          <code>null</code> if a parsing error occurs. Although the
+-     *          values returned are {@link String}s they will have been
+-     *          validated to ensure that they conform to RFC 2617.
+-     *
+-     * @throws IllegalArgumentException If the header does not conform to RFC
+-     *                                  2617
+-     * @throws IOException If an error occurs while reading the input
+-     */
+-    public static Map<String,String> parseAuthorizationDigest (
+-            StringReader input) throws IllegalArgumentException, IOException {
+-
+-        Map<String,String> result = new HashMap<>();
+-
+-        if (skipConstant(input, "Digest") != SkipConstantResult.FOUND) {
+-            return null;
+-        }
+-        // All field names are valid tokens
+-        String field = readToken(input);
+-        if (field == null) {
+-            return null;
+-        }
+-        while (!field.equals("")) {
+-            if (skipConstant(input, "=") != SkipConstantResult.FOUND) {
+-                return null;
+-            }
+-            String value = null;
+-            Integer type = fieldTypes.get(field.toLowerCase(Locale.ENGLISH));
+-            if (type == null) {
+-                // auth-param = token "=" ( token | quoted-string )
+-                type = FIELD_TYPE_TOKEN_OR_QUOTED_STRING;
+-            }
+-            switch (type.intValue()) {
+-                case 0:
+-                    // FIELD_TYPE_TOKEN
+-                    value = readToken(input);
+-                    break;
+-                case 1:
+-                    // FIELD_TYPE_QUOTED_STRING
+-                    value = readQuotedString(input, false);
+-                    break;
+-                case 2:
+-                    // FIELD_TYPE_TOKEN_OR_QUOTED_STRING
+-                    value = readTokenOrQuotedString(input, false);
+-                    break;
+-                case 3:
+-                    // FIELD_TYPE_LHEX
+-                    value = readLhex(input);
+-                    break;
+-                case 4:
+-                    // FIELD_TYPE_QUOTED_TOKEN
+-                    value = readQuotedToken(input);
+-                    break;
+-                default:
+-                    // Error
+-                    throw new IllegalArgumentException(
+-                            "TODO i18n: Unsupported type");
+-            }
+-
+-            if (value == null) {
+-                return null;
+-            }
+-            result.put(field, value);
+-
+-            if (skipConstant(input, ",") == SkipConstantResult.NOT_FOUND) {
+-                return null;
+-            }
+-            field = readToken(input);
+-            if (field == null) {
+-                return null;
+-            }
+-        }
+-
+-        return result;
+-    }
+-
+-    public static MediaType parseMediaType(StringReader input)
+-            throws IOException {
+-
+-        // Type (required)
+-        String type = readToken(input);
+-        if (type == null || type.length() == 0) {
+-            return null;
+-        }
+-
+-        if (skipConstant(input, "/") == SkipConstantResult.NOT_FOUND) {
+-            return null;
+-        }
+-
+-        // Subtype (required)
+-        String subtype = readToken(input);
+-        if (subtype == null || subtype.length() == 0) {
+-            return null;
+-        }
+-
+-        LinkedHashMap<String,String> parameters = new LinkedHashMap<>();
+-
+-        SkipConstantResult lookForSemiColon = skipConstant(input, ";");
+-        if (lookForSemiColon == SkipConstantResult.NOT_FOUND) {
+-            return null;
+-        }
+-        while (lookForSemiColon == SkipConstantResult.FOUND) {
+-            String attribute = readToken(input);
+-
+-            String value = "";
+-            if (skipConstant(input, "=") == SkipConstantResult.FOUND) {
+-                value = readTokenOrQuotedString(input, true);
+-            }
+-
+-            if (attribute != null) {
+-                parameters.put(attribute.toLowerCase(Locale.ENGLISH), value);
+-            }
+-
+-            lookForSemiColon = skipConstant(input, ";");
+-            if (lookForSemiColon == SkipConstantResult.NOT_FOUND) {
+-                return null;
+-            }
+-        }
+-
+-        return new MediaType(type, subtype, parameters);
+-    }
+-
+     public static String unquote(String input) {
+         if (input == null || input.length() < 2 || input.charAt(0) != '"') {
+             return input;
+@@ -244,7 +79,7 @@ public class HttpParser {
+         return result.toString();
+     }
+ 
+-    private static boolean isToken(int c) {
++    static boolean isToken(int c) {
+         // Fast for correct values, slower for incorrect ones
+         try {
+             return isToken[c];
+@@ -253,7 +88,7 @@ public class HttpParser {
+         }
+     }
+ 
+-    private static boolean isHex(int c) {
++    static boolean isHex(int c) {
+         // Fast for correct values, slower for incorrect ones
+         try {
+             return isHex[c];
+@@ -263,8 +98,7 @@ public class HttpParser {
+     }
+ 
+     // Skip any LWS and return the next char
+-    private static int skipLws(StringReader input, boolean withReset)
+-            throws IOException {
++    static int skipLws(StringReader input, boolean withReset) throws IOException {
+ 
+         if (withReset) {
+             input.mark(1);
+@@ -284,8 +118,7 @@ public class HttpParser {
+         return c;
+     }
+ 
+-    private static SkipConstantResult skipConstant(StringReader input,
+-            String constant) throws IOException {
++    static SkipConstantResult skipConstant(StringReader input, String constant) throws IOException {
+         int len = constant.length();
+ 
+         int c = skipLws(input, false);
+@@ -310,7 +143,7 @@ public class HttpParser {
+      *          available to read or <code>null</code> if data other than a
+      *          token was found
+      */
+-    private static String readToken(StringReader input) throws IOException {
++    static String readToken(StringReader input) throws IOException {
+         StringBuilder result = new StringBuilder();
+ 
+         int c = skipLws(input, false);
+@@ -334,8 +167,7 @@ public class HttpParser {
+      *         quoted string was found or null if the end of data was reached
+      *         before the quoted string was terminated
+      */
+-    private static String readQuotedString(StringReader input,
+-            boolean returnQuoted) throws IOException {
++    static String readQuotedString(StringReader input, boolean returnQuoted) throws IOException {
+ 
+         int c = skipLws(input, false);
+ 
+@@ -370,8 +202,8 @@ public class HttpParser {
+         return result.toString();
+     }
+ 
+-    private static String readTokenOrQuotedString(StringReader input,
+-            boolean returnQuoted) throws IOException {
++    static String readTokenOrQuotedString(StringReader input, boolean returnQuoted)
++            throws IOException {
+ 
+         // Go back so first non-LWS character is available to be read again
+         int c = skipLws(input, true);
+@@ -395,8 +227,7 @@ public class HttpParser {
+      *         quoted token was found or null if the end of data was reached
+      *         before a quoted token was terminated
+      */
+-    private static String readQuotedToken(StringReader input)
+-            throws IOException {
++    static String readQuotedToken(StringReader input) throws IOException {
+ 
+         StringBuilder result = new StringBuilder();
+         boolean quoted = false;
+@@ -447,8 +278,7 @@ public class HttpParser {
+      * @return  the sequence of LHEX (minus any surrounding quotes) if any was
+      *          found, or <code>null</code> if data other LHEX was found
+      */
+-    private static String readLhex(StringReader input)
+-            throws IOException {
++    static String readLhex(StringReader input) throws IOException {
+ 
+         StringBuilder result = new StringBuilder();
+         boolean quoted = false;
+@@ -491,7 +321,7 @@ public class HttpParser {
+         }
+     }
+ 
+-    private static enum SkipConstantResult {
++    static enum SkipConstantResult {
+         FOUND,
+         NOT_FOUND,
+         EOF
+
+==================================================
+MediaTypeCache.java
+index ce60a14863..c5b546ef29 100644
+--- a/java/org/apache/tomcat/util/http/parser/MediaType.java
++++ b/java/org/apache/tomcat/util/http/parser/MediaType.java
+@@ -16,6 +16,8 @@
+  */
+ package org.apache.tomcat.util.http.parser;
+ 
++import java.io.IOException;
++import java.io.StringReader;
+ import java.util.LinkedHashMap;
+ import java.util.Locale;
+ import java.util.Map;
+@@ -29,15 +31,13 @@ public class MediaType {
+     private volatile String noCharset;
+     private volatile String withCharset;
+ 
+-    protected MediaType(String type, String subtype,
+-            LinkedHashMap<String,String> parameters) {
++    protected MediaType(String type, String subtype, LinkedHashMap<String,String> parameters) {
+         this.type = type;
+         this.subtype = subtype;
+         this.parameters = parameters;
+ 
+         String cs = parameters.get("charset");
+-        if (cs != null && cs.length() > 0 &&
+-                cs.charAt(0) == '"') {
++        if (cs != null && cs.length() > 0 && cs.charAt(0) == '"') {
+             cs = HttpParser.unquote(cs);
+         }
+         this.charset = cs;
+@@ -122,4 +122,57 @@ public class MediaType {
+         }
+         return noCharset;
+     }
++
++    /**
++     * Parses a MediaType value, either from a HTTP header or from an application.
++     *
++     * @param input a reader over the header text
++     * @return a MediaType parsed from the input, or null if not valid
++     * @throws IOException if there was a problem reading the input
++     */
++    public static MediaType parseMediaType(StringReader input) throws IOException {
++
++        // Type (required)
++        String type = HttpParser.readToken(input);
++        if (type == null || type.length() == 0) {
++            return null;
++        }
++
++        if (HttpParser.skipConstant(input, "/") == HttpParser.SkipConstantResult.NOT_FOUND) {
++            return null;
++        }
++
++        // Subtype (required)
++        String subtype = HttpParser.readToken(input);
++        if (subtype == null || subtype.length() == 0) {
++            return null;
++        }
++
++        LinkedHashMap<String,String> parameters = new LinkedHashMap<>();
++
++        HttpParser.SkipConstantResult lookForSemiColon = HttpParser.skipConstant(input, ";");
++        if (lookForSemiColon == HttpParser.SkipConstantResult.NOT_FOUND) {
++            return null;
++        }
++        while (lookForSemiColon == HttpParser.SkipConstantResult.FOUND) {
++            String attribute = HttpParser.readToken(input);
++
++            String value = "";
++            if (HttpParser.skipConstant(input, "=") == HttpParser.SkipConstantResult.FOUND) {
++                value = HttpParser.readTokenOrQuotedString(input, true);
++            }
++
++            if (attribute != null) {
++                parameters.put(attribute.toLowerCase(Locale.ENGLISH), value);
++            }
++
++            lookForSemiColon = HttpParser.skipConstant(input, ";");
++            if (lookForSemiColon == HttpParser.SkipConstantResult.NOT_FOUND) {
++                return null;
++            }
++        }
++
++        return new MediaType(type, subtype, parameters);
++    }
++
+ }
+
+==================================================
+TestAuthorizationDigest.java
+index 0fb0181434..191aef307c 100644
+--- a/java/org/apache/tomcat/util/http/parser/MediaTypeCache.java
++++ b/java/org/apache/tomcat/util/http/parser/MediaTypeCache.java
+@@ -51,7 +51,7 @@ public class MediaTypeCache {
+ 
+         MediaType m = null;
+         try {
+-            m = HttpParser.parseMediaType(new StringReader(input));
++            m = MediaType.parseMediaType(new StringReader(input));
+         } catch (IOException e) {
+             // Ignore - return null
+         }
+
+==================================================
+TestMediaType.java
+index ee22469850..0e28907ff1 100644
+--- a/test/org/apache/tomcat/util/http/parser/TestAuthorizationDigest.java
++++ b/test/org/apache/tomcat/util/http/parser/TestAuthorizationDigest.java
+@@ -38,7 +38,7 @@ public class TestAuthorizationDigest {
+ 
+         StringReader input = new StringReader(header);
+ 
+-        Map<String,String> result = HttpParser.parseAuthorizationDigest(input);
++        Map<String,String> result = Authorization.parseAuthorizationDigest(input);
+ 
+         Assert.assertEquals("mthornton", result.get("username"));
+         Assert.assertEquals("optrak.com", result.get("realm"));
+@@ -69,7 +69,7 @@ public class TestAuthorizationDigest {
+ 
+         StringReader input = new StringReader(header);
+ 
+-        Map<String,String> result = HttpParser.parseAuthorizationDigest(input);
++        Map<String,String> result = Authorization.parseAuthorizationDigest(input);
+ 
+         Assert.assertEquals("mthornton", result.get("username"));
+         Assert.assertEquals("optrak.com", result.get("realm"));
+@@ -93,7 +93,7 @@ public class TestAuthorizationDigest {
+ 
+         StringReader input = new StringReader(header);
+ 
+-        Map<String,String> result = HttpParser.parseAuthorizationDigest(input);
++        Map<String,String> result = Authorization.parseAuthorizationDigest(input);
+ 
+         Assert.assertEquals("mthornton", result.get("username"));
+         Assert.assertEquals("auth", result.get("qop"));
+@@ -107,7 +107,7 @@ public class TestAuthorizationDigest {
+ 
+         StringReader input = new StringReader(header);
+ 
+-        Map<String,String> result = HttpParser.parseAuthorizationDigest(input);
++        Map<String,String> result = Authorization.parseAuthorizationDigest(input);
+ 
+         Assert.assertEquals("mthornton", result.get("username"));
+         Assert.assertEquals("auth", result.get("qop"));
+@@ -120,7 +120,7 @@ public class TestAuthorizationDigest {
+ 
+         StringReader input = new StringReader(header);
+ 
+-        Map<String,String> result = HttpParser.parseAuthorizationDigest(input);
++        Map<String,String> result = Authorization.parseAuthorizationDigest(input);
+ 
+         Assert.assertEquals("00000001", result.get("nc"));
+     }
+@@ -131,7 +131,7 @@ public class TestAuthorizationDigest {
+ 
+         StringReader input = new StringReader(header);
+ 
+-        Map<String,String> result = HttpParser.parseAuthorizationDigest(input);
++        Map<String,String> result = Authorization.parseAuthorizationDigest(input);
+ 
+         Assert.assertEquals("09abcdef", result.get("nc"));
+     }
+@@ -142,7 +142,7 @@ public class TestAuthorizationDigest {
+ 
+         StringReader input = new StringReader(header);
+ 
+-        Map<String,String> result = HttpParser.parseAuthorizationDigest(input);
++        Map<String,String> result = Authorization.parseAuthorizationDigest(input);
+ 
+         Assert.assertEquals("00abcdef", result.get("nc"));
+     }
+@@ -153,7 +153,7 @@ public class TestAuthorizationDigest {
+ 
+         StringReader input = new StringReader(header);
+ 
+-        Map<String,String> result = HttpParser.parseAuthorizationDigest(input);
++        Map<String,String> result = Authorization.parseAuthorizationDigest(input);
+ 
+         Assert.assertNull(result);
+     }
+@@ -164,7 +164,7 @@ public class TestAuthorizationDigest {
+ 
+         StringReader input = new StringReader(header);
+ 
+-        Map<String,String> result = HttpParser.parseAuthorizationDigest(input);
++        Map<String,String> result = Authorization.parseAuthorizationDigest(input);
+         Assert.assertNull(result);
+     }
+ 
+@@ -174,7 +174,7 @@ public class TestAuthorizationDigest {
+ 
+         StringReader input = new StringReader(header);
+ 
+-        Map<String,String> result = HttpParser.parseAuthorizationDigest(input);
++        Map<String,String> result = Authorization.parseAuthorizationDigest(input);
+         Assert.assertNull(result);
+     }
+ 
+@@ -184,7 +184,7 @@ public class TestAuthorizationDigest {
+ 
+         StringReader input = new StringReader(header);
+ 
+-        Map<String,String> result = HttpParser.parseAuthorizationDigest(input);
++        Map<String,String> result = Authorization.parseAuthorizationDigest(input);
+         Assert.assertNull(result);
+     }
+ 
+@@ -194,7 +194,7 @@ public class TestAuthorizationDigest {
+ 
+         StringReader input = new StringReader(header);
+ 
+-        Map<String,String> result = HttpParser.parseAuthorizationDigest(input);
++        Map<String,String> result = Authorization.parseAuthorizationDigest(input);
+         Assert.assertEquals("auth", result.get("qop"));
+     }
+ 
+@@ -204,7 +204,7 @@ public class TestAuthorizationDigest {
+ 
+         StringReader input = new StringReader(header);
+ 
+-        Map<String,String> result = HttpParser.parseAuthorizationDigest(input);
++        Map<String,String> result = Authorization.parseAuthorizationDigest(input);
+         Assert.assertEquals("auth", result.get("qop"));
+     }
+ 
+@@ -214,7 +214,7 @@ public class TestAuthorizationDigest {
+ 
+         StringReader input = new StringReader(header);
+ 
+-        Map<String,String> result = HttpParser.parseAuthorizationDigest(input);
++        Map<String,String> result = Authorization.parseAuthorizationDigest(input);
+         Assert.assertNull(result);
+     }
+ 
+@@ -224,7 +224,7 @@ public class TestAuthorizationDigest {
+ 
+         StringReader input = new StringReader(header);
+ 
+-        Map<String,String> result = HttpParser.parseAuthorizationDigest(input);
++        Map<String,String> result = Authorization.parseAuthorizationDigest(input);
+         Assert.assertNull(result);
+     }
+ 
+@@ -234,7 +234,7 @@ public class TestAuthorizationDigest {
+ 
+         StringReader input = new StringReader(header);
+ 
+-        Map<String,String> result = HttpParser.parseAuthorizationDigest(input);
++        Map<String,String> result = Authorization.parseAuthorizationDigest(input);
+         Assert.assertNull(result);
+     }
+ 
+@@ -244,7 +244,7 @@ public class TestAuthorizationDigest {
+ 
+         StringReader input = new StringReader(header);
+ 
+-        Map<String,String> result = HttpParser.parseAuthorizationDigest(input);
++        Map<String,String> result = Authorization.parseAuthorizationDigest(input);
+         Assert.assertNull(result);
+     }
+ 
+@@ -254,7 +254,7 @@ public class TestAuthorizationDigest {
+ 
+         StringReader input = new StringReader(header);
+ 
+-        Map<String,String> result = HttpParser.parseAuthorizationDigest(input);
++        Map<String,String> result = Authorization.parseAuthorizationDigest(input);
+         Assert.assertNull(result);
+     }
+ 
+@@ -264,7 +264,7 @@ public class TestAuthorizationDigest {
+ 
+         StringReader input = new StringReader(header);
+ 
+-        Map<String,String> result = HttpParser.parseAuthorizationDigest(input);
++        Map<String,String> result = Authorization.parseAuthorizationDigest(input);
+         Assert.assertNull(result);
+     }
+ 
+@@ -274,7 +274,7 @@ public class TestAuthorizationDigest {
+ 
+         StringReader input = new StringReader(header);
+ 
+-        Map<String,String> result = HttpParser.parseAuthorizationDigest(input);
++        Map<String,String> result = Authorization.parseAuthorizationDigest(input);
+         Assert.assertNull(result);
+     }
+ 
+@@ -284,7 +284,7 @@ public class TestAuthorizationDigest {
+ 
+         StringReader input = new StringReader(header);
+ 
+-        Map<String,String> result = HttpParser.parseAuthorizationDigest(input);
++        Map<String,String> result = Authorization.parseAuthorizationDigest(input);
+         Assert.assertNull(result);
+     }
+ 
+@@ -294,7 +294,7 @@ public class TestAuthorizationDigest {
+ 
+         StringReader input = new StringReader(header);
+ 
+-        Map<String,String> result = HttpParser.parseAuthorizationDigest(input);
++        Map<String,String> result = Authorization.parseAuthorizationDigest(input);
+         Assert.assertNull(result);
+     }
+ 
+@@ -306,7 +306,7 @@ public class TestAuthorizationDigest {
+ 
+         StringReader input = new StringReader(header);
+ 
+-        Map<String,String> result = HttpParser.parseAuthorizationDigest(input);
++        Map<String,String> result = Authorization.parseAuthorizationDigest(input);
+         Assert.assertEquals("b", result.get("a"));
+     }
+ 
+@@ -318,7 +318,7 @@ public class TestAuthorizationDigest {
+ 
+         StringReader input = new StringReader(header);
+ 
+-        Map<String,String> result = HttpParser.parseAuthorizationDigest(input);
++        Map<String,String> result = Authorization.parseAuthorizationDigest(input);
+         Assert.assertEquals("b", result.get("a"));
+     }
+ }
+
+==================================================

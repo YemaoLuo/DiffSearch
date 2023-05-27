@@ -1,0 +1,847 @@
+8e5d0a0560de11502a5b7fb619b9d4b1fa4f4230
+==================================================
+Re-factor the async state machine into a separate class so it can be re-used for the AJP processors as well.
+==================================================
+Mark Emlyn
+==================================================
+Wed Sep 29 16:13:05 2010 +0000
+==================================================
+AsyncStateMachine.java
+Re-factor the async state machine into a separate class so it can be re-used for the AJP processors as well.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1002711 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Constants.java
+new file mode 100644
+index 0000000000..fe996e2388
+--- /dev/null
++++ b/java/org/apache/coyote/AsyncStateMachine.java
+@@ -0,0 +1,321 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.coyote;
++
++import java.security.AccessController;
++import java.security.PrivilegedAction;
++
++import org.apache.catalina.core.AsyncContextImpl;
++import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
++import org.apache.tomcat.util.res.StringManager;
++
++/**
++ * Manages the state transitions for async requests.
++ * TODO: State transition diagram
++ * 
++ * The internal states that are used are:
++ * DISPATCHED    - Standard request. Not in Async mode.
++ * STARTING      - ServletRequest.startAsync() has been called but the
++ *                 request in which that call was made has not finished
++ *                 processing.
++ * STARTED       - ServletRequest.startAsync() has been called and the
++ *                 request in which that call was made has finished
++ *                 processing.
++ * MUST_COMPLETE - complete() has been called before the request in which
++ *                 ServletRequest.startAsync() has finished. As soon as that
++ *                 request finishes, the complete() will be processed.
++ * COMPLETING    - The call to complete() was made once the request was in
++ *                 the STARTED state. May or may not be triggered by a
++ *                 container thread - depends if start(Runnable) was used
++ * TIMING_OUT    - The async request has timed out and is waiting for a call
++ *                 to complete(). If that isn't made, the error state will
++ *                 entered.
++ * MUST_DISPATCH - dispatch() has been called before the request in which
++ *                 ServletRequest.startAsync() has finished. As soon as that
++ *                 request finishes, the dispatch() will be processed.
++ * DISPATCHING   - The dispatch is being processed.
++ * ERROR         - Something went wrong.
++ */
++public class AsyncStateMachine {
++
++    /**
++     * The string manager for this package.
++     */
++    private static final StringManager sm =
++        StringManager.getManager(Constants.Package);
++
++    private static enum AsyncState {
++        DISPATCHED(false, false, false),
++        STARTING(true, true, false),
++        STARTED(true, true, false),
++        MUST_COMPLETE(true, false, false),
++        COMPLETING(true, false, false),
++        TIMING_OUT(true, false, false),
++        MUST_DISPATCH(true, false, true),
++        DISPATCHING(true, false, true),
++        ERROR(true,false,false);
++    
++        private boolean isAsync;
++        private boolean isStarted;
++        private boolean isDispatching;
++        
++        private AsyncState(boolean isAsync, boolean isStarted,
++                boolean isDispatching) {
++            this.isAsync = isAsync;
++            this.isStarted = isStarted;
++            this.isDispatching = isDispatching;
++        }
++        
++        public boolean isAsync() {
++            return this.isAsync;
++        }
++        
++        public boolean isStarted() {
++            return this.isStarted;
++        }
++        
++        public boolean isDispatching() {
++            return this.isDispatching;
++        }
++    }
++    
++
++    private volatile AsyncState state = AsyncState.DISPATCHED;
++    // Need this to fire listener on complete
++    private AsyncContextImpl asyncCtxt = null;
++    private Processor processor;
++    
++    
++    public AsyncStateMachine(Processor processor) {
++        this.processor = processor;
++    }
++
++
++    public boolean isAsync() {
++        return state.isAsync();
++    }
++
++    public boolean isAsyncDispatching() {
++        return state.isDispatching();
++    }
++
++    public boolean isAsyncStarted() {
++        return state.isStarted();
++    }
++
++    public boolean isAsyncTimingOut() {
++        return state == AsyncState.TIMING_OUT;
++    }
++
++
++    public synchronized void asyncStart(AsyncContextImpl asyncCtxt) {
++        if (state == AsyncState.DISPATCHED) {
++            state = AsyncState.STARTING;
++            this.asyncCtxt = asyncCtxt;
++        } else {
++            throw new IllegalStateException(
++                    sm.getString("asyncStateMachine.invalidAsyncState",
++                            "startAsync()", state));
++        }
++    }
++    
++    /*
++     * Async has been processed. Whether or not to enter a long poll depends on
++     * current state. For example, as per SRV.2.3.3.3 can now process calls to
++     * complete() or dispatch().
++     */
++    public synchronized SocketState asyncPostProcess() {
++        
++        if (state == AsyncState.STARTING) {
++            state = AsyncState.STARTED;
++            return SocketState.LONG;
++        } else if (state == AsyncState.MUST_COMPLETE) {
++            asyncCtxt.fireOnComplete();
++            state = AsyncState.DISPATCHED;
++            return SocketState.ASYNC_END;
++        } else if (state == AsyncState.COMPLETING) {
++            state = AsyncState.DISPATCHED;
++            return SocketState.ASYNC_END;
++        } else if (state == AsyncState.MUST_DISPATCH) {
++            state = AsyncState.DISPATCHING;
++            return SocketState.ASYNC_END;
++        } else if (state == AsyncState.DISPATCHING) {
++            state = AsyncState.DISPATCHED;
++            return SocketState.ASYNC_END;
++        } else if (state == AsyncState.ERROR) {
++            asyncCtxt.fireOnComplete();
++            state = AsyncState.DISPATCHED;
++            return SocketState.ASYNC_END;
++        //} else if (state == AsyncState.DISPATCHED) {
++        //    // No state change
++        //    return SocketState.OPEN;
++        } else {
++            throw new IllegalStateException(
++                    sm.getString("asyncStateMachine.invalidAsyncState",
++                            "asyncLongPoll()", state));
++        }
++    }
++    
++
++    public synchronized boolean asyncComplete() {
++        boolean doComplete = false;
++        
++        if (state == AsyncState.STARTING) {
++            state = AsyncState.MUST_COMPLETE;
++        } else if (state == AsyncState.STARTED) {
++            state = AsyncState.COMPLETING;
++            doComplete = true;
++        } else if (state == AsyncState.TIMING_OUT ||
++                state == AsyncState.ERROR) {
++            state = AsyncState.MUST_COMPLETE;
++        } else {
++            throw new IllegalStateException(
++                    sm.getString("asyncStateMachine.invalidAsyncState",
++                            "asyncComplete()", state));
++            
++        }
++        return doComplete;
++    }
++    
++    
++    public synchronized boolean asyncTimeout() {
++        if (state == AsyncState.STARTED) {
++            state = AsyncState.TIMING_OUT;
++            return true;
++        } else if (state == AsyncState.COMPLETING ||
++                state == AsyncState.DISPATCHED) {
++            // NOOP - App called complete between the the timeout firing and
++            // execution reaching this point
++            return false;
++        } else {
++            throw new IllegalStateException(
++                    sm.getString("asyncStateMachine.invalidAsyncState",
++                            "timeoutAsync()", state));
++        }
++    }
++    
++    
++    public synchronized boolean asyncDispatch() {
++        boolean doDispatch = false;
++        if (state == AsyncState.STARTING) {
++            state = AsyncState.MUST_DISPATCH;
++        } else if (state == AsyncState.STARTED) {
++            state = AsyncState.DISPATCHING;
++            doDispatch = true;
++        } else {
++            throw new IllegalStateException(
++                    sm.getString("asyncStateMachine.invalidAsyncState",
++                            "dispatchAsync()", state));
++        }
++        return doDispatch;
++    }
++    
++    
++    public synchronized void asyncDispatched() {
++        if (state == AsyncState.DISPATCHING) {
++            state = AsyncState.DISPATCHED;
++        } else {
++            throw new IllegalStateException(
++                    sm.getString("asyncStateMachine.invalidAsyncState",
++                            "dispatchAsync()", state));
++        }
++    }
++    
++    
++    public synchronized boolean asyncError() {
++        boolean doDispatch = false;
++        if (state == AsyncState.DISPATCHED ||
++                state == AsyncState.TIMING_OUT) {
++            state = AsyncState.ERROR;
++        } else {
++            throw new IllegalStateException(
++                    sm.getString("asyncStateMachine.invalidAsyncState",
++                            "dispatchAsync()", state));
++        }
++        return doDispatch;
++    }
++    
++    public synchronized void asyncRun(Runnable runnable) {
++        if (state == AsyncState.STARTING || state ==  AsyncState.STARTED) {
++            // Execute the runnable using a container thread from the
++            // Connector's thread pool. Use a wrapper to prevent a memory leak
++            ClassLoader oldCL;
++            if (Constants.IS_SECURITY_ENABLED) {
++                PrivilegedAction<ClassLoader> pa = new PrivilegedGetTccl();
++                oldCL = AccessController.doPrivileged(pa);
++            } else {
++                oldCL = Thread.currentThread().getContextClassLoader();
++            }
++            try {
++                if (Constants.IS_SECURITY_ENABLED) {
++                    PrivilegedAction<Void> pa = new PrivilegedSetTccl(
++                            this.getClass().getClassLoader());
++                    AccessController.doPrivileged(pa);
++                } else {
++                    Thread.currentThread().setContextClassLoader(
++                            this.getClass().getClassLoader());
++                }
++                
++                processor.getExecutor().execute(runnable);
++            } finally {
++                if (Constants.IS_SECURITY_ENABLED) {
++                    PrivilegedAction<Void> pa = new PrivilegedSetTccl(
++                            oldCL);
++                    AccessController.doPrivileged(pa);
++                } else {
++                    Thread.currentThread().setContextClassLoader(oldCL);
++                }
++            }
++        } else {
++            throw new IllegalStateException(
++                    sm.getString("asyncStateMachine.invalidAsyncState",
++                            "runAsync()", state));
++        }
++
++    }
++    
++    
++    public void recycle() {
++        asyncCtxt = null;
++        state = AsyncState.DISPATCHED;
++    }
++    
++    
++    private static class PrivilegedSetTccl implements PrivilegedAction<Void> {
++
++        private ClassLoader cl;
++
++        PrivilegedSetTccl(ClassLoader cl) {
++            this.cl = cl;
++        }
++
++        @Override
++        public Void run() {
++            Thread.currentThread().setContextClassLoader(cl);
++            return null;
++        }
++    }
++
++    private static class PrivilegedGetTccl
++            implements PrivilegedAction<ClassLoader> {
++
++        @Override
++        public ClassLoader run() {
++            return Thread.currentThread().getContextClassLoader();
++        }
++    }
++}
+
+==================================================
+Processor.java
+new file mode 100644
+index 0000000000..36584c886e
+--- /dev/null
++++ b/java/org/apache/coyote/LocalStrings.properties
+@@ -0,0 +1,16 @@
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.
++# The ASF licenses this file to You under the Apache License, Version 2.0
++# (the "License"); you may not use this file except in compliance with
++# the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++asyncStateMachine.invalidAsyncState=Calling [{0}] is not valid for a request with Async state [{1}]
+
+==================================================
+AbstractHttp11Processor.java
+index 35b2567ec0..11367b9307 100644
+--- a/java/org/apache/coyote/Processor.java
++++ b/java/org/apache/coyote/Processor.java
+@@ -17,29 +17,12 @@
+ 
+ package org.apache.coyote;
+ 
+-import java.io.IOException;
+-import java.io.InputStream;
+-import java.io.OutputStream;
++import java.util.concurrent.Executor;
+ 
+ 
+ /**
+- * Processor.
+- *
+- * Not really used, should be deprecated. 
+- *
+- * @author Remy Maucherat
++ * Common interface for processors of all protocols.
+  */
+ public interface Processor {
+-
+-
+-    public void setAdapter(Adapter adapter);
+-
+-
+-    public Adapter getAdapter();
+-
+-
+-    public void process(InputStream input, OutputStream output)
+-        throws IOException;
+-
+-
++    Executor getExecutor();
+ }
+
+==================================================
+Http11AprProcessor.java
+index 8eccaf7ffa..397c1b3842 100644
+--- a/java/org/apache/coyote/http11/AbstractHttp11Processor.java
++++ b/java/org/apache/coyote/http11/AbstractHttp11Processor.java
+@@ -17,8 +17,6 @@
+ package org.apache.coyote.http11;
+ 
+ import java.io.IOException;
+-import java.security.AccessController;
+-import java.security.PrivilegedAction;
+ import java.util.StringTokenizer;
+ import java.util.concurrent.Executor;
+ import java.util.concurrent.atomic.AtomicBoolean;
+@@ -28,6 +26,8 @@ import java.util.regex.PatternSyntaxException;
+ import org.apache.catalina.core.AsyncContextImpl;
+ import org.apache.coyote.ActionCode;
+ import org.apache.coyote.Adapter;
++import org.apache.coyote.AsyncStateMachine;
++import org.apache.coyote.Processor;
+ import org.apache.coyote.Request;
+ import org.apache.coyote.Response;
+ import org.apache.coyote.http11.filters.BufferedInputFilter;
+@@ -50,7 +50,7 @@ import org.apache.tomcat.util.net.AbstractEndpoint;
+ import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+-public abstract class AbstractHttp11Processor {
++public abstract class AbstractHttp11Processor implements Processor {
+ 
+     protected abstract Log getLog();
+ 
+@@ -237,6 +237,12 @@ public abstract class AbstractHttp11Processor {
+     protected String server = null;
+ 
+     
++    /**
++     * Track changes in state for async requests.
++     */
++    protected AsyncStateMachine asyncStateMachine = new AsyncStateMachine(this);
++
++
+     /**
+      * Set compression level.
+      */
+@@ -907,24 +913,24 @@ public abstract class AbstractHttp11Processor {
+                 request.getInputBuffer();
+             internalBuffer.addActiveFilter(savedBody);
+         } else if (actionCode == ActionCode.ASYNC_START) {
+-            asyncStart((AsyncContextImpl) param);
++            asyncStateMachine.asyncStart((AsyncContextImpl) param);
+         } else if (actionCode == ActionCode.ASYNC_DISPATCHED) {
+-            asyncDispatched();
++            asyncStateMachine.asyncDispatched();
+         } else if (actionCode == ActionCode.ASYNC_TIMEOUT) {
+             AtomicBoolean result = (AtomicBoolean) param;
+-            result.set(asyncTimeout());
++            result.set(asyncStateMachine.asyncTimeout());
+         } else if (actionCode == ActionCode.ASYNC_RUN) {
+-            asyncRun((Runnable) param);
++            asyncStateMachine.asyncRun((Runnable) param);
+         } else if (actionCode == ActionCode.ASYNC_ERROR) {
+-            asyncError();
++            asyncStateMachine.asyncError();
+         } else if (actionCode == ActionCode.ASYNC_IS_STARTED) {
+-            ((AtomicBoolean) param).set(isAsyncStarted());
++            ((AtomicBoolean) param).set(asyncStateMachine.isAsyncStarted());
+         } else if (actionCode == ActionCode.ASYNC_IS_DISPATCHING) {
+-            ((AtomicBoolean) param).set(isAsyncDispatching());
++            ((AtomicBoolean) param).set(asyncStateMachine.isAsyncDispatching());
+         } else if (actionCode == ActionCode.ASYNC_IS_ASYNC) {
+-            ((AtomicBoolean) param).set(isAsync());
++            ((AtomicBoolean) param).set(asyncStateMachine.isAsync());
+         } else if (actionCode == ActionCode.ASYNC_IS_TIMINGOUT) {
+-            ((AtomicBoolean) param).set(isAsyncTimingOut());
++            ((AtomicBoolean) param).set(asyncStateMachine.isAsyncTimingOut());
+         } else {
+             actionInternal(actionCode, param);
+         }
+@@ -1115,276 +1121,20 @@ public abstract class AbstractHttp11Processor {
+     public final void recycle() {
+         getInputBuffer().recycle();
+         getOutputBuffer().recycle();
+-        asyncCtxt = null;
++        asyncStateMachine.recycle();
+         recycleInternal();
+     }
+     
+     protected abstract void recycleInternal();
+-    
+-    protected abstract Executor getExecutor();
+-    
+-    // -------------------------------------------------- Async state management
+-    
+-    /*
+-     * DISPATCHED    - Standard request. Not in Async mode.
+-     * STARTING      - ServletRequest.startAsync() has been called but the
+-     *                 request in which that call was made has not finished
+-     *                 processing.
+-     * STARTED       - ServletRequest.startAsync() has been called and the
+-     *                 request in which that call was made has finished
+-     *                 processing.
+-     * MUST_COMPLETE - complete() has been called before the request in which
+-     *                 ServletRequest.startAsync() has finished. As soon as that
+-     *                 request finishes, the complete() will be processed.
+-     * COMPLETING    - The call to complete() was made once the request was in
+-     *                 the STARTED state. May or may not be triggered by a
+-     *                 container thread - depends if start(Runnable) was used
+-     * 
+-     * TODO - markt - Move this to a separate class
+-     */
+-    private static enum AsyncState {
+-        DISPATCHED(false, false, false),
+-        STARTING(true, true, false),
+-        STARTED(true, true, false),
+-        MUST_COMPLETE(true, false, false),
+-        COMPLETING(true, false, false),
+-        TIMING_OUT(true, false, false),
+-        MUST_DISPATCH(true, false, true),
+-        DISPATCHING(true, false, true),
+-        ERROR(true,false,false);
+-    
+-        private boolean isAsync;
+-        private boolean isStarted;
+-        private boolean isDispatching;
+-        
+-        private AsyncState(boolean isAsync, boolean isStarted,
+-                boolean isDispatching) {
+-            this.isAsync = isAsync;
+-            this.isStarted = isStarted;
+-            this.isDispatching = isDispatching;
+-        }
+-        
+-        public boolean isAsync() {
+-            return this.isAsync;
+-        }
+-        
+-        public boolean isStarted() {
+-            return this.isStarted;
+-        }
+-        
+-        public boolean isDispatching() {
+-            return this.isDispatching;
+-        }
+-    }
+-    
+-    private volatile AsyncState state = AsyncState.DISPATCHED;
+-    // Need this to fire listener on complete
+-    private AsyncContextImpl asyncCtxt = null;
+-    
+-    protected boolean isAsync() {
+-        return state.isAsync();
+-    }
+ 
+-    protected boolean isAsyncDispatching() {
+-        return state.isDispatching();
+-    }
+-
+-    protected boolean isAsyncStarted() {
+-        return state.isStarted();
+-    }
+-
+-    protected boolean isAsyncTimingOut() {
+-        return state == AsyncState.TIMING_OUT;
+-    }
+-
+-
+-    private synchronized void asyncStart(AsyncContextImpl asyncCtxt) {
+-        if (state == AsyncState.DISPATCHED) {
+-            state = AsyncState.STARTING;
+-            this.asyncCtxt = asyncCtxt;
+-        } else {
+-            throw new IllegalStateException(
+-                    sm.getString("abstractHttp11Protocol.invalidAsyncState",
+-                            "startAsync()", state));
+-        }
+-    }
+-    
+-    /*
+-     * Async has been processed. Whether or not to enter a long poll depends on
+-     * current state. For example, as per SRV.2.3.3.3 can now process calls to
+-     * complete() or dispatch().
+-     */
+-    protected synchronized SocketState asyncPostProcess() {
+-        
+-        if (state == AsyncState.STARTING) {
+-            state = AsyncState.STARTED;
+-            return SocketState.LONG;
+-        } else if (state == AsyncState.MUST_COMPLETE) {
+-            asyncCtxt.fireOnComplete();
+-            state = AsyncState.DISPATCHED;
+-            return SocketState.ASYNC_END;
+-        } else if (state == AsyncState.COMPLETING) {
+-            state = AsyncState.DISPATCHED;
+-            return SocketState.ASYNC_END;
+-        } else if (state == AsyncState.MUST_DISPATCH) {
+-            state = AsyncState.DISPATCHING;
+-            return SocketState.ASYNC_END;
+-        } else if (state == AsyncState.DISPATCHING) {
+-            state = AsyncState.DISPATCHED;
+-            return SocketState.ASYNC_END;
+-        } else if (state == AsyncState.ERROR) {
+-            asyncCtxt.fireOnComplete();
+-            state = AsyncState.DISPATCHED;
+-            return SocketState.ASYNC_END;
+-        //} else if (state == AsyncState.DISPATCHED) {
+-        //    // No state change
+-        //    return SocketState.OPEN;
+-        } else {
+-            throw new IllegalStateException(
+-                    sm.getString("abstractHttp11Protocol.invalidAsyncState",
+-                            "asyncLongPoll()", state));
+-        }
+-    }
+-    
+-
+-    protected synchronized boolean asyncComplete() {
+-        boolean doComplete = false;
+-        
+-        if (state == AsyncState.STARTING) {
+-            state = AsyncState.MUST_COMPLETE;
+-        } else if (state == AsyncState.STARTED) {
+-            state = AsyncState.COMPLETING;
+-            doComplete = true;
+-        } else if (state == AsyncState.TIMING_OUT ||
+-                state == AsyncState.ERROR) {
+-            state = AsyncState.MUST_COMPLETE;
+-        } else {
+-            throw new IllegalStateException(
+-                    sm.getString("abstractHttp11Protocol.invalidAsyncState",
+-                            "asyncComplete()", state));
+-            
+-        }
+-        return doComplete;
+-    }
+-    
+-    
+-    private synchronized boolean asyncTimeout() {
+-        if (state == AsyncState.STARTED) {
+-            state = AsyncState.TIMING_OUT;
+-            return true;
+-        } else if (state == AsyncState.COMPLETING ||
+-                state == AsyncState.DISPATCHED) {
+-            // NOOP - App called complete between the the timeout firing and
+-            // execution reaching this point
+-            return false;
+-        } else {
+-            throw new IllegalStateException(
+-                    sm.getString("abstractHttp11Protocol.invalidAsyncState",
+-                            "timeoutAsync()", state));
+-        }
+-    }
+-    
+-    
+-    protected synchronized boolean asyncDispatch() {
+-        boolean doDispatch = false;
+-        if (state == AsyncState.STARTING) {
+-            state = AsyncState.MUST_DISPATCH;
+-        } else if (state == AsyncState.STARTED) {
+-            state = AsyncState.DISPATCHING;
+-            doDispatch = true;
+-        } else {
+-            throw new IllegalStateException(
+-                    sm.getString("abstractHttp11Protocol.invalidAsyncState",
+-                            "dispatchAsync()", state));
+-        }
+-        return doDispatch;
+-    }
++    @Override
++    public abstract Executor getExecutor();
+     
+-    
+-    private synchronized void asyncDispatched() {
+-        if (state == AsyncState.DISPATCHING) {
+-            state = AsyncState.DISPATCHED;
+-        } else {
+-            throw new IllegalStateException(
+-                    sm.getString("abstractHttp11Protocol.invalidAsyncState",
+-                            "dispatchAsync()", state));
+-        }
+-    }
+-    
+-    
+-    private synchronized boolean asyncError() {
+-        boolean doDispatch = false;
+-        if (state == AsyncState.DISPATCHED ||
+-                state == AsyncState.TIMING_OUT) {
+-            state = AsyncState.ERROR;
+-        } else {
+-            throw new IllegalStateException(
+-                    sm.getString("abstractHttp11Protocol.invalidAsyncState",
+-                            "dispatchAsync()", state));
+-        }
+-        return doDispatch;
+-    }
+-    
+-    private synchronized void asyncRun(Runnable runnable) {
+-        if (state == AsyncState.STARTING || state ==  AsyncState.STARTED) {
+-            // Execute the runnable using a container thread from the
+-            // Connector's thread pool. Use a wrapper to prevent a memory leak
+-            ClassLoader oldCL;
+-            if (Constants.IS_SECURITY_ENABLED) {
+-                PrivilegedAction<ClassLoader> pa = new PrivilegedGetTccl();
+-                oldCL = AccessController.doPrivileged(pa);
+-            } else {
+-                oldCL = Thread.currentThread().getContextClassLoader();
+-            }
+-            try {
+-                if (Constants.IS_SECURITY_ENABLED) {
+-                    PrivilegedAction<Void> pa = new PrivilegedSetTccl(
+-                            this.getClass().getClassLoader());
+-                    AccessController.doPrivileged(pa);
+-                } else {
+-                    Thread.currentThread().setContextClassLoader(
+-                            this.getClass().getClassLoader());
+-                }
+-                
+-                getExecutor().execute(runnable);
+-            } finally {
+-                if (Constants.IS_SECURITY_ENABLED) {
+-                    PrivilegedAction<Void> pa = new PrivilegedSetTccl(
+-                            oldCL);
+-                    AccessController.doPrivileged(pa);
+-                } else {
+-                    Thread.currentThread().setContextClassLoader(oldCL);
+-                }
+-            }
+-        } else {
+-            throw new IllegalStateException(
+-                    sm.getString("abstractHttp11Protocol.invalidAsyncState",
+-                            "runAsync()", state));
+-        }
+-
++    protected boolean isAsync() {
++        return asyncStateMachine.isAsync();
+     }
+     
+-    private static class PrivilegedSetTccl implements PrivilegedAction<Void> {
+-
+-        private ClassLoader cl;
+-
+-        PrivilegedSetTccl(ClassLoader cl) {
+-            this.cl = cl;
+-        }
+-
+-        @Override
+-        public Void run() {
+-            Thread.currentThread().setContextClassLoader(cl);
+-            return null;
+-        }
+-    }
+-
+-    private static class PrivilegedGetTccl
+-            implements PrivilegedAction<ClassLoader> {
+-
+-        @Override
+-        public ClassLoader run() {
+-            return Thread.currentThread().getContextClassLoader();
+-        }
++    protected SocketState asyncPostProcess() {
++        return asyncStateMachine.asyncPostProcess();
+     }
+ }
+
+==================================================
+Http11NioProcessor.java
+index fa89994bcc..ef1a6f4e0f 100644
+--- a/java/org/apache/coyote/http11/Http11AprProcessor.java
++++ b/java/org/apache/coyote/http11/Http11AprProcessor.java
+@@ -602,7 +602,7 @@ public class Http11AprProcessor extends AbstractHttp11Processor implements Actio
+         } else if (actionCode == ActionCode.COMET_SETTIMEOUT) {
+             //no op
+         } else if (actionCode == ActionCode.ASYNC_COMPLETE) {
+-            if (asyncComplete()) {
++            if (asyncStateMachine.asyncComplete()) {
+                 endpoint.processSocketAsync(this.socket, SocketStatus.OPEN);
+             }
+         } else if (actionCode == ActionCode.ASYNC_SETTIMEOUT) {
+@@ -610,7 +610,7 @@ public class Http11AprProcessor extends AbstractHttp11Processor implements Actio
+             long timeout = ((Long)param).longValue();
+             socket.setTimeout(timeout);
+         } else if (actionCode == ActionCode.ASYNC_DISPATCH) {
+-            if (asyncDispatch()) {
++            if (asyncStateMachine.asyncDispatch()) {
+                 endpoint.processSocketAsync(this.socket, SocketStatus.OPEN);
+             }
+         }
+@@ -909,7 +909,7 @@ public class Http11AprProcessor extends AbstractHttp11Processor implements Actio
+     }
+     
+     @Override
+-    protected Executor getExecutor() {
++    public Executor getExecutor() {
+         return endpoint.getExecutor();
+     }
+ }
+
+==================================================
+Http11Processor.java
+index 4fe8d32284..39681db799 100644
+--- a/java/org/apache/coyote/http11/Http11NioProcessor.java
++++ b/java/org/apache/coyote/http11/Http11NioProcessor.java
+@@ -238,7 +238,7 @@ public class Http11NioProcessor extends AbstractHttp11Processor implements Actio
+                         Integer comettimeout = (Integer) request.getAttribute("org.apache.tomcat.comet.timeout");
+                         if (comettimeout != null) attach.setTimeout(comettimeout.longValue());
+                     } else {
+-                        if (isAsyncDispatching()) {
++                        if (asyncStateMachine.isAsyncDispatching()) {
+                             //reset the timeout
+                             if (keepAlive && keepAliveTimeout>0) {
+                                 attach.setTimeout(keepAliveTimeout);
+@@ -659,7 +659,7 @@ public class Http11NioProcessor extends AbstractHttp11Processor implements Actio
+             if ( rp.getStage() != org.apache.coyote.Constants.STAGE_SERVICE ) //async handling
+                 attach.setTimeout(timeout);
+         } else if (actionCode == ActionCode.ASYNC_COMPLETE) {
+-            if (asyncComplete()) {
++            if (asyncStateMachine.asyncComplete()) {
+                 endpoint.processSocket(this.socket, SocketStatus.OPEN, true);
+             }
+         } else if (actionCode == ActionCode.ASYNC_SETTIMEOUT) {
+@@ -670,7 +670,7 @@ public class Http11NioProcessor extends AbstractHttp11Processor implements Actio
+             //if we are not piggy backing on a worker thread, set the timeout
+             attach.setTimeout(timeout);
+         } else if (actionCode == ActionCode.ASYNC_DISPATCH) {
+-            if (asyncDispatch()) {
++            if (asyncStateMachine.asyncDispatch()) {
+                 endpoint.processSocket(this.socket, SocketStatus.OPEN, true);
+             }
+         }
+@@ -1022,7 +1022,7 @@ public class Http11NioProcessor extends AbstractHttp11Processor implements Actio
+     }
+ 
+     @Override
+-    protected Executor getExecutor() {
++    public Executor getExecutor() {
+         return endpoint.getExecutor();
+     }
+ }
+
+==================================================

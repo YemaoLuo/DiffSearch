@@ -1,0 +1,179 @@
+681e741b4ce82f21a6d82fff48085a2d741b123d
+==================================================
+Add 100-continue support to HTTP/2
+==================================================
+Mark Thomas
+==================================================
+Wed Sep 30 23:33:55 2015 +0000
+==================================================
+Http2UpgradeHandler.java
+Add 100-continue support to HTTP/2
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1706173 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Stream.java
+index 6882a60fb4..83e6bfa1cf 100644
+--- a/java/org/apache/coyote/http2/Http2UpgradeHandler.java
++++ b/java/org/apache/coyote/http2/Http2UpgradeHandler.java
+@@ -458,7 +458,8 @@ public class Http2UpgradeHandler extends AbstractStream implements InternalHttpU
+     }
+ 
+ 
+-    void writeHeaders(Stream stream, Response coyoteResponse) throws IOException {
++    void writeHeaders(Stream stream, Response coyoteResponse, int payloadSize)
++            throws IOException {
+         if (log.isDebugEnabled()) {
+             log.debug(sm.getString("upgradeHandler.writeHeaders", connectionId,
+                     stream.getIdentifier()));
+@@ -468,10 +469,8 @@ public class Http2UpgradeHandler extends AbstractStream implements InternalHttpU
+         headers.addValue(":status").setString(Integer.toString(coyoteResponse.getStatus()));
+         // This ensures the Stream processing thread has control of the socket.
+         synchronized (socketWrapper) {
+-            // Frame sizes are allowed to be bigger than 4k but for headers that
+-            // should be plenty
+             byte[] header = new byte[9];
+-            ByteBuffer target = ByteBuffer.allocate(4 * 1024);
++            ByteBuffer target = ByteBuffer.allocate(payloadSize);
+             boolean first = true;
+             State state = null;
+             while (state != State.COMPLETE) {
+
+==================================================
+StreamProcessor.java
+index 2024ea3a67..b1b645d14b 100644
+--- a/java/org/apache/coyote/http2/Stream.java
++++ b/java/org/apache/coyote/http2/Stream.java
+@@ -37,6 +37,12 @@ public class Stream extends AbstractStream implements HeaderEmitter {
+     private static final Log log = LogFactory.getLog(Stream.class);
+     private static final StringManager sm = StringManager.getManager(Stream.class);
+ 
++    private static final Response ACK_RESPONSE = new Response();
++
++    static {
++        ACK_RESPONSE.setStatus(101);
++    }
++
+     private volatile int weight = Constants.DEFAULT_WEIGHT;
+ 
+     private final Http2UpgradeHandler handler;
+@@ -225,6 +231,9 @@ public class Stream extends AbstractStream implements HeaderEmitter {
+             break;
+         }
+         default: {
++            if ("expect".equals(name) && "100-continue".equals(value)) {
++                coyoteRequest.setExpectation(true);
++            }
+             // Assume other HTTP header
+             coyoteRequest.getMimeHeaders().addValue(name).setString(value);
+         }
+@@ -233,9 +242,16 @@ public class Stream extends AbstractStream implements HeaderEmitter {
+ 
+ 
+     void writeHeaders() throws IOException {
+-        handler.writeHeaders(this, coyoteResponse);
++        // TODO: Is 1k the optimal value?
++        handler.writeHeaders(this, coyoteResponse, 1024);
+     }
+ 
++    void writeAck() throws IOException {
++        // TODO: Is 64 too big? Just the status header with compression
++        handler.writeHeaders(this, ACK_RESPONSE, 64);
++    }
++
++
+ 
+     void flushData() throws IOException {
+         if (log.isDebugEnabled()) {
+
+==================================================
+Http2TestBase.java
+index 35c15fc2d0..047b159e9d 100644
+--- a/java/org/apache/coyote/http2/StreamProcessor.java
++++ b/java/org/apache/coyote/http2/StreamProcessor.java
+@@ -139,6 +139,16 @@ public class StreamProcessor extends AbstractProcessor implements Runnable {
+             }
+             break;
+         }
++        case ACK: {
++            if (!response.isCommitted() && request.hasExpectation()) {
++                try {
++                    stream.writeAck();
++                } catch (IOException ioe) {
++                    // TODO
++                }
++            }
++            break;
++        }
+         case CLIENT_FLUSH: {
+             action(ActionCode.COMMIT, null);
+             try {
+@@ -330,7 +340,6 @@ public class StreamProcessor extends AbstractProcessor implements Runnable {
+                     sm.getString("streamProcessor.httpupgrade.notsupported"));
+ 
+         // Unimplemented / to review
+-        case ACK:
+         case CLOSE_NOW:
+         case DISABLE_SWALLOW_INPUT:
+         case END_REQUEST:
+
+==================================================
+TestHttp2Section_6_9.java
+index 2a53b93285..151332a3b0 100644
+--- a/test/org/apache/coyote/http2/Http2TestBase.java
++++ b/test/org/apache/coyote/http2/Http2TestBase.java
+@@ -232,12 +232,17 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+ 
+     protected void sendSimplePostRequest(int streamId, byte[] padding, boolean writeBody)
+             throws IOException {
++        sendSimplePostRequest(streamId, padding, writeBody, false);
++    }
++
++    protected void sendSimplePostRequest(int streamId, byte[] padding, boolean writeBody,
++            boolean useExpectation) throws IOException {
+         byte[] headersFrameHeader = new byte[9];
+         ByteBuffer headersPayload = ByteBuffer.allocate(128);
+         byte[] dataFrameHeader = new byte[9];
+         ByteBuffer dataPayload = ByteBuffer.allocate(128);
+ 
+-        buildPostRequest(headersFrameHeader, headersPayload,
++        buildPostRequest(headersFrameHeader, headersPayload, useExpectation,
+                 dataFrameHeader, dataPayload, padding, streamId);
+         writeFrame(headersFrameHeader, headersPayload);
+         if (writeBody) {
+@@ -247,11 +252,15 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+ 
+ 
+     protected void buildPostRequest(byte[] headersFrameHeader, ByteBuffer headersPayload,
+-            byte[] dataFrameHeader, ByteBuffer dataPayload, byte[] padding, int streamId) {
++            boolean useExpectation, byte[] dataFrameHeader, ByteBuffer dataPayload, byte[] padding,
++            int streamId) {
+         MimeHeaders headers = new MimeHeaders();
+         headers.addValue(":method").setString("POST");
+         headers.addValue(":path").setString("/simple");
+         headers.addValue(":authority").setString("localhost:" + getPort());
++        if (useExpectation) {
++            headers.addValue("expect").setString("100-continue");
++        }
+         hpackEncoder.encode(headers, headersPayload);
+ 
+         headersPayload.flip();
+
+==================================================
+TestHttp2Section_8_1.java
+index e00f695f12..84d4cf355b 100644
+--- a/test/org/apache/coyote/http2/TestHttp2Section_6_9.java
++++ b/test/org/apache/coyote/http2/TestHttp2Section_6_9.java
+@@ -167,7 +167,7 @@ public class TestHttp2Section_6_9 extends Http2TestBase {
+         byte[] dataFrameHeader = new byte[9];
+         ByteBuffer dataPayload = ByteBuffer.allocate(8 * 1024);
+ 
+-        buildPostRequest(headersFrameHeader, headersPayload,
++        buildPostRequest(headersFrameHeader, headersPayload, false,
+                 dataFrameHeader, dataPayload, null, 3);
+ 
+         // Write the headers
+
+==================================================

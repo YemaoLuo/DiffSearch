@@ -1,0 +1,321 @@
+c48f647d951f20d5b51a5ad3f3dbd07be05c3e3e
+==================================================
+Create/destroy Decoders via the InstanceManager (BZ 65262)
+==================================================
+Mark Thomas
+==================================================
+Wed Apr 28 12:47:31 2021 +0100
+==================================================
+PojoClassHolder.java
+Create/destroy Decoders via the InstanceManager (BZ 65262)
+
+
+
+==================================================
+PojoHolder.java
+index e2c1da82f8..61e338b054 100644
+--- a/java/org/apache/tomcat/websocket/PojoClassHolder.java
++++ b/java/org/apache/tomcat/websocket/PojoClassHolder.java
+@@ -54,7 +54,7 @@ public class PojoClassHolder implements ClientEndpointHolder {
+             } else {
+                 pojo = instanceManager.newInstance(pojoClazz);
+             }
+-            return new PojoEndpointClient(pojo, clientEndpointConfig.getDecoders());
++            return new PojoEndpointClient(pojo, clientEndpointConfig.getDecoders(), instanceManager);
+         } catch (ReflectiveOperationException | SecurityException | NamingException e) {
+             throw new DeploymentException(sm.getString("clientEndpointHolder.instanceCreationFailed"), e);
+         }
+
+==================================================
+Util.java
+index 7195944df3..8ff3f4287f 100644
+--- a/java/org/apache/tomcat/websocket/PojoHolder.java
++++ b/java/org/apache/tomcat/websocket/PojoHolder.java
+@@ -55,6 +55,6 @@ public class PojoHolder implements ClientEndpointHolder {
+                 throw new DeploymentException(sm.getString("clientEndpointHolder.instanceRegistrationFailed"), e);
+             }
+         }
+-        return new PojoEndpointClient(pojo, clientEndpointConfig.getDecoders());
++        return new PojoEndpointClient(pojo, clientEndpointConfig.getDecoders(), instanceManager);
+     }
+ }
+
+==================================================
+PojoEndpointClient.java
+index 50b47c3aca..afefa8c8af 100644
+--- a/java/org/apache/tomcat/websocket/pojo/LocalStrings.properties
++++ b/java/org/apache/tomcat/websocket/pojo/LocalStrings.properties
+@@ -22,6 +22,8 @@ pojoEndpointBase.onOpenFail=Failed to call onOpen method of POJO end point for P
+ pojoMessageHandlerWhole.decodeIoFail=IO error while decoding message
+ pojoMessageHandlerWhole.maxBufferSize=The maximum supported message size for this implementation is Integer.MAX_VALUE
+ 
++pojoMessageHandlerWholeBase.decodeDestoryFailed=Failed to destroy the decoder of type [{0}]
++
+ pojoMethodMapping.decodePathParamFail=Failed to decode path parameter value [{0}] to expected type [{1}]
+ pojoMethodMapping.duplicateAnnotation=Duplicate annotations [{0}] present on class [{1}]
+ pojoMethodMapping.duplicateLastParam=Multiple boolean (last) parameters present on the method [{0}] of class [{1}] that was annotated with OnMessage
+
+==================================================
+PojoMessageHandlerWholeBase.java
+index 66033f35aa..2aebe00e93 100644
+--- a/java/org/apache/tomcat/websocket/pojo/PojoEndpointClient.java
++++ b/java/org/apache/tomcat/websocket/pojo/PojoEndpointClient.java
+@@ -24,6 +24,8 @@ import jakarta.websocket.DeploymentException;
+ import jakarta.websocket.EndpointConfig;
+ import jakarta.websocket.Session;
+ 
++import org.apache.tomcat.InstanceManager;
++
+ /**
+  * Wrapper class for instances of POJOs annotated with
+  * {@link jakarta.websocket.ClientEndpoint} so they appear as standard
+@@ -31,6 +33,7 @@ import jakarta.websocket.Session;
+  */
+ public class PojoEndpointClient extends PojoEndpointBase {
+ 
++    @Deprecated
+     public PojoEndpointClient(Object pojo,
+             List<Class<? extends Decoder>> decoders) throws DeploymentException {
+         super(Collections.<String,String>emptyMap());
+@@ -38,6 +41,12 @@ public class PojoEndpointClient extends PojoEndpointBase {
+         setMethodMapping(new PojoMethodMapping(pojo.getClass(), decoders, null));
+     }
+ 
++    public PojoEndpointClient(Object pojo, List<Class<? extends Decoder>> decoders, InstanceManager instanceManager) throws DeploymentException {
++        super(Collections.<String,String>emptyMap());
++        setPojo(pojo);
++        setMethodMapping(new PojoMethodMapping(pojo.getClass(), decoders, null, instanceManager));
++    }
++
+     @Override
+     public void onOpen(Session session, EndpointConfig config) {
+         doOnOpen(session, config);
+
+==================================================
+PojoMessageHandlerWholeBinary.java
+index 90d7398866..4fdb87c480 100644
+--- a/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerWholeBase.java
++++ b/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerWholeBase.java
+@@ -21,11 +21,17 @@ import java.lang.reflect.Method;
+ import java.util.ArrayList;
+ import java.util.List;
+ 
++import javax.naming.NamingException;
++
+ import jakarta.websocket.DecodeException;
+ import jakarta.websocket.Decoder;
+ import jakarta.websocket.MessageHandler;
+ import jakarta.websocket.Session;
+ 
++import org.apache.juli.logging.Log;
++import org.apache.juli.logging.LogFactory;
++import org.apache.tomcat.InstanceManager;
++import org.apache.tomcat.util.res.StringManager;
+ import org.apache.tomcat.websocket.WsSession;
+ 
+ /**
+@@ -37,6 +43,9 @@ import org.apache.tomcat.websocket.WsSession;
+ public abstract class PojoMessageHandlerWholeBase<T>
+         extends PojoMessageHandlerBase<T> implements MessageHandler.Whole<T> {
+ 
++    private final Log log = LogFactory.getLog(PojoMessageHandlerWholeBase.class);  // must not be static
++    private static final StringManager sm = StringManager.getManager(PojoMessageHandlerWholeBase.class);
++
+     protected final List<Decoder> decoders = new ArrayList<>();
+ 
+     public PojoMessageHandlerWholeBase(Object pojo, Method method,
+@@ -47,6 +56,17 @@ public abstract class PojoMessageHandlerWholeBase<T>
+     }
+ 
+ 
++    protected Decoder createDecoderInstance(Class<? extends Decoder> clazz)
++            throws ReflectiveOperationException, NamingException {
++        InstanceManager instanceManager = ((WsSession) session).getInstanceManager();
++        if (instanceManager == null) {
++            return clazz.getConstructor().newInstance();
++        } else {
++            return (Decoder) instanceManager.newInstance(clazz);
++        }
++    }
++
++
+     @Override
+     public final void onMessage(T message) {
+ 
+@@ -91,8 +111,17 @@ public abstract class PojoMessageHandlerWholeBase<T>
+ 
+ 
+     protected void onClose() {
++        InstanceManager instanceManager = ((WsSession) session).getInstanceManager();
++
+         for (Decoder decoder : decoders) {
+             decoder.destroy();
++            if (instanceManager != null) {
++                try {
++                    instanceManager.destroyInstance(decoder);
++                } catch (IllegalAccessException | InvocationTargetException e) {
++                    log.warn(sm.getString("pojoMessageHandlerWholeBase.decodeDestoryFailed", decoder.getClass()), e);
++                }
++            }
+         }
+     }
+ 
+
+==================================================
+PojoMessageHandlerWholeText.java
+index 93feeebdde..9a7699de2e 100644
+--- a/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerWholeBinary.java
++++ b/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerWholeBinary.java
+@@ -22,6 +22,8 @@ import java.lang.reflect.Method;
+ import java.nio.ByteBuffer;
+ import java.util.List;
+ 
++import javax.naming.NamingException;
++
+ import jakarta.websocket.DecodeException;
+ import jakarta.websocket.Decoder;
+ import jakarta.websocket.Decoder.Binary;
+@@ -63,13 +65,11 @@ public class PojoMessageHandlerWholeBinary
+             if (decoderClazzes != null) {
+                 for (Class<? extends Decoder> decoderClazz : decoderClazzes) {
+                     if (Binary.class.isAssignableFrom(decoderClazz)) {
+-                        Binary<?> decoder = (Binary<?>) decoderClazz.getConstructor().newInstance();
++                        Binary<?> decoder = (Binary<?>) createDecoderInstance(decoderClazz);
+                         decoder.init(config);
+                         decoders.add(decoder);
+-                    } else if (BinaryStream.class.isAssignableFrom(
+-                            decoderClazz)) {
+-                        BinaryStream<?> decoder = (BinaryStream<?>)
+-                                decoderClazz.getConstructor().newInstance();
++                    } else if (BinaryStream.class.isAssignableFrom(decoderClazz)) {
++                        BinaryStream<?> decoder = (BinaryStream<?>) createDecoderInstance(decoderClazz);
+                         decoder.init(config);
+                         decoders.add(decoder);
+                     } else {
+@@ -77,7 +77,7 @@ public class PojoMessageHandlerWholeBinary
+                     }
+                 }
+             }
+-        } catch (ReflectiveOperationException e) {
++        } catch (ReflectiveOperationException | NamingException e) {
+             throw new IllegalArgumentException(e);
+         }
+         this.isForInputStream = isForInputStream;
+
+==================================================
+PojoMethodMapping.java
+index ce12f169cd..9d2c646c19 100644
+--- a/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerWholeText.java
++++ b/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerWholeText.java
+@@ -21,6 +21,8 @@ import java.io.StringReader;
+ import java.lang.reflect.Method;
+ import java.util.List;
+ 
++import javax.naming.NamingException;
++
+ import jakarta.websocket.DecodeException;
+ import jakarta.websocket.Decoder;
+ import jakarta.websocket.Decoder.Text;
+@@ -73,13 +75,11 @@ public class PojoMessageHandlerWholeText
+             if (decoderClazzes != null) {
+                 for (Class<? extends Decoder> decoderClazz : decoderClazzes) {
+                     if (Text.class.isAssignableFrom(decoderClazz)) {
+-                        Text<?> decoder = (Text<?>) decoderClazz.getConstructor().newInstance();
++                        Text<?> decoder = (Text<?>) createDecoderInstance(decoderClazz);
+                         decoder.init(config);
+                         decoders.add(decoder);
+-                    } else if (TextStream.class.isAssignableFrom(
+-                            decoderClazz)) {
+-                        TextStream<?> decoder =
+-                                (TextStream<?>) decoderClazz.getConstructor().newInstance();
++                    } else if (TextStream.class.isAssignableFrom(decoderClazz)) {
++                        TextStream<?> decoder = (TextStream<?>) createDecoderInstance(decoderClazz);
+                         decoder.init(config);
+                         decoders.add(decoder);
+                     } else {
+@@ -87,7 +87,7 @@ public class PojoMessageHandlerWholeText
+                     }
+                 }
+             }
+-        } catch (ReflectiveOperationException e) {
++        } catch (ReflectiveOperationException | NamingException e) {
+             throw new IllegalArgumentException(e);
+         }
+     }
+
+==================================================
+WsServerContainer.java
+index 4ace70fcba..ce07c34ca1 100644
+--- a/java/org/apache/tomcat/websocket/pojo/PojoMethodMapping.java
++++ b/java/org/apache/tomcat/websocket/pojo/PojoMethodMapping.java
+@@ -44,6 +44,7 @@ import jakarta.websocket.PongMessage;
+ import jakarta.websocket.Session;
+ import jakarta.websocket.server.PathParam;
+ 
++import org.apache.tomcat.InstanceManager;
+ import org.apache.tomcat.util.res.StringManager;
+ import org.apache.tomcat.websocket.DecoderEntry;
+ import org.apache.tomcat.websocket.Util;
+@@ -70,13 +71,41 @@ public class PojoMethodMapping {
+     private final String wsPath;
+ 
+ 
+-    public PojoMethodMapping(Class<?> clazzPojo,
+-            List<Class<? extends Decoder>> decoderClazzes, String wsPath)
+-                    throws DeploymentException {
++    /**
++     * Create a method mapping for the given POJO
++     *
++     * @param clazzPojo         POJO implementation class
++     * @param decoderClazzes    Set of potential decoder classes
++     * @param wsPath            Path at which the endpoint will be deployed
++     *
++     * @throws DeploymentException If the mapping cannot be completed
++     *
++     * @deprecated Will be removed in Tomcat 10.1.x
++     *             Use (@link {@link #PojoMethodMapping(Class, List, String, InstanceManager)}
++     */
++    @Deprecated
++    public PojoMethodMapping(Class<?> clazzPojo, List<Class<? extends Decoder>> decoderClazzes, String wsPath)
++            throws DeploymentException {
++        this(clazzPojo, decoderClazzes, wsPath, null);
++    }
++
++
++    /**
++     * Create a method mapping for the given POJO
++     *
++     * @param clazzPojo         POJO implementation class
++     * @param decoderClazzes    Set of potential decoder classes
++     * @param wsPath            Path at which the endpoint will be deployed
++     * @param instanceManager   Instance manager to use to create Decoder instances
++     *
++     * @throws DeploymentException If the mapping cannot be completed
++     */
++    public PojoMethodMapping(Class<?> clazzPojo, List<Class<? extends Decoder>> decoderClazzes, String wsPath,
++            InstanceManager instanceManager) throws DeploymentException {
+ 
+         this.wsPath = wsPath;
+ 
+-        List<DecoderEntry> decoders = Util.getDecoders(decoderClazzes);
++        List<DecoderEntry> decoders = Util.getDecoders(decoderClazzes, instanceManager);
+         Method open = null;
+         Method close = null;
+         Method error = null;
+
+==================================================
+TesterWsClientAutobahn.java
+index 40d52cc0e5..96c1422b55 100644
+--- a/java/org/apache/tomcat/websocket/server/WsServerContainer.java
++++ b/java/org/apache/tomcat/websocket/server/WsServerContainer.java
+@@ -151,7 +151,7 @@ public class WsServerContainer extends WsWebSocketContainer
+ 
+             // Add method mapping to user properties
+             PojoMethodMapping methodMapping = new PojoMethodMapping(sec.getEndpointClass(),
+-                    sec.getDecoders(), path);
++                    sec.getDecoders(), path, getInstanceManager(Thread.currentThread().getContextClassLoader()));
+             if (methodMapping.getOnClose() != null || methodMapping.getOnOpen() != null
+                     || methodMapping.getOnError() != null || methodMapping.hasMessageHandlers()) {
+                 sec.getUserProperties().put(org.apache.tomcat.websocket.pojo.Constants.POJO_METHOD_MAPPING_KEY,
+
+==================================================

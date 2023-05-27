@@ -1,0 +1,253 @@
+24a048816941be10ec05752f3bd0d63246691864
+==================================================
+https://issues.apache.org/bugzilla/show_bug.cgi?id=52002 add in ability to configure pool so that connections can not be reused
+==================================================
+Filip Hanik
+==================================================
+Tue Mar 20 15:45:19 2012 +0000
+==================================================
+ConnectionPool.java
+https://issues.apache.org/bugzilla/show_bug.cgi?id=52002 add in ability to configure pool so that connections can not be reused
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1302948 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+DataSourceProxy.java
+index b8cac3e2f3..fe0e54875d 100644
+--- a/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/ConnectionPool.java
++++ b/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/ConnectionPool.java
+@@ -312,7 +312,12 @@ public class ConnectionPool {
+             getProxyConstructor(con.getXAConnection() != null);
+             //create the proxy
+             //TODO possible optimization, keep track if this connection was returned properly, and don't generate a new facade
+-            Connection connection = (Connection)proxyClassConstructor.newInstance(new Object[] { handler });
++            Connection connection = null;
++            if (getPoolProperties().getUseDisposableConnectionFacade() ) {
++                connection = (Connection)proxyClassConstructor.newInstance(new Object[] { new DisposableConnectionFacade(handler) });
++            } else {
++                connection = (Connection)proxyClassConstructor.newInstance(new Object[] {handler});
++            }
+             //return the connection
+             return connection;
+         }catch (Exception x) {
+
+==================================================
+DisposableConnectionFacade.java
+index e8095488e9..2e0703b4c1 100644
+--- a/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/DataSourceProxy.java
++++ b/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/DataSourceProxy.java
+@@ -1226,4 +1226,20 @@ public class DataSourceProxy implements PoolConfiguration {
+         return getPoolProperties().getRollbackOnReturn();
+     }
+ 
++    /**
++     * {@inheritDoc}
++     */
++    @Override
++    public void setUseDisposableConnectionFacade(boolean useDisposableConnectionFacade) {
++        getPoolProperties().setUseDisposableConnectionFacade(useDisposableConnectionFacade);
++    }
++
++    /**
++     * {@inheritDoc}
++     */
++    @Override
++    public boolean getUseDisposableConnectionFacade() {
++        return getPoolProperties().getUseDisposableConnectionFacade();
++    }
++
+ }
+
+==================================================
+JdbcInterceptor.java
+new file mode 100644
+index 0000000000..d167d90601
+--- /dev/null
++++ b/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/DisposableConnectionFacade.java
+@@ -0,0 +1,69 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.tomcat.jdbc.pool;
++
++import java.lang.reflect.Method;
++import java.sql.SQLException;
++
++/**
++ * A DisposableConnectionFacade object is the top most interceptor that wraps an object of type
++ * {@link PooledConnection}. The ProxyCutOffConnection intercepts two methods:
++ * <ul>
++ *   <li>{@link java.sql.Connection#close()} - returns the connection to the pool then breaks the link between cutoff and the next interceptor. May be called multiple times.</li>
++ *   <li>{@link java.lang.Object#toString()} - returns a custom string for this object</li>
++ * </ul>
++ * By default method comparisons is done on a String reference level, unless the {@link PoolConfiguration#setUseEquals(boolean)} has been called
++ * with a <code>true</code> argument.
++ * @author Kevin Grainer
++ */
++public class DisposableConnectionFacade extends JdbcInterceptor {
++    protected DisposableConnectionFacade(JdbcInterceptor interceptor) throws SQLException {
++        setUseEquals(interceptor.isUseEquals());
++        setNext(interceptor);
++    }
++
++    @Override
++    public void reset(ConnectionPool parent, PooledConnection con) {
++    }
++
++    @Override
++    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
++        if (compare(ISCLOSED_VAL, method) && getNext() == null) {
++            return Boolean.TRUE;
++        }
++        if (compare(CLOSE_VAL, method) && getNext() == null) {
++            return null;
++        }
++
++        try {
++            return super.invoke(proxy, method, args);
++        } catch (NullPointerException e) {
++            if (getNext() == null) {
++                if (compare(TOSTRING_VAL, method)) {
++                    return "DisposableConnectionFacade[null]";
++                }
++                throw new SQLException("Connection has already been closed.");
++            }
++
++            throw e;
++        } finally {
++            if (compare(CLOSE_VAL, method)) {
++                setNext(null);
++            }
++        }
++    }
++}
+
+==================================================
+PoolConfiguration.java
+index 1e9a6cc51f..e75088bb27 100644
+--- a/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/JdbcInterceptor.java
++++ b/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/JdbcInterceptor.java
+@@ -70,7 +70,7 @@ public abstract class JdbcInterceptor implements InvocationHandler {
+     /**
+      * The next interceptor in the chain
+      */
+-    private JdbcInterceptor next = null;
++    private volatile JdbcInterceptor next = null;
+     /**
+      * Property that decides how we do string comparison, default is to use
+      * {@link String#equals(Object)}. If set to <code>false</code> then the
+
+==================================================
+PoolProperties.java
+index ccaba0045f..9663223281 100644
+--- a/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/PoolConfiguration.java
++++ b/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/PoolConfiguration.java
+@@ -821,4 +821,18 @@ public interface PoolConfiguration {
+      */
+     public boolean getRollbackOnReturn();
+ 
++    /**
++     * If set to true, the connection will be wrapped with facade that will disallow the connection to be used after
++     * {@link java.sql.Connection#close()} is called. If set to true, after {@link java.sql.Connection#close()} all calls except
++     * {@link java.sql.Connection#close()} and {@link java.sql.Connection#isClosed()} will throw an exception.
++     * @param useDisposableConnectionFacade
++     */
++    public void setUseDisposableConnectionFacade(boolean useDisposableConnectionFacade);
++    /**
++     * Returns true if this connection pool is configured to use a connection facade to prevent re-use of connection after
++     * {@link java.sql.Connection#close()} has been invoked
++     * @return true if {@link java.sql.Connection#close()} has been invoked.
++     */
++    public boolean getUseDisposableConnectionFacade();
++
+ }
+
+==================================================
+ConnectionPool.java
+index f6ae5f42a6..2ede4c5582 100644
+--- a/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/PoolProperties.java
++++ b/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/PoolProperties.java
+@@ -86,6 +86,7 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
+     protected boolean alternateUsernameAllowed = false;
+     protected boolean commitOnReturn = false;
+     protected boolean rollbackOnReturn = false;
++    protected boolean useDisposableConnectionFacade;
+ 
+ 
+     /**
+@@ -1194,4 +1195,29 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
+     public boolean getRollbackOnReturn() {
+         return this.rollbackOnReturn;
+     }
++
++    /**
++     * {@inheritDoc}
++     */
++    @Override
++    public void setUseDisposableConnectionFacade(boolean useDisposableConnectionFacade) {
++        this.useDisposableConnectionFacade = useDisposableConnectionFacade;
++    }
++
++    /**
++     * {@inheritDoc}
++     */
++    @Override
++    public boolean getUseDisposableConnectionFacade() {
++        return useDisposableConnectionFacade;
++    }
++
++    @Override
++    protected Object clone() throws CloneNotSupportedException {
++        // TODO Auto-generated method stub
++        return super.clone();
++    }
++
++
++
+ }
+
+==================================================
+MultipleCloseTest.java
+index d552539bac..49c5020a67 100644
+--- a/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/jmx/ConnectionPool.java
++++ b/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/jmx/ConnectionPool.java
+@@ -777,5 +777,22 @@ public class ConnectionPool extends NotificationBroadcasterSupport implements Co
+         return getPoolProperties().getRollbackOnReturn();
+     }
+ 
++    /**
++     * {@inheritDoc}
++     */
++    @Override
++    public void setUseDisposableConnectionFacade(boolean useDisposableConnectionFacade) {
++        getPoolProperties().setUseDisposableConnectionFacade(useDisposableConnectionFacade);
++    }
++
++    /**
++     * {@inheritDoc}
++     */
++    @Override
++    public boolean getUseDisposableConnectionFacade() {
++        return getPoolProperties().getUseDisposableConnectionFacade();
++    }
++
++
+ 
+ }
+
+==================================================

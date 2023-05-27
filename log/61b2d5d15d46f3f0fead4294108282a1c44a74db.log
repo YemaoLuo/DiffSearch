@@ -1,0 +1,310 @@
+61b2d5d15d46f3f0fead4294108282a1c44a74db
+==================================================
+Improve error handling if non-blocking IO code swallows IOExceptions
+==================================================
+Mark Thomas
+==================================================
+Wed Feb 24 18:43:22 2021 +0000
+==================================================
+CoyoteAdapter.java
+Improve error handling if non-blocking IO code swallows IOExceptions
+
+Tomcat previously expected IOExceptions in onWritePossible() and
+onDataAvailable() to not be swallowed. These additions allow correct
+error handling even if the application code swallows the exception.
+
+
+
+==================================================
+InputBuffer.java
+index e9100e125f..84190ac1a3 100644
+--- a/java/org/apache/catalina/connector/CoyoteAdapter.java
++++ b/java/org/apache/catalina/connector/CoyoteAdapter.java
+@@ -179,6 +179,10 @@ public class CoyoteAdapter implements Adapter {
+                                 readListener != null) {
+                             readListener.onAllDataRead();
+                         }
++                        // User code may have swallowed an IOException
++                        if (response.getCoyoteResponse().isExceptionPresent()) {
++                            throw response.getCoyoteResponse().getErrorException();
++                        }
+                     } catch (Throwable t) {
+                         ExceptionUtils.handleThrowable(t);
+                         // Need to trigger the call to AbstractProcessor.setErrorState()
+@@ -207,6 +211,10 @@ public class CoyoteAdapter implements Adapter {
+                         if (request.isFinished() && req.sendAllDataReadEvent()) {
+                             readListener.onAllDataRead();
+                         }
++                        // User code may have swallowed an IOException
++                        if (request.getCoyoteRequest().isExceptionPresent()) {
++                            throw request.getCoyoteRequest().getErrorException();
++                        }
+                     } catch (Throwable t) {
+                         ExceptionUtils.handleThrowable(t);
+                         // Need to trigger the call to AbstractProcessor.setErrorState()
+
+==================================================
+OutputBuffer.java
+index d3afe7c63a..9b8ebb721e 100644
+--- a/java/org/apache/catalina/connector/InputBuffer.java
++++ b/java/org/apache/catalina/connector/InputBuffer.java
+@@ -335,6 +335,7 @@ public class InputBuffer extends Reader
+         try {
+             return coyoteRequest.doRead(this);
+         } catch (IOException ioe) {
++            coyoteRequest.setErrorException(ioe);
+             // An IOException on a read is almost always due to
+             // the remote client aborting the request.
+             throw new ClientAbortException(ioe);
+@@ -343,9 +344,7 @@ public class InputBuffer extends Reader
+ 
+ 
+     public int readByte() throws IOException {
+-        if (closed) {
+-            throw new IOException(sm.getString("inputBuffer.streamClosed"));
+-        }
++        throwIfClosed();
+ 
+         if (checkByteBufferEof()) {
+             return -1;
+@@ -355,9 +354,7 @@ public class InputBuffer extends Reader
+ 
+ 
+     public int read(byte[] b, int off, int len) throws IOException {
+-        if (closed) {
+-            throw new IOException(sm.getString("inputBuffer.streamClosed"));
+-        }
++        throwIfClosed();
+ 
+         if (checkByteBufferEof()) {
+             return -1;
+@@ -380,9 +377,7 @@ public class InputBuffer extends Reader
+      * @throws IOException if an input or output exception has occurred
+      */
+     public int read(ByteBuffer to) throws IOException {
+-        if (closed) {
+-            throw new IOException(sm.getString("inputBuffer.streamClosed"));
+-        }
++        throwIfClosed();
+ 
+         if (checkByteBufferEof()) {
+             return -1;
+@@ -436,10 +431,7 @@ public class InputBuffer extends Reader
+ 
+     @Override
+     public int read() throws IOException {
+-
+-        if (closed) {
+-            throw new IOException(sm.getString("inputBuffer.streamClosed"));
+-        }
++        throwIfClosed();
+ 
+         if (checkCharBufferEof()) {
+             return -1;
+@@ -450,21 +442,14 @@ public class InputBuffer extends Reader
+ 
+     @Override
+     public int read(char[] cbuf) throws IOException {
+-
+-        if (closed) {
+-            throw new IOException(sm.getString("inputBuffer.streamClosed"));
+-        }
+-
++        throwIfClosed();
+         return read(cbuf, 0, cbuf.length);
+     }
+ 
+ 
+     @Override
+     public int read(char[] cbuf, int off, int len) throws IOException {
+-
+-        if (closed) {
+-            throw new IOException(sm.getString("inputBuffer.streamClosed"));
+-        }
++        throwIfClosed();
+ 
+         if (checkCharBufferEof()) {
+             return -1;
+@@ -477,9 +462,7 @@ public class InputBuffer extends Reader
+ 
+     @Override
+     public long skip(long n) throws IOException {
+-        if (closed) {
+-            throw new IOException(sm.getString("inputBuffer.streamClosed"));
+-        }
++        throwIfClosed();
+ 
+         if (n < 0) {
+             throw new IllegalArgumentException();
+@@ -505,9 +488,7 @@ public class InputBuffer extends Reader
+ 
+     @Override
+     public boolean ready() throws IOException {
+-        if (closed) {
+-            throw new IOException(sm.getString("inputBuffer.streamClosed"));
+-        }
++        throwIfClosed();
+         if (state == INITIAL_STATE) {
+             state = CHAR_STATE;
+         }
+@@ -524,9 +505,7 @@ public class InputBuffer extends Reader
+     @Override
+     public void mark(int readAheadLimit) throws IOException {
+ 
+-        if (closed) {
+-            throw new IOException(sm.getString("inputBuffer.streamClosed"));
+-        }
++        throwIfClosed();
+ 
+         if (cb.remaining() <= 0) {
+             clear(cb);
+@@ -544,15 +523,15 @@ public class InputBuffer extends Reader
+     @Override
+     public void reset() throws IOException {
+ 
+-        if (closed) {
+-            throw new IOException(sm.getString("inputBuffer.streamClosed"));
+-        }
++        throwIfClosed();
+ 
+         if (state == CHAR_STATE) {
+             if (markPos < 0) {
+                 clear(cb);
+                 markPos = -1;
+-                throw new IOException();
++                IOException ioe = new IOException();
++                coyoteRequest.setErrorException(ioe);
++                throw ioe;
+             } else {
+                 cb.position(markPos);
+             }
+@@ -562,6 +541,14 @@ public class InputBuffer extends Reader
+     }
+ 
+ 
++    private void throwIfClosed() throws IOException {
++        if (closed) {
++            IOException ioe = new IOException(sm.getString("inputBuffer.streamClosed"));
++            coyoteRequest.setErrorException(ioe);
++            throw ioe;
++        }
++    }
++
+     public void checkConverter() throws IOException {
+         if (conv != null) {
+             return;
+
+==================================================
+Request.java
+index ac475554c8..0ea4dbda6d 100644
+--- a/java/org/apache/catalina/connector/OutputBuffer.java
++++ b/java/org/apache/catalina/connector/OutputBuffer.java
+@@ -349,6 +349,7 @@ public class OutputBuffer extends Writer {
+                 // An IOException on a write is almost always due to
+                 // the remote client aborting the request. Wrap this
+                 // so that it can be handled better by the error dispatcher.
++                coyoteResponse.setErrorException(e);
+                 throw new ClientAbortException(e);
+             }
+         }
+
+==================================================
+Response.java
+index 199cc800c2..219eb5fdc6 100644
+--- a/java/org/apache/coyote/Request.java
++++ b/java/org/apache/coyote/Request.java
+@@ -162,6 +162,11 @@ public final class Request {
+ 
+     private boolean sendfile = true;
+ 
++    /**
++     * Holds request body reading error exception.
++     */
++    private Exception errorException = null;
++
+     volatile ReadListener listener;
+ 
+     public ReadListener getReadListener() {
+@@ -566,6 +571,34 @@ public final class Request {
+     }
+ 
+ 
++    // -------------------- Error tracking --------------------
++
++    /**
++     * Set the error Exception that occurred during the writing of the response
++     * processing.
++     *
++     * @param ex The exception that occurred
++     */
++    public void setErrorException(Exception ex) {
++        errorException = ex;
++    }
++
++
++    /**
++     * Get the Exception that occurred during the writing of the response.
++     *
++     * @return The exception that occurred
++     */
++    public Exception getErrorException() {
++        return errorException;
++    }
++
++
++    public boolean isExceptionPresent() {
++        return errorException != null;
++    }
++
++
+     // -------------------- debug --------------------
+ 
+     @Override
+
+==================================================
+TestNonBlockingAPI.java
+index d5f95ead53..114587f05f 100644
+--- a/java/org/apache/coyote/Response.java
++++ b/java/org/apache/coyote/Response.java
+@@ -126,9 +126,9 @@ public final class Response {
+     private long commitTimeNanos = -1;
+ 
+     /**
+-     * Holds request error exception.
++     * Holds response writing error exception.
+      */
+-    Exception errorException = null;
++    private Exception errorException = null;
+ 
+     /**
+      * With the introduction of async processing and the possibility of
+@@ -285,7 +285,8 @@ public final class Response {
+     // -----------------Error State --------------------
+ 
+     /**
+-     * Set the error Exception that occurred during request processing.
++     * Set the error Exception that occurred during the writing of the response
++     * processing.
+      *
+      * @param ex The exception that occurred
+      */
+@@ -295,7 +296,7 @@ public final class Response {
+ 
+ 
+     /**
+-     * Get the Exception that occurred during request processing.
++     * Get the Exception that occurred during the writing of the response.
+      *
+      * @return The exception that occurred
+      */
+@@ -305,7 +306,7 @@ public final class Response {
+ 
+ 
+     public boolean isExceptionPresent() {
+-        return ( errorException != null );
++        return errorException != null;
+     }
+ 
+ 
+
+==================================================

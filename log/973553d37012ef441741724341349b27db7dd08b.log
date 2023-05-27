@@ -1,0 +1,217 @@
+973553d37012ef441741724341349b27db7dd08b
+==================================================
+Update SSL Session handling based on Filip's comments. HTTP session invalidation is now separate from SSLSession validation. The hooks remain to invalidate the SSL session if required.
+==================================================
+Mark Emlyn
+==================================================
+Mon Jan 12 21:18:54 2009 +0000
+==================================================
+CoyoteAdapter.java
+Update SSL Session handling based on Filip's comments. HTTP session invalidation is now separate from SSLSession validation. The hooks remain to invalidate the SSL session if required.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@733899 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Request.java
+index 731b540349..4e2a6a8f15 100644
+--- a/java/org/apache/catalina/connector/CoyoteAdapter.java
++++ b/java/org/apache/catalina/connector/CoyoteAdapter.java
+@@ -524,8 +524,7 @@ public class CoyoteAdapter
+         if (request.getRequestedSessionId() == null &&
+                 SSL_ONLY.equals(request.getServletContext()
+                         .getEffectiveSessionTrackingModes()) &&
+-                Boolean.TRUE.equals(
+-                        request.getConnector().getAttribute("SSLEnabled"))) {
++                        request.connector.secure) {
+             // TODO Is there a better way to map SSL sessions to our sesison ID?
+             // TODO The request.getAttribute() will cause a number of other SSL
+             //      attribute to be populated. Is this a performance concern?
+
+==================================================
+ApplicationContext.java
+index 4438bf43f4..a35f7a6f38 100644
+--- a/java/org/apache/catalina/connector/Request.java
++++ b/java/org/apache/catalina/connector/Request.java
+@@ -925,6 +925,10 @@ public class Request
+             if(attr != null) {
+                 attributes.put(Globals.SSL_SESSION_ID_ATTR, attr);
+             }
++            attr = coyoteRequest.getAttribute(Globals.SSL_SESSION_MGR_ATTR);
++            if(attr != null) {
++                attributes.put(Globals.SSL_SESSION_MGR_ATTR, attr);
++            }
+             attr = attributes.get(name);
+         }
+         return attr;
+@@ -938,7 +942,8 @@ public class Request
+         return Globals.CERTIFICATES_ATTR.equals(name) ||
+             Globals.CIPHER_SUITE_ATTR.equals(name) ||
+             Globals.KEY_SIZE_ATTR.equals(name)  ||
+-            Globals.SSL_SESSION_ID_ATTR.equals(name);
++            Globals.SSL_SESSION_ID_ATTR.equals(name) ||
++            Globals.SSL_SESSION_MGR_ATTR.equals(name);
+     }
+ 
+     /**
+@@ -2403,13 +2408,6 @@ public class Request
+         if ((connector.getEmptySessionPath() 
+                 && isRequestedSessionIdFromCookie()) || requestedSessionSSL ) {
+             session = manager.createSession(getRequestedSessionId());
+-            if (requestedSessionSSL) {
+-                coyoteRequest.action(ActionCode.ACTION_REQ_SSL_SESSION_MGR,
+-                        null);
+-                session.setNote(
+-                        org.apache.catalina.session.Constants.SESS_SSL_MGMT,
+-                        getAttribute(Globals.SSL_SESSION_MGR_ATTR));
+-            }
+         } else {
+             session = manager.createSession(null);
+         }
+
+==================================================
+Constants.java
+index 81ae804e44..d5999fa208 100644
+--- a/java/org/apache/catalina/core/ApplicationContext.java
++++ b/java/org/apache/catalina/core/ApplicationContext.java
+@@ -864,7 +864,7 @@ public class ApplicationContext
+      * SessionTrackingMode#COOKIE} is supported unless the <code>cookies</code>
+      * attribute has been set to <code>false</code> for the context and {@link
+      * SessionTrackingMode#SSL} is supported if at least one of the connectors
+-     * used by this context has the attribute <code>SSLEnabled</code> set to
++     * used by this context has the attribute <code>secure</code> set to
+      * <code>true</code>.
+      */
+     public EnumSet<SessionTrackingMode> getDefaultSessionTrackingModes() {
+@@ -887,7 +887,7 @@ public class ApplicationContext
+         // TODO extend this for SSL sessions managed by accelerators, web
+         // servers etc
+         for (Connector connector : connectors) {
+-            if (Boolean.TRUE.equals(connector.getAttribute("SSLEnabled"))) {
++            if (Boolean.TRUE.equals(connector.getAttribute("secure"))) {
+                 defaultSessionTrackingModes.add(SessionTrackingMode.SSL);
+                 break;
+             }
+@@ -1123,4 +1123,4 @@ public class ApplicationContext
+     }
+ 
+ 
+-}
++}
+\ No newline at end of file
+
+==================================================
+ManagerBase.java
+index ca4b09aa04..24546879e5 100644
+--- a/java/org/apache/catalina/session/Constants.java
++++ b/java/org/apache/catalina/session/Constants.java
+@@ -29,10 +29,4 @@ public class Constants {
+ 
+     public static final String Package = "org.apache.catalina.session";
+ 
+-    /**
+-     * Name of note containing SSL session manager
+-     */
+-    public static final String SESS_SSL_MGMT =
+-        "org.apache.catalina.session.SSL_MGMT";
+-
+ }
+
+==================================================
+ActionCode.java
+index 5624c9a727..8f5749fcc5 100644
+--- a/java/org/apache/catalina/session/ManagerBase.java
++++ b/java/org/apache/catalina/session/ManagerBase.java
+@@ -53,7 +53,6 @@ import org.apache.catalina.util.StringManager;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.modeler.Registry;
+-import org.apache.tomcat.util.net.SSLSessionManager;
+ 
+ 
+ /**
+@@ -908,12 +907,6 @@ public abstract class ManagerBase implements Manager, MBeanRegistration {
+     public void remove(Session session) {
+ 
+         sessions.remove(session.getIdInternal());
+-        // Close the underlying SSL session
+-        SSLSessionManager mgr =
+-            (SSLSessionManager) session.getNote(Constants.SESS_SSL_MGMT);
+-        if (mgr != null) {
+-            mgr.invalidateSession();
+-        }
+ 
+     }
+ 
+
+==================================================
+Http11AprProcessor.java
+index eb55f760ee..63642342c9 100644
+--- a/java/org/apache/coyote/ActionCode.java
++++ b/java/org/apache/coyote/ActionCode.java
+@@ -163,12 +163,6 @@ public final class ActionCode {
+      */
+     public static final ActionCode ACTION_COMET_SETTIMEOUT = new ActionCode(25);
+     
+-    /**
+-     * Callback for lazy evaluation - obtain the SSL Session Manager
+-     */
+-    public static final ActionCode ACTION_REQ_SSL_SESSION_MGR =
+-        new ActionCode(26);
+-    
+     // ----------------------------------------------------------- Constructors
+     int code;
+ 
+
+==================================================
+Http11NioProcessor.java
+index 78446df8c9..3a57faead6 100644
+--- a/java/org/apache/coyote/http11/Http11AprProcessor.java
++++ b/java/org/apache/coyote/http11/Http11AprProcessor.java
+@@ -1141,6 +1141,8 @@ public class Http11AprProcessor implements ActionHook {
+                     if (sslO != null) {
+                         request.setAttribute(AprEndpoint.SESSION_ID_KEY, sslO);
+                     }
++                    //TODO provide a hook to enable the SSL session to be
++                    // invalidated. Set AprEndpoint.SESSION_MGR req attr
+                 } catch (Exception e) {
+                     log.warn(sm.getString("http11processor.socket.ssl"), e);
+                 }
+@@ -1198,9 +1200,6 @@ public class Http11AprProcessor implements ActionHook {
+             //no op
+         } else if (actionCode == ActionCode.ACTION_COMET_SETTIMEOUT) {
+             //no op
+-        } else if (actionCode == ActionCode.ACTION_REQ_SSL_SESSION_MGR) {
+-            //TODO SERVLET3 provide a hook to enable the SSL session to be
+-            // invalidated
+         }
+ 
+     }
+
+==================================================
+Http11Processor.java
+index e6768c70fc..38523b927c 100644
+--- a/java/org/apache/coyote/http11/Http11NioProcessor.java
++++ b/java/org/apache/coyote/http11/Http11NioProcessor.java
+@@ -1175,6 +1175,7 @@ public class Http11NioProcessor implements ActionHook {
+                     if (sslO != null)
+                         request.setAttribute
+                             (SSLSupport.SESSION_ID_KEY, sslO);
++                    request.setAttribute(SSLSupport.SESSION_MGR, sslSupport);
+                 }
+             } catch (Exception e) {
+                 log.warn(sm.getString("http11processor.socket.ssl"), e);
+@@ -1236,10 +1237,6 @@ public class Http11NioProcessor implements ActionHook {
+             RequestInfo rp = request.getRequestProcessor();
+             if ( rp.getStage() != org.apache.coyote.Constants.STAGE_SERVICE ) //async handling
+                 attach.setTimeout(timeout);
+-        } else if (actionCode == ActionCode.ACTION_REQ_SSL_SESSION_MGR) {
+-            if( sslSupport != null) {
+-                request.setAttribute(SSLSupport.SESSION_MGR, sslSupport);
+-            }
+         }
+     }
+ 
+
+==================================================

@@ -1,0 +1,366 @@
+dc80771eb8eba86f2b556322dccf89a2fedba212
+==================================================
+Further refactoring towards a fix for BZ 55143
+==================================================
+Mark Emlyn
+==================================================
+Wed Jun 26 11:54:31 2013 +0000
+==================================================
+Util.java
+index fb0ca6db8c..5ff22b8246 100644
+--- a/java/org/apache/tomcat/websocket/LocalStrings.properties
++++ b/java/org/apache/tomcat/websocket/LocalStrings.properties
+@@ -26,7 +26,9 @@ asyncChannelWrapperSecure.writeFail=Only wrote [{0}] of [{1}] bytes
+ 
+ backgroundProcessManager.processFailed=A background process failed
+ 
++util.invalidMessageHandler=The message handler provided does not have an onMessage(Object) method
+ util.invalidType=Unable to coerce value [{0}] to type [{1}]. That type is not supported.
++util.unknownDecoderType=The Decoder type [{0}] is not recognized
+ 
+ # Note the wsFrame.* messages are used as close reasons in WebSocket control
+ # frames and therefore must be 123 bytes (not characters) or less in length.
+
+==================================================
+WsSession.java
+index c95922bbde..f23c6547ce 100644
+--- a/java/org/apache/tomcat/websocket/Util.java
++++ b/java/org/apache/tomcat/websocket/Util.java
+@@ -16,13 +16,16 @@
+  */
+ package org.apache.tomcat.websocket;
+ 
++import java.lang.reflect.Method;
+ import java.lang.reflect.ParameterizedType;
+ import java.lang.reflect.Type;
+ import java.lang.reflect.TypeVariable;
+ import java.nio.ByteBuffer;
+ import java.security.NoSuchAlgorithmException;
+ import java.security.SecureRandom;
++import java.util.ArrayList;
+ import java.util.HashSet;
++import java.util.List;
+ import java.util.Queue;
+ import java.util.Set;
+ import java.util.concurrent.ConcurrentLinkedQueue;
+@@ -30,11 +33,19 @@ import java.util.concurrent.ConcurrentLinkedQueue;
+ import javax.websocket.CloseReason.CloseCode;
+ import javax.websocket.CloseReason.CloseCodes;
+ import javax.websocket.Decoder;
++import javax.websocket.Decoder.Binary;
++import javax.websocket.Decoder.BinaryStream;
++import javax.websocket.Decoder.Text;
++import javax.websocket.Decoder.TextStream;
++import javax.websocket.DeploymentException;
+ import javax.websocket.Encoder;
++import javax.websocket.EndpointConfig;
+ import javax.websocket.MessageHandler;
+ import javax.websocket.PongMessage;
+ 
+ import org.apache.tomcat.util.res.StringManager;
++import org.apache.tomcat.websocket.pojo.PojoMessageHandlerWholeBinary;
++import org.apache.tomcat.websocket.pojo.PojoMessageHandlerWholeText;
+ 
+ /**
+  * Utility class for internal use only within the
+@@ -271,40 +282,179 @@ public class Util {
+     }
+ 
+ 
++    public static List<DecoderEntry> getDecoders(
++            Class<? extends Decoder>[] decoderClazzes)
++                    throws DeploymentException{
++
++        List<DecoderEntry> result = new ArrayList<>();
++        for (Class<? extends Decoder> decoderClazz : decoderClazzes) {
++            // Need to instantiate decoder to ensure it is valid and that
++            // deployment can be failed if it is not
++            @SuppressWarnings("unused")
++            Decoder instance;
++            try {
++                instance = decoderClazz.newInstance();
++            } catch (InstantiationException | IllegalAccessException e) {
++                throw new DeploymentException(
++                        sm.getString("pojoMethodMapping.invalidDecoder",
++                                decoderClazz.getName()), e);
++            }
++            DecoderEntry entry = new DecoderEntry(
++                    Util.getDecoderType(decoderClazz), decoderClazz);
++            result.add(entry);
++        }
++
++        return result;
++    }
++
++
++
+     public static Set<MessageHandlerResult> getMessageHandlers(
+-            MessageHandler listener) {
++            MessageHandler listener, EndpointConfig endpointConfig) {
+ 
+-        Type t = Util.getMessageType(listener);
++        Class<?> target = Util.getMessageType(listener);
+ 
+         // Will never be more than 2 types
+         Set<MessageHandlerResult> results = new HashSet<>(2);
+ 
+         // Simple cases - handlers already accepts one of the types expected by
+         // the frame handling code
+-        if (String.class.isAssignableFrom((Class<?>) t)) {
++        if (String.class.isAssignableFrom(target)) {
+             MessageHandlerResult result =
+                     new MessageHandlerResult(listener,
+                             MessageHandlerResultType.TEXT);
+             results.add(result);
+-        } else if (ByteBuffer.class.isAssignableFrom((Class<?>) t)) {
++        } else if (ByteBuffer.class.isAssignableFrom(target)) {
+             MessageHandlerResult result =
+                     new MessageHandlerResult(listener,
+                             MessageHandlerResultType.BINARY);
+             results.add(result);
+-        } else if (PongMessage.class.isAssignableFrom((Class<?>) t)) {
++        } else if (PongMessage.class.isAssignableFrom(target)) {
+             MessageHandlerResult result =
+                     new MessageHandlerResult(listener,
+                             MessageHandlerResultType.PONG);
+             results.add(result);
++            // TODO byte[], Reader, InputStream
+         } else {
+-            // TODO Decoder handling
++            // More complex case - listener that requires a decoder
++            DecoderMatch decoderMatch;
++            try {
++                decoderMatch = new DecoderMatch(target,
++                        endpointConfig.getDecoders());
++            } catch (DeploymentException e) {
++                throw new IllegalArgumentException(e);
++            }
++            Method m = getOnMessageMethod(listener);
++            if (decoderMatch.getBinaryDecoders().size() > 0) {
++                MessageHandlerResult result = new MessageHandlerResult(
++                        new PojoMessageHandlerWholeBinary(listener, m,
++                                endpointConfig,
++                                decoderMatch.getBinaryDecoders()),
++                        MessageHandlerResultType.BINARY);
++                results.add(result);
++            }
++            if (decoderMatch.getTextDecoders().size() > 0) {
++                MessageHandlerResult result = new MessageHandlerResult(
++                        new PojoMessageHandlerWholeText(listener, m,
++                                endpointConfig, decoderMatch.getTextDecoders()),
++                        MessageHandlerResultType.TEXT);
++                results.add(result);
++            }
+         }
+ 
+         if (results.size() == 0) {
+             throw new IllegalArgumentException(
+-                    sm.getString("wsSession.unknownHandler", listener, t));
++                    sm.getString("wsSession.unknownHandler", listener, target));
+         }
+ 
+         return results;
+     }
++
++
++    private static Method getOnMessageMethod(MessageHandler listener) {
++        try {
++            return listener.getClass().getMethod("onMessage", Object.class);
++        } catch (NoSuchMethodException | SecurityException e) {
++            throw new IllegalArgumentException(
++                    sm.getString("util.invalidMessageHandler"), e);
++        }
++    }
++
++    public static class DecoderEntry {
++
++        private final Class<?> clazz;
++        private final Class<? extends Decoder> decoderClazz;
++
++        public DecoderEntry(Class<?> clazz,
++                Class<? extends Decoder> decoderClazz) {
++            this.clazz = clazz;
++            this.decoderClazz = decoderClazz;
++        }
++
++        public Class<?> getClazz() {
++            return clazz;
++        }
++
++        public Class<? extends Decoder> getDecoderClazz() {
++            return decoderClazz;
++        }
++    }
++
++
++    private static class DecoderMatch {
++
++        private final List<Class<? extends Decoder>> textDecoders =
++                new ArrayList<>();
++        private final List<Class<? extends Decoder>> binaryDecoders =
++                new ArrayList<>();
++
++
++        public DecoderMatch(Class<?> target, List<Class<? extends Decoder>> decoders)
++                throws DeploymentException {
++            List<DecoderEntry> decoderEntries = getDecoders(
++                    decoders.toArray(new Class[decoders.size()]));
++            for (DecoderEntry decoderEntry : decoderEntries) {
++                if (decoderEntry.getClazz().isAssignableFrom(target)) {
++                    if (Binary.class.isAssignableFrom(
++                            decoderEntry.getDecoderClazz())) {
++                        binaryDecoders.add(decoderEntry.getDecoderClazz());
++                        // willDecode() method means this decoder may or may not
++                        // decode a message so need to carry on checking for
++                        // other matches
++                    } else if (BinaryStream.class.isAssignableFrom(
++                            decoderEntry.getDecoderClazz())) {
++                        binaryDecoders.add(decoderEntry.getDecoderClazz());
++                        // Stream decoders have to process the message so no
++                        // more decoders can be matched
++                        break;
++                    } else if (Text.class.isAssignableFrom(
++                            decoderEntry.getDecoderClazz())) {
++                        textDecoders.add(decoderEntry.getDecoderClazz());
++                        // willDecode() method means this decoder may or may not
++                        // decode a message so need to carry on checking for
++                        // other matches
++                    } else if (TextStream.class.isAssignableFrom(
++                            decoderEntry.getDecoderClazz())) {
++                        textDecoders.add(decoderEntry.getDecoderClazz());
++                        // Stream decoders have to process the message so no
++                        // more decoders can be matched
++                        break;
++                    } else {
++                        throw new IllegalArgumentException(
++                                sm.getString("util.unknownDecoderType"));
++                    }
++                }
++            }
++        }
++
++
++        public List<Class<? extends Decoder>> getTextDecoders() {
++            return textDecoders;
++        }
++
++
++        public List<Class<? extends Decoder>> getBinaryDecoders() {
++            return binaryDecoders;
++        }
++    }
+ }
+
+==================================================
+PojoMessageHandlerWholeBinary.java
+index 65151787ab..9fd6153fdb 100644
+--- a/java/org/apache/tomcat/websocket/WsSession.java
++++ b/java/org/apache/tomcat/websocket/WsSession.java
+@@ -64,6 +64,7 @@ public class WsSession implements Session {
+     private final Map<String,List<String>> requestParameterMap;
+     private final String queryString;
+     private final Principal userPrincipal;
++    private final EndpointConfig endpointConfig;
+ 
+     private final String subProtocol;
+     private final Map<String,String> pathParameters;
+@@ -132,6 +133,7 @@ public class WsSession implements Session {
+         this.pathParameters = pathParameters;
+         this.secure = secure;
+         this.wsRemoteEndpoint.setEncoders(endpointConfig);
++        this.endpointConfig = endpointConfig;
+ 
+         this.userProperties.putAll(endpointConfig.getUserProperties());
+         this.id = Long.toHexString(ids.getAndIncrement());
+@@ -161,7 +163,8 @@ public class WsSession implements Session {
+         // arbitrary objects with MessageHandlers and can wrap MessageHandlers
+         // just as easily.
+ 
+-        Set<MessageHandlerResult> mhResults = Util.getMessageHandlers(listener);
++        Set<MessageHandlerResult> mhResults =
++                Util.getMessageHandlers(listener, endpointConfig);
+ 
+         for (MessageHandlerResult mhResult : mhResults) {
+             switch (mhResult.getType()) {
+
+==================================================
+PojoMessageHandlerWholeText.java
+index e44cd9fe1a..74398fa74b 100644
+--- a/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerWholeBinary.java
++++ b/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerWholeBinary.java
+@@ -28,6 +28,7 @@ import javax.websocket.Decoder;
+ import javax.websocket.Decoder.Binary;
+ import javax.websocket.Decoder.BinaryStream;
+ import javax.websocket.EndpointConfig;
++import javax.websocket.MessageHandler;
+ import javax.websocket.Session;
+ 
+ import org.apache.tomcat.util.res.StringManager;
+@@ -73,6 +74,25 @@ public class PojoMessageHandlerWholeBinary
+     }
+ 
+ 
++    public PojoMessageHandlerWholeBinary(MessageHandler listener,
++            Method method, EndpointConfig config,
++            List<Class<? extends Decoder>> binaryDecoders) {
++        super(listener, method, null, new Object[1], -1, false, -1);
++
++        try {
++            for (Class<? extends Decoder> decoderClazz : binaryDecoders) {
++                Binary<?> decoder = (Binary<?>) decoderClazz.newInstance();
++                decoder.init(config);
++                decoders.add(decoder);
++            }
++        } catch (IllegalAccessException | InstantiationException e) {
++            throw new IllegalArgumentException(e);
++        }
++
++        this.isForInputStream = false;
++    }
++
++
+     @Override
+     protected Object decode(ByteBuffer message) throws DecodeException {
+         for (Decoder decoder : decoders) {
+
+==================================================
+PojoMethodMapping.java
+index 9eed5271ff..fe2e0b550b 100644
+--- a/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerWholeText.java
++++ b/java/org/apache/tomcat/websocket/pojo/PojoMessageHandlerWholeText.java
+@@ -27,6 +27,7 @@ import javax.websocket.Decoder;
+ import javax.websocket.Decoder.Text;
+ import javax.websocket.Decoder.TextStream;
+ import javax.websocket.EndpointConfig;
++import javax.websocket.MessageHandler;
+ import javax.websocket.Session;
+ 
+ import org.apache.tomcat.util.res.StringManager;
+@@ -81,6 +82,25 @@ public class PojoMessageHandlerWholeText
+     }
+ 
+ 
++    public PojoMessageHandlerWholeText(MessageHandler listener,
++            Method method, EndpointConfig config,
++            List<Class<? extends Decoder>> textDecoders) {
++        super(listener, method, null, new Object[1], -1, false, -1);
++
++        try {
++            for (Class<? extends Decoder> decoderClazz : textDecoders) {
++                Text<?> decoder = (Text<?>) decoderClazz.newInstance();
++                decoder.init(config);
++                decoders.add(decoder);
++            }
++        } catch (IllegalAccessException | InstantiationException e) {
++            throw new IllegalArgumentException(e);
++        }
++
++        primitiveType = null;
++    }
++
++
+     @Override
+     protected Object decode(String message) throws DecodeException {
+         // Handle primitives
+
+==================================================

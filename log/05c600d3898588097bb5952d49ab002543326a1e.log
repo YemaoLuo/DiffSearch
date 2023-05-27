@@ -1,0 +1,177 @@
+05c600d3898588097bb5952d49ab002543326a1e
+==================================================
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=53853
+==================================================
+Filip Hanik
+==================================================
+Thu Aug 7 20:15:19 2014 +0000
+==================================================
+GenericNamingResourcesFactory.java
+index dab6ad9ee2..f85135af61 100644
+--- a/modules/jdbc-pool/doc/jdbc-pool.xml
++++ b/modules/jdbc-pool/doc/jdbc-pool.xml
+@@ -170,6 +170,22 @@
+       </attribute>
+     </attributes>
+   </subsection>
++  
++  <subsection name="System Properties">
++    <p>System properties are JVM wide, affect all pools created in the JVM</p>
++    <attributes>
++      <attribute name="org.apache.tomcat.jdbc.pool.onlyAttemptCurrentClassLoader" required="false">
++        <p>(boolean) Controls classloading of dynamic classes, such as 
++           jdbc drivers, interceptors and validators. If set to false, default value, 
++           the pool will first attempt to load using the current loader and if class loading fails
++           attempt to load using the thread context loader.
++           Set this value to try, if you wish to remain backwards compatible, 
++           Apache Tomcat 8.0.8 and earlier, and only attempt the current loader.
++           If not set then the default value is <code>false</code>.)
++        </p>
++      </attribute>
++    </attributes>
++  </subsection>
+ 
+   <subsection name="Common Attributes">
+   <p>These attributes are shared between commons-dbcp and tomcat-jdbc-pool, in some cases default values are different.</p>
+
+==================================================
+ClassLoaderUtil.java
+index ef6a6653dd..311a025dd6 100644
+--- a/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/naming/GenericNamingResourcesFactory.java
++++ b/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/naming/GenericNamingResourcesFactory.java
+@@ -31,6 +31,8 @@ import javax.naming.spi.ObjectFactory;
+ 
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
++import org.apache.tomcat.jdbc.pool.ClassLoaderUtil;
++
+ /**
+  * Simple way of configuring generic resources by using reflection.
+  * Example usage:
+@@ -57,7 +59,12 @@ public class GenericNamingResourcesFactory implements ObjectFactory {
+         Enumeration<RefAddr> refs = ref.getAll();
+ 
+         String type = ref.getClassName();
+-        Object o = Class.forName(type).newInstance();
++        Object o = 
++            ClassLoaderUtil.loadClass(
++                type,
++                GenericNamingResourcesFactory.class.getClassLoader(),
++                Thread.currentThread().getContextClassLoader())
++            .newInstance();
+ 
+         while (refs.hasMoreElements()) {
+             RefAddr addr = refs.nextElement();
+
+==================================================
+PoolProperties.java
+new file mode 100644
+index 0000000000..fd2edc5236
+--- /dev/null
++++ b/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/ClassLoaderUtil.java
+@@ -0,0 +1,61 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.tomcat.jdbc.pool;
++
++
++import org.apache.juli.logging.Log;
++import org.apache.juli.logging.LogFactory;
++
++public class ClassLoaderUtil {
++    private static final Log log = LogFactory.getLog(ClassLoaderUtil.class);
++    
++    private static final boolean onlyAttemptFirstLoader = 
++        Boolean.getBoolean(System.getProperty("org.apache.tomcat.jdbc.pool.onlyAttemptCurrentClassLoader", "false")); 
++    
++    public static Class loadClass(String className, ClassLoader... classLoaders) throws ClassNotFoundException {
++        ClassNotFoundException last = null;
++        StringBuffer errorMsg = null;
++        for (ClassLoader cl : classLoaders) {
++            try {
++                if (cl!=null) {
++                    if (log.isDebugEnabled()) {
++                        log.debug("Attempting to load class["+className+"] from "+cl);
++                    }
++                    return Class.forName(className, true, cl);
++                } else {
++                    throw new ClassNotFoundException("Classloader is null");
++                }
++            } catch (ClassNotFoundException x) {
++                last = x;
++                if (errorMsg==null) {
++                    errorMsg = new StringBuffer();
++                } else {
++                    errorMsg.append(";");
++                }
++                errorMsg.append("ClassLoader:");
++                errorMsg.append(cl.toString());
++            }
++            if (onlyAttemptFirstLoader) {
++                break;
++            }
++        }
++        throw new ClassNotFoundException("Unable to load class:"+className+" from "+errorMsg, last);
++    }
++
++
++
++}
+
+==================================================
+PooledConnection.java
+index 7f1f7e3fc9..f080aa2fa9 100644
+--- a/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/PoolProperties.java
++++ b/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/PoolProperties.java
+@@ -767,7 +767,11 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
+ 
+         try {
+             @SuppressWarnings("unchecked")
+-            Class<Validator> validatorClass = (Class<Validator>)Class.forName(className);
++            Class<Validator> validatorClass = (Class<Validator>)ClassLoaderUtil.loadClass(
++                className,
++                PoolProperties.class.getClassLoader(),
++                Thread.currentThread().getContextClassLoader()
++            );
+             validator = validatorClass.newInstance();
+         } catch (ClassNotFoundException e) {
+             log.warn("The class "+className+" cannot be found.", e);
+@@ -957,12 +961,20 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
+                     if (log.isDebugEnabled()) {
+                         log.debug("Loading interceptor class:"+PoolConfiguration.PKG_PREFIX+getClassName());
+                     }
+-                    clazz = Class.forName(PoolConfiguration.PKG_PREFIX+getClassName(), true, this.getClass().getClassLoader());
++                    clazz = ClassLoaderUtil.loadClass(
++                        PoolConfiguration.PKG_PREFIX+getClassName(), 
++                        this.getClass().getClassLoader(),
++                        Thread.currentThread().getContextClassLoader()
++                    );
+                 } else {
+                     if (log.isDebugEnabled()) {
+                         log.debug("Loading interceptor class:"+getClassName());
+                     }
+-                    clazz = Class.forName(getClassName(), true, this.getClass().getClassLoader());
++                    clazz = ClassLoaderUtil.loadClass(
++                        getClassName(), 
++                        this.getClass().getClassLoader(),
++                        Thread.currentThread().getContextClassLoader()
++                    );
+                 }
+             }
+             return (Class<? extends JdbcInterceptor>)clazz;
+
+==================================================

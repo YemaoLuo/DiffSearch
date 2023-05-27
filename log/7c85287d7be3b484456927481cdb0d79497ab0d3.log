@@ -1,0 +1,241 @@
+7c85287d7be3b484456927481cdb0d79497ab0d3
+==================================================
+SPNEGO support part 2
+==================================================
+Mark Emlyn
+==================================================
+Thu Mar 31 19:33:04 2011 +0000
+==================================================
+Globals.java
+SPNEGO support part 2
+Expose the users delegated credentials through a request attribute so applications can make use of it
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1087416 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Realm.java
+index 1505a2b8ff..124378ce24 100644
+--- a/java/org/apache/catalina/Globals.java
++++ b/java/org/apache/catalina/Globals.java
+@@ -151,6 +151,10 @@ public final class Globals {
+         "javax.security.auth.subject";
+ 
+     
++    public static final String GSS_CREDENTIAL_ATTR =
++        "org.apache.catalina.realm.GSS_CREDENTIAL";
++
++
+     /**
+      * The master flag which controls strict servlet specification 
+      * compliance.
+
+==================================================
+SpnegoAuthenticator.java
+index b9e85c1386..f03f4b6dd9 100644
+--- a/java/org/apache/catalina/Realm.java
++++ b/java/org/apache/catalina/Realm.java
+@@ -111,9 +111,11 @@ public interface Realm {
+      * Return the Principal associated with the specified chain of X509
+      * client certificates.  If there is none, return <code>null</code>.
+      *
+-     * @param certs The gssContext processed by the {@link Authenticator}.
++     * @param gssContext The gssContext processed by the {@link Authenticator}.
++     * @param storeCreds Should the realm attempt to store the delegated
++     *                   credentials in the returned Principal?
+      */
+-    public Principal authenticate(GSSContext gssContext);
++    public Principal authenticate(GSSContext gssContext, boolean storeCreds);
+     
+     
+     /**
+
+==================================================
+Request.java
+index b30cfd322d..8dc05faac4 100644
+--- a/java/org/apache/catalina/authenticator/SpnegoAuthenticator.java
++++ b/java/org/apache/catalina/authenticator/SpnegoAuthenticator.java
+@@ -77,6 +77,15 @@ public class SpnegoAuthenticator extends AuthenticatorBase {
+         this.loginConfigName = loginConfigName;
+     }
+ 
++    private boolean storeDelegatedCredentials = true;
++    public boolean isStoreDelegatedCredentials() {
++        return storeDelegatedCredentials;
++    }
++    public void setStoreDelegatedCredentials(
++            boolean storeDelegatedCredentials) {
++        this.storeDelegatedCredentials = storeDelegatedCredentials;
++    }
++
+ 
+     @Override
+     protected String getAuthMethod() {
+@@ -229,7 +238,8 @@ public class SpnegoAuthenticator extends AuthenticatorBase {
+                 return false;
+             }
+ 
+-            principal = context.getRealm().authenticate(gssContext);
++            principal = context.getRealm().authenticate(gssContext,
++                    storeDelegatedCredentials);
+         } catch (GSSException e) {
+             if (log.isDebugEnabled()) {
+                 log.debug(sm.getString("spnegoAuthenticator.ticketValidateFail",
+
+==================================================
+CombinedRealm.java
+index e90055be25..ff6283fa58 100644
+--- a/java/org/apache/catalina/connector/Request.java
++++ b/java/org/apache/catalina/connector/Request.java
+@@ -923,6 +923,13 @@ public class Request
+             return asyncSupported;
+         }
+ 
++        if (name.equals(Globals.GSS_CREDENTIAL_ATTR)) {
++            if (userPrincipal instanceof GenericPrincipal) {
++                return ((GenericPrincipal) userPrincipal).getGssCredential();
++            }
++            return null;
++        }
++
+         Object attr=attributes.get(name);
+ 
+         if(attr!=null)
+
+==================================================
+GenericPrincipal.java
+index b6cd91e868..70b2e7f1a5 100644
+--- a/java/org/apache/catalina/realm/CombinedRealm.java
++++ b/java/org/apache/catalina/realm/CombinedRealm.java
+@@ -271,7 +271,7 @@ public class CombinedRealm extends RealmBase {
+      * {@inheritDoc}
+      */
+     @Override
+-    public Principal authenticate(GSSContext gssContext) {
++    public Principal authenticate(GSSContext gssContext, boolean storeCreds) {
+         if (gssContext.isEstablished()) {
+             Principal authenticatedUser = null;
+             String username = null;
+@@ -292,7 +292,7 @@ public class CombinedRealm extends RealmBase {
+                             username, realm.getInfo()));
+                 }
+ 
+-                authenticatedUser = realm.authenticate(gssContext);
++                authenticatedUser = realm.authenticate(gssContext, storeCreds);
+ 
+                 if (authenticatedUser == null) {
+                     if (log.isDebugEnabled()) {
+
+==================================================
+LockOutRealm.java
+index 01fb5a8ef2..c2485019d6 100644
+--- a/java/org/apache/catalina/realm/LocalStrings.properties
++++ b/java/org/apache/catalina/realm/LocalStrings.properties
+@@ -65,6 +65,7 @@ memoryRealm.readXml=Exception while reading memory database file
+ memoryRealm.xmlFeatureEncoding=Exception configuring digester to permit java encoding names in XML files. Only IANA encoding names will be supported.
+ realmBase.algorithm=Invalid message digest algorithm {0} specified
+ realmBase.alreadyStarted=This Realm has already been started
++realmBase.delegatedCredentialFail=Unable to obtain delegated credentials for user [{0}
+ realmBase.digest=Error digesting user credentials
+ realmBase.forbidden=Access to the requested resource has been denied
+ realmBase.hasRoleFailure=Username {0} does NOT have role {1}
+
+==================================================
+RealmBase.java
+index 7059a85eb5..194e42cef4 100644
+--- a/java/org/apache/catalina/realm/LockOutRealm.java
++++ b/java/org/apache/catalina/realm/LockOutRealm.java
+@@ -225,7 +225,7 @@ public class LockOutRealm extends CombinedRealm {
+      * {@inheritDoc}
+      */
+     @Override
+-    public Principal authenticate(GSSContext gssContext) {
++    public Principal authenticate(GSSContext gssContext, boolean storeCreds) {
+         if (gssContext.isEstablished()) {
+             String username = null;
+             GSSName name = null;
+@@ -246,7 +246,8 @@ public class LockOutRealm extends CombinedRealm {
+                 return null;
+             }
+ 
+-            Principal authenticatedUser = super.authenticate(gssContext);
++            Principal authenticatedUser =
++                    super.authenticate(gssContext, storeCreds);
+             
+             if (authenticatedUser == null) {
+                 registerAuthFailure(username);
+
+==================================================
+StandardSession.java
+index fc5ad22fcc..323ba835b9 100644
+--- a/java/org/apache/catalina/realm/RealmBase.java
++++ b/java/org/apache/catalina/realm/RealmBase.java
+@@ -55,6 +55,7 @@ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.res.StringManager;
+ import org.ietf.jgss.GSSContext;
++import org.ietf.jgss.GSSCredential;
+ import org.ietf.jgss.GSSException;
+ import org.ietf.jgss.GSSName;
+ 
+@@ -424,7 +425,7 @@ public abstract class RealmBase extends LifecycleMBeanBase implements Realm {
+      * {@inheritDoc}
+      */
+     @Override
+-    public Principal authenticate(GSSContext gssContext) {
++    public Principal authenticate(GSSContext gssContext, boolean storeCred) {
+         if (gssContext.isEstablished()) {
+             GSSName name = null;
+             try {
+@@ -434,7 +435,20 @@ public abstract class RealmBase extends LifecycleMBeanBase implements Realm {
+             }
+             
+             if (name!= null) {
+-                return getPrincipal(name.toString());
++                GSSCredential gssCredential = null;
++                if (storeCred && gssContext.getCredDelegState()) {
++                    try {
++                        gssCredential = gssContext.getDelegCred();
++                    } catch (GSSException e) {
++                        e.printStackTrace();
++                        if (log.isDebugEnabled()) {
++                            log.debug(sm.getString(
++                                    "realmBase.delegatedCredentialFail", name),
++                                    e);
++                        }
++                    }
++                }
++                return getPrincipal(name.toString(), gssCredential);
+             }
+         }
+         
+@@ -785,7 +799,7 @@ public abstract class RealmBase extends LifecycleMBeanBase implements Realm {
+             if (roles.length == 0 && !constraint.getAllRoles()) {
+                 if(constraint.getAuthConstraint()) {
+                     if( log.isDebugEnabled() )
+-                        log.debug("No roles ");
++                        log.debug("No role)s ");
+                     status = false; // No listed roles means no access at all
+                     denyfromall = true;
+                     break;
+@@ -1181,6 +1195,17 @@ public abstract class RealmBase extends LifecycleMBeanBase implements Realm {
+     protected abstract Principal getPrincipal(String username);
+ 
+ 
++    protected Principal getPrincipal(String username,
++            GSSCredential gssCredential) {
++        Principal p = getPrincipal(username);
++        
++        if (p instanceof GenericPrincipal) {
++            ((GenericPrincipal) p).setGssCredential(gssCredential);
++        }
++        
++        return p;
++    }
++
+     /**
+      * Return the Server object that is the ultimate parent for the container
+      * with which this Realm is associated. If the server cannot be found (eg
+
+==================================================

@@ -1,0 +1,162 @@
+cf1e104968d049dcdc8a9d4bc057dc0efeffd9ab
+==================================================
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=55500
+==================================================
+Mark Emlyn
+==================================================
+Tue Sep 3 09:24:08 2013 +0000
+==================================================
+AbstractAjpProcessor.java
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=55500
+Ensure async timeout is applied when using Servlet 3.0 async with the AJP NIO connector.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1519611 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AjpAprProcessor.java
+index becef18724..f756c8658d 100644
+--- a/java/org/apache/coyote/ajp/AbstractAjpProcessor.java
++++ b/java/org/apache/coyote/ajp/AbstractAjpProcessor.java
+@@ -473,6 +473,10 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+             asyncStateMachine.asyncStart((AsyncContextCallback) param);
+         } else if (actionCode == ActionCode.ASYNC_DISPATCHED) {
+             asyncStateMachine.asyncDispatched();
++        } else if (actionCode == ActionCode.ASYNC_SETTIMEOUT) {
++            if (param == null) return;
++            long timeout = ((Long)param).longValue();
++            socketWrapper.setTimeout(timeout);
+         } else if (actionCode == ActionCode.ASYNC_TIMEOUT) {
+             AtomicBoolean result = (AtomicBoolean) param;
+             result.set(asyncStateMachine.asyncTimeout());
+@@ -556,6 +560,7 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+         try {
+             rp.setStage(org.apache.coyote.Constants.STAGE_SERVICE);
+             error = !getAdapter().asyncDispatch(request, response, status);
++            resetTimeouts();
+         } catch (InterruptedIOException e) {
+             error = true;
+         } catch (Throwable t) {
+@@ -806,6 +811,18 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+     // Methods called by action()
+     protected abstract void actionInternal(ActionCode actionCode, Object param);
+ 
++    // Methods called by asyncDispatch
++    /**
++     * Provides a mechanism for those connector implementations (currently only
++     * NIO) that need to reset timeouts from Async timeouts to standard HTTP
++     * timeouts once async processing completes.
++     */
++    protected abstract void resetTimeouts();
++
++    // Methods called by prepareResponse()
++    protected abstract void output(byte[] src, int offset, int length)
++            throws IOException;
++
+     // Methods called by process()
+     protected abstract void setupSocket(SocketWrapper<S> socketWrapper)
+             throws IOException;
+@@ -813,10 +830,6 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+     protected abstract void setTimeout(SocketWrapper<S> socketWrapper,
+             int timeout) throws IOException;
+ 
+-    // Methods called by prepareResponse()
+-    protected abstract void output(byte[] src, int offset, int length)
+-            throws IOException;
+-
+     // Methods used by readMessage
+     /**
+      * Read at least the specified amount of bytes, and place them
+
+==================================================
+AjpNioProcessor.java
+index 47fc808033..415129deb6 100644
+--- a/java/org/apache/coyote/ajp/AjpAprProcessor.java
++++ b/java/org/apache/coyote/ajp/AjpAprProcessor.java
+@@ -89,10 +89,7 @@ public class AjpAprProcessor extends AbstractAjpProcessor<Long> {
+                 ((AprEndpoint)endpoint).processSocketAsync(this.socketWrapper,
+                         SocketStatus.OPEN_READ);
+             }
+-        } else if (actionCode == ActionCode.ASYNC_SETTIMEOUT) {
+-            if (param == null) return;
+-            long timeout = ((Long)param).longValue();
+-            socketWrapper.setTimeout(timeout);
++
+         } else if (actionCode == ActionCode.ASYNC_DISPATCH) {
+             if (asyncStateMachine.asyncDispatch()) {
+                 ((AprEndpoint)endpoint).processSocketAsync(this.socketWrapper,
+@@ -102,6 +99,13 @@ public class AjpAprProcessor extends AbstractAjpProcessor<Long> {
+     }
+ 
+ 
++    @Override
++    protected void resetTimeouts() {
++        // NO-OP. The AJP APR/native connector only uses the timeout value on
++        //        time SocketWrapper for async timeouts.
++    }
++
++
+     @Override
+     protected void setupSocket(SocketWrapper<Long> socketWrapper) {
+         long socketRef = socketWrapper.getSocket().longValue();
+
+==================================================
+AjpProcessor.java
+index 64acf5a5ea..08ddb88294 100644
+--- a/java/org/apache/coyote/ajp/AjpNioProcessor.java
++++ b/java/org/apache/coyote/ajp/AjpNioProcessor.java
+@@ -26,7 +26,6 @@ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.net.NioChannel;
+ import org.apache.tomcat.util.net.NioEndpoint;
+-import org.apache.tomcat.util.net.NioEndpoint.KeyAttachment;
+ import org.apache.tomcat.util.net.NioSelectorPool;
+ import org.apache.tomcat.util.net.SocketStatus;
+ import org.apache.tomcat.util.net.SocketWrapper;
+@@ -74,14 +73,7 @@ public class AjpNioProcessor extends AbstractAjpProcessor<NioChannel> {
+                 ((NioEndpoint)endpoint).dispatchForEvent(
+                         socketWrapper.getSocket(), SocketStatus.OPEN_READ, true);
+             }
+-        } else if (actionCode == ActionCode.ASYNC_SETTIMEOUT) {
+-            if (param == null) return;
+-            long timeout = ((Long)param).longValue();
+-            final KeyAttachment ka =
+-                    (KeyAttachment)socketWrapper.getSocket().getAttachment(false);
+-            if (keepAliveTimeout > 0) {
+-                ka.setTimeout(timeout);
+-            }
++
+         } else if (actionCode == ActionCode.ASYNC_DISPATCH) {
+             if (asyncStateMachine.asyncDispatch()) {
+                 ((NioEndpoint)endpoint).dispatchForEvent(
+@@ -91,6 +83,27 @@ public class AjpNioProcessor extends AbstractAjpProcessor<NioChannel> {
+     }
+ 
+ 
++    @Override
++    protected void resetTimeouts() {
++        // The NIO connector uses the timeout configured on the wrapper in the
++        // poller. Therefore, it needs to be reset once asycn processing has
++        // finished.
++        final NioEndpoint.KeyAttachment attach = (NioEndpoint.KeyAttachment)socketWrapper.getSocket().getAttachment(false);
++        if (!error && attach != null &&
++                asyncStateMachine.isAsyncDispatching()) {
++            long soTimeout = endpoint.getSoTimeout();
++
++            //reset the timeout
++            if (keepAliveTimeout > 0) {
++                attach.setTimeout(keepAliveTimeout);
++            } else {
++                attach.setTimeout(soTimeout);
++            }
++        }
++
++    }
++
++
+     @Override
+     protected void setupSocket(SocketWrapper<NioChannel> socketWrapper)
+             throws IOException {
+
+==================================================

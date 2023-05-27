@@ -1,0 +1,193 @@
+341d9cb3d9a315f1d83abcb52125164db260222b
+==================================================
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=56739
+==================================================
+Mark Emlyn
+==================================================
+Thu Aug 7 08:53:01 2014 +0000
+==================================================
+CoyoteAdapter.java
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=56739
+If an application handles an error on an application thread during asynchronous processing by calling HttpServletResponse.sendError(), then ensure that the application is given an opportunity to report that error via an appropriate application defined error page if one is configured.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1616441 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Response.java
+index 52020e7db4..ad2f59d207 100644
+--- a/java/org/apache/catalina/connector/CoyoteAdapter.java
++++ b/java/org/apache/catalina/connector/CoyoteAdapter.java
+@@ -400,6 +400,14 @@ public class CoyoteAdapter implements Adapter {
+                 }
+             }
+ 
++            // Has an error occurred during async processing that needs to be
++            // processed by the application's error page mechanism (or Tomcat's
++            // if the application doesn't define one)?
++            if (!request.isAsyncDispatching() && request.isAsync() &&
++                    response.isErrorReportRequired()) {
++                connector.getService().getContainer().getPipeline().getFirst().invoke(request, response);
++            }
++
+             if (request.isAsyncDispatching()) {
+                 success = true;
+                 connector.getService().getContainer().getPipeline().getFirst().invoke(request, response);
+
+==================================================
+StandardHostValve.java
+index a9cc48c091..63a5a9a261 100644
+--- a/java/org/apache/catalina/core/LocalStrings.properties
++++ b/java/org/apache/catalina/core/LocalStrings.properties
+@@ -158,6 +158,7 @@ standardEngine.jvmRouteFail=Failed to set Engine's jvmRoute attribute from syste
+ standardEngine.noHost=No Host matches server name {0}
+ standardEngine.notHost=Child of an Engine must be a Host
+ standardEngine.notParent=Engine cannot have a parent Container
++standardHost.asyncStateError=An asynchronous request was received for processing that was neither an async dispatch nor an error to process
+ standardHost.clientAbort=Remote Client Aborted Request, IOException: {0}
+ standardHost.invalidErrorReportValveClass=Couldn''t load specified error report valve class: {0}
+ standardHost.noContext=No Context configured to process this request
+
+==================================================
+ErrorReportValve.java
+index 9eed762347..86e37abb52 100644
+--- a/java/org/apache/catalina/core/StandardHostValve.java
++++ b/java/org/apache/catalina/core/StandardHostValve.java
+@@ -119,10 +119,8 @@ final class StandardHostValve extends ValveBase {
+             request.setAsyncSupported(context.getPipeline().isAsyncSupported());
+         }
+ 
+-        // Don't fire listeners during async processing
+-        // If a request init listener throws an exception, the request is
+-        // aborted
+         boolean asyncAtStart = request.isAsync();
++        boolean asyncDispatching = request.isAsyncDispatching();
+         // An async error page may dispatch to another resource. This flag helps
+         // ensure an infinite error handling loop is not entered
+         boolean errorAtStart = response.isError();
+@@ -131,13 +129,22 @@ final class StandardHostValve extends ValveBase {
+             context.bind(Globals.IS_SECURITY_ENABLED, MY_CLASSLOADER);
+ 
+             if (!asyncAtStart && !context.fireRequestInitEvent(request)) {
+-                // If a listener fails then request processing stops here.
++                // Don't fire listeners during async processing (the listener
++                // fired for the request that called startAsync()).
++                // If a request init listener throws an exception, the request
++                // is aborted.
+                 return;
+             }
+ 
+             // Ask this Context to process this request
+             try {
+-                context.getPipeline().getFirst().invoke(request, response);
++                if (!asyncAtStart || asyncDispatching) {
++                    context.getPipeline().getFirst().invoke(request, response);
++                } else {
++                    if (!errorAtStart) {
++                        throw new IllegalStateException(sm.getString("standardHost.asyncStateError"));
++                    }
++                }
+             } catch (Throwable t) {
+                 ExceptionUtils.handleThrowable(t);
+                 if (errorAtStart) {
+@@ -266,7 +273,7 @@ final class StandardHostValve extends ValveBase {
+             // Look for a default error page
+             errorPage = context.findErrorPage(0);
+         }
+-        if (errorPage != null) {
++        if (errorPage != null && response.setErrorReported()) {
+             response.setAppCommitted(false);
+             request.setAttribute(RequestDispatcher.ERROR_STATUS_CODE,
+                               Integer.valueOf(statusCode));
+@@ -345,31 +352,33 @@ final class StandardHostValve extends ValveBase {
+         }
+ 
+         if (errorPage != null) {
+-            response.setAppCommitted(false);
+-            request.setAttribute(Globals.DISPATCHER_REQUEST_PATH_ATTR,
+-                    errorPage.getLocation());
+-            request.setAttribute(Globals.DISPATCHER_TYPE_ATTR,
+-                    DispatcherType.ERROR);
+-            request.setAttribute(RequestDispatcher.ERROR_STATUS_CODE,
+-                    new Integer(HttpServletResponse.SC_INTERNAL_SERVER_ERROR));
+-            request.setAttribute(RequestDispatcher.ERROR_MESSAGE,
+-                              throwable.getMessage());
+-            request.setAttribute(RequestDispatcher.ERROR_EXCEPTION,
+-                              realError);
+-            Wrapper wrapper = request.getWrapper();
+-            if (wrapper != null) {
+-                request.setAttribute(RequestDispatcher.ERROR_SERVLET_NAME,
+-                                  wrapper.getName());
+-            }
+-            request.setAttribute(RequestDispatcher.ERROR_REQUEST_URI,
+-                                 request.getRequestURI());
+-            request.setAttribute(RequestDispatcher.ERROR_EXCEPTION_TYPE,
+-                              realError.getClass());
+-            if (custom(request, response, errorPage)) {
+-                try {
+-                    response.finishResponse();
+-                } catch (IOException e) {
+-                    container.getLogger().warn("Exception Processing " + errorPage, e);
++            if (response.setErrorReported()) {
++                response.setAppCommitted(false);
++                request.setAttribute(Globals.DISPATCHER_REQUEST_PATH_ATTR,
++                        errorPage.getLocation());
++                request.setAttribute(Globals.DISPATCHER_TYPE_ATTR,
++                        DispatcherType.ERROR);
++                request.setAttribute(RequestDispatcher.ERROR_STATUS_CODE,
++                        new Integer(HttpServletResponse.SC_INTERNAL_SERVER_ERROR));
++                request.setAttribute(RequestDispatcher.ERROR_MESSAGE,
++                                  throwable.getMessage());
++                request.setAttribute(RequestDispatcher.ERROR_EXCEPTION,
++                                  realError);
++                Wrapper wrapper = request.getWrapper();
++                if (wrapper != null) {
++                    request.setAttribute(RequestDispatcher.ERROR_SERVLET_NAME,
++                                      wrapper.getName());
++                }
++                request.setAttribute(RequestDispatcher.ERROR_REQUEST_URI,
++                                     request.getRequestURI());
++                request.setAttribute(RequestDispatcher.ERROR_EXCEPTION_TYPE,
++                                  realError.getClass());
++                if (custom(request, response, errorPage)) {
++                    try {
++                        response.finishResponse();
++                    } catch (IOException e) {
++                        container.getLogger().warn("Exception Processing " + errorPage, e);
++                    }
+                 }
+             }
+         } else {
+
+==================================================
+TestAsyncContextImpl.java
+index 70cd9b8683..eb3508086d 100644
+--- a/java/org/apache/catalina/valves/ErrorReportValve.java
++++ b/java/org/apache/catalina/valves/ErrorReportValve.java
+@@ -79,9 +79,10 @@ public class ErrorReportValve extends ValveBase {
+         getNext().invoke(request, response);
+ 
+         if (response.isCommitted()) {
+-            if (response.isErrorAfterCommit()) {
+-                // Attempt to flush any data that is still to be written to the
+-                // client
++            if (response.setErrorReported()) {
++                // Error wasn't previously reported but we can't write an error
++                // page because the response has already been committed. Attempt
++                // to flush any data that is still to be written to the client.
+                 try {
+                     response.flushBuffer();
+                 } catch (Throwable t) {
+@@ -146,7 +147,8 @@ public class ErrorReportValve extends ValveBase {
+         // Do nothing on a 1xx, 2xx and 3xx status
+         // Do nothing if anything has been written already
+         // Do nothing if the response hasn't been explicitly marked as in error
+-        if (statusCode < 400 || response.getContentWritten() > 0 || !response.isError()) {
++        //    and that error has not been reported.
++        if (statusCode < 400 || response.getContentWritten() > 0 || !response.setErrorReported()) {
+             return;
+         }
+         String message = RequestUtil.filter(response.getMessage());
+
+==================================================

@@ -1,0 +1,198 @@
+72418baa099c6d4d3d401aab1172399cd0826605
+==================================================
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=50793
+==================================================
+Mark Emlyn
+==================================================
+Wed Feb 16 17:35:24 2011 +0000
+==================================================
+CoyoteAdapter.java
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=50793
+Correctly fire request init/destroy events for astnc requests
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1071321 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+StandardContext.java
+index 153788f914..9d2e2b0c98 100644
+--- a/java/org/apache/catalina/connector/CoyoteAdapter.java
++++ b/java/org/apache/catalina/connector/CoyoteAdapter.java
+@@ -268,6 +268,17 @@ public class CoyoteAdapter implements Adapter {
+         boolean success = true;
+         AsyncContextImpl asyncConImpl = (AsyncContextImpl)request.getAsyncContext();
+         try {
++            if (!request.isAsync() && !comet) {
++                // Error or timeout - need to tell listeners the request is over
++                // Have to test this first since state may change while in this
++                // method and this is only required if entering this methos in
++                // this state 
++                Context ctxt = (Context) request.getMappingData().context;
++                if (ctxt != null) {
++                    ctxt.fireRequestDestroyEvent(request);
++                }
++            }
++
+             if (status==SocketStatus.TIMEOUT) {
+                 success = true;
+                 if (!asyncConImpl.timeout()) {
+
+==================================================
+StandardContextValve.java
+index c7bc03bb57..c84889a09f 100644
+--- a/java/org/apache/catalina/core/StandardContext.java
++++ b/java/org/apache/catalina/core/StandardContext.java
+@@ -50,7 +50,6 @@ import javax.management.NotificationListener;
+ import javax.management.ObjectName;
+ import javax.naming.NamingException;
+ import javax.naming.directory.DirContext;
+-import javax.servlet.DispatcherType;
+ import javax.servlet.FilterConfig;
+ import javax.servlet.RequestDispatcher;
+ import javax.servlet.Servlet;
+@@ -5817,30 +5816,26 @@ public class StandardContext extends ContainerBase
+ 
+         if ((instances != null) && (instances.length > 0)) {
+ 
+-            // Don't fire the listener for async requests
+-            if (!DispatcherType.ASYNC.equals(request.getDispatcherType())) {
++            ServletRequestEvent event = 
++                    new ServletRequestEvent(getServletContext(), request);
++
++            for (int i = 0; i < instances.length; i++) {
++                if (instances[i] == null)
++                    continue;
++                if (!(instances[i] instanceof ServletRequestListener))
++                    continue;
++                ServletRequestListener listener =
++                    (ServletRequestListener) instances[i];
+                 
+-                ServletRequestEvent event = 
+-                        new ServletRequestEvent(getServletContext(), request);
+-    
+-                for (int i = 0; i < instances.length; i++) {
+-                    if (instances[i] == null)
+-                        continue;
+-                    if (!(instances[i] instanceof ServletRequestListener))
+-                        continue;
+-                    ServletRequestListener listener =
+-                        (ServletRequestListener) instances[i];
+-                    
+-                    try {
+-                        listener.requestInitialized(event);
+-                    } catch (Throwable t) {
+-                        ExceptionUtils.handleThrowable(t);
+-                        getLogger().error(sm.getString(
+-                                "standardContext.requestListener.requestInit",
+-                                instances[i].getClass().getName()), t);
+-                        request.setAttribute(RequestDispatcher.ERROR_EXCEPTION, t);
+-                        return false;
+-                    }
++                try {
++                    listener.requestInitialized(event);
++                } catch (Throwable t) {
++                    ExceptionUtils.handleThrowable(t);
++                    getLogger().error(sm.getString(
++                            "standardContext.requestListener.requestInit",
++                            instances[i].getClass().getName()), t);
++                    request.setAttribute(RequestDispatcher.ERROR_EXCEPTION, t);
++                    return false;
+                 }
+             }
+         }
+@@ -5854,31 +5849,27 @@ public class StandardContext extends ContainerBase
+ 
+         if ((instances != null) && (instances.length > 0)) {
+ 
+-            // Don't fire the listener for async requests
+-            if (!DispatcherType.ASYNC.equals(request.getDispatcherType())) {
++            ServletRequestEvent event = 
++                new ServletRequestEvent(getServletContext(), request);
+ 
+-                ServletRequestEvent event = 
+-                    new ServletRequestEvent(getServletContext(), request);
+-
+-                for (int i = 0; i < instances.length; i++) {
+-                    int j = (instances.length -1) -i;
+-                    if (instances[j] == null)
+-                        continue;
+-                    if (!(instances[j] instanceof ServletRequestListener))
+-                        continue;
+-                    ServletRequestListener listener =
+-                        (ServletRequestListener) instances[j];
+-                    
+-                    try {
+-                        listener.requestDestroyed(event);
+-                    } catch (Throwable t) {
+-                        ExceptionUtils.handleThrowable(t);
+-                        getLogger().error(sm.getString(
+-                                "standardContext.requestListener.requestInit",
+-                                instances[j].getClass().getName()), t);
+-                        request.setAttribute(RequestDispatcher.ERROR_EXCEPTION, t);
+-                        return false;
+-                    }
++            for (int i = 0; i < instances.length; i++) {
++                int j = (instances.length -1) -i;
++                if (instances[j] == null)
++                    continue;
++                if (!(instances[j] instanceof ServletRequestListener))
++                    continue;
++                ServletRequestListener listener =
++                    (ServletRequestListener) instances[j];
++                
++                try {
++                    listener.requestDestroyed(event);
++                } catch (Throwable t) {
++                    ExceptionUtils.handleThrowable(t);
++                    getLogger().error(sm.getString(
++                            "standardContext.requestListener.requestInit",
++                            instances[j].getClass().getName()), t);
++                    request.setAttribute(RequestDispatcher.ERROR_EXCEPTION, t);
++                    return false;
+                 }
+             }
+         }
+
+==================================================
+TestAsyncContextImpl.java
+index 1a29ee0149..2b45997635 100644
+--- a/java/org/apache/catalina/core/StandardContextValve.java
++++ b/java/org/apache/catalina/core/StandardContextValve.java
+@@ -21,6 +21,7 @@ package org.apache.catalina.core;
+ 
+ import java.io.IOException;
+ 
++import javax.servlet.RequestDispatcher;
+ import javax.servlet.ServletException;
+ import javax.servlet.http.HttpServletResponse;
+ 
+@@ -152,15 +153,24 @@ final class StandardContextValve
+             }
+         }
+ 
++        // Don't fire listeners during async processing
+         // If a request init listener throws an exception, the request is
+         // aborted
+-        if (context.fireRequestInitEvent(request)) {
++        boolean asyncAtStart = request.isAsync(); 
++        if (asyncAtStart || context.fireRequestInitEvent(request)) {
+             if (request.isAsyncSupported()) {
+                 request.setAsyncSupported(wrapper.getPipeline().isAsyncSupported());
+             }
+             wrapper.getPipeline().getFirst().invoke(request, response);
+ 
+-            context.fireRequestDestroyEvent(request);
++            // If the request was async at the start and an error occurred then
++            // the async error handling will kick-in and that will fire the
++            // request destroyed event *after* the error handling has taken
++            // place
++            if (!(request.isAsync() || (asyncAtStart && request.getAttribute(
++                        RequestDispatcher.ERROR_EXCEPTION) != null))) {
++                context.fireRequestDestroyEvent(request);
++            }
+         }
+     }
+ 
+
+==================================================

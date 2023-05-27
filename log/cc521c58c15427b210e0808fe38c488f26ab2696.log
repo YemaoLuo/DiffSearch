@@ -1,0 +1,417 @@
+cc521c58c15427b210e0808fe38c488f26ab2696
+==================================================
+First pass at the plumbing to link from ALPN to creating a protocol specific processor to handle the connection. Some, but not all, of the plumbing that will be required for HTTP upgrade is also provided.
+==================================================
+Mark Thomas
+==================================================
+Wed Apr 8 20:57:56 2015 +0000
+==================================================
+AbstractProtocol.java
+First pass at the plumbing to link from ALPN to creating a protocol specific processor to handle the connection. Some, but not all, of the plumbing that will be required for HTTP upgrade is also provided.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1672177 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+UpgradeProtocol.java
+index deb6b7f7aa..c588b62f9f 100644
+--- a/java/org/apache/coyote/AbstractProtocol.java
++++ b/java/org/apache/coyote/AbstractProtocol.java
+@@ -365,6 +365,15 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+     protected abstract String getProtocolName();
+ 
+ 
++    /**
++     * @param name The name of the requested negotiated protocol.
++     *
++     * @return The instance where {@link UpgradeProtocol#getAlpnName()} matches
++     *         the requested protocol
++     */
++    protected abstract UpgradeProtocol getNegotiatedProtocol(String name);
++
++
+     // ----------------------------------------------------- JMX related methods
+ 
+     protected String domain;
+@@ -633,6 +642,16 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+             ContainerThreadMarker.set();
+ 
+             try {
++                if (processor == null) {
++                    String negotiatedProtocol = wrapper.getNegotiatedProtocol();
++                    if (negotiatedProtocol != null) {
++                        UpgradeProtocol upgradeProtocol =
++                                getProtocol().getNegotiatedProtocol(negotiatedProtocol);
++                        if (upgradeProtocol != null) {
++                            processor = upgradeProtocol.getProcessor(wrapper);
++                        }
++                    }
++                }
+                 if (processor == null) {
+                     processor = recycledProcessors.pop();
+                 }
+
+==================================================
+AbstractAjpProtocol.java
+new file mode 100644
+index 0000000000..79cb8a7df4
+--- /dev/null
++++ b/java/org/apache/coyote/UpgradeProtocol.java
+@@ -0,0 +1,62 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.coyote;
++
++import org.apache.tomcat.util.net.SocketWrapperBase;
++
++public interface UpgradeProtocol {
++
++    /**
++     * @return The name that clients will use to request an upgrade to this
++     *         protocol via an HTTP/1.1 upgrade request or <code>null</code> if
++     *         upgrade via an HTTP/1.1 upgrade request is not supported.
++     */
++    public String getHttpUpgradeName();
++
++    /**
++     * @return The byte sequence as listed in the IANA registry for this
++     *         protocol or <code>null</code> if upgrade via ALPN is not
++     *         supported.
++     */
++    public byte[] getAlpnIdentifier();
++
++    /**
++     * @return The name of the protocol as listed in the IANA registry if and
++     *         only if {@link #getAlpnIdentifier()} returns the UTF-8 encoding
++     *         of this name. If {@link #getAlpnIdentifier()} returns some other
++     *         byte sequence, then this method returns the empty string. If
++     *         upgrade via ALPN is not supported then <code>null</code> is
++     *         returned.
++     */
++    /*
++     * Implementation note: If Tomcat ever supports ALPN for a protocol where
++     *                      the identifier is not the UTF-8 encoding of the name
++     *                      then some refactoring is going to be required.
++     *
++     * Implementation note: Tomcat assumes that the UTF-8 encoding of this name
++     *                      will not exceed 255 bytes. Tomcat's behaviour if
++     *                      longer names are used is undefined.
++     */
++    public String getAlpnName();
++
++    /**
++     *
++     * @return A processor instance for processing a connection using this
++     *         protocol.
++     */
++    public Processor getProcessor(SocketWrapperBase<?> socketWrapper);
++}
+
+==================================================
+AbstractHttp11Protocol.java
+index 8b88064592..485718c0d3 100644
+--- a/java/org/apache/coyote/ajp/AbstractAjpProtocol.java
++++ b/java/org/apache/coyote/ajp/AbstractAjpProtocol.java
+@@ -22,6 +22,7 @@ import javax.servlet.http.HttpUpgradeHandler;
+ 
+ import org.apache.coyote.AbstractProtocol;
+ import org.apache.coyote.Processor;
++import org.apache.coyote.UpgradeProtocol;
+ import org.apache.tomcat.util.net.AbstractEndpoint;
+ import org.apache.tomcat.util.net.SocketWrapperBase;
+ import org.apache.tomcat.util.res.StringManager;
+@@ -67,6 +68,17 @@ public abstract class AbstractAjpProtocol<S> extends AbstractProtocol<S> {
+     }
+ 
+ 
++    /**
++     * {@inheritDoc}
++     *
++     * AJP does not support protocol negotiation so this always returns null.
++     */
++    @Override
++    protected UpgradeProtocol getNegotiatedProtocol(String name) {
++        return null;
++    }
++
++
+     // ------------------------------------------------- AJP specific properties
+     // ------------------------------------------ managed in the ProtocolHandler
+ 
+
+==================================================
+Http2Protocol.java
+index 506ecd0f9c..2082e79746 100644
+--- a/java/org/apache/coyote/http11/AbstractHttp11Protocol.java
++++ b/java/org/apache/coyote/http11/AbstractHttp11Protocol.java
+@@ -20,9 +20,11 @@ import java.io.IOException;
+ import java.nio.ByteBuffer;
+ import java.util.ArrayList;
+ import java.util.Collections;
++import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.List;
+ import java.util.Locale;
++import java.util.Map;
+ import java.util.Set;
+ import java.util.concurrent.ConcurrentHashMap;
+ 
+@@ -30,6 +32,7 @@ import javax.servlet.http.HttpUpgradeHandler;
+ 
+ import org.apache.coyote.AbstractProtocol;
+ import org.apache.coyote.Processor;
++import org.apache.coyote.UpgradeProtocol;
+ import org.apache.coyote.http11.upgrade.InternalHttpUpgradeHandler;
+ import org.apache.coyote.http11.upgrade.UpgradeProcessorExternal;
+ import org.apache.coyote.http11.upgrade.UpgradeProcessorInternal;
+@@ -41,6 +44,13 @@ public abstract class AbstractHttp11Protocol<S> extends AbstractProtocol<S> {
+     public AbstractHttp11Protocol(AbstractEndpoint<S> endpoint) {
+         super(endpoint);
+         setSoTimeout(Constants.DEFAULT_CONNECTION_TIMEOUT);
++
++        // TODO: Make this configurable via nested UpgradeProtocol elements in
++        //       the Connector.
++        //       This is disabled by default otherwise it will break the
++        //       APR/native connector with clients that support h2 with ALPN
++        //       (because the Http2Protocol is only stubbed out)
++        //addUpgradeProtocol(new Http2Protocol());
+     }
+ 
+ 
+@@ -256,6 +266,27 @@ public abstract class AbstractHttp11Protocol<S> extends AbstractProtocol<S> {
+     }
+ 
+ 
++    /**
++     * The protocols that are available via internal Tomcat support for access
++     * via HTTP upgrade.
++     */
++    private final Map<String,UpgradeProtocol> httpUpgradeProtocols = new HashMap<>();
++    /**
++     * The protocols that are available via internal Tomcat support for access
++     * via ALPN negotiation.
++     */
++    private final Map<String,UpgradeProtocol> negotiatedProtocols = new HashMap<>();
++    public void addUpgradeProtocol(UpgradeProtocol upgradeProtocol) {
++        httpUpgradeProtocols.put(upgradeProtocol.getHttpUpgradeName(), upgradeProtocol);
++        negotiatedProtocols.put(upgradeProtocol.getAlpnName(), upgradeProtocol);
++        getEndpoint().addNegotiatedProtocol(upgradeProtocol.getAlpnName());
++    }
++    @Override
++    public UpgradeProtocol getNegotiatedProtocol(String negotiatedName) {
++        return negotiatedProtocols.get(negotiatedName);
++    }
++
++
+     // ------------------------------------------------ HTTP specific properties
+     // ------------------------------------------ passed through to the EndPoint
+ 
+
+==================================================
+Http2UpgradeHandler.java
+new file mode 100644
+index 0000000000..3199952381
+--- /dev/null
++++ b/java/org/apache/coyote/http2/Http2Protocol.java
+@@ -0,0 +1,53 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.coyote.http2;
++
++import java.nio.charset.StandardCharsets;
++
++import org.apache.coyote.Processor;
++import org.apache.coyote.UpgradeProtocol;
++import org.apache.coyote.http11.upgrade.UpgradeProcessorInternal;
++import org.apache.tomcat.util.net.SocketWrapperBase;
++
++public class Http2Protocol implements UpgradeProtocol {
++
++    private static final String HTTP_UPGRADE_NAME = "h2c";
++    private static final String ALPN_NAME = "h2";
++    private static final byte[] ALPN_IDENTIFIER = ALPN_NAME.getBytes(StandardCharsets.UTF_8);
++
++    @Override
++    public String getHttpUpgradeName() {
++        return HTTP_UPGRADE_NAME;
++    }
++
++    @Override
++    public byte[] getAlpnIdentifier() {
++        return ALPN_IDENTIFIER;
++    }
++
++    @Override
++    public String getAlpnName() {
++        return ALPN_NAME;
++    }
++
++    @Override
++    public Processor getProcessor(SocketWrapperBase<?> socketWrapper) {
++        UpgradeProcessorInternal processor =
++                new UpgradeProcessorInternal(socketWrapper, null, new Http2UpgradeHandler());
++        return processor;
++    }
++}
+
+==================================================
+SpdyProxyProtocol.java
+new file mode 100644
+index 0000000000..92634a7ca3
+--- /dev/null
++++ b/java/org/apache/coyote/http2/Http2UpgradeHandler.java
+@@ -0,0 +1,48 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.coyote.http2;
++
++import javax.servlet.http.WebConnection;
++
++import org.apache.coyote.http11.upgrade.InternalHttpUpgradeHandler;
++import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
++import org.apache.tomcat.util.net.SocketStatus;
++import org.apache.tomcat.util.net.SocketWrapperBase;
++
++public class Http2UpgradeHandler implements InternalHttpUpgradeHandler {
++
++    @Override
++    public void init(WebConnection connection) {
++        // TODO Auto-generated method stub
++    }
++
++    @Override
++    public void setSocketWrapper(SocketWrapperBase<?> wrapper) {
++        // TODO Auto-generated method stub
++    }
++
++    @Override
++    public SocketState upgradeDispatch(SocketStatus status) {
++        // TODO Auto-generated method stub
++        return null;
++    }
++
++    @Override
++    public void destroy() {
++        // TODO Auto-generated method stub
++    }
++}
+
+==================================================
+AbstractEndpoint.java
+index 8586842bdc..6d28733483 100644
+--- a/java/org/apache/coyote/spdy/SpdyProxyProtocol.java
++++ b/java/org/apache/coyote/spdy/SpdyProxyProtocol.java
+@@ -20,6 +20,7 @@ import java.io.IOException;
+ import java.nio.channels.SocketChannel;
+ 
+ import org.apache.coyote.AbstractProtocol;
++import org.apache.coyote.UpgradeProtocol;
+ import org.apache.coyote.ajp.Constants;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+@@ -136,4 +137,10 @@ public class SpdyProxyProtocol extends AbstractProtocol<NioChannel> {
+             // TODO Auto-generated method stub
+         }
+     }
++
++    @Override
++    protected UpgradeProtocol getNegotiatedProtocol(String name) {
++        // TODO Auto-generated method stub
++        return null;
++    }
+ }
+
+==================================================
+AprEndpoint.java
+index 462b036e60..8949b7286f 100644
+--- a/java/org/apache/tomcat/util/net/AbstractEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AbstractEndpoint.java
+@@ -24,6 +24,7 @@ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.Iterator;
++import java.util.List;
+ import java.util.Set;
+ import java.util.StringTokenizer;
+ import java.util.concurrent.ConcurrentHashMap;
+@@ -496,6 +497,11 @@ public abstract class AbstractEndpoint<S> {
+     protected abstract boolean getDeferAccept();
+ 
+ 
++    protected final List<String> negotiableProtocols = new ArrayList<>();
++    public void addNegotiatedProtocol(String negotiableProtocol) {
++        negotiableProtocols.add(negotiableProtocol);
++    }
++
+     /**
+      * Attributes provide a way for configuration to be passed to sub-components
+      * without the {@link org.apache.coyote.ProtocolHandler} being aware of the
+
+==================================================
+SocketWrapperBase.java
+index cb6b11a5a4..8f4eaf3b19 100644
+--- a/java/org/apache/tomcat/util/net/LocalStrings.properties
++++ b/java/org/apache/tomcat/util/net/LocalStrings.properties
+@@ -41,12 +41,15 @@ endpoint.debug.socket=socket [{0}]
+ endpoint.debug.socketCloseFail=Failed to close socket
+ endpoint.debug.socketTimeout=Timing out [{0}]
+ endpoint.debug.unlock=Caught exception trying to unlock accept on port {0}
++endpoint.accept.fail=Socket accept failed
++endpoint.alpn.fail=Failed to configure endpoint for ALPN using {0}
++endpoint.alpn.negotiated=Negotiated [{0}] protocol using ALPN
+ endpoint.executor.fail=Executor rejected socket [{0}] for processing
++endpoint.getAttribute=[{0}] is [{1}]
+ endpoint.init.bind=Socket bind failed: [{0}] {1}
+ endpoint.init.listen=Socket listen failed: [{0}] {1}
+ endpoint.init.notavail=APR not available
+-endpoint.accept.fail=Socket accept failed
+-endpoint.getAttribute=[{0}] is [{1}]
++endpoint.noNegotiation=TLS was not configured for the [{0}] connector so negotiation via ALPN for {1} is not available
+ endpoint.poll.limitedpollsize=Failed to create poller with specified size of {0}
+ endpoint.poll.initfail=Poller creation failed
+ endpoint.poll.fail=Critical poller failure (restarting poller): [{0}] {1}
+
+==================================================

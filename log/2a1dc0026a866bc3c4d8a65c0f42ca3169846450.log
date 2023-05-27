@@ -1,0 +1,566 @@
+2a1dc0026a866bc3c4d8a65c0f42ca3169846450
+==================================================
+Refactor
+==================================================
+Mark Thomas
+==================================================
+Tue Jan 12 13:48:06 2016 +0000
+==================================================
+ManagerServlet.java
+Refactor
+
+1. More clearly differentiate between:
+- implemented protocols/ciphers
+- configured protocols/ciphers
+- enabled protocols/ciphers
+and use common terminology throughout.
+
+2. Remove the ensbledCiphers hack for JSSE+OpenSSL and replace with full implementation so the manager app now correctly reports the enabled ciphers.
+
+3. Simplify. SSLContextWrapper has been removed.
+
+4. Standardise treatment of unknown protocol. JSSE silently swallowed it. OpenSSL refused to start. Both now log a warning and continue.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1724234 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AbstractJsseEndpoint.java
+index 8916170ed6..795a45b26b 100644
+--- a/java/org/apache/catalina/manager/ManagerServlet.java
++++ b/java/org/apache/catalina/manager/ManagerServlet.java
+@@ -62,7 +62,6 @@ import org.apache.tomcat.util.Diagnostics;
+ import org.apache.tomcat.util.ExceptionUtils;
+ import org.apache.tomcat.util.modeler.Registry;
+ import org.apache.tomcat.util.net.SSLHostConfig;
+-import org.apache.tomcat.util.net.SSLHostConfigCertificate;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+ 
+@@ -1707,16 +1706,13 @@ public class ManagerServlet extends HttpServlet implements ContainerServlet {
+             if (Boolean.TRUE.equals(connector.getProperty("SSLEnabled"))) {
+                 SSLHostConfig[] sslHostConfigs = connector.getProtocolHandler().findSslHostConfigs();
+                 for (SSLHostConfig sslHostConfig : sslHostConfigs) {
+-                    for (SSLHostConfigCertificate cert : sslHostConfig.getCertificates()) {
+-                        String name = connector.toString() + "-" + sslHostConfig.getHostName() +
+-                                "-" + cert.getType();
+-                        Set<String> cipherList = new HashSet<>();
+-                        String[] cipherNames = cert.getEnabledCiphers();
+-                        for (String cipherName : cipherNames) {
+-                            cipherList.add(cipherName);
+-                        }
+-                        result.put(name, cipherList);
++                    String name = connector.toString() + "-" + sslHostConfig.getHostName();
++                    Set<String> cipherList = new HashSet<>();
++                    String[] cipherNames = sslHostConfig.getEnabledCiphers();
++                    for (String cipherName : cipherNames) {
++                        cipherList.add(cipherName);
+                     }
++                result.put(name, cipherList);
+                 }
+             } else {
+                 Set<String> cipherList = new HashSet<>();
+
+==================================================
+AprEndpoint.java
+index 8d35c629d4..0a6de01568 100644
+--- a/java/org/apache/tomcat/util/net/AbstractJsseEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AbstractJsseEndpoint.java
+@@ -77,8 +77,14 @@ public abstract class AbstractJsseEndpoint<S> extends AbstractEndpoint<S> {
+             sslImplementation = SSLImplementation.getInstance(getSslImplementationName());
+ 
+             for (SSLHostConfig sslHostConfig : sslHostConfigs.values()) {
++                boolean firstCertificate = true;
+                 for (SSLHostConfigCertificate certificate : sslHostConfig.getCertificates(true)) {
+                     SSLUtil sslUtil = sslImplementation.getSSLUtil(certificate);
++                    if (firstCertificate) {
++                        firstCertificate = false;
++                        sslHostConfig.setEnabledProtocols(sslUtil.getEnabledProtocols());
++                        sslHostConfig.setEnabledCiphers(sslUtil.getEnabledCiphers());
++                    }
+ 
+                     SSLContext sslContext = sslUtil.createSSLContext(negotiableProtocols);
+                     sslContext.init(sslUtil.getKeyManagers(), sslUtil.getTrustManagers(), null);
+@@ -87,8 +93,7 @@ public abstract class AbstractJsseEndpoint<S> extends AbstractEndpoint<S> {
+                     if (sessionContext != null) {
+                         sslUtil.configureSessionContext(sessionContext);
+                     }
+-                    SSLContextWrapper sslContextWrapper = new SSLContextWrapper(sslContext, sslUtil);
+-                    certificate.setSslContextWrapper(sslContextWrapper);
++                    certificate.setSslContext(sslContext);
+                 }
+             }
+ 
+@@ -100,8 +105,8 @@ public abstract class AbstractJsseEndpoint<S> extends AbstractEndpoint<S> {
+         if (isSSLEnabled()) {
+             for (SSLHostConfig sslHostConfig : sslHostConfigs.values()) {
+                 for (SSLHostConfigCertificate certificate : sslHostConfig.getCertificates(true)) {
+-                    if (certificate.getSslContextWrapper() != null) {
+-                        SSLContext sslContext = certificate.getSslContextWrapper().getSSLContext();
++                    if (certificate.getSslContext() != null) {
++                        SSLContext sslContext = certificate.getSslContext();
+                         if (sslContext != null) {
+                             sslContext.destroy();
+                         }
+@@ -116,13 +121,13 @@ public abstract class AbstractJsseEndpoint<S> extends AbstractEndpoint<S> {
+ 
+         SSLHostConfigCertificate certificate = selectCertificate(sslHostConfig, clientRequestedCiphers);
+ 
+-        SSLContextWrapper sslContextWrapper = certificate.getSslContextWrapper();
+-        if (sslContextWrapper == null) {
++        SSLContext sslContext = certificate.getSslContext();
++        if (sslContext == null) {
+             throw new IllegalStateException(
+                     sm.getString("endpoint.jsse.noSslContext", sniHostName));
+         }
+ 
+-        SSLEngine engine = sslContextWrapper.getSSLContext().createSSLEngine();
++        SSLEngine engine = sslContext.createSSLEngine();
+         switch (sslHostConfig.getCertificateVerification()) {
+         case NONE:
+             engine.setNeedClientAuth(false);
+@@ -137,8 +142,8 @@ public abstract class AbstractJsseEndpoint<S> extends AbstractEndpoint<S> {
+             break;
+         }
+         engine.setUseClientMode(false);
+-        engine.setEnabledCipherSuites(sslContextWrapper.getEnabledCiphers());
+-        engine.setEnabledProtocols(sslContextWrapper.getEnabledProtocols());
++        engine.setEnabledCipherSuites(sslHostConfig.getEnabledCiphers());
++        engine.setEnabledProtocols(sslHostConfig.getEnabledProtocols());
+ 
+         SSLParameters sslParameters = engine.getSSLParameters();
+         sslParameters.setUseCipherSuitesOrder(sslHostConfig.getHonorCipherOrder());
+@@ -188,27 +193,8 @@ public abstract class AbstractJsseEndpoint<S> extends AbstractEndpoint<S> {
+     public void unbind() throws Exception {
+         for (SSLHostConfig sslHostConfig : sslHostConfigs.values()) {
+             for (SSLHostConfigCertificate certificate : sslHostConfig.getCertificates(true)) {
+-                certificate.setSslContextWrapper(null);
++                certificate.setSslContext(null);
+             }
+         }
+     }
+-
+-
+-    static class SSLContextWrapper {
+-
+-        private final SSLContext sslContext;
+-        private final String[] enabledCiphers;
+-        private final String[] enabledProtocols;
+-
+-        public SSLContextWrapper(SSLContext sslContext, SSLUtil sslUtil) {
+-            this.sslContext = sslContext;
+-            // Determine which cipher suites and protocols to enable
+-            enabledCiphers = sslUtil.getEnableableCiphers(sslContext);
+-            enabledProtocols = sslUtil.getEnableableProtocols(sslContext);
+-        }
+-
+-        public SSLContext getSSLContext() { return sslContext;}
+-        public String[] getEnabledCiphers() { return enabledCiphers; }
+-        public String[] getEnabledProtocols() { return enabledProtocols; }
+-    }
+ }
+
+==================================================
+SSLHostConfig.java
+index 65ef66b28f..b83b21f6cf 100644
+--- a/java/org/apache/tomcat/util/net/LocalStrings.properties
++++ b/java/org/apache/tomcat/util/net/LocalStrings.properties
+@@ -123,3 +123,7 @@ sslHostConfig.mismatch=The property [{0}] was set on the SSLHostConfig named [{1
+ sslHostConfig.prefix_missing=The protocol [{0}] was added to the list of protocols on the SSLHostConfig named [{1}]. Check if a +/- prefix is missing.
+ 
+ sslImplementation.cnfe= Unable to create SSLImplementation for class [{0}]
++
++slUtilBase.noneSupported=None of the [{0}] specified are supported by the SSL engine : [{1}]
++sslUtilBase.active=The [{0}] that are active are : [{1}]
++sslUtilBase.skipped=Some of the specified [{0}] are not supported by the SSL engine and have been skipped: [{1}]
+
+==================================================
+SSLHostConfigCertificate.java
+index c999737725..475284bc1e 100644
+--- a/java/org/apache/tomcat/util/net/SSLHostConfig.java
++++ b/java/org/apache/tomcat/util/net/SSLHostConfig.java
+@@ -70,10 +70,12 @@ public class SSLHostConfig {
+ 
+     // Configuration properties
+ 
++    // Internal
++    private String[] enabledCiphers;
++    private String[] enabledProtocols;
+     // Nested
+     private SSLHostConfigCertificate defaultCertificate = null;
+     private Set<SSLHostConfigCertificate> certificates = new HashSet<>(4);
+-
+     // Common
+     private String certificateRevocationListFile;
+     private CertificateVerification certificateVerification = CertificateVerification.NONE;
+@@ -160,6 +162,38 @@ public class SSLHostConfig {
+     }
+ 
+ 
++    // ----------------------------------------------------- Internal properties
++
++    /**
++     * @see SSLUtil#getEnabledProtocols()
++     *
++     * @return The protocols enabled for this TLS virtual host
++     */
++    public String[] getEnabledProtocols() {
++        return enabledProtocols;
++    }
++
++
++    void setEnabledProtocols(String[] enabledProtocols) {
++        this.enabledProtocols = enabledProtocols;
++    }
++
++
++    /**
++     * @see SSLUtil#getEnabledCiphers()
++     *
++     * @return The ciphers enabled for this TLS virtual host
++     */
++    public String[] getEnabledCiphers() {
++        return enabledCiphers;
++    }
++
++
++    void setEnabledCiphers(String[] enabledCiphers) {
++        this.enabledCiphers = enabledCiphers;
++    }
++
++
+     // ------------------------------------------- Nested configuration elements
+ 
+     private void registerDefaultCertificate() {
+
+==================================================
+SSLUtil.java
+index 9cba47792b..678ce9c810 100644
+--- a/java/org/apache/tomcat/util/net/SSLHostConfigCertificate.java
++++ b/java/org/apache/tomcat/util/net/SSLHostConfigCertificate.java
+@@ -18,9 +18,7 @@ package org.apache.tomcat.util.net;
+ 
+ import java.util.HashSet;
+ import java.util.Set;
+-import java.util.stream.Collectors;
+ 
+-import org.apache.tomcat.util.net.AbstractJsseEndpoint.SSLContextWrapper;
+ import org.apache.tomcat.util.net.openssl.ciphers.Authentication;
+ 
+ 
+@@ -36,7 +34,7 @@ public class SSLHostConfigCertificate {
+     // OpenSSL can handle multiple certs in a single config so the reference to
+     // the context is at the virtual host level. JSSE can't so the reference is
+     // held here on the certificate.
+-    private SSLContextWrapper sslContextWrapper;
++    private SSLContext sslContext;
+ 
+     // Common
+     private final SSLHostConfig sslHostConfig;
+@@ -66,23 +64,23 @@ public class SSLHostConfigCertificate {
+     }
+ 
+ 
+-    public SSLContextWrapper getSslContextWrapper() {
+-        return sslContextWrapper;
++    public SSLContext getSslContext() {
++        return sslContext;
+     }
+ 
+ 
+-    public void setSslContextWrapper(SSLContextWrapper sslContextWrapper) {
+-        this.sslContextWrapper = sslContextWrapper;
++    public void setSslContext(SSLContext sslContext) {
++        this.sslContext = sslContext;
+     }
+ 
+ 
+-    // Common
+-
+     public SSLHostConfig getSSLHostConfig() {
+         return sslHostConfig;
+     }
+ 
+ 
++    // Common
++
+     public Type getType() {
+         return type;
+     }
+@@ -198,17 +196,6 @@ public class SSLHostConfigCertificate {
+     }
+ 
+ 
+-    public String[] getEnabledCiphers() {
+-        SSLContextWrapper wrapper = getSslContextWrapper();
+-        if (wrapper != null) {
+-            return wrapper.getEnabledCiphers();
+-        }
+-
+-        return sslHostConfig.getCipherList().stream().map(c -> c.toString()).
+-                collect(Collectors.toList()).toArray(new String[0]);
+-    }
+-
+-
+     // Nested types
+ 
+     public static enum Type {
+
+==================================================
+SSLUtilBase.java
+index 9fa3ce09f4..c65f7a23fa 100644
+--- a/java/org/apache/tomcat/util/net/SSLUtil.java
++++ b/java/org/apache/tomcat/util/net/SSLUtil.java
+@@ -38,32 +38,34 @@ public interface SSLUtil {
+     public void configureSessionContext(SSLSessionContext sslSessionContext);
+ 
+     /**
+-     * Determines the SSL cipher suites that can be enabled, based on the
+-     * configuration of the endpoint and the ciphers supported by the SSL
+-     * implementation.
++     * The set of enabled protocols is the intersection of the implemented
++     * protocols and the configured protocols. If no protocols are explicitly
++     * configured, then all of the implemented protocols will be included in the
++     * returned array.
+      *
+-     * @param context An initialized context to obtain the supported ciphers from.
++     * @return The protocols currently enabled and available for clients to
++     *         select from for the associated connection
+      *
+-     * @return Array of SSL cipher suites that may be enabled (which may be
+-     *         empty if none of the specified ciphers are supported), or
+-     *         the defaults for the underlying SSL implementation if
+-     *         the endpoint configuration does not specify any ciphers.
++     * @throws IllegalArgumentException  If there is no intersection between the
++     *         implemented and configured protocols
+      */
+-    public String[] getEnableableCiphers(SSLContext context);
++    public String[] getEnabledProtocols() throws IllegalArgumentException;
+ 
+     /**
+-     * Determines the SSL protocol variants that can be enabled, based on the
+-     * configuration of the endpoint and the ciphers supported by the SSL
+-     * implementation.
++     * The set of enabled ciphers is the intersection of the implemented ciphers
++     * and the configured ciphers. If no ciphers are explicitly configured, then
++     * the default ciphers will be included in the returned array.
++     * <p>
++     * The ciphers used during the TLS handshake may be further restricted by
++     * the {@link #getEnabledProtocols()} and the certificates.
+      *
+-     * @param context An initialized context to obtain the supported protocols from.
++     * @return The ciphers currently enabled and available for clients to select
++     *         from for the associated connection
+      *
+-     * @return Array of SSL protocol variants that may be enabled (which may be
+-     *         empty if none of the specified protocols are supported), or
+-     *         the defaults for the underlying SSL implementation if
+-     *         the endpoint configuration does not specify any protocols.
++     * @throws IllegalArgumentException  If there is no intersection between the
++     *         implemented and configured ciphers
+      */
+-    public String[] getEnableableProtocols(SSLContext context);
++    public String[] getEnabledCiphers() throws IllegalArgumentException;
+ 
+     /**
+      * Optional interface that can be implemented by
+
+==================================================
+JSSEUtil.java
+index 11ab156b34..a57c3e8d18 100644
+--- a/java/org/apache/tomcat/util/net/SSLUtilBase.java
++++ b/java/org/apache/tomcat/util/net/SSLUtilBase.java
+@@ -16,15 +16,102 @@
+  */
+ package org.apache.tomcat.util.net;
+ 
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.List;
++import java.util.Set;
++
++import org.apache.juli.logging.Log;
++import org.apache.tomcat.util.res.StringManager;
++
+ /**
+  * Common base class for {@link SSLUtil} implementations.
+  */
+ public abstract class SSLUtilBase implements SSLUtil {
+ 
++    private static final StringManager sm = StringManager.getManager(SSLUtilBase.class);
++
+     protected final SSLHostConfigCertificate certificate;
+ 
++    private final String[] enabledProtocols;
++    private final String[] enabledCiphers;
++
+ 
+     protected SSLUtilBase(SSLHostConfigCertificate certificate) {
+         this.certificate = certificate;
++        SSLHostConfig sslHostConfig = certificate.getSSLHostConfig();
++
++        // Calculate the enabled protocols
++        Set<String> configuredProtocols = sslHostConfig.getProtocols();
++        Set<String> implementedProtocols = getImplementedProtocols();
++        List<String> enabledProtocols =
++                getEnabled("protocols", true, configuredProtocols, implementedProtocols);
++        this.enabledProtocols = enabledProtocols.toArray(new String[enabledProtocols.size()]);
++
++        // Calculate the enabled ciphers
++        List<String> configuredCiphers = sslHostConfig.getJsseCipherNames();
++        Set<String> implementedCiphers = getImplementedCiphers();
++        List<String> enabledCiphers =
++                getEnabled("ciphers", false, configuredCiphers, implementedCiphers);
++        this.enabledCiphers = enabledCiphers.toArray(new String[enabledCiphers.size()]);
++    }
++
++
++    private <T> List<T> getEnabled(String name, boolean warnOnSkip, Collection<T> configured,
++            Collection<T> implemented) {
++
++        List<T> enabled = new ArrayList<>();
++
++        if (implemented.size() == 0) {
++            // Unable to determine the list of available protocols. This will
++            // have been logged previously.
++            // Use the configuredProtocols and hope they work. If not, an error
++            // will be generated when the list is used. Not ideal but no more
++            // can be done at this point.
++            enabled.addAll(configured);
++        } else {
++            enabled.addAll(implemented);
++            enabled.retainAll(configured);
++
++            if (enabled.isEmpty()) {
++                // Don't use the defaults in this case. They may be less secure
++                // than the configuration the user intended.
++                // Force the failure of the connector
++                throw new IllegalArgumentException(
++                        sm.getString("sslUtilBase.noneSupported", name, configured));
++            }
++            if (getLog().isDebugEnabled()) {
++                getLog().debug(sm.getString("sslUtilBase.active", name, enabled));
++            }
++            if (getLog().isDebugEnabled() || warnOnSkip) {
++                if (enabled.size() != configured.size()) {
++                    List<T> skipped = new ArrayList<>();
++                    skipped.addAll(configured);
++                    skipped.removeAll(enabled);
++                    String msg = sm.getString("sslUtilBase.skipped", name, skipped);
++                    if (warnOnSkip) {
++                        getLog().warn(msg);
++                    } else {
++                        getLog().debug(msg);
++                    }
++                }
++            }
++        }
++
++        return enabled;
+     }
++
++    @Override
++    public String[] getEnabledProtocols() {
++        return enabledProtocols;
++    }
++
++    @Override
++    public String[] getEnabledCiphers() {
++        return enabledCiphers;
++    }
++
++    protected abstract Set<String> getImplementedProtocols();
++    protected abstract Set<String> getImplementedCiphers();
++    protected abstract Log getLog();
+ }
+
+==================================================
+OpenSSLContext.java
+index 38968d6bd1..e53212d9c0 100644
+--- a/java/org/apache/tomcat/util/net/jsse/LocalStrings.properties
++++ b/java/org/apache/tomcat/util/net/jsse/LocalStrings.properties
+@@ -21,12 +21,9 @@ jsse.invalidTrustManagerClassName=The trustManagerClassName provided [{0}] does
+ jsse.requested_ciphers_not_supported=None of the ciphers specified are supported by the SSL engine : {0}
+ jsse.enableable_ciphers=Specified SSL ciphers that are supported and enableable are : {0}
+ jsse.unsupported_ciphers=Some specified SSL ciphers are not supported by the SSL engine : {0}
+-jsse.requested_protocols_not_supported=None of the SSL protocols specified are supported by the SSL engine : {0}
+-jsse.enableable_protocols=Specified SSL protocols that are supported and enableable are : {0}
+-jsse.unsupported_protocols=Some specified SSL protocols are not supported by the SSL engine : {0}
+ jsse.excludeDefaultProtocol=The SSL protocol [{0}] which is enabled by default in this JRE was excluded from the defaults used by Tomcat
+ jsse.noDefaultCiphers=Unable to determine a default for ciphers for [{0}]. Set an explicit value to ensure the connector can start.
+-jsse.noDefaultProtocols=Unable to determine a default for sslEnabledProtocols for [{0}]. Set an explicit value to ensure the connector can start.
++jsse.noDefaultProtocols=Unable to determine a default for sslEnabledProtocols. Set an explicit value to ensure the connector can start.
+ jsse.exceptionOnClose=Failure to close socket.
+ jsseSupport.clientCertError=Error trying to obtain a certificate from the client
+ jseeSupport.certTranslationError=Error translating certificate [{0}]
+
+==================================================
+OpenSSLEngine.java
+index 7d3f101d81..12f7dd5a81 100644
+--- a/java/org/apache/tomcat/util/net/openssl/OpenSSLContext.java
++++ b/java/org/apache/tomcat/util/net/openssl/OpenSSLContext.java
+@@ -120,7 +120,7 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
+             if (sslHostConfig.getProtocols().size() == 0) {
+                 value = SSL.SSL_PROTOCOL_ALL;
+             } else {
+-                for (String protocol : sslHostConfig.getProtocols()) {
++                for (String protocol : sslHostConfig.getEnabledProtocols()) {
+                     if (Constants.SSL_PROTO_SSLv2Hello.equalsIgnoreCase(protocol)) {
+                         // NO-OP. OpenSSL always supports SSLv2Hello
+                     } else if (Constants.SSL_PROTO_SSLv2.equalsIgnoreCase(protocol)) {
+
+==================================================
+OpenSSLUtil.java
+index 5f3edadd89..72fb7be96d 100644
+--- a/java/org/apache/tomcat/util/net/openssl/OpenSSLEngine.java
++++ b/java/org/apache/tomcat/util/net/openssl/OpenSSLEngine.java
+@@ -68,7 +68,7 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
+     private static final SSLException ENGINE_CLOSED = new SSLException(sm.getString("engine.engineClosed"));
+     private static final SSLException ENCRYPTED_PACKET_OVERSIZED = new SSLException(sm.getString("engine.oversizedPacket"));
+ 
+-    private static final Set<String> AVAILABLE_CIPHER_SUITES;
++    protected static final Set<String> AVAILABLE_CIPHER_SUITES;
+ 
+     static {
+         final Set<String> availableCipherSuites = new LinkedHashSet<>(128);
+@@ -114,7 +114,7 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
+     // Protocols
+     static final int VERIFY_DEPTH = 10;
+ 
+-    private static final String[] SUPPORTED_PROTOCOLS = {
++    private static final String[] IMPLEMENTED_PROTOCOLS = {
+         Constants.SSL_PROTO_SSLv2Hello,
+         Constants.SSL_PROTO_SSLv2,
+         Constants.SSL_PROTO_SSLv3,
+@@ -122,8 +122,8 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
+         Constants.SSL_PROTO_TLSv1_1,
+         Constants.SSL_PROTO_TLSv1_2
+     };
+-    private static final Set<String> SUPPORTED_PROTOCOLS_SET =
+-            new HashSet<>(Arrays.asList(SUPPORTED_PROTOCOLS));
++    protected static final Set<String> IMPLEMENTED_PROTOCOLS_SET =
++            new HashSet<>(Arrays.asList(IMPLEMENTED_PROTOCOLS));
+ 
+     // Header (5) + Data (2^14) + Compression (1024) + Encryption (1024) + MAC (20) + Padding (256)
+     static final int MAX_ENCRYPTED_PACKET_LENGTH = MAX_CIPHERTEXT_LENGTH + 5 + 20 + 256;
+@@ -746,7 +746,7 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
+ 
+     @Override
+     public String[] getSupportedProtocols() {
+-        return SUPPORTED_PROTOCOLS.clone();
++        return IMPLEMENTED_PROTOCOLS.clone();
+     }
+ 
+     @Override
+@@ -790,7 +790,7 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
+         boolean tlsv1_1 = false;
+         boolean tlsv1_2 = false;
+         for (String p : protocols) {
+-            if (!SUPPORTED_PROTOCOLS_SET.contains(p)) {
++            if (!IMPLEMENTED_PROTOCOLS_SET.contains(p)) {
+                 throw new IllegalArgumentException(sm.getString("engine.unsupportedProtocol", p));
+             }
+             if (p.equals(Constants.SSL_PROTO_SSLv2)) {
+
+==================================================

@@ -1,0 +1,273 @@
+93696360f79201746c48dc129a97a1a19c22ebea
+==================================================
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=49299
+==================================================
+Mark Emlyn
+==================================================
+Sun May 16 21:47:26 2010 +0000
+==================================================
+Globals.java
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=49299
+Implement the requirements of section 7.1.1 of the Servlet 3.0 spec that require the path parameter to change name as well.
+Remove the option to set the default via a system property for the sake of simplicity.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@944920 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+CoyoteAdapter.java
+index fb25b6132c..6f45f4801a 100644
+--- a/java/org/apache/catalina/Globals.java
++++ b/java/org/apache/catalina/Globals.java
+@@ -264,22 +264,6 @@ public final class Globals {
+         "javax.servlet.error.servlet_name";
+ 
+     
+-    /**
+-     * The name of the cookie used to pass the session identifier back
+-     * and forth with the client.
+-     */
+-    public static final String SESSION_COOKIE_NAME = "JSESSIONID";
+-
+-
+-    /**
+-     * The name of the path parameter used to pass the session identifier
+-     * back and forth with the client.
+-     */
+-    public static final String SESSION_PARAMETER_NAME =
+-        System.getProperty("org.apache.catalina.SESSION_PARAMETER_NAME",
+-                "jsessionid");
+-
+-
+     /**
+      * The servlet context attribute under which we store a flag used
+      * to mark this request as having been processed by the SSIServlet.
+
+==================================================
+Request.java
+index 705b881862..8cbc3f9919 100644
+--- a/java/org/apache/catalina/connector/LocalStrings.properties
++++ b/java/org/apache/catalina/connector/LocalStrings.properties
+@@ -33,7 +33,7 @@ coyoteConnector.protocolUnregistrationFailed=Protocol handler stop failed
+ #
+ coyoteAdapter.service=An exception or error occurred in the container during the request processing
+ coyoteAdapter.read=The servlet did not read all available bytes during the processing of the read event
+-coyoteAdapter.parseSession=Unable to parse the session ID using encoding [{0}]. The session ID in the URL will be ignored.
++coyoteAdapter.parsePathParam=Unable to parse the path parameters using encoding [{0}]. The path parameters in the URL will be ignored.
+ 
+ #
+ # CoyoteResponse
+
+==================================================
+Response.java
+index 49647b5640..eeb9d799ef 100644
+--- a/java/org/apache/catalina/connector/Request.java
++++ b/java/org/apache/catalina/connector/Request.java
+@@ -418,10 +418,21 @@ public class Request
+     protected Boolean asyncSupported = null;
+     
+     
++    /**
++     * Path parameters
++     */
++    protected Map<String,String> pathParameters = new HashMap<String, String>();
+ 
+     // --------------------------------------------------------- Public Methods
+ 
+     
++    protected void addPathParameter(String name, String value) {
++        pathParameters.put(name, value);
++    }
++
++    protected String getPathParameter(String name) {
++        return pathParameters.get(name);
++    }
+ 
+     public void setAsyncSupported(boolean asyncSupported) {
+         this.asyncSupported = Boolean.valueOf(asyncSupported);
+@@ -506,6 +517,7 @@ public class Request
+         if (asyncContext!=null) asyncContext.recycle();
+         asyncContext = null;
+ 
++        pathParameters.clear();
+     }
+ 
+     protected boolean isProcessing() {
+
+==================================================
+ApplicationSessionCookieConfig.java
+index 32b9954f1a..401c4d0c2e 100644
+--- a/java/org/apache/catalina/connector/Response.java
++++ b/java/org/apache/catalina/connector/Response.java
+@@ -45,6 +45,7 @@ import org.apache.catalina.Context;
+ import org.apache.catalina.Globals;
+ import org.apache.catalina.Session;
+ import org.apache.catalina.Wrapper;
++import org.apache.catalina.core.ApplicationSessionCookieConfig;
+ import org.apache.catalina.security.SecurityUtil;
+ import org.apache.catalina.util.CharsetMapper;
+ import org.apache.catalina.util.DateTool;
+@@ -1517,7 +1518,10 @@ public class Response
+             String file = url.getFile();
+             if ((file == null) || !file.startsWith(contextPath))
+                 return (false);
+-            String tok = ";" + Globals.SESSION_PARAMETER_NAME + "=" + session.getIdInternal();
++            String tok = ";" +
++                    ApplicationSessionCookieConfig.getSessionUriParamName(
++                                request.getContext()) +
++                    "=" + session.getIdInternal();
+             if( file.indexOf(tok, contextPath.length()) >= 0 )
+                 return (false);
+         }
+@@ -1653,7 +1657,8 @@ public class Response
+         StringBuilder sb = new StringBuilder(path);
+         if( sb.length() > 0 ) { // jsessionid can't be first.
+             sb.append(";");
+-            sb.append(Globals.SESSION_PARAMETER_NAME);
++            sb.append(ApplicationSessionCookieConfig.getSessionUriParamName(
++                    request.getContext()));
+             sb.append("=");
+             sb.append(sessionId);
+         }
+
+==================================================
+RealmBase.java
+index 1db3b5709b..4739fc3e18 100644
+--- a/java/org/apache/catalina/core/ApplicationSessionCookieConfig.java
++++ b/java/org/apache/catalina/core/ApplicationSessionCookieConfig.java
+@@ -21,10 +21,12 @@ import javax.servlet.SessionCookieConfig;
+ import javax.servlet.http.Cookie;
+ 
+ import org.apache.catalina.Context;
+-import org.apache.catalina.Globals;
+ 
+ public class ApplicationSessionCookieConfig implements SessionCookieConfig {
+ 
++    private static final String DEFAULT_SESSION_COOKIE_NAME = "JSESSIONID";
++    private static final String DEFAULT_SESSION_PARAMETER_NAME = "jsessionid";
++    
+     private boolean httpOnly;
+     private boolean secure;
+     private int maxAge = -1;
+@@ -160,12 +162,7 @@ public class ApplicationSessionCookieConfig implements SessionCookieConfig {
+     }
+     
+     
+-    /**
+-     * Determine the name to use for the session cookie for the provided
+-     * context.
+-     * @param context
+-     */
+-    public static String getSessionCookieName(Context context) {
++    private static String getConfiguredSessionCookieName(Context context) {
+         
+         // Priority is:
+         // 1. Cookie name defined in context
+@@ -184,7 +181,40 @@ public class ApplicationSessionCookieConfig implements SessionCookieConfig {
+                 return cookieName;
+             }
+         }
++
++        return null;
++    }
++    
++    
++    /**
++     * Determine the name to use for the session cookie for the provided
++     * context.
++     * @param context
++     */
++    public static String getSessionCookieName(Context context) {
++    
++        String result = getConfiguredSessionCookieName(context);
++        
++        if (result == null) {
++            result = DEFAULT_SESSION_COOKIE_NAME; 
++        }
++        
++        return result; 
++    }
++    
++    /**
++     * Determine the name to use for the session cookie for the provided
++     * context.
++     * @param context
++     */
++    public static String getSessionUriParamName(Context context) {
++        
++        String result = getConfiguredSessionCookieName(context);
++        
++        if (result == null) {
++            result = DEFAULT_SESSION_PARAMETER_NAME; 
++        }
+         
+-        return Globals.SESSION_COOKIE_NAME;
++        return result; 
+     }
+ }
+
+==================================================
+TestCoyoteAdaptor.java
+index c07daa3ad9..a1b14cc941 100644
+--- a/java/org/apache/catalina/realm/RealmBase.java
++++ b/java/org/apache/catalina/realm/RealmBase.java
+@@ -34,7 +34,6 @@ import javax.servlet.http.HttpServletResponse;
+ import org.apache.catalina.Container;
+ import org.apache.catalina.Context;
+ import org.apache.catalina.Engine;
+-import org.apache.catalina.Globals;
+ import org.apache.catalina.Host;
+ import org.apache.catalina.LifecycleException;
+ import org.apache.catalina.LifecycleState;
+@@ -43,6 +42,7 @@ import org.apache.catalina.Server;
+ import org.apache.catalina.Service;
+ import org.apache.catalina.connector.Request;
+ import org.apache.catalina.connector.Response;
++import org.apache.catalina.core.ApplicationSessionCookieConfig;
+ import org.apache.catalina.deploy.LoginConfig;
+ import org.apache.catalina.deploy.SecurityConstraint;
+ import org.apache.catalina.deploy.SecurityCollection;
+@@ -367,10 +367,11 @@ public abstract class RealmBase extends LifecycleMBeanBase implements Realm {
+                     + " Server digest:" + serverDigest);
+         }
+         
+-        if (serverDigest.equals(clientDigest))
++        if (serverDigest.equals(clientDigest)) {
+             return getPrincipal(username);
+-        else
+-            return null;
++        }
++
++        return null;
+     }
+ 
+ 
+@@ -754,11 +755,11 @@ public abstract class RealmBase extends LifecycleMBeanBase implements Realm {
+                     status = false; // No listed roles means no access at all
+                     denyfromall = true;
+                     break;
+-                } else {
+-                    if(log.isDebugEnabled())
+-                        log.debug("Passing all access");
+-                    status = true;
+                 }
++                
++                if(log.isDebugEnabled())
++                    log.debug("Passing all access");
++                status = true;
+             } else if (principal == null) {
+                 if (log.isDebugEnabled())
+                     log.debug("  No user authenticated, cannot grant access");
+@@ -923,7 +924,8 @@ public abstract class RealmBase extends LifecycleMBeanBase implements Realm {
+         if ((requestedSessionId != null) &&
+             request.isRequestedSessionIdFromURL()) {
+             file.append(";");
+-            file.append(Globals.SESSION_PARAMETER_NAME);
++            file.append(ApplicationSessionCookieConfig.getSessionUriParamName(
++                    request.getContext()));
+             file.append("=");
+             file.append(requestedSessionId);
+         }
+
+==================================================

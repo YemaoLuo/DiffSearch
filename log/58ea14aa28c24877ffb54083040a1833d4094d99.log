@@ -1,0 +1,287 @@
+58ea14aa28c24877ffb54083040a1833d4094d99
+==================================================
+Fix BZ 66209 - Add option to retain bloom filters for JAR indexing
+==================================================
+Mark Thomas
+==================================================
+Mon Oct 31 08:47:52 2022 +0000
+==================================================
+Context.java
+Fix BZ 66209 - Add option to retain bloom filters for JAR indexing
+
+https://bz.apache.org/bugzilla/show_bug.cgi?id=66209
+Based on a patch by Rahul Jaisimha
+This also moves configuration for archive indexing from Context to
+WebResourceRoot
+
+
+==================================================
+WebResourceRoot.java
+index 83a9a02674..1ac36ee92e 100644
+--- a/java/org/apache/catalina/Context.java
++++ b/java/org/apache/catalina/Context.java
+@@ -1948,14 +1948,21 @@ public interface Context extends Container, ContextBind {
+     /**
+      * @return <code>true</code> if the resources archive lookup will
+      * use a bloom filter.
++     *
++     * @deprecated This method will be removed in Tomcat 11 onwards.
++     *             Use {@link WebResourceRoot#getArchiveIndexStrategy()}
+      */
++    @Deprecated
+     public boolean getUseBloomFilterForArchives();
+ 
+     /**
+      * Set bloom filter flag value.
+      *
+      * @param useBloomFilterForArchives The new fast class path scan flag
++     *
++     * @deprecated This method will be removed in Tomcat 11 onwards
++     *             Use {@link WebResourceRoot#setArchiveIndexStrategy(String)}
+      */
++    @Deprecated
+     public void setUseBloomFilterForArchives(boolean useBloomFilterForArchives);
+-
+ }
+
+==================================================
+StandardContext.java
+index ae37893e1f..36bad52945 100644
+--- a/java/org/apache/catalina/WebResourceRoot.java
++++ b/java/org/apache/catalina/WebResourceRoot.java
+@@ -399,6 +399,27 @@ public interface WebResourceRoot extends Lifecycle {
+      */
+     boolean getTrackLockedFiles();
+ 
++    /**
++     * Set the strategy to use for the resources archive lookup.
++     *
++     * @param archiveIndexStrategy The strategy to use for the resources archive lookup
++     */
++    void setArchiveIndexStrategy(String archiveIndexStrategy);
++
++    /**
++     * Get the strategy to use for the resources archive lookup.
++     *
++     * @return The strategy to use for the resources archive lookup
++     */
++    String getArchiveIndexStrategy();
++
++    /**
++     * Get the strategy to use for the resources archive lookup.
++     *
++     * @return The strategy to use for the resources archive lookup
++     */
++    ArchiveIndexStrategy getArchiveIndexStrategyEnum();
++
+     /**
+      * This method will be invoked by the context on a periodic basis and allows
+      * the implementation a method that executes periodic tasks, such as purging
+@@ -464,6 +485,28 @@ public interface WebResourceRoot extends Lifecycle {
+         CLASSES_JAR
+     }
+ 
++    enum ArchiveIndexStrategy {
++        SIMPLE(false, false),
++        BLOOM(true, true),
++        PURGED(true, false);
++
++        private final boolean usesBloom;
++        private final boolean retain;
++
++        ArchiveIndexStrategy(boolean usesBloom, boolean retain) {
++            this.usesBloom = usesBloom;
++            this.retain = retain;
++        }
++
++        public boolean getUsesBloom() {
++            return usesBloom;
++        }
++
++        public boolean getRetain() {
++            return retain;
++        }
++    }
++
+     /**
+      * Provides a mechanism to modify the caching behaviour.
+      */
+
+==================================================
+AbstractArchiveResourceSet.java
+index 8000b3d18f..92f9f9d434 100644
+--- a/java/org/apache/catalina/core/mbeans-descriptors.xml
++++ b/java/org/apache/catalina/core/mbeans-descriptors.xml
+@@ -322,7 +322,7 @@
+                type="boolean"/>
+ 
+     <attribute name="useBloomFilterForArchives"
+-               description="Use a bloom filter for archives lookups"
++               description="DEPRECATED: Use a bloom filter for archives lookups"
+                type="boolean"/>
+ 
+     <attribute name="useHttpOnly"
+
+==================================================
+StandardRoot.java
+index 4907c21201..3933cb3ab1 100644
+--- a/java/org/apache/catalina/webresources/AbstractArchiveResourceSet.java
++++ b/java/org/apache/catalina/webresources/AbstractArchiveResourceSet.java
+@@ -41,6 +41,7 @@ public abstract class AbstractArchiveResourceSet extends AbstractResourceSet {
+     protected final Object archiveLock = new Object();
+     private long archiveUseCount = 0;
+     private JarContents jarContents;
++    private boolean retainBloomFilterForArchives = false;
+ 
+     protected final void setBaseUrl(URL baseUrl) {
+         this.baseUrl = baseUrl;
+@@ -308,13 +309,16 @@ public abstract class AbstractArchiveResourceSet extends AbstractResourceSet {
+                 sm.getString("abstractArchiveResourceSet.setReadOnlyFalse"));
+     }
+ 
++    @SuppressWarnings("deprecation")
+     protected JarFile openJarFile() throws IOException {
+         synchronized (archiveLock) {
+             if (archive == null) {
+                 archive = new JarFile(new File(getBase()), true, ZipFile.OPEN_READ, Runtime.version());
+                 WebResourceRoot root = getRoot();
+-                if ((root.getContext() != null) && root.getContext().getUseBloomFilterForArchives()) {
++                if (root.getArchiveIndexStrategyEnum().getUsesBloom() ||
++                        root.getContext() != null && root.getContext().getUseBloomFilterForArchives()) {
+                     jarContents = new JarContents(archive);
++                    retainBloomFilterForArchives = root.getArchiveIndexStrategyEnum().getRetain();
+                 }
+             }
+             archiveUseCount++;
+@@ -339,7 +343,9 @@ public abstract class AbstractArchiveResourceSet extends AbstractResourceSet {
+                 }
+                 archive = null;
+                 archiveEntries = null;
+-                jarContents = null;
++                if (!retainBloomFilterForArchives) {
++                    jarContents = null;
++                }
+             }
+         }
+     }
+
+==================================================
+TestAbstractArchiveResourceSet.java
+index 5c26332532..057572884e 100644
+--- a/java/org/apache/catalina/webresources/mbeans-descriptors.xml
++++ b/java/org/apache/catalina/webresources/mbeans-descriptors.xml
+@@ -52,6 +52,11 @@
+                  type="java.util.List"
+             writeable="false"/>
+ 
++    <attribute   name="archiveIndexStrategy"
++          description="Strategy to use for the resources archive lookup"
++                 type="java.lang.String"
++            writeable="true"/>
++
+   </mbean>
+ 
+   <mbean         name="Cache"
+
+==================================================
+TestStandardRoot.java
+index 7c5b2f275d..ba5f742d65 100644
+--- a/test/org/apache/catalina/webresources/TestAbstractArchiveResourceSet.java
++++ b/test/org/apache/catalina/webresources/TestAbstractArchiveResourceSet.java
+@@ -17,6 +17,7 @@
+ package org.apache.catalina.webresources;
+ 
+ import java.io.File;
++import java.lang.reflect.Field;
+ 
+ import org.junit.Assert;
+ import org.junit.Test;
+@@ -30,20 +31,85 @@ public class TestAbstractArchiveResourceSet {
+      * https://bz.apache.org/bugzilla/show_bug.cgi?id=65586
+      */
+     @Test
+-    public void testBloomFilterWithDirectory() {
++    public void testBloomFilterWithDirectoryVerifyCleanup() throws Exception {
+         WebResourceRoot root = new TesterWebResourceRoot();
+ 
++        root.setArchiveIndexStrategy(WebResourceRoot.ArchiveIndexStrategy.BLOOM.name());
++
++        File file = new File("webapps/examples/WEB-INF/lib/taglibs-standard-impl-1.2.5-migrated-0.0.1.jar");
++
++        JarResourceSet jarResourceSet = new JarResourceSet(root, "/WEB-INF/classes", file.getAbsolutePath(), "/");
++        jarResourceSet.getArchiveEntries(false);
++        Assert.assertNotNull(getJarContents(jarResourceSet));
++
++        WebResource r1 = jarResourceSet.getResource("/WEB-INF/classes/org/");
++        Assert.assertTrue(r1.isDirectory());
++        Assert.assertNotNull(getJarContents(jarResourceSet));
++
++        WebResource r2 = jarResourceSet.getResource("/WEB-INF/classes/org");
++        Assert.assertTrue(r2.isDirectory());
++        Assert.assertNotNull(getJarContents(jarResourceSet));
++
++        jarResourceSet.gc();
++        Assert.assertNotNull(getJarContents(jarResourceSet));
++    }
++
++    @Test
++    public void testPurgedBloomFilterWithDirectoryVerifyCleanup() throws Exception {
++        WebResourceRoot root = new TesterWebResourceRoot();
++
++        root.setArchiveIndexStrategy(WebResourceRoot.ArchiveIndexStrategy.PURGED.name());
++
++        File file = new File("webapps/examples/WEB-INF/lib/taglibs-standard-impl-1.2.5-migrated-0.0.1.jar");
++
++        JarResourceSet jarResourceSet = new JarResourceSet(root, "/WEB-INF/classes", file.getAbsolutePath(), "/");
++        jarResourceSet.getArchiveEntries(false);
++        Assert.assertNotNull(getJarContents(jarResourceSet));
++
++        WebResource r1 = jarResourceSet.getResource("/WEB-INF/classes/org/");
++        Assert.assertTrue(r1.isDirectory());
++        Assert.assertNotNull(getJarContents(jarResourceSet));
++
++        WebResource r2 = jarResourceSet.getResource("/WEB-INF/classes/org");
++        Assert.assertTrue(r2.isDirectory());
++        Assert.assertNotNull(getJarContents(jarResourceSet));
++
++        jarResourceSet.gc();
++        Assert.assertNull(getJarContents(jarResourceSet));
++    }
++
++    @Deprecated
++    @Test
++    public void testBloomFilterWithSimpleArchiveIndexing() throws Exception {
++        WebResourceRoot root = new TesterWebResourceRoot();
++
++        root.setArchiveIndexStrategy(WebResourceRoot.ArchiveIndexStrategy.SIMPLE.name());
+         root.getContext().setUseBloomFilterForArchives(true);
+ 
+         File file = new File("webapps/examples/WEB-INF/lib/taglibs-standard-impl-1.2.5-migrated-0.0.1.jar");
+ 
+         JarResourceSet jarResourceSet = new JarResourceSet(root, "/WEB-INF/classes", file.getAbsolutePath(), "/");
+         jarResourceSet.getArchiveEntries(false);
++        Assert.assertNotNull(getJarContents(jarResourceSet));
+ 
+         WebResource r1 = jarResourceSet.getResource("/WEB-INF/classes/org/");
+         Assert.assertTrue(r1.isDirectory());
++        Assert.assertNotNull(getJarContents(jarResourceSet));
+ 
+         WebResource r2 = jarResourceSet.getResource("/WEB-INF/classes/org");
+         Assert.assertTrue(r2.isDirectory());
++        Assert.assertNotNull(getJarContents(jarResourceSet));
++
++        jarResourceSet.gc();
++        Assert.assertNull(getJarContents(jarResourceSet));
++    }
++
++    private JarContents getJarContents(Object target)
++        throws IllegalArgumentException, IllegalAccessException, NoSuchFieldException, SecurityException {
++        Field field = AbstractArchiveResourceSet.class.getDeclaredField("jarContents");
++        field.setAccessible(true);
++        JarContents contents = (JarContents) field.get(target);
++
++        return contents;
+     }
+ }
+
+==================================================

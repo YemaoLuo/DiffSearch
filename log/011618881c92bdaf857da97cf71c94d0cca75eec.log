@@ -1,0 +1,466 @@
+011618881c92bdaf857da97cf71c94d0cca75eec
+==================================================
+WebSocket 1.0 implementation part 11 of many
+==================================================
+Mark Emlyn
+==================================================
+Tue Dec 11 21:59:06 2012 +0000
+==================================================
+PongMessage.java
+WebSocket 1.0 implementation part 11 of many
+Fix s/ping/pong/ in the API. pings are automatically responded to with pongs. Apps send ping and receive pongs. (Sending unsolicited pong is also possible.)
+Handle incoming messages (at the frame, still need to map WebSocketMessage annotations)
+Add some debug to the examples to check messages are received
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1420446 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+PojoMethodMapping.java
+similarity index 94%
+rename from java/javax/websocket/PingMessage.java
+rename to java/javax/websocket/PongMessage.java
+index cfac120cd2..0926e3f5fe 100644
+--- a/java/javax/websocket/PingMessage.java
++++ b/java/javax/websocket/PongMessage.java
+@@ -1,23 +1,23 @@
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package javax.websocket;
+-
+-import java.nio.ByteBuffer;
+-
+-public interface PingMessage {
+-    ByteBuffer getApplicationData();
+-}
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package javax.websocket;
++
++import java.nio.ByteBuffer;
++
++public interface PongMessage {
++    ByteBuffer getApplicationData();
++}
+
+==================================================
+WsFrame.java
+index fedbf9b5f8..ee49c8a102 100644
+--- a/java/org/apache/tomcat/websocket/PojoMethodMapping.java
++++ b/java/org/apache/tomcat/websocket/PojoMethodMapping.java
+@@ -23,6 +23,7 @@ import java.util.Map;
+ import javax.websocket.Session;
+ import javax.websocket.WebSocketClose;
+ import javax.websocket.WebSocketError;
++import javax.websocket.WebSocketMessage;
+ import javax.websocket.WebSocketOpen;
+ import javax.websocket.WebSocketPathParam;
+ 
+@@ -57,6 +58,8 @@ public class PojoMethodMapping {
+             } else if (error == null &&
+                     method.getAnnotation(WebSocketError.class) != null) {
+                 error = method;
++            } else if (method.getAnnotation(WebSocketMessage.class) != null) {
++                // TODO
+             }
+         }
+         this.onOpen = open;
+
+==================================================
+WsPongMessage.java
+index 7fabc58e8a..347819a9a7 100644
+--- a/java/org/apache/tomcat/websocket/WsFrame.java
++++ b/java/org/apache/tomcat/websocket/WsFrame.java
+@@ -22,6 +22,8 @@ import java.nio.ByteBuffer;
+ import java.nio.charset.Charset;
+ 
+ import javax.servlet.ServletInputStream;
++import javax.websocket.MessageHandler;
++import javax.websocket.PongMessage;
+ 
+ import org.apache.tomcat.util.res.StringManager;
+ 
+@@ -40,12 +42,17 @@ public class WsFrame {
+     private int pos = 0;
+ 
+     private State state = State.NEW_FRAME;
++    private int headerLength = 0;
++    private boolean continutationExpected = false;
++    private boolean textMessage = false;
++    private long payloadSent = 0;
++
++    private long payloadLength = 0;
+     private boolean fin;
+     private int rsv;
+     private byte opCode;
+     private byte[] mask = new byte[4];
+-    private long payloadLength = -1;
+-    private int headerLength = -1;
++    int maskIndex = 0;
+ 
+ 
+     public WsFrame(ServletInputStream sis, WsSession wsSession) {
+@@ -107,6 +114,27 @@ public class WsFrame {
+         rsv = (b & 0x70) >>> 4;
+         opCode = (byte) (b & 0x0F);
+ 
++        if (!isControl()) {
++            if (continutationExpected) {
++                if (opCode != Constants.OPCODE_CONTINUATION) {
++                    // TODO i18n
++                    throw new IllegalStateException();
++                }
++            } else {
++                if (opCode == Constants.OPCODE_BINARY) {
++                    textMessage = false;
++                } else if (opCode == Constants.OPCODE_TEXT) {
++                    textMessage = true;
++                } else {
++                    // TODO i18n
++                    throw new UnsupportedOperationException();
++                }
++            }
++
++            continutationExpected = !fin;
++        }
++
++
+         b = inputBuffer[1];
+         // Client data must be masked
+         if ((b & 0x80) == 0) {
+@@ -172,63 +200,129 @@ public class WsFrame {
+             if (opCode == Constants.OPCODE_CLOSE) {
+                 wsSession.close();
+             } else if (opCode == Constants.OPCODE_PING) {
+-                wsSession.getPingMessageHandler().onMessage(
+-                        new WsPingMessage(getPayload()));
++                wsSession.getRemote().sendPong(getPayloadBinary());
+             } else if (opCode == Constants.OPCODE_PONG) {
+-                // TODO
+-                // Validate the PONG?
++                MessageHandler.Basic<PongMessage> mhPong =
++                        wsSession.getPongMessageHandler();
++                if (mhPong != null) {
++                    mhPong.onMessage(new WsPongMessage(getPayloadBinary()));
++                }
+             } else {
+                 // TODO i18n
+                 throw new UnsupportedOperationException();
+             }
+             return true;
+         }
+-        if (isPayloadComplete()) {
+-            // TODO Check if partial messages supported
+-            if (inputBuffer.length - pos > 0) {
++        if (!isPayloadComplete()) {
++            if (usePartial()) {
++                sendPayload(false);
+                 return false;
++            } else {
++                if (inputBuffer.length - pos > 0) {
++                    return false;
++                }
++                throw new UnsupportedOperationException();
+             }
+-            throw new UnsupportedOperationException();
+         } else {
+-            // Unmask the data
+-            for (int i = 0; i < payloadLength; i++) {
+-                inputBuffer[headerLength + i] = (byte)
+-                        ((inputBuffer[headerLength + i] ^ mask[i % 4]) & 0xFF);
+-            }
+-            // TODO Handle incoming data properly
+-            System.out.println(new String(inputBuffer, headerLength,
+-                    (int) payloadLength, Charset.forName("UTF-8")));
++            sendPayload(true);
+         }
+ 
+         state = State.NEW_FRAME;
+-        pos = 0;
++        payloadLength = 0;
++        payloadSent = 0;
++        maskIndex = 0;
+         return true;
+     }
+ 
+ 
++    @SuppressWarnings("unchecked")
++    private void sendPayload(boolean last) {
++        if (textMessage) {
++            String payload = getPayloadText();
++            MessageHandler mh = wsSession.getTextMessageHandler();
++            if (mh != null) {
++                if (mh instanceof MessageHandler.Async<?>) {
++                    ((MessageHandler.Async<String>) mh).onMessage(payload,
++                            last);
++                } else {
++                    ((MessageHandler.Basic<String>) mh).onMessage(payload);
++                }
++            }
++        } else {
++            ByteBuffer payload = getPayloadBinary();
++            MessageHandler mh = wsSession.getBinaryMessageHandler();
++            if (mh != null) {
++                if (mh instanceof MessageHandler.Async<?>) {
++                    ((MessageHandler.Async<ByteBuffer>) mh).onMessage(payload,
++                            last);
++                } else {
++                    ((MessageHandler.Basic<ByteBuffer>) mh).onMessage(payload);
++                }
++            }
++        }
++    }
++
+     private boolean isControl() {
+         return (opCode & 0x08) > 0;
+     }
+ 
+ 
+     private boolean isPayloadComplete() {
+-        return pos < (headerLength + payloadLength);
++        return (payloadSent + pos - headerLength) >= payloadLength;
++    }
++
++    private boolean usePartial() {
++        if (opCode == Constants.OPCODE_BINARY) {
++            MessageHandler mh = wsSession.getBinaryMessageHandler();
++            if (mh != null) {
++                return mh instanceof MessageHandler.Async<?>;
++            }
++            return false;
++        } else if (opCode == Constants.OPCODE_TEXT) {
++            MessageHandler mh = wsSession.getTextMessageHandler();
++            if (mh != null) {
++                return mh instanceof MessageHandler.Async<?>;
++            }
++            return false;
++        } else {
++            // All other OpCodes require the full payload to be present
++            return false;
++        }
+     }
+ 
+-    private ByteBuffer getPayload() {
+-        ByteBuffer result;
++    private ByteBuffer getPayloadBinary() {
++        int end;
+         if (isPayloadComplete()) {
+-            result = ByteBuffer.allocate((int) payloadLength);
+-            System.arraycopy(inputBuffer, headerLength, result.array(), 0,
+-                    (int) payloadLength);
++            end = (int) (payloadLength - payloadSent) + headerLength;
+         } else {
+-            // TODO Handle partial payloads
+-            result = null;
++            end = pos;
+         }
+ 
++        ByteBuffer result = ByteBuffer.allocate(end - headerLength);
++
++        for (int i = headerLength; i < end; i++) {
++            result.put(i - headerLength,
++                    (byte) ((inputBuffer[i] ^ mask[maskIndex]) & 0xFF));
++            maskIndex++;
++            if (maskIndex == 4) {
++                maskIndex = 0;
++            }
++        }
++
++        // May have read past end of current frame into next
++
++        pos = 0;
++        headerLength = 0;
++
+         return result;
+     }
+ 
++    private String getPayloadText() {
++        ByteBuffer bb = getPayloadBinary();
++
++        return new String(bb.array(), Charset.forName("UTF-8"));
++    }
++
+     protected static long byteArrayToLong(byte[] b, int start, int len)
+             throws IOException {
+ 
+
+==================================================
+WsSession.java
+similarity index 88%
+rename from java/org/apache/tomcat/websocket/WsPingMessage.java
+rename to java/org/apache/tomcat/websocket/WsPongMessage.java
+index a20a6469d1..417c3961f4 100644
+--- a/java/org/apache/tomcat/websocket/WsPingMessage.java
++++ b/java/org/apache/tomcat/websocket/WsPongMessage.java
+@@ -18,13 +18,13 @@ package org.apache.tomcat.websocket;
+ 
+ import java.nio.ByteBuffer;
+ 
+-import javax.websocket.PingMessage;
++import javax.websocket.PongMessage;
+ 
+-public class WsPingMessage implements PingMessage {
++public class WsPongMessage implements PongMessage {
+ 
+     private final ByteBuffer applicationData;
+ 
+-    public WsPingMessage(ByteBuffer applicationData) {
++    public WsPongMessage(ByteBuffer applicationData) {
+         this.applicationData = applicationData;
+     }
+ 
+
+==================================================
+EchoAnnotation.java
+index 545c798a1a..03cea02383 100644
+--- a/java/org/apache/tomcat/websocket/WsSession.java
++++ b/java/org/apache/tomcat/websocket/WsSession.java
+@@ -30,7 +30,7 @@ import javax.websocket.CloseReason;
+ import javax.websocket.CloseReason.CloseCodes;
+ import javax.websocket.Endpoint;
+ import javax.websocket.MessageHandler;
+-import javax.websocket.PingMessage;
++import javax.websocket.PongMessage;
+ import javax.websocket.RemoteEndpoint;
+ import javax.websocket.Session;
+ 
+@@ -38,7 +38,7 @@ public class WsSession implements Session {
+ 
+     private MessageHandler textMessageHandler = null;
+     private MessageHandler binaryMessageHandler = null;
+-    private MessageHandler.Basic<PingMessage> pingMessageHandler =
++    private MessageHandler.Basic<PongMessage> pongMessageHandler =
+             new DefaultPingMessageHandler(this);
+ 
+     private final Endpoint localEndpoint;
+@@ -62,12 +62,24 @@ public class WsSession implements Session {
+             throw new IllegalArgumentException();
+         }
+         if (types[0].getClass().equals(String.class)) {
++            if (textMessageHandler != null) {
++                // TODO i18n
++                throw new IllegalStateException();
++            }
+             textMessageHandler = listener;
+         } else if (types[0].getClass().equals(ByteBuffer.class)){
++            if (binaryMessageHandler != null) {
++                // TODO i18n
++                throw new IllegalStateException();
++            }
+             binaryMessageHandler = listener;
+-        } else if (types[0].getClass().equals(PingMessage.class)){
++        } else if (types[0].getClass().equals(PongMessage.class)){
++            if (pongMessageHandler != null) {
++                // TODO i18n
++                throw new IllegalStateException();
++            }
+             if (listener instanceof MessageHandler.Basic<?>) {
+-                pingMessageHandler = (MessageHandler.Basic<PingMessage>) listener;
++                pongMessageHandler = (MessageHandler.Basic<PongMessage>) listener;
+             } else {
+                 // TODO i18n
+                 throw new IllegalArgumentException();
+@@ -87,8 +99,8 @@ public class WsSession implements Session {
+         if (textMessageHandler != null) {
+             result.add(textMessageHandler);
+         }
+-        if (pingMessageHandler != null) {
+-            result.add(pingMessageHandler);
++        if (pongMessageHandler != null) {
++            result.add(pongMessageHandler);
+         }
+         return result;
+     }
+@@ -102,8 +114,8 @@ public class WsSession implements Session {
+             textMessageHandler = null;
+         } else if (listener.equals(binaryMessageHandler)) {
+             binaryMessageHandler = null;
+-        } else if (listener.equals(pingMessageHandler)) {
+-            pingMessageHandler = null;
++        } else if (listener.equals(pongMessageHandler)) {
++            pongMessageHandler = null;
+         }
+         // TODO Ignore? ISE?
+     }
+@@ -224,13 +236,13 @@ public class WsSession implements Session {
+         return binaryMessageHandler;
+     }
+ 
+-    public MessageHandler.Basic<PingMessage> getPingMessageHandler() {
+-        return pingMessageHandler;
++    public MessageHandler.Basic<PongMessage> getPongMessageHandler() {
++        return pongMessageHandler;
+     }
+ 
+ 
+     private static class DefaultPingMessageHandler
+-            implements MessageHandler.Basic<PingMessage>{
++            implements MessageHandler.Basic<PongMessage>{
+ 
+         private final WsSession wsSession;
+ 
+@@ -239,7 +251,7 @@ public class WsSession implements Session {
+         }
+ 
+         @Override
+-        public void onMessage(PingMessage message) {
++        public void onMessage(PongMessage message) {
+             RemoteEndpoint remoteEndpoint = wsSession.getRemote();
+             if (remoteEndpoint != null) {
+                 remoteEndpoint.sendPong(message.getApplicationData());
+
+==================================================
+EchoEndpoint.java
+index 60768a915b..bf35af9c59 100644
+--- a/webapps/examples/WEB-INF/classes/websocket/echo/EchoAnnotation.java
++++ b/webapps/examples/WEB-INF/classes/websocket/echo/EchoAnnotation.java
+@@ -17,6 +17,7 @@
+ package websocket.echo;
+ 
+ import javax.websocket.WebSocketEndpoint;
++import javax.websocket.WebSocketMessage;
+ import javax.websocket.WebSocketOpen;
+ import javax.websocket.WebSocketPathParam;
+ 
+@@ -27,4 +28,10 @@ public class EchoAnnotation {
+     public void printOpen(@WebSocketPathParam("test") String test) {
+         System.out.println("EchoAnnotation.printOpen() with [" + test + "]");
+     }
++
++    @WebSocketMessage
++    public String printMessage(String msg) {
++        System.out.println("EchoAnnotation.printMessage() with [" + msg + "]");
++        return msg;
++    }
+ }
+
+==================================================

@@ -1,0 +1,444 @@
+0e27cf01709550833bca840400cb3dd6db465142
+==================================================
+Push socket type specific sendfile code down to SocketWrapper
+==================================================
+Mark Thomas
+==================================================
+Fri Jan 23 19:03:11 2015 +0000
+==================================================
+Http11AprProcessor.java
+Push socket type specific sendfile code down to SocketWrapper
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1654323 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Http11Nio2Processor.java
+index 5f83e8be11..0a108483ef 100644
+--- a/java/org/apache/coyote/http11/Http11AprProcessor.java
++++ b/java/org/apache/coyote/http11/Http11AprProcessor.java
+@@ -96,22 +96,19 @@ public class Http11AprProcessor extends AbstractHttp11Processor<Long> {
+         // Do sendfile as needed: add socket to sendfile and end
+         if (sendfileData != null && !getErrorState().isError()) {
+             sendfileData.keepAlive = keepAlive;
+-            sendfileData.socket = socketWrapper.getSocket().longValue();
+-            if (!((AprEndpoint)endpoint).getSendfile().add(sendfileData)) {
+-                // Didn't send all of the data to sendfile.
+-                if (sendfileData.socket == 0) {
+-                    // The socket is no longer set. Something went wrong.
+-                    // Close the connection. Too late to set status code.
+-                    if (log.isDebugEnabled()) {
+-                        log.debug(sm.getString(
+-                                "http11processor.sendfile.error"));
+-                    }
+-                    setErrorState(ErrorState.CLOSE_NOW, null);
+-                } else {
+-                    // The sendfile Poller will add the socket to the main
+-                    // Poller once sendfile processing is complete
+-                    sendfileInProgress = true;
++            switch (socketWrapper.processSendfile(sendfileData)) {
++            case DONE:
++                // If sendfile is complete, no need to break keep-alive loop
++                return false;
++            case PENDING:
++                sendfileInProgress = true;
++                return true;
++            case ERROR:
++                // Write failed
++                if (log.isDebugEnabled()) {
++                    log.debug(sm.getString("http11processor.sendfile.error"));
+                 }
++                setErrorState(ErrorState.CLOSE_NOW, null);
+                 return true;
+             }
+         }
+
+==================================================
+Http11NioProcessor.java
+index a50c26e8d4..f6aa28e10f 100644
+--- a/java/org/apache/coyote/http11/Http11Nio2Processor.java
++++ b/java/org/apache/coyote/http11/Http11Nio2Processor.java
+@@ -120,17 +120,18 @@ public class Http11Nio2Processor extends AbstractHttp11Processor<Nio2Channel> {
+ 
+ 
+     @Override
+-    protected boolean breakKeepAliveLoop(
+-            SocketWrapperBase<Nio2Channel> socketWrapper) {
++    protected boolean breakKeepAliveLoop(SocketWrapperBase<Nio2Channel> socketWrapper) {
+         openSocket = keepAlive;
+         // Do sendfile as needed: add socket to sendfile and end
+         if (sendfileData != null && !getErrorState().isError()) {
+             sendfileData.keepAlive = keepAlive;
+-            ((Nio2Endpoint.Nio2SocketWrapper) socketWrapper).setSendfileData(sendfileData);
+-            switch (((Nio2Endpoint) endpoint)
+-                    .processSendfile((Nio2Endpoint.Nio2SocketWrapper) socketWrapper)) {
++            switch (socketWrapper.processSendfile(sendfileData)) {
+             case DONE:
++                // If sendfile is complete, no need to break keep-alive loop
+                 return false;
++            case PENDING:
++                sendfileInProgress = true;
++                return true;
+             case ERROR:
+                 // Write failed
+                 if (log.isDebugEnabled()) {
+@@ -138,9 +139,6 @@ public class Http11Nio2Processor extends AbstractHttp11Processor<Nio2Channel> {
+                 }
+                 setErrorState(ErrorState.CLOSE_NOW, null);
+                 return true;
+-            case PENDING:
+-                sendfileInProgress = true;
+-                return true;
+             }
+         }
+         return false;
+@@ -155,7 +153,6 @@ public class Http11Nio2Processor extends AbstractHttp11Processor<Nio2Channel> {
+ 
+     // ----------------------------------------------------- ActionHook Methods
+ 
+-
+     /**
+      * Send an action to the connector.
+      *
+
+==================================================
+AprEndpoint.java
+index eb67ced63f..445c74c2b3 100644
+--- a/java/org/apache/coyote/http11/Http11NioProcessor.java
++++ b/java/org/apache/coyote/http11/Http11NioProcessor.java
+@@ -30,7 +30,6 @@ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.net.AbstractEndpoint;
+ import org.apache.tomcat.util.net.NioChannel;
+ import org.apache.tomcat.util.net.NioEndpoint;
+-import org.apache.tomcat.util.net.NioEndpoint.NioSocketWrapper;
+ import org.apache.tomcat.util.net.SSLSupport;
+ import org.apache.tomcat.util.net.SecureNioChannel;
+ import org.apache.tomcat.util.net.SocketWrapperBase;
+@@ -119,21 +118,21 @@ public class Http11NioProcessor extends AbstractHttp11Processor<NioChannel> {
+         // Do sendfile as needed: add socket to sendfile and end
+         if (sendfileData != null && !getErrorState().isError()) {
+             sendfileData.keepAlive = keepAlive;
+-            ((NioSocketWrapper) socketWrapper).setSendfileData(sendfileData);
+-            SelectionKey key = socketWrapper.getSocket().getIOChannel().keyFor(
+-                    socketWrapper.getSocket().getPoller().getSelector());
+-            //do the first write on this thread, might as well
+-            if (socketWrapper.getSocket().getPoller().processSendfile(key,
+-                    (NioSocketWrapper) socketWrapper, true)) {
++            switch (socketWrapper.processSendfile(sendfileData)) {
++            case DONE:
++                // If sendfile is complete, no need to break keep-alive loop
++                return false;
++            case PENDING:
+                 sendfileInProgress = true;
+-            } else {
++                return true;
++            case ERROR:
+                 // Write failed
+                 if (log.isDebugEnabled()) {
+                     log.debug(sm.getString("http11processor.sendfile.error"));
+                 }
+                 setErrorState(ErrorState.CLOSE_NOW, null);
++                return true;
+             }
+-            return true;
+         }
+         return false;
+     }
+
+==================================================
+Nio2Endpoint.java
+index a32dc265f1..8c6511a770 100644
+--- a/java/org/apache/tomcat/util/net/AprEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AprEndpoint.java
+@@ -1919,10 +1919,10 @@ public class AprEndpoint extends AbstractEndpoint<Long> {
+      */
+     public static class SendfileData extends SendfileDataBase {
+         // File
+-        public long fd;
+-        public long fdpool;
++        protected long fd;
++        protected long fdpool;
+         // Socket and socket pool
+-        public long socket;
++        protected long socket;
+     }
+ 
+ 
+@@ -2010,7 +2010,7 @@ public class AprEndpoint extends AbstractEndpoint<Long> {
+          * @return true if all the data has been sent right away, and false
+          *              otherwise
+          */
+-        public boolean add(SendfileData data) {
++        public SendfileState add(SendfileData data) {
+             // Initialize fd from data given
+             try {
+                 data.fdpool = Socket.pool(data.socket);
+@@ -2027,7 +2027,7 @@ public class AprEndpoint extends AbstractEndpoint<Long> {
+                         if (!(-nw == Status.EAGAIN)) {
+                             Pool.destroy(data.fdpool);
+                             data.socket = 0;
+-                            return false;
++                            return SendfileState.ERROR;
+                         } else {
+                             // Break the loop and add the socket to poller.
+                             break;
+@@ -2039,15 +2039,14 @@ public class AprEndpoint extends AbstractEndpoint<Long> {
+                             // Entire file has been sent
+                             Pool.destroy(data.fdpool);
+                             // Set back socket to blocking mode
+-                            Socket.timeoutSet(
+-                                    data.socket, getSoTimeout() * 1000);
+-                            return true;
++                            Socket.timeoutSet(data.socket, getSoTimeout() * 1000);
++                            return SendfileState.DONE;
+                         }
+                     }
+                 }
+             } catch (Exception e) {
+                 log.warn(sm.getString("endpoint.sendfile.error"), e);
+-                return false;
++                return SendfileState.ERROR;
+             }
+             // Add socket to the list. Newly added sockets will wait
+             // at most for pollTime before being polled
+@@ -2055,7 +2054,7 @@ public class AprEndpoint extends AbstractEndpoint<Long> {
+                 addS.add(data);
+                 this.notify();
+             }
+-            return false;
++            return SendfileState.PENDING;
+         }
+ 
+         /**
+@@ -2643,5 +2642,12 @@ public class AprEndpoint extends AbstractEndpoint<Long> {
+             ((AprEndpoint) getEndpoint()).getPoller().add(
+                     getSocket().longValue(), -1, read, write);
+         }
++
++
++        @Override
++        public SendfileState processSendfile(SendfileDataBase sendfileData) {
++            ((SendfileData) sendfileData).socket = getSocket().longValue();
++            return ((AprEndpoint) getEndpoint()).getSendfile().add((SendfileData) sendfileData);
++        }
+     }
+ }
+
+==================================================
+NioEndpoint.java
+index 4aefd0e582..0ded6d04f4 100644
+--- a/java/org/apache/tomcat/util/net/Nio2Endpoint.java
++++ b/java/org/apache/tomcat/util/net/Nio2Endpoint.java
+@@ -1291,6 +1291,7 @@ public class Nio2Endpoint extends AbstractEndpoint<Nio2Channel> {
+             // NO-OP. Appropriate handlers will already have been registered.
+         }
+ 
++
+         public void awaitBytes() {
+             if (getSocket() == null) {
+                 return;
+@@ -1304,6 +1305,12 @@ public class Nio2Endpoint extends AbstractEndpoint<Nio2Channel> {
+             }
+         }
+ 
++
++        @Override
++        public SendfileState processSendfile(SendfileDataBase sendfileData) {
++            setSendfileData((SendfileData) sendfileData);
++            return ((Nio2Endpoint) getEndpoint()).processSendfile(this);
++        }
+     }
+ 
+ 
+@@ -1612,7 +1619,7 @@ public class Nio2Endpoint extends AbstractEndpoint<Nio2Channel> {
+      * SendfileData class.
+      */
+     public static class SendfileData extends SendfileDataBase {
+-        public FileChannel fchannel;
++        protected FileChannel fchannel;
+         // Internal use only
+         private Nio2SocketWrapper socket;
+         private ByteBuffer buffer;
+
+==================================================
+SocketWrapperBase.java
+index dc677824b6..be58551c0d 100644
+--- a/java/org/apache/tomcat/util/net/NioEndpoint.java
++++ b/java/org/apache/tomcat/util/net/NioEndpoint.java
+@@ -1114,45 +1114,51 @@ public class NioEndpoint extends AbstractEndpoint<NioChannel> {
+             return result;
+         }
+ 
+-        public boolean processSendfile(SelectionKey sk, NioSocketWrapper attachment, boolean event) {
++        public SendfileState processSendfile(SelectionKey sk, NioSocketWrapper socketWrapper, boolean event) {
+             NioChannel sc = null;
+             try {
+-                unreg(sk, attachment, sk.readyOps());
+-                SendfileData sd = attachment.getSendfileData();
++                unreg(sk, socketWrapper, sk.readyOps());
++                SendfileData sd = socketWrapper.getSendfileData();
+ 
+                 if (log.isTraceEnabled()) {
+                     log.trace("Processing send file for: " + sd.fileName);
+                 }
+ 
+-                //setup the file channel
+-                if ( sd.fchannel == null ) {
++                // This method is called by the Http11Processor for the first
++                // execution and then subsequent executions are via the Poller.
++                // This boolean keeps track of the current caller as the
++                // required behaviour varies slightly.
++                boolean calledByProcessor = (sd.fchannel == null);
++
++                if (calledByProcessor) {
++                    // Setup the file channel
+                     File f = new File(sd.fileName);
+-                    if ( !f.exists() ) {
++                    if (!f.exists()) {
+                         cancelledKey(sk);
+-                        return false;
++                        return SendfileState.ERROR;
+                     }
+                     @SuppressWarnings("resource") // Closed when channel is closed
+                     FileInputStream fis = new FileInputStream(f);
+                     sd.fchannel = fis.getChannel();
+                 }
+ 
+-                //configure output channel
+-                sc = attachment.getSocket();
++                // Configure output channel
++                sc = socketWrapper.getSocket();
+                 sc.setSendFile(true);
+-                //ssl channel is slightly different
++                // TLS/SSL channel is slightly different
+                 WritableByteChannel wc = ((sc instanceof SecureNioChannel)?sc:sc.getIOChannel());
+ 
+-                //we still have data in the buffer
++                // We still have data in the buffer
+                 if (sc.getOutboundRemaining()>0) {
+                     if (sc.flushOutbound()) {
+-                        attachment.access();
++                        socketWrapper.access();
+                     }
+                 } else {
+                     long written = sd.fchannel.transferTo(sd.pos,sd.length,wc);
+-                    if ( written > 0 ) {
++                    if (written > 0) {
+                         sd.pos += written;
+                         sd.length -= written;
+-                        attachment.access();
++                        socketWrapper.access();
+                     } else {
+                         // Unusual not to be able to transfer any bytes
+                         // Check the length was set correctly
+@@ -1162,53 +1168,57 @@ public class NioEndpoint extends AbstractEndpoint<NioChannel> {
+                         }
+                     }
+                 }
+-                if ( sd.length <= 0 && sc.getOutboundRemaining()<=0) {
++                if (sd.length <= 0 && sc.getOutboundRemaining()<=0) {
+                     if (log.isDebugEnabled()) {
+                         log.debug("Send file complete for: "+sd.fileName);
+                     }
+-                    attachment.setSendfileData(null);
++                    socketWrapper.setSendfileData(null);
+                     try {
+                         sd.fchannel.close();
+                     } catch (Exception ignore) {
+                     }
+-                    if ( sd.keepAlive ) {
++                    if (!calledByProcessor) {
++                        if (sd.keepAlive) {
+                             if (log.isDebugEnabled()) {
+                                 log.debug("Connection is keep alive, registering back for OP_READ");
+                             }
+                             if (event) {
+-                                this.add(attachment.getSocket(),SelectionKey.OP_READ);
++                                this.add(socketWrapper.getSocket(),SelectionKey.OP_READ);
+                             } else {
+-                                reg(sk,attachment,SelectionKey.OP_READ);
++                                reg(sk,socketWrapper,SelectionKey.OP_READ);
+                             }
+-                    } else {
+-                        if (log.isDebugEnabled()) {
+-                            log.debug("Send file connection is being closed");
++                        } else {
++                            if (log.isDebugEnabled()) {
++                                log.debug("Send file connection is being closed");
++                            }
++                            cancelledKey(sk);
+                         }
+-                        cancelledKey(sk);
+-                        return false;
+                     }
++                    return SendfileState.DONE;
+                 } else {
+-                    if (log.isDebugEnabled()) {
+-                        log.debug("OP_WRITE for sendfile: " + sd.fileName);
+-                    }
+-                    if (event) {
+-                        add(attachment.getSocket(),SelectionKey.OP_WRITE);
+-                    } else {
+-                        reg(sk,attachment,SelectionKey.OP_WRITE);
++                    if (!calledByProcessor) {
++                        if (log.isDebugEnabled()) {
++                            log.debug("OP_WRITE for sendfile: " + sd.fileName);
++                        }
++                        if (event) {
++                            add(socketWrapper.getSocket(),SelectionKey.OP_WRITE);
++                        } else {
++                            reg(sk,socketWrapper,SelectionKey.OP_WRITE);
++                        }
+                     }
++                    return SendfileState.PENDING;
+                 }
+-            }catch ( IOException x ) {
+-                if ( log.isDebugEnabled() ) log.debug("Unable to complete sendfile request:", x);
++            } catch (IOException x) {
++                if (log.isDebugEnabled()) log.debug("Unable to complete sendfile request:", x);
+                 cancelledKey(sk);
+-                return false;
+-            }catch ( Throwable t ) {
+-                log.error("",t);
++                return SendfileState.ERROR;
++            } catch (Throwable t) {
++                log.error("", t);
+                 cancelledKey(sk);
+-                return false;
+-            }finally {
++                return SendfileState.ERROR;
++            } finally {
+                 if (sc!=null) sc.setSendFile(false);
+             }
+-            return true;
+         }
+ 
+         protected void unreg(SelectionKey sk, NioSocketWrapper attachment, int readyOps) {
+@@ -1575,6 +1585,16 @@ public class NioEndpoint extends AbstractEndpoint<NioChannel> {
+                 key.interestOps(key.interestOps() | SelectionKey.OP_READ);
+             }
+         }
++
++
++        @Override
++        public SendfileState processSendfile(SendfileDataBase sendfileData) {
++            setSendfileData((SendfileData) sendfileData);
++            SelectionKey key = getSocket().getIOChannel().keyFor(
++                    getSocket().getPoller().getSelector());
++            // Might as well do the first write on this thread
++            return getSocket().getPoller().processSendfile(key, this, true);
++        }
+     }
+ 
+ 
+@@ -1756,6 +1776,6 @@ public class NioEndpoint extends AbstractEndpoint<NioChannel> {
+      * SendfileData class.
+      */
+     public static class SendfileData extends SendfileDataBase {
+-        public volatile FileChannel fchannel;
++        protected volatile FileChannel fchannel;
+     }
+ }
+
+==================================================

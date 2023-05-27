@@ -1,0 +1,149 @@
+193d3b5c464f5169992e5f9ebb9bf609f0b1efe8
+==================================================
+Add in the ability to catch non blocking read and write errors and propagate that to the servlet
+==================================================
+Filip Hanik
+==================================================
+Fri Jul 6 15:40:14 2012 +0000
+==================================================
+CoyoteAdapter.java
+Add in the ability to catch non blocking read and write errors and propagate that to the servlet
+
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1358271 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AsyncContextImpl.java
+index 0ca01c90d2..19e1e0e3c7 100644
+--- a/java/org/apache/catalina/connector/CoyoteAdapter.java
++++ b/java/org/apache/catalina/connector/CoyoteAdapter.java
+@@ -293,6 +293,22 @@ public class CoyoteAdapter implements Adapter {
+                 if (!asyncConImpl.timeout()) {
+                     asyncConImpl.setErrorState(null);
+                 }
++            } else if (status==SocketStatus.ASYNC_READ_ERROR) {
++                success = true;
++                Throwable t = (Throwable)req.getAttribute(RequestDispatcher.ERROR_EXCEPTION);
++                req.getAttributes().remove(RequestDispatcher.ERROR_EXCEPTION);
++                asyncConImpl.notifyReadError(t);
++                if (t != null) {
++                    asyncConImpl.setErrorState(t);
++                }
++            } else if (status==SocketStatus.ASYNC_WRITE_ERROR) {
++                success = true;
++                Throwable t = (Throwable)req.getAttribute(RequestDispatcher.ERROR_EXCEPTION);
++                req.getAttributes().remove(RequestDispatcher.ERROR_EXCEPTION);
++                asyncConImpl.notifyWriteError(t);
++                if (t != null) {
++                    asyncConImpl.setErrorState(t);
++                }
+             }
+ 
+ 
+
+==================================================
+Http11NioProcessor.java
+index 14b70e01d7..0a39eb0d1d 100644
+--- a/java/org/apache/catalina/core/AsyncContextImpl.java
++++ b/java/org/apache/catalina/core/AsyncContextImpl.java
+@@ -135,6 +135,32 @@ public class AsyncContextImpl implements AsyncContext, AsyncContextCallback {
+         return true;
+     }
+ 
++    public boolean notifyWriteError(Throwable error) {
++        if (request.getResponse().getCoyoteResponse().getWriteListener()==null) return false;
++        ClassLoader oldCL = Thread.currentThread().getContextClassLoader();
++        ClassLoader newCL = request.getContext().getLoader().getClassLoader();
++        try {
++            Thread.currentThread().setContextClassLoader(newCL);
++            request.getResponse().getCoyoteResponse().getWriteListener().onError(error);
++            return true;
++        } finally {
++            Thread.currentThread().setContextClassLoader(oldCL);
++        }
++    }
++
++    public boolean notifyReadError(Throwable error) {
++        if (request.getCoyoteRequest().getReadListener()==null) return false;
++        ClassLoader oldCL = Thread.currentThread().getContextClassLoader();
++        ClassLoader newCL = request.getContext().getLoader().getClassLoader();
++        try {
++            Thread.currentThread().setContextClassLoader(newCL);
++            request.getCoyoteRequest().getReadListener().onError(error);
++            return true;
++        } finally {
++            Thread.currentThread().setContextClassLoader(oldCL);
++        }
++    }
++
+     public boolean timeout() throws IOException {
+         AtomicBoolean result = new AtomicBoolean();
+         request.getCoyoteRequest().action(ActionCode.ASYNC_TIMEOUT, result);
+
+==================================================
+SocketStatus.java
+index 8c89475211..4ea21adb39 100644
+--- a/java/org/apache/coyote/http11/Http11NioProcessor.java
++++ b/java/org/apache/coyote/http11/Http11NioProcessor.java
+@@ -24,6 +24,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ import javax.net.ssl.SSLEngine;
+ import javax.servlet.ReadListener;
++import javax.servlet.RequestDispatcher;
+ import javax.servlet.WriteListener;
+ 
+ import org.apache.coyote.ActionCode;
+@@ -192,14 +193,15 @@ public class Http11NioProcessor extends AbstractHttp11Processor<NioChannel> {
+                     }
+                 }catch (IOException x) {
+                     if (log.isDebugEnabled()) log.debug("Unable to write async data.",x);
+-                    //TODO FIXME-- fix - so we can notify of error
+-                    return SocketState.CLOSED;
++                    status = SocketStatus.ASYNC_WRITE_ERROR;
++                    request.setAttribute(RequestDispatcher.ERROR_EXCEPTION, x);
+                 }
+                 //return if we have more data to write
+-                if (isRegisteredForWrite(attach)) {
++                if (status == SocketStatus.OPEN_WRITE && isRegisteredForWrite(attach)) {
+                     return SocketState.LONG;
+                 }
+             }catch (IllegalStateException x) {
++                attach.interestOps(attach.interestOps() | SelectionKey.OP_WRITE);
+             }
+         } else if (status == SocketStatus.OPEN_READ) {
+             try {
+@@ -209,17 +211,18 @@ public class Http11NioProcessor extends AbstractHttp11Processor<NioChannel> {
+                     }
+                 }catch (IOException x) {
+                     if (log.isDebugEnabled()) log.debug("Unable to read async data.",x);
+-                  //TODO FIXME-- fix - so we can notify of error
+-                    return SocketState.CLOSED;
++                    status = SocketStatus.ASYNC_READ_ERROR;
++                    request.setAttribute(RequestDispatcher.ERROR_EXCEPTION, x);
+                 }
+                 //return if we have more data to write
+             }catch (IllegalStateException x) {
++                attach.interestOps(attach.interestOps() | SelectionKey.OP_READ);
+             }
+         }
+ 
+         SocketState state = super.asyncDispatch(status);
+         //return if we have more data to write
+-        if (isRegisteredForWrite(attach)) {
++        if (state == SocketState.LONG && isRegisteredForWrite(attach)) {
+             return SocketState.LONG;
+         } else {
+             return state;
+@@ -246,7 +249,7 @@ public class Http11NioProcessor extends AbstractHttp11Processor<NioChannel> {
+     protected boolean isRegisteredForWrite(KeyAttachment attach) {
+         //return if we have more data to write
+         if (outputBuffer.hasDataToWrite()) {
+-            attach.interestOps(SelectionKey.OP_WRITE);
++            attach.interestOps(attach.interestOps() | SelectionKey.OP_WRITE);
+             return true;
+         } else {
+             return false;
+
+==================================================

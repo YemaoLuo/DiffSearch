@@ -1,0 +1,171 @@
+3f2e2d89ce9285e1b373b08f56d2a89ef9f911db
+==================================================
+Add some plumbing for non-blocking writes to the AJP connectors. There
+==================================================
+Mark Emlyn
+==================================================
+Wed Sep 4 12:33:42 2013 +0000
+==================================================
+AbstractAjpProcessor.java
+Add some plumbing for non-blocking writes to the AJP connectors. There
+is no functional change. All writes remain blocking.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1519994 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AjpAprProcessor.java
+index 87cb9fce21..819e271a4b 100644
+--- a/java/org/apache/coyote/ajp/AbstractAjpProcessor.java
++++ b/java/org/apache/coyote/ajp/AbstractAjpProcessor.java
+@@ -672,7 +672,7 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+                     }
+                     cping = true;
+                     try {
+-                        output(pongMessageArray, 0, pongMessageArray.length);
++                        output(pongMessageArray, 0, pongMessageArray.length, true);
+                     } catch (IOException e) {
+                         error = true;
+                     }
+@@ -855,8 +855,8 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+     protected abstract void resetTimeouts();
+ 
+     // Methods called by prepareResponse()
+-    protected abstract void output(byte[] src, int offset, int length)
+-            throws IOException;
++    protected abstract int output(byte[] src, int offset, int length,
++            boolean block) throws IOException;
+ 
+     // Methods called by process()
+     protected abstract void setupSocket(SocketWrapper<S> socketWrapper)
+@@ -1002,7 +1002,7 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+ 
+         // Request more data immediately
+         if (!first && !waitingForBodyMessage) {
+-            output(getBodyMessageArray, 0, getBodyMessageArray.length);
++            output(getBodyMessageArray, 0, getBodyMessageArray.length, true);
+             waitingForBodyMessage = true;
+         }
+ 
+@@ -1397,8 +1397,7 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+ 
+         // Write to buffer
+         responseMessage.end();
+-        output(responseMessage.getBuffer(), 0,
+-                responseMessage.getLen());
++        output(responseMessage.getBuffer(), 0, responseMessage.getLen(), true);
+     }
+ 
+ 
+@@ -1408,7 +1407,7 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+     protected void flush(boolean explicit) throws IOException {
+         if (explicit && !finished) {
+             // Send the flush message
+-            output(flushMessageArray, 0, flushMessageArray.length);
++            output(flushMessageArray, 0, flushMessageArray.length, true);
+         }
+     }
+ 
+@@ -1440,9 +1439,9 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+ 
+         // Add the end message
+         if (error) {
+-            output(endAndCloseMessageArray, 0, endAndCloseMessageArray.length);
++            output(endAndCloseMessageArray, 0, endAndCloseMessageArray.length, true);
+         } else {
+-            output(endMessageArray, 0, endMessageArray.length);
++            output(endMessageArray, 0, endMessageArray.length, true);
+         }
+     }
+ 
+@@ -1523,7 +1522,7 @@ public abstract class AbstractAjpProcessor<S> extends AbstractProcessor<S> {
+                     responseMessage.appendByte(Constants.JK_AJP13_SEND_BODY_CHUNK);
+                     responseMessage.appendBytes(chunk.getBytes(), chunk.getOffset() + off, thisTime);
+                     responseMessage.end();
+-                    output(responseMessage.getBuffer(), 0, responseMessage.getLen());
++                    output(responseMessage.getBuffer(), 0, responseMessage.getLen(), true);
+ 
+                     off += thisTime;
+                 }
+
+==================================================
+AjpNioProcessor.java
+index 1dd64edb81..8c124e45c5 100644
+--- a/java/org/apache/coyote/ajp/AjpAprProcessor.java
++++ b/java/org/apache/coyote/ajp/AjpAprProcessor.java
+@@ -24,6 +24,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock.WriteLock;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.jni.Socket;
++import org.apache.tomcat.jni.Status;
+ import org.apache.tomcat.util.net.AprEndpoint;
+ import org.apache.tomcat.util.net.SocketWrapper;
+ 
+@@ -102,22 +103,32 @@ public class AjpAprProcessor extends AbstractAjpProcessor<Long> {
+ 
+ 
+     @Override
+-    protected void output(byte[] src, int offset, int length)
++    protected int output(byte[] src, int offset, int length, boolean block)
+             throws IOException {
++
++        if (length == 0) {
++            return 0;
++        }
++
+         outputBuffer.put(src, offset, length);
+ 
+-        long socketRef = socketWrapper.getSocket().longValue();
++        int result = -1;
+ 
+-        if (outputBuffer.position() > 0) {
+-            if ((socketRef != 0) &&
+-                    writeSocket(0, outputBuffer.position(), true) < 0) {
++        if (socketWrapper.getSocket().longValue() != 0) {
++            result = writeSocket(0, outputBuffer.position(), block);
++            if (Status.APR_STATUS_IS_EAGAIN(-result)) {
++                result = 0;
++            }
++            if (result < 0) {
+                 // There are no re-tries so clear the buffer to prevent a
+                 // possible overflow if the buffer is used again. BZ53119.
+                 outputBuffer.clear();
+                 throw new IOException(sm.getString("ajpprocessor.failedsend"));
+             }
+-            outputBuffer.clear();
+         }
++        outputBuffer.clear();
++
++        return result;
+     }
+ 
+ 
+
+==================================================
+AjpProcessor.java
+index 3df520af88..1d7c1059b6 100644
+--- a/java/org/apache/coyote/ajp/AjpNioProcessor.java
++++ b/java/org/apache/coyote/ajp/AjpNioProcessor.java
+@@ -110,7 +110,7 @@ public class AjpNioProcessor extends AbstractAjpProcessor<NioChannel> {
+ 
+ 
+     @Override
+-    protected void output(byte[] src, int offset, int length)
++    protected int output(byte[] src, int offset, int length, boolean block)
+             throws IOException {
+ 
+         NioEndpoint.KeyAttachment att =
+@@ -132,8 +132,8 @@ public class AjpNioProcessor extends AbstractAjpProcessor<NioChannel> {
+             //ignore
+         }
+         try {
+-            pool.write(writeBuffer, socketWrapper.getSocket(), selector,
+-                    writeTimeout, true);
++            return pool.write(writeBuffer, socketWrapper.getSocket(), selector,
++                    writeTimeout, block);
+         } finally {
+             writeBuffer.clear();
+             if (selector != null) {
+
+==================================================

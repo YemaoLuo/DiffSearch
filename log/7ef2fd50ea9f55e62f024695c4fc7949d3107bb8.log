@@ -1,0 +1,301 @@
+7ef2fd50ea9f55e62f024695c4fc7949d3107bb8
+==================================================
+Extract Context.bind and unbind to an interface to make the CL bind cleaner for the upgrade code (including using a PA if needed).
+==================================================
+Remy Maucherat
+==================================================
+Mon Nov 23 16:19:33 2015 +0000
+==================================================
+Context.java
+Extract Context.bind and unbind to an interface to make the CL bind cleaner for the upgrade code (including using a PA if needed).
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1715866 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Request.java
+index c2c255f500..a59dff7db4 100644
+--- a/java/org/apache/catalina/Context.java
++++ b/java/org/apache/catalina/Context.java
+@@ -29,6 +29,7 @@ import javax.servlet.ServletSecurityElement;
+ import javax.servlet.descriptor.JspConfigDescriptor;
+ 
+ import org.apache.catalina.deploy.NamingResourcesImpl;
++import org.apache.tomcat.ContextBind;
+ import org.apache.tomcat.InstanceManager;
+ import org.apache.tomcat.JarScanner;
+ import org.apache.tomcat.util.descriptor.web.ApplicationParameter;
+@@ -57,7 +58,7 @@ import org.apache.tomcat.util.http.CookieProcessor;
+  *
+  * @author Craig R. McClanahan
+  */
+-public interface Context extends Container {
++public interface Context extends Container, ContextBind {
+ 
+ 
+     // ----------------------------------------------------- Manifest Constants
+@@ -1625,45 +1626,6 @@ public interface Context extends Container {
+      */
+     public Map<String, String> findPreDestroyMethods();
+ 
+-    /**
+-     * Change the current thread context class loader to the web application
+-     * class loader. If no web application class loader is defined, or if the
+-     * current thread is already using the web application class loader then no
+-     * change will be made. If the class loader is changed and a
+-     * {@link ThreadBindingListener} is configured then
+-     * {@link ThreadBindingListener#bind()} will be called after the change has
+-     * been made.
+-     *
+-     * @param usePrivilegedAction
+-     *          Should a {@link java.security.PrivilegedAction} be used when
+-     *          obtaining the current thread context class loader and setting
+-     *          the new one?
+-     * @param originalClassLoader
+-     *          The current class loader if known to save this method having to
+-     *          look it up
+-     *
+-     * @return If the class loader has been changed by the method it will return
+-     *         the thread context class loader in use when the method was
+-     *         called. If no change was made then this method returns null.
+-     */
+-    public ClassLoader bind(boolean usePrivilegedAction, ClassLoader originalClassLoader);
+-
+-    /**
+-     * Restore the current thread context class loader to the original class
+-     * loader in used before {@link #bind(boolean, ClassLoader)} was called. If
+-     * no original class loader is passed to this method then no change will be
+-     * made. If the class loader is changed and a {@link ThreadBindingListener}
+-     * is configured then {@link ThreadBindingListener#unbind()} will be called
+-     * before the change is made.
+-     *
+-     * @param usePrivilegedAction
+-     *          Should a {@link java.security.PrivilegedAction} be used when
+-     *          setting the current thread context class loader?
+-     * @param originalClassLoader
+-     *          The class loader to restore as the thread context class loader
+-     */
+-    public void unbind(boolean usePrivilegedAction, ClassLoader originalClassLoader);
+-
+     /**
+      * Obtain the token necessary for operations on the associated JNDI naming
+      * context.
+
+==================================================
+AbstractProtocol.java
+index 9404fb2ba8..8180aaa57b 100644
+--- a/java/org/apache/catalina/connector/Request.java
++++ b/java/org/apache/catalina/connector/Request.java
+@@ -1865,7 +1865,7 @@ public class Request implements HttpServletRequest {
+             throw new ServletException(e);
+         }
+         UpgradeToken upgradeToken = new UpgradeToken(handler,
+-                getContext().getLoader().getClassLoader(), instanceManager);
++                getContext(), instanceManager);
+ 
+         coyoteRequest.action(ActionCode.UPGRADE, upgradeToken);
+ 
+
+==================================================
+UpgradeToken.java
+index 5c079decbc..c5c77f727f 100644
+--- a/java/org/apache/coyote/AbstractProtocol.java
++++ b/java/org/apache/coyote/AbstractProtocol.java
+@@ -780,14 +780,11 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+                         if (upgradeToken.getInstanceManager() == null) {
+                             httpUpgradeHandler.init((WebConnection) processor);
+                         } else {
+-                            Thread thread = Thread.currentThread();
+-                            // Set context class loader environment for user class call
+-                            ClassLoader originalClassLoader = thread.getContextClassLoader();
++                            ClassLoader oldCL = upgradeToken.getContextBind().bind(false, null);
+                             try {
+-                                thread.setContextClassLoader(upgradeToken.getApplicationClassLoader());
+                                 httpUpgradeHandler.init((WebConnection) processor);
+                             } finally {
+-                                thread.setContextClassLoader(originalClassLoader);
++                                upgradeToken.getContextBind().unbind(false, oldCL);
+                             }
+                         }
+                     }
+@@ -833,15 +830,12 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+                         if (instanceManager == null) {
+                             httpUpgradeHandler.destroy();
+                         } else {
+-                            Thread thread = Thread.currentThread();
+-                            // Set context class loader environment for user class call
+-                            ClassLoader originalClassLoader = thread.getContextClassLoader();
++                            ClassLoader oldCL = upgradeToken.getContextBind().bind(false, null);
+                             try {
+-                                thread.setContextClassLoader(upgradeToken.getApplicationClassLoader());
+                                 httpUpgradeHandler.destroy();
+                                 instanceManager.destroyInstance(httpUpgradeHandler);
+                             } finally {
+-                                thread.setContextClassLoader(originalClassLoader);
++                                upgradeToken.getContextBind().unbind(false, oldCL);
+                             }
+                         }
+                     } else {
+
+==================================================
+Http11Processor.java
+index 3e6857759a..cf297fbe28 100644
+--- a/java/org/apache/coyote/UpgradeToken.java
++++ b/java/org/apache/coyote/UpgradeToken.java
+@@ -19,6 +19,7 @@ package org.apache.coyote;
+ 
+ import javax.servlet.http.HttpUpgradeHandler;
+ 
++import org.apache.tomcat.ContextBind;
+ import org.apache.tomcat.InstanceManager;
+ 
+ /**
+@@ -26,19 +27,19 @@ import org.apache.tomcat.InstanceManager;
+  */
+ public final class UpgradeToken {
+ 
+-    private final ClassLoader applicationClassLoader;
++    private final ContextBind contextBind;
+     private final HttpUpgradeHandler httpUpgradeHandler;
+     private final InstanceManager instanceManager;
+ 
+     public UpgradeToken(HttpUpgradeHandler httpUpgradeHandler,
+-            ClassLoader applicationClassLoader, InstanceManager instanceManager) {
+-        this.applicationClassLoader = applicationClassLoader;
++            ContextBind contextBind, InstanceManager instanceManager) {
++        this.contextBind = contextBind;
+         this.httpUpgradeHandler = httpUpgradeHandler;
+         this.instanceManager = instanceManager;
+     }
+ 
+-    public final ClassLoader getApplicationClassLoader() {
+-        return applicationClassLoader;
++    public final ContextBind getContextBind() {
++        return contextBind;
+     }
+ 
+     public final HttpUpgradeHandler getHttpUpgradeHandler() {
+
+==================================================
+UpgradeServletInputStream.java
+index 4f74dbf7c4..ed838fbb16 100644
+--- a/java/org/apache/coyote/http11/Http11Processor.java
++++ b/java/org/apache/coyote/http11/Http11Processor.java
+@@ -1041,8 +1041,7 @@ public class Http11Processor extends AbstractProcessor {
+                         InternalHttpUpgradeHandler upgradeHandler =
+                                 upgradeProtocol.getInternalUpgradeHandler(
+                                         getAdapter(), cloneRequest(request));
+-                        UpgradeToken upgradeToken = new UpgradeToken(
+-                                upgradeHandler, Http11Processor.class.getClassLoader(), null);
++                        UpgradeToken upgradeToken = new UpgradeToken(upgradeHandler, null, null);
+                         action(ActionCode.UPGRADE, upgradeToken);
+                         return SocketState.UPGRADING;
+                     }
+
+==================================================
+UpgradeServletOutputStream.java
+index 276b658686..25b808e60b 100644
+--- a/java/org/apache/coyote/http11/upgrade/UpgradeServletInputStream.java
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeServletInputStream.java
+@@ -206,10 +206,8 @@ public class UpgradeServletInputStream extends ServletInputStream {
+             return;
+         }
+         ready = Boolean.TRUE;
+-        Thread thread = Thread.currentThread();
+-        ClassLoader originalClassLoader = thread.getContextClassLoader();
++        ClassLoader oldCL = processor.getUpgradeToken().getContextBind().bind(false, null);
+         try {
+-            thread.setContextClassLoader(processor.getUpgradeToken().getApplicationClassLoader());
+             if (!eof) {
+                 listener.onDataAvailable();
+             }
+@@ -220,7 +218,7 @@ public class UpgradeServletInputStream extends ServletInputStream {
+             ExceptionUtils.handleThrowable(t);
+             onError(t);
+         } finally {
+-            thread.setContextClassLoader(originalClassLoader);
++            processor.getUpgradeToken().getContextBind().unbind(false, oldCL);
+         }
+     }
+ 
+@@ -229,16 +227,14 @@ public class UpgradeServletInputStream extends ServletInputStream {
+         if (listener == null) {
+             return;
+         }
+-        Thread thread = Thread.currentThread();
+-        ClassLoader originalClassLoader = thread.getContextClassLoader();
++        ClassLoader oldCL = processor.getUpgradeToken().getContextBind().bind(false, null);
+         try {
+-            thread.setContextClassLoader(processor.getUpgradeToken().getApplicationClassLoader());
+             listener.onError(t);
+         } catch (Throwable t2) {
+             ExceptionUtils.handleThrowable(t2);
+             log.warn(sm.getString("upgrade.sis.onErrorFail"), t2);
+         } finally {
+-            thread.setContextClassLoader(originalClassLoader);
++            processor.getUpgradeToken().getContextBind().unbind(false, oldCL);
+         }
+         try {
+             close();
+
+==================================================
+Http2Protocol.java
+index 5e6f558b0e..81f0f786fc 100644
+--- a/java/org/apache/coyote/http11/upgrade/UpgradeServletOutputStream.java
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeServletOutputStream.java
+@@ -245,16 +245,14 @@ public class UpgradeServletOutputStream extends ServletOutputStream {
+         }
+ 
+         if (fire) {
+-            Thread thread = Thread.currentThread();
+-            ClassLoader originalClassLoader = thread.getContextClassLoader();
++            ClassLoader oldCL = processor.getUpgradeToken().getContextBind().bind(false, null);
+             try {
+-                thread.setContextClassLoader(processor.getUpgradeToken().getApplicationClassLoader());
+                 listener.onWritePossible();
+             } catch (Throwable t) {
+                 ExceptionUtils.handleThrowable(t);
+                 onError(t);
+             } finally {
+-                thread.setContextClassLoader(originalClassLoader);
++                processor.getUpgradeToken().getContextBind().unbind(false, oldCL);
+             }
+         }
+     }
+@@ -264,16 +262,14 @@ public class UpgradeServletOutputStream extends ServletOutputStream {
+         if (listener == null) {
+             return;
+         }
+-        Thread thread = Thread.currentThread();
+-        ClassLoader originalClassLoader = thread.getContextClassLoader();
++        ClassLoader oldCL = processor.getUpgradeToken().getContextBind().bind(false, null);
+         try {
+-            thread.setContextClassLoader(processor.getUpgradeToken().getApplicationClassLoader());
+             listener.onError(t);
+         } catch (Throwable t2) {
+             ExceptionUtils.handleThrowable(t2);
+             log.warn(sm.getString("upgrade.sos.onErrorFail"), t2);
+         } finally {
+-            thread.setContextClassLoader(originalClassLoader);
++            processor.getUpgradeToken().getContextBind().unbind(false, oldCL);
+         }
+         try {
+             close();
+
+==================================================
+ContextBind.java
+index 1506483e89..e64b9acc8f 100644
+--- a/java/org/apache/coyote/http2/Http2Protocol.java
++++ b/java/org/apache/coyote/http2/Http2Protocol.java
+@@ -73,7 +73,7 @@ public class Http2Protocol implements UpgradeProtocol {
+     @Override
+     public Processor getProcessor(SocketWrapperBase<?> socketWrapper, Adapter adapter) {
+         UpgradeProcessorInternal processor = new UpgradeProcessorInternal(socketWrapper, null,
+-                new UpgradeToken(getInternalUpgradeHandler(adapter, null), Http2Protocol.class.getClassLoader(), null));
++                new UpgradeToken(getInternalUpgradeHandler(adapter, null), null, null));
+         return processor;
+     }
+ 
+
+==================================================

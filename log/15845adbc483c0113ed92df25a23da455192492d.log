@@ -1,0 +1,435 @@
+15845adbc483c0113ed92df25a23da455192492d
+==================================================
+More work towards using Charset rather than String internally to reduce the number of calls required to B2CConverter.getCharset() or equivalent during a request.
+==================================================
+Mark Thomas
+==================================================
+Thu May 4 20:19:52 2017 +0000
+==================================================
+CoyoteAdapter.java
+More work towards using Charset rather than String internally to reduce the number of calls required to B2CConverter.getCharset() or equivalent during a request.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1793887 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Request.java
+index db56f56d37..c6366ea46b 100644
+--- a/java/org/apache/catalina/connector/CoyoteAdapter.java
++++ b/java/org/apache/catalina/connector/CoyoteAdapter.java
+@@ -318,7 +318,7 @@ public class CoyoteAdapter implements Adapter {
+             res.setNote(ADAPTER_NOTES, response);
+ 
+             // Set query string encoding
+-            req.getParameters().setQueryStringEncoding(connector.getURIEncoding());
++            req.getParameters().setQueryStringCharset(connector.getURICharset());
+         }
+ 
+         if (connector.getXpoweredBy()) {
+@@ -447,7 +447,7 @@ public class CoyoteAdapter implements Adapter {
+             res.setNote(ADAPTER_NOTES, response);
+ 
+             // Set query string encoding
+-            req.getParameters().setQueryStringEncoding(connector.getURIEncoding());
++            req.getParameters().setQueryStringCharset(connector.getURICharset());
+         }
+ 
+         try {
+
+==================================================
+ApplicationHttpRequest.java
+index 8ad51bda0e..f6b0896f64 100644
+--- a/java/org/apache/catalina/connector/Request.java
++++ b/java/org/apache/catalina/connector/Request.java
+@@ -985,6 +985,26 @@ public class Request implements HttpServletRequest {
+     }
+ 
+ 
++    private Charset getCharset() {
++        Charset charset = coyoteRequest.getCharset();
++        if (charset != null) {
++            return charset;
++        }
++
++        Context context = getContext();
++        if (context != null) {
++            String encoding = context.getRequestCharacterEncoding();
++            try {
++                return B2CConverter.getCharset(encoding);
++            } catch (UnsupportedEncodingException e) {
++                // Ignore
++            }
++        }
++
++        return org.apache.coyote.Constants.DEFAULT_BODY_CHARSET;
++    }
++
++
+     /**
+      * @return the content length for this Request.
+      */
+@@ -2796,15 +2816,7 @@ public class Request implements HttpServletRequest {
+                         upload.parseRequest(new ServletRequestContext(this));
+                 int maxPostSize = getConnector().getMaxPostSize();
+                 int postSize = 0;
+-                String enc = getCharacterEncoding();
+-                Charset charset = null;
+-                if (enc != null) {
+-                    try {
+-                        charset = B2CConverter.getCharset(enc);
+-                    } catch (UnsupportedEncodingException e) {
+-                        // Ignore
+-                    }
+-                }
++                Charset charset = getCharset();
+                 for (FileItem item : items) {
+                     ApplicationPart part = new ApplicationPart(item, location);
+                     parts.add(part);
+@@ -2812,31 +2824,15 @@ public class Request implements HttpServletRequest {
+                         String name = part.getName();
+                         String value = null;
+                         try {
+-                            String encoding = parameters.getEncoding();
+-                            if (encoding == null) {
+-                                if (enc == null) {
+-                                    encoding = Parameters.DEFAULT_ENCODING;
+-                                } else {
+-                                    encoding = enc;
+-                                }
+-                            }
+-                            value = part.getString(encoding);
++                            Charset paramCharset = parameters.getCharset();
++                            value = part.getString(paramCharset.name());
+                         } catch (UnsupportedEncodingException uee) {
+-                            try {
+-                                value = part.getString(Parameters.DEFAULT_ENCODING);
+-                            } catch (UnsupportedEncodingException e) {
+-                                // Should not be possible
+-                            }
++                            // Not possible
+                         }
+                         if (maxPostSize >= 0) {
+                             // Have to calculate equivalent size. Not completely
+                             // accurate but close enough.
+-                            if (charset == null) {
+-                                // Name length
+-                                postSize += name.getBytes().length;
+-                            } else {
+-                                postSize += name.getBytes(charset).length;
+-                            }
++                            postSize += name.getBytes(charset).length;
+                             if (value != null) {
+                                 // Equals sign
+                                 postSize++;
+@@ -3127,20 +3123,12 @@ public class Request implements HttpServletRequest {
+ 
+             // getCharacterEncoding() may have been overridden to search for
+             // hidden form field containing request encoding
+-            String enc = getCharacterEncoding();
++            Charset charset = getCharset();
+ 
+             boolean useBodyEncodingForURI = connector.getUseBodyEncodingForURI();
+-            if (enc != null) {
+-                parameters.setEncoding(enc);
+-                if (useBodyEncodingForURI) {
+-                    parameters.setQueryStringEncoding(enc);
+-                }
+-            } else {
+-                parameters.setEncoding(org.apache.coyote.Constants.DEFAULT_BODY_CHARSET.name());
+-                if (useBodyEncodingForURI) {
+-                    parameters.setQueryStringEncoding(
+-                            org.apache.coyote.Constants.DEFAULT_BODY_CHARSET.name());
+-                }
++            parameters.setCharset(charset);
++            if (useBodyEncodingForURI) {
++                parameters.setQueryStringCharset(charset);
+             }
+             // Note: If !useBodyEncodingForURI, the query string encoding is
+             //       that set towards the start of CoyoyeAdapter.service()
+
+==================================================
+Parameters.java
+index 7778d91355..9be932c48e 100644
+--- a/java/org/apache/catalina/core/ApplicationHttpRequest.java
++++ b/java/org/apache/catalina/core/ApplicationHttpRequest.java
+@@ -21,6 +21,8 @@ package org.apache.catalina.core;
+ 
+ import java.io.IOException;
+ import java.io.UnsupportedEncodingException;
++import java.nio.charset.Charset;
++import java.nio.charset.StandardCharsets;
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.Enumeration;
+@@ -878,19 +880,19 @@ class ApplicationHttpRequest extends HttpServletRequestWrapper {
+         // - To add to the fun, the URI default changed in Servlet 4.0 to UTF-8
+ 
+         String encoding = getCharacterEncoding();
+-        // No need to process null value, as ISO-8859-1 is the default encoding
+-        // in MessageBytes.toBytes().
++        Charset charset = null;
+         if (encoding != null) {
+             try {
+-                queryMB.setCharset(B2CConverter.getCharset(encoding));
+-            } catch (UnsupportedEncodingException ignored) {
++                charset = B2CConverter.getCharset(encoding);
++                queryMB.setCharset(charset);
++            } catch (UnsupportedEncodingException e) {
+                 // Fall-back to default (ISO-8859-1)
+-                encoding = null;
++                charset = StandardCharsets.ISO_8859_1;
+             }
+         }
+ 
+         paramParser.setQuery(queryMB);
+-        paramParser.setQueryStringEncoding(encoding);
++        paramParser.setQueryStringCharset(charset);
+         paramParser.handleQueryParameters();
+ 
+         // Insert the additional parameters from the dispatch target
+
+==================================================
+TestParameters.java
+index 72fb2589a3..138e80da6e 100644
+--- a/java/org/apache/tomcat/util/http/Parameters.java
++++ b/java/org/apache/tomcat/util/http/Parameters.java
+@@ -60,8 +60,8 @@ public final class Parameters {
+     private UDecoder urlDec;
+     private final MessageBytes decodedQuery = MessageBytes.newInstance();
+ 
+-    private String encoding=null;
+-    private String queryStringEncoding=null;
++    private Charset charset = StandardCharsets.ISO_8859_1;
++    private Charset queryStringCharset = StandardCharsets.UTF_8;
+ 
+     private int limit = -1;
+     private int parameterCount = 0;
+@@ -84,21 +84,58 @@ public final class Parameters {
+         this.limit = limit;
+     }
+ 
++    /**
++     * @return The current encoding
++     *
++     * @deprecated This method will be removed in Tomcat 9.0.x
++     */
++    @Deprecated
+     public String getEncoding() {
+-        return encoding;
++        return charset.name();
++    }
++
++    public Charset getCharset() {
++        return charset;
++    }
++
++    /**
++     * @param s The new encoding
++     *
++     * @deprecated This method will be removed in Tomcat 9.0.x
++     */
++    @Deprecated
++    public void setEncoding(String s) {
++        setCharset(getCharset(s, DEFAULT_BODY_CHARSET));
+     }
+ 
+-    public void setEncoding( String s ) {
+-        encoding=s;
++    public void setCharset(Charset charset) {
++        if (charset == null) {
++            charset = DEFAULT_BODY_CHARSET;
++        }
++        this.charset = charset;
+         if(log.isDebugEnabled()) {
+-            log.debug( "Set encoding to " + s );
++            log.debug("Set encoding to " + charset.name());
+         }
+     }
+ 
+-    public void setQueryStringEncoding( String s ) {
+-        queryStringEncoding=s;
++    /**
++     * @param s The new query string encoding
++     *
++     * @deprecated This method will be removed in Tomcat 9
++     */
++    @Deprecated
++    public void setQueryStringEncoding(String s) {
++        setQueryStringCharset(getCharset(s, DEFAULT_URI_CHARSET));
++    }
++
++    public void setQueryStringCharset(Charset queryStringCharset) {
++        if (queryStringCharset == null) {
++            queryStringCharset = DEFAULT_URI_CHARSET;
++        }
++        this.queryStringCharset = queryStringCharset;
++
+         if(log.isDebugEnabled()) {
+-            log.debug( "Set query string encoding to " + s );
++            log.debug("Set query string encoding to " + queryStringCharset.name());
+         }
+     }
+ 
+@@ -123,8 +160,8 @@ public final class Parameters {
+     public void recycle() {
+         parameterCount = 0;
+         paramHashValues.clear();
+-        didQueryParameters=false;
+-        encoding=null;
++        didQueryParameters = false;
++        charset = null;
+         decodedQuery.recycle();
+         parseFailedReason = null;
+     }
+@@ -165,28 +202,27 @@ public final class Parameters {
+     /** Process the query string into parameters
+      */
+     public void handleQueryParameters() {
+-        if( didQueryParameters ) {
++        if (didQueryParameters) {
+             return;
+         }
+ 
+-        didQueryParameters=true;
++        didQueryParameters = true;
+ 
+-        if( queryMB==null || queryMB.isNull() ) {
++        if (queryMB == null || queryMB.isNull()) {
+             return;
+         }
+ 
+         if(log.isDebugEnabled()) {
+-            log.debug("Decoding query " + decodedQuery + " " +
+-                    queryStringEncoding);
++            log.debug("Decoding query " + decodedQuery + " " + queryStringCharset.name());
+         }
+ 
+         try {
+-            decodedQuery.duplicate( queryMB );
++            decodedQuery.duplicate(queryMB);
+         } catch (IOException e) {
+             // Can't happen, as decodedQuery can't overflow
+             e.printStackTrace();
+         }
+-        processParameters( decodedQuery, queryStringEncoding );
++        processParameters(decodedQuery, queryStringCharset);
+     }
+ 
+ 
+@@ -226,20 +262,19 @@ public final class Parameters {
+     private final ByteChunk origName=new ByteChunk();
+     private final ByteChunk origValue=new ByteChunk();
+     public static final String DEFAULT_ENCODING = "ISO-8859-1";
+-    private static final Charset DEFAULT_CHARSET =
+-            StandardCharsets.ISO_8859_1;
++    private static final Charset DEFAULT_BODY_CHARSET = StandardCharsets.ISO_8859_1;
++    private static final Charset DEFAULT_URI_CHARSET = StandardCharsets.UTF_8;
+ 
+ 
+     public void processParameters( byte bytes[], int start, int len ) {
+-        processParameters(bytes, start, len, getCharset(encoding));
++        processParameters(bytes, start, len, charset);
+     }
+ 
+-    private void processParameters(byte bytes[], int start, int len,
+-                                  Charset charset) {
++    private void processParameters(byte bytes[], int start, int len, Charset charset) {
+ 
+         if(log.isDebugEnabled()) {
+             log.debug(sm.getString("parameters.bytes",
+-                    new String(bytes, start, len, DEFAULT_CHARSET)));
++                    new String(bytes, start, len, DEFAULT_BODY_CHARSET)));
+         }
+ 
+         int decodeFailCount = 0;
+@@ -309,8 +344,7 @@ public final class Parameters {
+             if (log.isDebugEnabled() && valueStart == -1) {
+                 log.debug(sm.getString("parameters.noequal",
+                         Integer.valueOf(nameStart), Integer.valueOf(nameEnd),
+-                        new String(bytes, nameStart, nameEnd-nameStart,
+-                                DEFAULT_CHARSET)));
++                        new String(bytes, nameStart, nameEnd-nameStart, DEFAULT_BODY_CHARSET)));
+             }
+ 
+             if (nameEnd <= nameStart ) {
+@@ -327,8 +361,8 @@ public final class Parameters {
+                 if (logMode != null) {
+                     String extract;
+                     if (valueEnd > nameStart) {
+-                        extract = new String(bytes, nameStart, valueEnd
+-                                - nameStart, DEFAULT_CHARSET);
++                        extract = new String(bytes, nameStart, valueEnd - nameStart,
++                                DEFAULT_BODY_CHARSET);
+                     } else {
+                         extract = "";
+                     }
+@@ -482,7 +516,18 @@ public final class Parameters {
+         urlDec.convert(bc, true);
+     }
+ 
+-    public void processParameters( MessageBytes data, String encoding ) {
++    /**
++     * @param data      Parameter data
++     * @param encoding  Encoding to use for encoded bytes
++     *
++     * @deprecated This method will be removed in Tomcat 9.0.x
++     */
++    @Deprecated
++    public void processParameters(MessageBytes data, String encoding) {
++        processParameters(data, getCharset(encoding, DEFAULT_BODY_CHARSET));
++    }
++
++    public void processParameters(MessageBytes data, Charset charset) {
+         if( data==null || data.isNull() || data.getLength() <= 0 ) {
+             return;
+         }
+@@ -491,18 +536,17 @@ public final class Parameters {
+             data.toBytes();
+         }
+         ByteChunk bc=data.getByteChunk();
+-        processParameters( bc.getBytes(), bc.getOffset(),
+-                           bc.getLength(), getCharset(encoding));
++        processParameters(bc.getBytes(), bc.getOffset(), bc.getLength(), charset);
+     }
+ 
+-    private Charset getCharset(String encoding) {
++    private Charset getCharset(String encoding, Charset defaultCharset) {
+         if (encoding == null) {
+-            return DEFAULT_CHARSET;
++            return defaultCharset;
+         }
+         try {
+             return B2CConverter.getCharset(encoding);
+         } catch (UnsupportedEncodingException e) {
+-            return DEFAULT_CHARSET;
++            return defaultCharset;
+         }
+     }
+ 
+
+==================================================
+TesterParametersPerformance.java
+index 7bd95e190d..d9327c395e 100644
+--- a/test/org/apache/tomcat/util/http/TestParameters.java
++++ b/test/org/apache/tomcat/util/http/TestParameters.java
+@@ -18,6 +18,7 @@ package org.apache.tomcat.util.http;
+ 
+ import java.io.UnsupportedEncodingException;
+ import java.net.URLEncoder;
++import java.nio.charset.StandardCharsets;
+ import java.util.Enumeration;
+ 
+ import static org.junit.Assert.assertArrayEquals;
+@@ -105,7 +106,7 @@ public class TestParameters {
+         byte[] data = input.toString().getBytes();
+ 
+         Parameters p = new Parameters();
+-        p.setEncoding("UTF-8");
++        p.setCharset(StandardCharsets.UTF_8);
+         p.setLimit(limit);
+ 
+         long start = System.nanoTime();
+
+==================================================

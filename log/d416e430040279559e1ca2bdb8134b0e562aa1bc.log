@@ -1,0 +1,347 @@
+d416e430040279559e1ca2bdb8134b0e562aa1bc
+==================================================
+Update Commons Pool fork to 2.4.0
+==================================================
+Mark Thomas
+==================================================
+Thu May 28 20:09:07 2015 +0000
+==================================================
+BaseGenericObjectPool.java
+Update Commons Pool fork to 2.4.0
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1682320 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+GenericKeyedObjectPool.java
+index af8df22ecc..8d816a02ce 100644
+--- a/java/org/apache/tomcat/dbcp/pool2/impl/BaseGenericObjectPool.java
++++ b/java/org/apache/tomcat/dbcp/pool2/impl/BaseGenericObjectPool.java
+@@ -21,6 +21,7 @@ import java.io.StringWriter;
+ import java.io.Writer;
+ import java.lang.management.ManagementFactory;
+ import java.lang.ref.WeakReference;
++import java.util.Deque;
+ import java.util.Iterator;
+ import java.util.TimerTask;
+ import java.util.concurrent.atomic.AtomicLong;
+@@ -89,7 +90,7 @@ public abstract class BaseGenericObjectPool<T> {
+     volatile boolean closed = false;
+     final Object evictionLock = new Object();
+     private Evictor evictor = null; // @GuardedBy("evictionLock")
+-    Iterator<PooledObject<T>> evictionIterator = null; // @GuardedBy("evictionLock")
++    EvictionIterator evictionIterator = null; // @GuardedBy("evictionLock")
+     /*
+      * Class loader for evictor thread to use since, in a JavaEE or similar
+      * environment, the context class loader for the evictor thread may not have
+@@ -583,7 +584,9 @@ public abstract class BaseGenericObjectPool<T> {
+ 
+     /**
+      * Sets the name of the {@link EvictionPolicy} implementation that is
+-     * used by this pool.
++     * used by this pool. The Pool will attempt to load the class using the
++     * thread context class loader. If that fails, the Pool will attempt to load
++     * the class using the class loader that loaded this class.
+      *
+      * @param evictionPolicyClassName   the fully qualified class name of the
+      *                                  new eviction policy
+@@ -593,8 +596,13 @@ public abstract class BaseGenericObjectPool<T> {
+     public final void setEvictionPolicyClassName(
+             String evictionPolicyClassName) {
+         try {
+-            Class<?> clazz = Class.forName(evictionPolicyClassName, true,
+-                    Thread.currentThread().getContextClassLoader());
++            Class<?> clazz;
++            try {
++                clazz = Class.forName(evictionPolicyClassName, true,
++                        Thread.currentThread().getContextClassLoader());
++            } catch (ClassNotFoundException e) {
++                clazz = Class.forName(evictionPolicyClassName);
++            }
+             Object policy = clazz.newInstance();
+             if (policy instanceof EvictionPolicy<?>) {
+                 @SuppressWarnings("unchecked") // safe, because we just checked the class
+@@ -645,9 +653,11 @@ public abstract class BaseGenericObjectPool<T> {
+ 
+     /**
+      * Returns the {@link EvictionPolicy} defined for this pool.
++     *
+      * @return the eviction policy
++     * @since 2.4
+      */
+-    final EvictionPolicy<T> getEvictionPolicy() {
++    protected EvictionPolicy<T> getEvictionPolicy() {
+         return evictionPolicy;
+     }
+ 
+@@ -1098,4 +1108,96 @@ public abstract class BaseGenericObjectPool<T> {
+             return (long) result;
+         }
+     }
++
++    /**
++     * The idle object eviction iterator. Holds a reference to the idle objects.
++     */
++    class EvictionIterator implements Iterator<PooledObject<T>> {
++
++        private final Deque<PooledObject<T>> idleObjects;
++        private final Iterator<PooledObject<T>> idleObjectIterator;
++
++        /**
++         * Create an EvictionIterator for the provided idle instance deque.
++         * @param idleObjects underlying deque
++         */
++        EvictionIterator(final Deque<PooledObject<T>> idleObjects) {
++            this.idleObjects = idleObjects;
++
++            if (getLifo()) {
++                idleObjectIterator = idleObjects.descendingIterator();
++            } else {
++                idleObjectIterator = idleObjects.iterator();
++            }
++        }
++
++        /**
++         * Returns the idle object deque referenced by this iterator.
++         * @return the idle object deque
++         */
++        public Deque<PooledObject<T>> getIdleObjects() {
++            return idleObjects;
++        }
++
++        /** {@inheritDoc} */
++        @Override
++        public boolean hasNext() {
++            return idleObjectIterator.hasNext();
++        }
++
++        /** {@inheritDoc} */
++        @Override
++        public PooledObject<T> next() {
++            return idleObjectIterator.next();
++        }
++
++        /** {@inheritDoc} */
++        @Override
++        public void remove() {
++            idleObjectIterator.remove();
++        }
++
++    }
++
++    /**
++     * Wrapper for objects under management by the pool.
++     *
++     * GenericObjectPool and GenericKeyedObjectPool maintain references to all
++     * objects under management using maps keyed on the objects. This wrapper
++     * class ensures that objects can work as hash keys.
++     *
++     * @param <T> type of objects in the pool
++     */
++    static class IdentityWrapper<T> {
++        /** Wrapped object */
++        private final T instance;
++
++        /**
++         * Create a wrapper for an instance.
++         *
++         * @param instance object to wrap
++         */
++        public IdentityWrapper(T instance) {
++            this.instance = instance;
++        }
++
++        @Override
++        public int hashCode() {
++            return System.identityHashCode(instance);
++        }
++
++        @Override
++        @SuppressWarnings("rawtypes")
++        public boolean equals(Object other) {
++            return ((IdentityWrapper) other).instance == instance;
++        }
++
++        /**
++         * @return the wrapped object
++         */
++        public T getObject() {
++            return instance;
++        }
++    }
++
+ }
+
+==================================================
+GenericKeyedObjectPoolConfig.java
+index 784e94b016..4e7a1ab8f3 100644
+--- a/java/org/apache/tomcat/dbcp/pool2/impl/GenericKeyedObjectPool.java
++++ b/java/org/apache/tomcat/dbcp/pool2/impl/GenericKeyedObjectPool.java
+@@ -17,6 +17,7 @@
+ package org.apache.tomcat.dbcp.pool2.impl;
+ 
+ import java.util.ArrayList;
++import java.util.Deque;
+ import java.util.HashMap;
+ import java.util.Iterator;
+ import java.util.List;
+@@ -468,13 +469,23 @@ public class GenericKeyedObjectPool<K,T> extends BaseGenericObjectPool<T>
+ 
+         ObjectDeque<T> objectDeque = poolMap.get(key);
+ 
+-        PooledObject<T> p = objectDeque.getAllObjects().get(obj);
++        PooledObject<T> p = objectDeque.getAllObjects().get(new IdentityWrapper<>(obj));
+ 
+         if (p == null) {
+             throw new IllegalStateException(
+                     "Returned object not currently part of this pool");
+         }
+ 
++        synchronized(p) {
++            final PooledObjectState state = p.getState();
++            if (state != PooledObjectState.ALLOCATED) {
++                throw new IllegalStateException(
++                        "Object has already been returned to this pool or is invalid");
++            } else {
++                p.markReturning(); // Keep from being marked abandoned (once GKOP does this)
++            }
++        }
++
+         long activeTime = p.getActiveTimeMillis();
+ 
+         if (getTestOnReturn()) {
+@@ -572,7 +583,7 @@ public class GenericKeyedObjectPool<K,T> extends BaseGenericObjectPool<T>
+ 
+         ObjectDeque<T> objectDeque = poolMap.get(key);
+ 
+-        PooledObject<T> p = objectDeque.getAllObjects().get(obj);
++        PooledObject<T> p = objectDeque.getAllObjects().get(new IdentityWrapper<>(obj));
+         if (p == null) {
+             throw new IllegalStateException(
+                     "Object not currently part of this pool");
+@@ -878,8 +889,6 @@ public class GenericKeyedObjectPool<K,T> extends BaseGenericObjectPool<T>
+ 
+             boolean testWhileIdle = getTestWhileIdle();
+ 
+-            LinkedBlockingDeque<PooledObject<T>> idleObjects = null;
+-
+             for (int i = 0, m = getNumTests(); i < m; i++) {
+                 if(evictionIterator == null || !evictionIterator.hasNext()) {
+                     if (evictionKeyIterator == null ||
+@@ -900,13 +909,9 @@ public class GenericKeyedObjectPool<K,T> extends BaseGenericObjectPool<T>
+                         if (objectDeque == null) {
+                             continue;
+                         }
+-                        idleObjects = objectDeque.getIdleObjects();
+ 
+-                        if (getLifo()) {
+-                            evictionIterator = idleObjects.descendingIterator();
+-                        } else {
+-                            evictionIterator = idleObjects.iterator();
+-                        }
++                        final Deque<PooledObject<T>> idleObjects = objectDeque.getIdleObjects();
++                        evictionIterator = new EvictionIterator(idleObjects);
+                         if (evictionIterator.hasNext()) {
+                             break;
+                         }
+@@ -917,8 +922,10 @@ public class GenericKeyedObjectPool<K,T> extends BaseGenericObjectPool<T>
+                     // Pools exhausted
+                     return;
+                 }
++                final Deque<PooledObject<T>> idleObjects;
+                 try {
+                     underTest = evictionIterator.next();
++                    idleObjects = evictionIterator.getIdleObjects();
+                 } catch (NoSuchElementException nsee) {
+                     // Object was borrowed in another thread
+                     // Don't count this as an eviction test so reduce i;
+@@ -964,14 +971,12 @@ public class GenericKeyedObjectPool<K,T> extends BaseGenericObjectPool<T>
+                             destroyedByEvictorCount.incrementAndGet();
+                         }
+                         if (active) {
+-                            if (!factory.validateObject(evictionKey,
+-                                    underTest)) {
++                            if (!factory.validateObject(evictionKey, underTest)) {
+                                 destroy(evictionKey, underTest, true);
+                                 destroyedByEvictorCount.incrementAndGet();
+                             } else {
+                                 try {
+-                                    factory.passivateObject(evictionKey,
+-                                            underTest);
++                                    factory.passivateObject(evictionKey, underTest);
+                                 } catch (Exception e) {
+                                     destroy(evictionKey, underTest, true);
+                                     destroyedByEvictorCount.incrementAndGet();
+@@ -1040,7 +1045,7 @@ public class GenericKeyedObjectPool<K,T> extends BaseGenericObjectPool<T>
+         }
+ 
+         createdCount.incrementAndGet();
+-        objectDeque.getAllObjects().put(p.getObject(), p);
++        objectDeque.getAllObjects().put(new IdentityWrapper<>(p.getObject()), p);
+         return p;
+     }
+ 
+@@ -1063,7 +1068,7 @@ public class GenericKeyedObjectPool<K,T> extends BaseGenericObjectPool<T>
+             boolean isIdle = objectDeque.getIdleObjects().remove(toDestroy);
+ 
+             if (isIdle || always) {
+-                objectDeque.getAllObjects().remove(toDestroy.getObject());
++                objectDeque.getAllObjects().remove(new IdentityWrapper<>(toDestroy.getObject()));
+                 toDestroy.invalidate();
+ 
+                 try {
+@@ -1247,8 +1252,7 @@ public class GenericKeyedObjectPool<K,T> extends BaseGenericObjectPool<T>
+      *
+      * @param key - The key to register for pool control.
+      *
+-     * @throws Exception If the associated factory fails to create the necessary
+-     *                   number of idle instances
++     * @throws Exception If the associated factory throws an exception
+      */
+     public void preparePool(K key) throws Exception {
+         int minIdlePerKeySave = getMinIdlePerKey();
+@@ -1432,11 +1436,10 @@ public class GenericKeyedObjectPool<K,T> extends BaseGenericObjectPool<T>
+         private final AtomicInteger createCount = new AtomicInteger(0);
+ 
+         /*
+-         * The map is keyed on pooled instances.  Note: pooled instances
+-         * <em>must</em> be distinguishable by equals for this structure to
+-         * work properly.
++         * The map is keyed on pooled instances, wrapped to ensure that
++         * they work properly as keys.
+          */
+-        private final Map<S, PooledObject<S>> allObjects =
++        private final Map<IdentityWrapper<S>, PooledObject<S>> allObjects =
+                 new ConcurrentHashMap<>();
+ 
+         /*
+@@ -1489,9 +1492,10 @@ public class GenericKeyedObjectPool<K,T> extends BaseGenericObjectPool<T>
+          *
+          * @return All the objects
+          */
+-        public Map<S, PooledObject<S>> getAllObjects() {
++        public Map<IdentityWrapper<S>, PooledObject<S>> getAllObjects() {
+             return allObjects;
+         }
++
+     }
+ 
+     //--- configuration attributes ---------------------------------------------
+
+==================================================
+GenericObjectPool.java
+index 41b02941a7..6754fd17e7 100644
+--- a/java/org/apache/tomcat/dbcp/pool2/impl/GenericKeyedObjectPoolConfig.java
++++ b/java/org/apache/tomcat/dbcp/pool2/impl/GenericKeyedObjectPoolConfig.java
+@@ -47,7 +47,7 @@ public class GenericKeyedObjectPoolConfig extends BaseObjectPoolConfig {
+     public static final int DEFAULT_MIN_IDLE_PER_KEY = 0;
+ 
+     /**
+-     * The default value for the {@code minIdlePerKey} configuration attribute.
++     * The default value for the {@code maxIdlePerKey} configuration attribute.
+      * @see GenericKeyedObjectPool#getMaxIdlePerKey()
+      */
+     public static final int DEFAULT_MAX_IDLE_PER_KEY = 8;
+
+==================================================

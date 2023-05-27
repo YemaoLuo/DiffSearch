@@ -1,0 +1,232 @@
+acf6076d7118571ebc881984b96792f861b72bb2
+==================================================
+Include failed TLS handshakes in the access log
+==================================================
+Mark Thomas
+==================================================
+Wed Jul 31 16:49:35 2019 +0100
+==================================================
+AbstractProcessor.java
+Include failed TLS handshakes in the access log
+
+Failed TLS handshakes are logged with the following information:
+- status 400
+- start time close to the connection failure
+- duration 0
+
+All other fields apart from network related fields (e.g. IP address etc)
+obtained from the SocketWrapper are empty.
+
+
+
+==================================================
+AbstractProcessorLight.java
+index e7909ba461..d94a8e4894 100644
+--- a/java/org/apache/coyote/AbstractProcessor.java
++++ b/java/org/apache/coyote/AbstractProcessor.java
+@@ -149,7 +149,7 @@ public abstract class AbstractProcessor extends AbstractProcessorLight implement
+      * Set the socket wrapper being used.
+      * @param socketWrapper The socket wrapper
+      */
+-    protected final void setSocketWrapper(SocketWrapperBase<?> socketWrapper) {
++    protected void setSocketWrapper(SocketWrapperBase<?> socketWrapper) {
+         this.socketWrapper = socketWrapper;
+     }
+ 
+@@ -944,6 +944,7 @@ public abstract class AbstractProcessor extends AbstractProcessorLight implement
+      */
+     protected abstract boolean flushBufferedWrite() throws IOException ;
+ 
++
+     /**
+      * Perform any necessary clean-up processing if the dispatch resulted in the
+      * completion of processing for the current request.
+@@ -955,4 +956,18 @@ public abstract class AbstractProcessor extends AbstractProcessorLight implement
+      *         request
+      */
+     protected abstract SocketState dispatchEndRequest() throws IOException;
++
++
++    @Override
++    protected final void logAccess(SocketWrapperBase<?> socketWrapper) throws IOException {
++        // Set the socket wrapper so the access log can read the socket related
++        // information (e.g. client IP)
++        setSocketWrapper(socketWrapper);
++        // Setup the minimal request information
++        request.setStartTime(System.currentTimeMillis());
++        // Setup the minimal response information
++        response.setStatus(400);
++        response.setError();
++        getAdapter().log(request, response, 0);
++    }
+ }
+
+==================================================
+Http11Processor.java
+index 7a46c79bc6..7d0b6e04d7 100644
+--- a/java/org/apache/coyote/AbstractProcessorLight.java
++++ b/java/org/apache/coyote/AbstractProcessorLight.java
+@@ -62,8 +62,10 @@ public abstract class AbstractProcessorLight implements Processor {
+             } else if (status == SocketEvent.OPEN_WRITE) {
+                 // Extra write event likely after async, ignore
+                 state = SocketState.LONG;
+-            } else if (status == SocketEvent.OPEN_READ){
++            } else if (status == SocketEvent.OPEN_READ) {
+                 state = service(socketWrapper);
++            } else if (status == SocketEvent.CONNECT_FAIL) {
++                logAccess(socketWrapper);
+             } else {
+                 // Default to closing the socket if the SocketEvent passed in
+                 // is not consistent with the current state of the Processor
+@@ -129,6 +131,19 @@ public abstract class AbstractProcessorLight implements Processor {
+     }
+ 
+ 
++    /**
++     * Add an entry to the access log for a failed connection attempt.
++     *
++     * @param socketWrapper The connection to process
++     *
++     * @throws IOException If an I/O error occurs during the processing of the
++     *         request
++     */
++    protected void logAccess(SocketWrapperBase<?> socketWrapper) throws IOException {
++        // NO-OP by default
++    }
++
++
+     /**
+      * Service a 'standard' HTTP request. This method is called for both new
+      * requests and for requests that have partially read the HTTP request line
+
+==================================================
+Http2UpgradeHandler.java
+index b707291a07..1ba4625680 100644
+--- a/java/org/apache/coyote/http11/Http11Processor.java
++++ b/java/org/apache/coyote/http11/Http11Processor.java
+@@ -276,8 +276,6 @@ public class Http11Processor extends AbstractProcessor {
+ 
+         // Setting up the I/O
+         setSocketWrapper(socketWrapper);
+-        inputBuffer.init(socketWrapper);
+-        outputBuffer.init(socketWrapper);
+ 
+         // Flags
+         keepAlive = true;
+@@ -505,6 +503,14 @@ public class Http11Processor extends AbstractProcessor {
+     }
+ 
+ 
++    @Override
++    protected final void setSocketWrapper(SocketWrapperBase<?> socketWrapper) {
++        super.setSocketWrapper(socketWrapper);
++        inputBuffer.init(socketWrapper);
++        outputBuffer.init(socketWrapper);
++    }
++
++
+     private Request cloneRequest(Request source) throws IOException {
+         Request dest = new Request();
+ 
+
+==================================================
+AprEndpoint.java
+index 71a5c1b9cd..41c620dd47 100644
+--- a/java/org/apache/coyote/http2/Http2UpgradeHandler.java
++++ b/java/org/apache/coyote/http2/Http2UpgradeHandler.java
+@@ -373,6 +373,7 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
+             case ERROR:
+             case TIMEOUT:
+             case STOP:
++            case CONNECT_FAIL:
+                 close();
+                 break;
+             }
+
+==================================================
+Nio2Endpoint.java
+index 1caa5e7d6b..f9bed26ad7 100644
+--- a/java/org/apache/tomcat/util/net/AprEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AprEndpoint.java
+@@ -1982,6 +1982,7 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
+                                 getConnectionTimeout(), Poll.APR_POLLIN);
+                     } else {
+                         // Close socket and pool
++                        getHandler().process(socket, SocketEvent.CONNECT_FAIL);
+                         closeSocket(socket.getSocket().longValue());
+                         socket = null;
+                     }
+@@ -1989,6 +1990,7 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
+                     // Process the request from this socket
+                     if (!setSocketOptions(socket)) {
+                         // Close socket and pool
++                        getHandler().process(socket, SocketEvent.CONNECT_FAIL);
+                         closeSocket(socket.getSocket().longValue());
+                         socket = null;
+                         return;
+
+==================================================
+NioEndpoint.java
+index 66f9e20d4f..4b59c9bb61 100644
+--- a/java/org/apache/tomcat/util/net/Nio2Endpoint.java
++++ b/java/org/apache/tomcat/util/net/Nio2Endpoint.java
+@@ -1682,6 +1682,7 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel,AsynchronousS
+                         launch = true;
+                     }
+                 } else if (handshake == -1 ) {
++                    getHandler().process(socketWrapper, SocketEvent.CONNECT_FAIL);
+                     socketWrapper.close();
+                 }
+             } catch (VirtualMachineError vme) {
+
+==================================================
+SocketEvent.java
+index 85bfa9d3b6..0df3b0a25c 100644
+--- a/java/org/apache/tomcat/util/net/NioEndpoint.java
++++ b/java/org/apache/tomcat/util/net/NioEndpoint.java
+@@ -1590,6 +1590,7 @@ public class NioEndpoint extends AbstractJsseEndpoint<NioChannel,SocketChannel>
+                         poller.cancelledKey(key, socketWrapper);
+                     }
+                 } else if (handshake == -1 ) {
++                    getHandler().process(socketWrapper, SocketEvent.CONNECT_FAIL);
+                     poller.cancelledKey(key, socketWrapper);
+                 } else if (handshake == SelectionKey.OP_READ){
+                     socketWrapper.registerReadInterest();
+
+==================================================
+WsHttpUpgradeHandler.java
+index 9df1116604..9d86028361 100644
+--- a/java/org/apache/tomcat/util/net/SocketEvent.java
++++ b/java/org/apache/tomcat/util/net/SocketEvent.java
+@@ -60,5 +60,14 @@ public enum SocketEvent {
+      *     during Servlet 3.0 asynchronous processing.</li>
+      * </ul>
+      */
+-    ERROR
++    ERROR,
++
++    /**
++     * A client attempted to establish a connection but failed. Examples of
++     * where this is used include:
++     * <ul>
++     * <li>TLS handshake failures</li>
++     * </ul>
++     */
++    CONNECT_FAIL
+ }
+
+==================================================
+TestUpgradeInternalHandler.java
+index 437a33ca8e..a1b82eadb8 100644
+--- a/java/org/apache/tomcat/websocket/server/WsHttpUpgradeHandler.java
++++ b/java/org/apache/tomcat/websocket/server/WsHttpUpgradeHandler.java
+@@ -178,6 +178,7 @@ public class WsHttpUpgradeHandler implements InternalHttpUpgradeHandler {
+                 //$FALL-THROUGH$
+             case DISCONNECT:
+             case TIMEOUT:
++            case CONNECT_FAIL:
+                 return SocketState.CLOSED;
+ 
+         }
+
+==================================================

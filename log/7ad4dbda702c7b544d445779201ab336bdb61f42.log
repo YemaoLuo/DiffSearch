@@ -1,0 +1,131 @@
+7ad4dbda702c7b544d445779201ab336bdb61f42
+==================================================
+Fix https://bz.apache.org/bugzilla/show_bug.cgi?id=60718
+==================================================
+Mark Thomas
+==================================================
+Wed Feb 15 20:27:21 2017 +0000
+==================================================
+CoyoteAdapter.java
+Fix https://bz.apache.org/bugzilla/show_bug.cgi?id=60718
+Improve error handling for asynchronous processing and correct a number of cases where the <requestDestroyed() event was not being fired and an entry wasn't being made in the access logs.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1783144 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AsyncContextImpl.java
+index bf16b75433..803931c92a 100644
+--- a/java/org/apache/catalina/connector/CoyoteAdapter.java
++++ b/java/org/apache/catalina/connector/CoyoteAdapter.java
+@@ -140,14 +140,7 @@ public class CoyoteAdapter implements Adapter {
+         req.getRequestProcessor().setWorkerThreadName(Thread.currentThread().getName());
+         try {
+             if (!request.isAsync()) {
+-                // Error or timeout - need to tell listeners the request is over
+-                // Have to test this first since state may change while in this
+-                // method and this is only required if entering this method in
+-                // this state
+-                Context ctxt = request.getMappingData().context;
+-                if (ctxt != null) {
+-                    ctxt.fireRequestDestroyEvent(request);
+-                }
++                // Error or timeout
+                 // Lift any suspension (e.g. if sendError() was used by an async
+                 // request) to allow the response to be written to the client
+                 response.setSuspended(false);
+@@ -382,6 +375,17 @@ public class CoyoteAdapter implements Adapter {
+         } catch (IOException e) {
+             // Ignore
+         } finally {
++            AtomicBoolean error = new AtomicBoolean(false);
++            res.action(ActionCode.IS_ERROR, error);
++
++            if (request.isAsyncCompleting() && error.get()) {
++                // Connection will be forcibly closed which will prevent
++                // completion happening at the usual point. Need to trigger
++                // call to onComplete() here.
++                res.action(ActionCode.ASYNC_POST_PROCESS,  null);
++                async = false;
++            }
++
+             // Access log
+             if (!async && postParseSuccess) {
+                 // Log only if processing was invoked.
+@@ -391,11 +395,9 @@ public class CoyoteAdapter implements Adapter {
+             }
+ 
+             req.getRequestProcessor().setWorkerThreadName(null);
+-            AtomicBoolean error = new AtomicBoolean(false);
+-            res.action(ActionCode.IS_ERROR, error);
+ 
+             // Recycle the wrapper request and response
+-            if (!async || error.get()) {
++            if (!async) {
+                 request.recycle();
+                 response.recycle();
+             }
+
+==================================================
+StandardHostValve.java
+index dcc0902667..1a3a595237 100644
+--- a/java/org/apache/catalina/core/AsyncContextImpl.java
++++ b/java/org/apache/catalina/core/AsyncContextImpl.java
+@@ -111,6 +111,7 @@ public class AsyncContextImpl implements AsyncContext, AsyncContextCallback {
+                 }
+             }
+         } finally {
++            context.fireRequestDestroyEvent(request);
+             clearServletRequestResponse();
+             context.unbind(Globals.IS_SECURITY_ENABLED, oldCL);
+         }
+
+==================================================
+AbstractProcessor.java
+index 8fe3e1a9d5..f459b492a6 100644
+--- a/java/org/apache/catalina/core/StandardHostValve.java
++++ b/java/org/apache/catalina/core/StandardHostValve.java
+@@ -178,7 +178,7 @@ final class StandardHostValve extends ValveBase {
+                 }
+             }
+ 
+-            if (!request.isAsync() && (!asyncAtStart || !response.isErrorReportRequired())) {
++            if (!request.isAsync() && !asyncAtStart) {
+                 context.fireRequestDestroyEvent(request);
+             }
+         } finally {
+
+==================================================
+AsyncStateMachine.java
+index f94c8f68f8..aab5322194 100644
+--- a/java/org/apache/coyote/AbstractProcessor.java
++++ b/java/org/apache/coyote/AbstractProcessor.java
+@@ -80,19 +80,19 @@ public abstract class AbstractProcessor extends AbstractProcessorLight implement
+     protected void setErrorState(ErrorState errorState, Throwable t) {
+         boolean blockIo = this.errorState.isIoAllowed() && !errorState.isIoAllowed();
+         this.errorState = this.errorState.getMostSevere(errorState);
++        if (response.getStatus() < 400) {
++            response.setStatus(500);
++        }
++        if (t != null) {
++            request.setAttribute(RequestDispatcher.ERROR_EXCEPTION, t);
++        }
+         if (blockIo && !ContainerThreadMarker.isContainerThread() && isAsync()) {
+             // The error occurred on a non-container thread during async
+             // processing which means not all of the necessary clean-up will
+             // have been completed. Dispatch to a container thread to do the
+             // clean-up. Need to do it this way to ensure that all the necessary
+             // clean-up is performed.
+-            if (response.getStatus() < 400) {
+-                response.setStatus(500);
+-            }
+             getLog().info(sm.getString("abstractProcessor.nonContainerThreadError"), t);
+-            // Set the request attribute so that the async onError() event is
+-            // fired when the error event is processed
+-            request.setAttribute(RequestDispatcher.ERROR_EXCEPTION, t);
+             processSocketEvent(SocketEvent.ERROR, true);
+         }
+     }
+
+==================================================

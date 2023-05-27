@@ -1,0 +1,225 @@
+b022c5746f9b46c2d7a95ab7aaf423f5b5b3c25a
+==================================================
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=54693.
+==================================================
+Keiichi Fujino
+==================================================
+Mon Sep 9 10:11:07 2013 +0000
+==================================================
+ConnectionPool.java
+index 5e91c6b74b..81eecf25d4 100644
+--- a/modules/jdbc-pool/doc/jdbc-pool.xml
++++ b/modules/jdbc-pool/doc/jdbc-pool.xml
+@@ -274,6 +274,15 @@
+          Example values are <code>SELECT 1</code>(mysql), <code>select 1 from dual</code>(oracle), <code>SELECT 1</code>(MS Sql Server)
+       </p>
+     </attribute>
++    
++    <attribute name="validationQueryTimeout" required="false">
++      <p>(int) The timeout in seconds before a connection validation queries fail.  This works by calling 
++         <code>java.sql.Statement.setQueryTimeout(seconds)</code> on the statement that executes the <code>validationQuery</code>.
++         The pool itself doesn't timeout the query, it is still up to the JDBC driver to enforce query timeouts. 
++         A value less than or equal to zero will disable this feature. 
++         The default value is <code>-1</code>.
++      </p>
++    </attribute>
+ 
+     <attribute name="validatorClassName" required="false">
+       <p>(String) The name of a class which implements the
+
+==================================================
+DataSourceFactory.java
+index aacd990b06..0b2dcdb4b3 100644
+--- a/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/ConnectionPool.java
++++ b/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/ConnectionPool.java
+@@ -712,7 +712,7 @@ public class ConnectionPool {
+             } else {
+                 //validation failed, make sure we disconnect
+                 //and clean up
+-                error =true;
++                throw new SQLException("Validation Query Failed, enable logValidationErrors for more details.");
+             } //end if
+         } catch (Exception e) {
+             error = true;
+@@ -732,7 +732,6 @@ public class ConnectionPool {
+             }
+             con.unlock();
+         }//catch
+-        return null;
+     }
+ 
+     /**
+
+==================================================
+DataSourceProxy.java
+index 8c8f7f1138..6d204ee7d6 100644
+--- a/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/DataSourceFactory.java
++++ b/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/DataSourceFactory.java
+@@ -80,6 +80,7 @@ public class DataSourceFactory implements ObjectFactory {
+     protected static final String PROP_TESTWHILEIDLE = "testWhileIdle";
+     protected static final String PROP_TESTONCONNECT = "testOnConnect";
+     protected static final String PROP_VALIDATIONQUERY = "validationQuery";
++    protected static final String PROP_VALIDATIONQUERY_TIMEOUT = "validationQueryTimeout";
+     protected static final String PROP_VALIDATOR_CLASS_NAME = "validatorClassName";
+ 
+     protected static final String PROP_NUMTESTSPEREVICTIONRUN = "numTestsPerEvictionRun";
+@@ -151,6 +152,7 @@ public class DataSourceFactory implements ObjectFactory {
+         PROP_URL,
+         PROP_USERNAME,
+         PROP_VALIDATIONQUERY,
++        PROP_VALIDATIONQUERY_TIMEOUT,
+         PROP_VALIDATOR_CLASS_NAME,
+         PROP_VALIDATIONINTERVAL,
+         PROP_ACCESSTOUNDERLYINGCONNECTIONALLOWED,
+@@ -369,6 +371,11 @@ public class DataSourceFactory implements ObjectFactory {
+         if (value != null) {
+             poolProperties.setValidationQuery(value);
+         }
++        
++        value = properties.getProperty(PROP_VALIDATIONQUERY_TIMEOUT);
++        if (value != null) {
++            poolProperties.setValidationQueryTimeout(Integer.parseInt(value));
++        }
+ 
+         value = properties.getProperty(PROP_VALIDATOR_CLASS_NAME);
+         if (value != null) {
+
+==================================================
+PoolConfiguration.java
+index f152f41c55..3e3af9ada8 100644
+--- a/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/DataSourceProxy.java
++++ b/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/DataSourceProxy.java
+@@ -452,6 +452,15 @@ public class DataSourceProxy implements PoolConfiguration {
+     public void setValidatorClassName(String className) {
+         this.poolProperties.setValidatorClassName(className);
+     }
++    
++    /**
++     * {@inheritDoc}
++     */
++    
++    @Override
++    public void setValidationQueryTimeout(int validationQueryTimeout) {
++        this.poolProperties.setValidationQueryTimeout(validationQueryTimeout);
++    }
+ 
+     /**
+      * {@inheritDoc}
+@@ -925,6 +934,15 @@ public class DataSourceProxy implements PoolConfiguration {
+         return getPoolProperties().getValidationQuery();
+     }
+ 
++    /**
++     * {@inheritDoc}
++     */
++    
++    @Override
++    public int getValidationQueryTimeout() {
++        return getPoolProperties().getValidationQueryTimeout();
++    }
++    
+     /**
+      * {@inheritDoc}
+      */
+
+==================================================
+PoolProperties.java
+index 35212eac59..bc854cc744 100644
+--- a/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/PoolConfiguration.java
++++ b/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/PoolConfiguration.java
+@@ -523,6 +523,19 @@ public interface PoolConfiguration {
+      */
+     public void setValidationQuery(String validationQuery);
+ 
++    /**
++     * The timeout in seconds before a connection validation queries fail.
++     * A value less than or equal to zero will disable this feature.  Defaults to -1. 
++     * @return the timeout value in seconds 
++     */
++    public int getValidationQueryTimeout();
++    
++    /**
++     * The timeout in seconds before a connection validation queries fail.
++     * A value less than or equal to zero will disable this feature.  Defaults to -1. 
++     */
++    public void setValidationQueryTimeout(int validationQueryTimeout);
++    
+     /**
+      * Return the name of the optional validator class - may be null.
+      *
+
+==================================================
+PooledConnection.java
+index 66829ba937..136a2c5fdc 100644
+--- a/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/PoolProperties.java
++++ b/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/PoolProperties.java
+@@ -57,6 +57,7 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
+     private volatile int minIdle = initialSize;
+     private volatile int maxWait = 30000;
+     private volatile String validationQuery;
++    private volatile int validationQueryTimeout = -1;
+     private volatile String validatorClassName;
+     private volatile Validator validator;
+     private volatile boolean testOnBorrow = false;
+@@ -379,6 +380,22 @@ public class PoolProperties implements PoolConfiguration, Cloneable, Serializabl
+         return validationQuery;
+     }
+ 
++    /**
++     * {@inheritDoc}
++     */
++    @Override
++    public int getValidationQueryTimeout() {
++        return validationQueryTimeout;
++    }
++    
++    /**
++     * {@inheritDoc}
++     */
++    @Override
++    public void setValidationQueryTimeout(int validationQueryTimeout) {
++        this.validationQueryTimeout = validationQueryTimeout;
++    }
++    
+     /**
+      * {@inheritDoc}
+      */
+
+==================================================
+ConnectionPool.java
+index 410a74ac4d..02a9868963 100644
+--- a/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/PooledConnection.java
++++ b/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/PooledConnection.java
+@@ -451,6 +451,12 @@ public class PooledConnection {
+         Statement stmt = null;
+         try {
+             stmt = connection.createStatement();
++            
++            int validationQueryTimeout = poolProperties.getValidationQueryTimeout();
++            if (validationQueryTimeout > 0) {
++                stmt.setQueryTimeout(validationQueryTimeout);
++            }
++            
+             stmt.execute(query);
+             stmt.close();
+             this.lastValidated = now;
+
+==================================================
+TestValidationQueryTimeout.java
+index ced32b4412..0e6682ebdd 100644
+--- a/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/mbeans-descriptors.xml
++++ b/modules/jdbc-pool/src/main/java/org/apache/tomcat/jdbc/pool/mbeans-descriptors.xml
+@@ -125,6 +125,11 @@
+            description="The query to run during validation"
+                   type="java.lang.String"
+              writeable="false"/>
++             
++    <attribute    name="validationQueryTimeout"
++           description="The timeout in seconds before a connection validation queries fail"
++                  type="java.lang.Integer"
++             writeable="false" />
+ 
+     <attribute    name="testOnBorrow"
+            description="True if validation happens when a connection is requested"
+
+==================================================

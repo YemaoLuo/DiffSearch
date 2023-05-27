@@ -1,0 +1,660 @@
+f8ead037fa43aa720672e98f3b4389e5a81e6c14
+==================================================
+Add TLS 1.3 ciphersuite setting
+==================================================
+remm remm@apache.org
+==================================================
+Tue Mar 15 14:43:46 2022 +0100
+==================================================
+OpenSSLContext.java
+index 9256996da2..5273538daf 100644
+--- a/modules/openssl-java17/openssl-tomcat.conf
++++ b/modules/openssl-java17/openssl-tomcat.conf
+@@ -186,6 +186,7 @@
+ --include-function SSL_CTX_set_alpn_select_cb                    # header: /usr/include/openssl/ssl.h
+ --include-function SSL_CTX_set_cert_verify_callback              # header: /usr/include/openssl/ssl.h
+ --include-function SSL_CTX_set_cipher_list                       # header: /usr/include/openssl/ssl.h
++--include-function SSL_CTX_set_ciphersuites                      # header: /usr/include/openssl/ssl.h
+ --include-function SSL_CTX_set_client_CA_list                    # header: /usr/include/openssl/ssl.h
+ --include-function SSL_CTX_set_default_passwd_cb                 # header: /usr/include/openssl/ssl.h
+ --include-function SSL_CTX_set_default_verify_paths              # header: /usr/include/openssl/ssl.h
+
+==================================================
+SSL_CTX_set_tmp_dh_callback$dh.java
+index ff249f001b..66942b8d8a 100644
+--- a/modules/openssl-java17/src/main/java/org/apache/tomcat/util/net/openssl/panama/OpenSSLContext.java
++++ b/modules/openssl-java17/src/main/java/org/apache/tomcat/util/net/openssl/panama/OpenSSLContext.java
+@@ -151,6 +151,9 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
+         }
+     }
+ 
++    private final int minTlsVersion;
++    private final int maxTlsVersion;
++
+     private final SSLHostConfig sslHostConfig;
+     private final SSLHostConfigCertificate certificate;
+     private final boolean alpn;
+@@ -274,9 +277,10 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
+             } else if ((protocol & SSL_PROTOCOL_SSLV3) > 0) {
+                 prot = SSL3_VERSION();
+             }
++            maxTlsVersion = prot;
+             // # define SSL_CTX_set_max_proto_version(sslCtx, version) \
+             //          SSL_CTX_ctrl(sslCtx, SSL_CTRL_SET_MAX_PROTO_VERSION, version, NULL)
+-            SSL_CTX_ctrl(sslCtx, SSL_CTRL_SET_MAX_PROTO_VERSION(), prot, MemoryAddress.NULL);
++            SSL_CTX_ctrl(sslCtx, SSL_CTRL_SET_MAX_PROTO_VERSION(), maxTlsVersion, MemoryAddress.NULL);
+             if (prot == TLS1_3_VERSION() && (protocol & SSL_PROTOCOL_TLSV1_2) > 0) {
+                 prot = TLS1_2_VERSION();
+             }
+@@ -289,9 +293,10 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
+             if (prot == TLS1_VERSION() && (protocol & SSL_PROTOCOL_SSLV3) > 0) {
+                 prot = SSL3_VERSION();
+             }
++            minTlsVersion = prot;
+             //# define SSL_CTX_set_min_proto_version(sslCtx, version) \
+             //         SSL_CTX_ctrl(sslCtx, SSL_CTRL_SET_MIN_PROTO_VERSION, version, NULL)
+-            SSL_CTX_ctrl(sslCtx, SSL_CTRL_SET_MIN_PROTO_VERSION(), prot, MemoryAddress.NULL);
++            SSL_CTX_ctrl(sslCtx, SSL_CTRL_SET_MIN_PROTO_VERSION(), minTlsVersion, MemoryAddress.NULL);
+ 
+             // Disable compression, usually unsafe
+             SSL_CTX_set_options(sslCtx, SSL_OP_NO_COMPRESSION());
+@@ -559,8 +564,15 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
+             }
+ 
+             // List the ciphers that the client is permitted to negotiate
+-            if (SSL_CTX_set_cipher_list(state.sslCtx, CLinker.toCString(sslHostConfig.getCiphers(), state.contextScope)) <= 0) {
+-                log.warn(sm.getString("engine.failedCipherSuite", sslHostConfig.getCiphers()));
++            if (minTlsVersion <= TLS1_2_VERSION()) {
++                if (SSL_CTX_set_cipher_list(state.sslCtx, CLinker.toCString(sslHostConfig.getCiphers(), state.contextScope)) <= 0) {
++                    log.warn(sm.getString("engine.failedCipherList", sslHostConfig.getCiphers()));
++                }
++            }
++            if (maxTlsVersion >= TLS1_3_VERSION()) {
++                if (SSL_CTX_set_ciphersuites(state.sslCtx, CLinker.toCString(sslHostConfig.getCiphers(), state.contextScope)) <= 0) {
++                    log.warn(sm.getString("engine.failedCipherSuite", sslHostConfig.getCiphers()));
++                }
+             }
+ 
+             if (certificate.getCertificateFile() == null) {
+@@ -635,19 +647,21 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
+                         ? CLinker.toCString(SSLHostConfig.adjustRelativePath(sslHostConfig.getCaCertificateFile()), state.contextScope) : null;
+                 MemorySegment caCertificatePathNative = sslHostConfig.getCaCertificatePath() != null
+                         ? CLinker.toCString(SSLHostConfig.adjustRelativePath(sslHostConfig.getCaCertificatePath()), state.contextScope) : null;
+-                if (SSL_CTX_load_verify_locations(state.sslCtx,
+-                        caCertificateFileNative == null ? MemoryAddress.NULL : caCertificateFileNative,
++                if ((sslHostConfig.getCaCertificateFile() != null || sslHostConfig.getCaCertificatePath() != null) 
++                        && SSL_CTX_load_verify_locations(state.sslCtx,
++                                caCertificateFileNative == null ? MemoryAddress.NULL : caCertificateFileNative,
+                                 caCertificatePathNative == null ? MemoryAddress.NULL : caCertificatePathNative) <= 0) {
+                     logLastError(allocator, "openssl.errorConfiguringLocations");
+                 } else {
+                     var caCerts = SSL_CTX_get_client_CA_list(state.sslCtx);
+                     if (MemoryAddress.NULL.equals(caCerts)) {
+-                        caCerts = SSL_load_client_CA_file(caCertificateFileNative);
++                        caCerts = SSL_load_client_CA_file(caCertificateFileNative == null ? MemoryAddress.NULL : caCertificateFileNative);
+                         if (!MemoryAddress.NULL.equals(caCerts)) {
+                             SSL_CTX_set_client_CA_list(state.sslCtx, caCerts);
+                         }
+                     } else {
+-                        if (SSL_add_file_cert_subjects_to_stack(caCerts, caCertificateFileNative) <= 0) {
++                        if (SSL_add_file_cert_subjects_to_stack(caCerts,
++                                caCertificateFileNative == null ? MemoryAddress.NULL : caCertificateFileNative) <= 0) {
+                             caCerts = MemoryAddress.NULL;
+                         }
+                     }
+
+==================================================
+SSL_set_info_callback$cb.java
+index f3b7292ca8..d0c004c60b 100644
+--- a/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/SSL_CTX_set_tmp_dh_callback$dh.java
++++ b/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/SSL_CTX_set_tmp_dh_callback$dh.java
+@@ -36,7 +36,7 @@ public interface SSL_CTX_set_tmp_dh_callback$dh {
+     static SSL_CTX_set_tmp_dh_callback$dh ofAddress(MemoryAddress addr) {
+         return (jdk.incubator.foreign.MemoryAddress x0, int x1, int x2) -> {
+             try {
+-                return (jdk.incubator.foreign.MemoryAddress)constants$21.SSL_CTX_set_tmp_dh_callback$dh$MH.invokeExact((Addressable)addr, x0, x1, x2);
++                return (jdk.incubator.foreign.MemoryAddress)constants$22.SSL_CTX_set_tmp_dh_callback$dh$MH.invokeExact((Addressable)addr, x0, x1, x2);
+             } catch (Throwable ex$) {
+                 throw new AssertionError("should not reach here", ex$);
+             }
+
+==================================================
+constants$14.java
+index de4072434c..3cde96ab1a 100644
+--- a/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/SSL_set_info_callback$cb.java
++++ b/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/SSL_set_info_callback$cb.java
+@@ -28,10 +28,10 @@ public interface SSL_set_info_callback$cb {
+ 
+     void apply(jdk.incubator.foreign.MemoryAddress x0, int x1, int x2);
+     static MemoryAddress allocate(SSL_set_info_callback$cb fi) {
+-        return RuntimeHelper.upcallStub(SSL_set_info_callback$cb.class, fi, constants$20.SSL_set_info_callback$cb$FUNC, "(Ljdk/incubator/foreign/MemoryAddress;II)V");
++        return RuntimeHelper.upcallStub(SSL_set_info_callback$cb.class, fi, constants$21.SSL_set_info_callback$cb$FUNC, "(Ljdk/incubator/foreign/MemoryAddress;II)V");
+     }
+     static MemoryAddress allocate(SSL_set_info_callback$cb fi, ResourceScope scope) {
+-        return RuntimeHelper.upcallStub(SSL_set_info_callback$cb.class, fi, constants$20.SSL_set_info_callback$cb$FUNC, "(Ljdk/incubator/foreign/MemoryAddress;II)V", scope);
++        return RuntimeHelper.upcallStub(SSL_set_info_callback$cb.class, fi, constants$21.SSL_set_info_callback$cb$FUNC, "(Ljdk/incubator/foreign/MemoryAddress;II)V", scope);
+     }
+     static SSL_set_info_callback$cb ofAddress(MemoryAddress addr) {
+         return (jdk.incubator.foreign.MemoryAddress x0, int x1, int x2) -> {
+
+==================================================
+constants$15.java
+index 914b41cf9c..aec4251a68 100644
+--- a/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/constants$14.java
++++ b/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/constants$14.java
+@@ -26,6 +26,15 @@ import jdk.incubator.foreign.*;
+ import static jdk.incubator.foreign.CLinker.*;
+ class constants$14 {
+ 
++    static final FunctionDescriptor SSL_CTX_set_ciphersuites$FUNC = FunctionDescriptor.of(C_INT,
++        C_POINTER,
++        C_POINTER
++    );
++    static final MethodHandle SSL_CTX_set_ciphersuites$MH = RuntimeHelper.downcallHandle(
++        openssl_h.LIBRARIES, "SSL_CTX_set_ciphersuites",
++        "(Ljdk/incubator/foreign/MemoryAddress;Ljdk/incubator/foreign/MemoryAddress;)I",
++        constants$14.SSL_CTX_set_ciphersuites$FUNC, false
++    );
+     static final FunctionDescriptor SSL_set_verify$FUNC = FunctionDescriptor.ofVoid(
+         C_POINTER,
+         C_INT,
+@@ -70,15 +79,6 @@ class constants$14 {
+         "(Ljdk/incubator/foreign/MemoryAddress;)J",
+         constants$14.SSL_SESSION_get_time$FUNC, false
+     );
+-    static final FunctionDescriptor SSL_SESSION_get_id$FUNC = FunctionDescriptor.of(C_POINTER,
+-        C_POINTER,
+-        C_POINTER
+-    );
+-    static final MethodHandle SSL_SESSION_get_id$MH = RuntimeHelper.downcallHandle(
+-        openssl_h.LIBRARIES, "SSL_SESSION_get_id",
+-        "(Ljdk/incubator/foreign/MemoryAddress;Ljdk/incubator/foreign/MemoryAddress;)Ljdk/incubator/foreign/MemoryAddress;",
+-        constants$14.SSL_SESSION_get_id$FUNC, false
+-    );
+ }
+ 
+ 
+
+==================================================
+constants$16.java
+index 2885289b5e..27a428b3c3 100644
+--- a/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/constants$15.java
++++ b/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/constants$15.java
+@@ -26,6 +26,15 @@ import jdk.incubator.foreign.*;
+ import static jdk.incubator.foreign.CLinker.*;
+ class constants$15 {
+ 
++    static final FunctionDescriptor SSL_SESSION_get_id$FUNC = FunctionDescriptor.of(C_POINTER,
++        C_POINTER,
++        C_POINTER
++    );
++    static final MethodHandle SSL_SESSION_get_id$MH = RuntimeHelper.downcallHandle(
++        openssl_h.LIBRARIES, "SSL_SESSION_get_id",
++        "(Ljdk/incubator/foreign/MemoryAddress;Ljdk/incubator/foreign/MemoryAddress;)Ljdk/incubator/foreign/MemoryAddress;",
++        constants$15.SSL_SESSION_get_id$FUNC, false
++    );
+     static final FunctionDescriptor SSL_get_peer_certificate$FUNC = FunctionDescriptor.of(C_POINTER,
+         C_POINTER
+     );
+@@ -60,16 +69,6 @@ class constants$15 {
+         "(Ljdk/incubator/foreign/MemoryAddress;Ljdk/incubator/foreign/MemoryAddress;)I",
+         constants$15.SSL_CTX_set_cert_verify_callback$cb$FUNC, false
+     );
+-    static final FunctionDescriptor SSL_CTX_set_cert_verify_callback$FUNC = FunctionDescriptor.ofVoid(
+-        C_POINTER,
+-        C_POINTER,
+-        C_POINTER
+-    );
+-    static final MethodHandle SSL_CTX_set_cert_verify_callback$MH = RuntimeHelper.downcallHandle(
+-        openssl_h.LIBRARIES, "SSL_CTX_set_cert_verify_callback",
+-        "(Ljdk/incubator/foreign/MemoryAddress;Ljdk/incubator/foreign/MemoryAddress;Ljdk/incubator/foreign/MemoryAddress;)V",
+-        constants$15.SSL_CTX_set_cert_verify_callback$FUNC, false
+-    );
+ }
+ 
+ 
+
+==================================================
+constants$17.java
+index 5b02c50a82..23b1e041d1 100644
+--- a/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/constants$16.java
++++ b/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/constants$16.java
+@@ -26,6 +26,16 @@ import jdk.incubator.foreign.*;
+ import static jdk.incubator.foreign.CLinker.*;
+ class constants$16 {
+ 
++    static final FunctionDescriptor SSL_CTX_set_cert_verify_callback$FUNC = FunctionDescriptor.ofVoid(
++        C_POINTER,
++        C_POINTER,
++        C_POINTER
++    );
++    static final MethodHandle SSL_CTX_set_cert_verify_callback$MH = RuntimeHelper.downcallHandle(
++        openssl_h.LIBRARIES, "SSL_CTX_set_cert_verify_callback",
++        "(Ljdk/incubator/foreign/MemoryAddress;Ljdk/incubator/foreign/MemoryAddress;Ljdk/incubator/foreign/MemoryAddress;)V",
++        constants$16.SSL_CTX_set_cert_verify_callback$FUNC, false
++    );
+     static final FunctionDescriptor SSL_CTX_use_PrivateKey$FUNC = FunctionDescriptor.of(C_INT,
+         C_POINTER,
+         C_POINTER
+@@ -71,14 +81,6 @@ class constants$16 {
+         "(Ljdk/incubator/foreign/MemoryAddress;Ljdk/incubator/foreign/MemoryAddress;I)I",
+         constants$16.SSL_CTX_set_session_id_context$FUNC, false
+     );
+-    static final FunctionDescriptor SSL_new$FUNC = FunctionDescriptor.of(C_POINTER,
+-        C_POINTER
+-    );
+-    static final MethodHandle SSL_new$MH = RuntimeHelper.downcallHandle(
+-        openssl_h.LIBRARIES, "SSL_new",
+-        "(Ljdk/incubator/foreign/MemoryAddress;)Ljdk/incubator/foreign/MemoryAddress;",
+-        constants$16.SSL_new$FUNC, false
+-    );
+ }
+ 
+ 
+
+==================================================
+constants$18.java
+index 0170ed6178..a26e43265f 100644
+--- a/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/constants$17.java
++++ b/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/constants$17.java
+@@ -26,6 +26,14 @@ import jdk.incubator.foreign.*;
+ import static jdk.incubator.foreign.CLinker.*;
+ class constants$17 {
+ 
++    static final FunctionDescriptor SSL_new$FUNC = FunctionDescriptor.of(C_POINTER,
++        C_POINTER
++    );
++    static final MethodHandle SSL_new$MH = RuntimeHelper.downcallHandle(
++        openssl_h.LIBRARIES, "SSL_new",
++        "(Ljdk/incubator/foreign/MemoryAddress;)Ljdk/incubator/foreign/MemoryAddress;",
++        constants$17.SSL_new$FUNC, false
++    );
+     static final FunctionDescriptor SSL_free$FUNC = FunctionDescriptor.ofVoid(
+         C_POINTER
+     );
+@@ -73,12 +81,6 @@ class constants$17 {
+         "(Ljdk/incubator/foreign/MemoryAddress;)Ljdk/incubator/foreign/MemoryAddress;",
+         constants$17.SSL_get_version$FUNC, false
+     );
+-    static final FunctionDescriptor TLS_server_method$FUNC = FunctionDescriptor.of(C_POINTER);
+-    static final MethodHandle TLS_server_method$MH = RuntimeHelper.downcallHandle(
+-        openssl_h.LIBRARIES, "TLS_server_method",
+-        "()Ljdk/incubator/foreign/MemoryAddress;",
+-        constants$17.TLS_server_method$FUNC, false
+-    );
+ }
+ 
+ 
+
+==================================================
+constants$19.java
+index 192567e9e9..9502060768 100644
+--- a/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/constants$18.java
++++ b/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/constants$18.java
+@@ -26,6 +26,12 @@ import jdk.incubator.foreign.*;
+ import static jdk.incubator.foreign.CLinker.*;
+ class constants$18 {
+ 
++    static final FunctionDescriptor TLS_server_method$FUNC = FunctionDescriptor.of(C_POINTER);
++    static final MethodHandle TLS_server_method$MH = RuntimeHelper.downcallHandle(
++        openssl_h.LIBRARIES, "TLS_server_method",
++        "()Ljdk/incubator/foreign/MemoryAddress;",
++        constants$18.TLS_server_method$FUNC, false
++    );
+     static final FunctionDescriptor SSL_get_ciphers$FUNC = FunctionDescriptor.of(C_POINTER,
+         C_POINTER
+     );
+@@ -66,14 +72,6 @@ class constants$18 {
+         "(Ljdk/incubator/foreign/MemoryAddress;)I",
+         constants$18.SSL_renegotiate_pending$FUNC, false
+     );
+-    static final FunctionDescriptor SSL_shutdown$FUNC = FunctionDescriptor.of(C_INT,
+-        C_POINTER
+-    );
+-    static final MethodHandle SSL_shutdown$MH = RuntimeHelper.downcallHandle(
+-        openssl_h.LIBRARIES, "SSL_shutdown",
+-        "(Ljdk/incubator/foreign/MemoryAddress;)I",
+-        constants$18.SSL_shutdown$FUNC, false
+-    );
+ }
+ 
+ 
+
+==================================================
+constants$20.java
+index 209695b18b..9135bf5a0a 100644
+--- a/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/constants$19.java
++++ b/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/constants$19.java
+@@ -26,6 +26,14 @@ import jdk.incubator.foreign.*;
+ import static jdk.incubator.foreign.CLinker.*;
+ class constants$19 {
+ 
++    static final FunctionDescriptor SSL_shutdown$FUNC = FunctionDescriptor.of(C_INT,
++        C_POINTER
++    );
++    static final MethodHandle SSL_shutdown$MH = RuntimeHelper.downcallHandle(
++        openssl_h.LIBRARIES, "SSL_shutdown",
++        "(Ljdk/incubator/foreign/MemoryAddress;)I",
++        constants$19.SSL_shutdown$FUNC, false
++    );
+     static final FunctionDescriptor SSL_verify_client_post_handshake$FUNC = FunctionDescriptor.of(C_INT,
+         C_POINTER
+     );
+@@ -68,14 +76,6 @@ class constants$19 {
+         "(Ljdk/incubator/foreign/MemoryAddress;)V",
+         constants$19.SSL_set_connect_state$FUNC, false
+     );
+-    static final FunctionDescriptor SSL_set_accept_state$FUNC = FunctionDescriptor.ofVoid(
+-        C_POINTER
+-    );
+-    static final MethodHandle SSL_set_accept_state$MH = RuntimeHelper.downcallHandle(
+-        openssl_h.LIBRARIES, "SSL_set_accept_state",
+-        "(Ljdk/incubator/foreign/MemoryAddress;)V",
+-        constants$19.SSL_set_accept_state$FUNC, false
+-    );
+ }
+ 
+ 
+
+==================================================
+constants$21.java
+index fbf5820ac8..724791772d 100644
+--- a/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/constants$20.java
++++ b/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/constants$20.java
+@@ -26,6 +26,14 @@ import jdk.incubator.foreign.*;
+ import static jdk.incubator.foreign.CLinker.*;
+ class constants$20 {
+ 
++    static final FunctionDescriptor SSL_set_accept_state$FUNC = FunctionDescriptor.ofVoid(
++        C_POINTER
++    );
++    static final MethodHandle SSL_set_accept_state$MH = RuntimeHelper.downcallHandle(
++        openssl_h.LIBRARIES, "SSL_set_accept_state",
++        "(Ljdk/incubator/foreign/MemoryAddress;)V",
++        constants$20.SSL_set_accept_state$FUNC, false
++    );
+     static final FunctionDescriptor SSL_get_privatekey$FUNC = FunctionDescriptor.of(C_POINTER,
+         C_POINTER
+     );
+@@ -68,11 +76,6 @@ class constants$20 {
+         "(Ljdk/incubator/foreign/MemoryAddress;)Ljdk/incubator/foreign/MemoryAddress;",
+         constants$20.SSL_get_session$FUNC, false
+     );
+-    static final FunctionDescriptor SSL_set_info_callback$cb$FUNC = FunctionDescriptor.ofVoid(
+-        C_POINTER,
+-        C_INT,
+-        C_INT
+-    );
+ }
+ 
+ 
+
+==================================================
+constants$22.java
+index c7b6ee481f..639ece94b9 100644
+--- a/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/constants$21.java
++++ b/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/constants$21.java
+@@ -64,10 +64,6 @@ class constants$21 {
+         C_INT,
+         C_INT
+     );
+-    static final MethodHandle SSL_CTX_set_tmp_dh_callback$dh$MH = RuntimeHelper.downcallHandle(
+-        "(Ljdk/incubator/foreign/MemoryAddress;II)Ljdk/incubator/foreign/MemoryAddress;",
+-        constants$21.SSL_CTX_set_tmp_dh_callback$dh$FUNC, false
+-    );
+ }
+ 
+ 
+
+==================================================
+constants$23.java
+index 68f384cd32..2dc66cd560 100644
+--- a/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/constants$22.java
++++ b/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/constants$22.java
+@@ -26,6 +26,15 @@ import jdk.incubator.foreign.*;
+ import static jdk.incubator.foreign.CLinker.*;
+ class constants$22 {
+ 
++    static final FunctionDescriptor SSL_CTX_set_tmp_dh_callback$dh$FUNC = FunctionDescriptor.of(C_POINTER,
++        C_POINTER,
++        C_INT,
++        C_INT
++    );
++    static final MethodHandle SSL_CTX_set_tmp_dh_callback$dh$MH = RuntimeHelper.downcallHandle(
++        "(Ljdk/incubator/foreign/MemoryAddress;II)Ljdk/incubator/foreign/MemoryAddress;",
++        constants$22.SSL_CTX_set_tmp_dh_callback$dh$FUNC, false
++    );
+     static final FunctionDescriptor SSL_CTX_set_tmp_dh_callback$FUNC = FunctionDescriptor.ofVoid(
+         C_POINTER,
+         C_POINTER
+@@ -66,15 +75,6 @@ class constants$22 {
+         "(Ljdk/incubator/foreign/MemoryAddress;I)I",
+         constants$22.SSL_CONF_CTX_set_flags$FUNC, false
+     );
+-    static final FunctionDescriptor SSL_CONF_CTX_set_ssl_ctx$FUNC = FunctionDescriptor.ofVoid(
+-        C_POINTER,
+-        C_POINTER
+-    );
+-    static final MethodHandle SSL_CONF_CTX_set_ssl_ctx$MH = RuntimeHelper.downcallHandle(
+-        openssl_h.LIBRARIES, "SSL_CONF_CTX_set_ssl_ctx",
+-        "(Ljdk/incubator/foreign/MemoryAddress;Ljdk/incubator/foreign/MemoryAddress;)V",
+-        constants$22.SSL_CONF_CTX_set_ssl_ctx$FUNC, false
+-    );
+ }
+ 
+ 
+
+==================================================
+constants$24.java
+index 5f130ca7d7..d91ff70d7d 100644
+--- a/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/constants$23.java
++++ b/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/constants$23.java
+@@ -26,6 +26,15 @@ import jdk.incubator.foreign.*;
+ import static jdk.incubator.foreign.CLinker.*;
+ class constants$23 {
+ 
++    static final FunctionDescriptor SSL_CONF_CTX_set_ssl_ctx$FUNC = FunctionDescriptor.ofVoid(
++        C_POINTER,
++        C_POINTER
++    );
++    static final MethodHandle SSL_CONF_CTX_set_ssl_ctx$MH = RuntimeHelper.downcallHandle(
++        openssl_h.LIBRARIES, "SSL_CONF_CTX_set_ssl_ctx",
++        "(Ljdk/incubator/foreign/MemoryAddress;Ljdk/incubator/foreign/MemoryAddress;)V",
++        constants$23.SSL_CONF_CTX_set_ssl_ctx$FUNC, false
++    );
+     static final FunctionDescriptor SSL_CONF_cmd$FUNC = FunctionDescriptor.of(C_INT,
+         C_POINTER,
+         C_POINTER,
+@@ -66,12 +75,6 @@ class constants$23 {
+         "()J",
+         constants$23.ERR_peek_last_error$FUNC, false
+     );
+-    static final FunctionDescriptor ERR_clear_error$FUNC = FunctionDescriptor.ofVoid();
+-    static final MethodHandle ERR_clear_error$MH = RuntimeHelper.downcallHandle(
+-        openssl_h.LIBRARIES, "ERR_clear_error",
+-        "()V",
+-        constants$23.ERR_clear_error$FUNC, false
+-    );
+ }
+ 
+ 
+
+==================================================
+constants$25.java
+index 82422ab029..4b894a6c1e 100644
+--- a/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/constants$24.java
++++ b/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/constants$24.java
+@@ -26,6 +26,12 @@ import jdk.incubator.foreign.*;
+ import static jdk.incubator.foreign.CLinker.*;
+ class constants$24 {
+ 
++    static final FunctionDescriptor ERR_clear_error$FUNC = FunctionDescriptor.ofVoid();
++    static final MethodHandle ERR_clear_error$MH = RuntimeHelper.downcallHandle(
++        openssl_h.LIBRARIES, "ERR_clear_error",
++        "()V",
++        constants$24.ERR_clear_error$FUNC, false
++    );
+     static final FunctionDescriptor ERR_error_string$FUNC = FunctionDescriptor.of(C_POINTER,
+         C_LONG,
+         C_POINTER
+@@ -74,15 +80,6 @@ class constants$24 {
+         "(Ljdk/incubator/foreign/MemoryAddress;Ljdk/incubator/foreign/MemoryAddress;)Ljdk/incubator/foreign/MemoryAddress;",
+         constants$24.d2i_PKCS12_bio$FUNC, false
+     );
+-    static final FunctionDescriptor RAND_seed$FUNC = FunctionDescriptor.ofVoid(
+-        C_POINTER,
+-        C_INT
+-    );
+-    static final MethodHandle RAND_seed$MH = RuntimeHelper.downcallHandle(
+-        openssl_h.LIBRARIES, "RAND_seed",
+-        "(Ljdk/incubator/foreign/MemoryAddress;I)V",
+-        constants$24.RAND_seed$FUNC, false
+-    );
+ }
+ 
+ 
+
+==================================================
+constants$26.java
+index 89f7a5bca5..d6e88ec7c0 100644
+--- a/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/constants$25.java
++++ b/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/constants$25.java
+@@ -26,6 +26,15 @@ import jdk.incubator.foreign.*;
+ import static jdk.incubator.foreign.CLinker.*;
+ class constants$25 {
+ 
++    static final FunctionDescriptor RAND_seed$FUNC = FunctionDescriptor.ofVoid(
++        C_POINTER,
++        C_INT
++    );
++    static final MethodHandle RAND_seed$MH = RuntimeHelper.downcallHandle(
++        openssl_h.LIBRARIES, "RAND_seed",
++        "(Ljdk/incubator/foreign/MemoryAddress;I)V",
++        constants$25.RAND_seed$FUNC, false
++    );
+     static final FunctionDescriptor RAND_load_file$FUNC = FunctionDescriptor.of(C_INT,
+         C_POINTER,
+         C_LONG
+@@ -69,14 +78,6 @@ class constants$25 {
+         "(Ljdk/incubator/foreign/MemoryAddress;Ljdk/incubator/foreign/MemoryAddress;Ljdk/incubator/foreign/MemoryAddress;I)I",
+         constants$25.ENGINE_ctrl_cmd_string$FUNC, false
+     );
+-    static final FunctionDescriptor ENGINE_free$FUNC = FunctionDescriptor.of(C_INT,
+-        C_POINTER
+-    );
+-    static final MethodHandle ENGINE_free$MH = RuntimeHelper.downcallHandle(
+-        openssl_h.LIBRARIES, "ENGINE_free",
+-        "(Ljdk/incubator/foreign/MemoryAddress;)I",
+-        constants$25.ENGINE_free$FUNC, false
+-    );
+ }
+ 
+ 
+
+==================================================
+constants$27.java
+index a253272af3..02ac4f2069 100644
+--- a/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/constants$26.java
++++ b/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/constants$26.java
+@@ -26,6 +26,14 @@ import jdk.incubator.foreign.*;
+ import static jdk.incubator.foreign.CLinker.*;
+ class constants$26 {
+ 
++    static final FunctionDescriptor ENGINE_free$FUNC = FunctionDescriptor.of(C_INT,
++        C_POINTER
++    );
++    static final MethodHandle ENGINE_free$MH = RuntimeHelper.downcallHandle(
++        openssl_h.LIBRARIES, "ENGINE_free",
++        "(Ljdk/incubator/foreign/MemoryAddress;)I",
++        constants$26.ENGINE_free$FUNC, false
++    );
+     static final FunctionDescriptor ENGINE_load_private_key$FUNC = FunctionDescriptor.of(C_POINTER,
+         C_POINTER,
+         C_POINTER,
+@@ -73,14 +81,6 @@ class constants$26 {
+         "(Ljdk/incubator/foreign/MemoryAddress;)I",
+         constants$26.OCSP_response_status$FUNC, false
+     );
+-    static final FunctionDescriptor OCSP_response_get1_basic$FUNC = FunctionDescriptor.of(C_POINTER,
+-        C_POINTER
+-    );
+-    static final MethodHandle OCSP_response_get1_basic$MH = RuntimeHelper.downcallHandle(
+-        openssl_h.LIBRARIES, "OCSP_response_get1_basic",
+-        "(Ljdk/incubator/foreign/MemoryAddress;)Ljdk/incubator/foreign/MemoryAddress;",
+-        constants$26.OCSP_response_get1_basic$FUNC, false
+-    );
+ }
+ 
+ 
+
+==================================================
+constants$28.java
+index 698b463288..82e8170c6c 100644
+--- a/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/constants$27.java
++++ b/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/constants$27.java
+@@ -26,6 +26,14 @@ import jdk.incubator.foreign.*;
+ import static jdk.incubator.foreign.CLinker.*;
+ class constants$27 {
+ 
++    static final FunctionDescriptor OCSP_response_get1_basic$FUNC = FunctionDescriptor.of(C_POINTER,
++        C_POINTER
++    );
++    static final MethodHandle OCSP_response_get1_basic$MH = RuntimeHelper.downcallHandle(
++        openssl_h.LIBRARIES, "OCSP_response_get1_basic",
++        "(Ljdk/incubator/foreign/MemoryAddress;)Ljdk/incubator/foreign/MemoryAddress;",
++        constants$27.OCSP_response_get1_basic$FUNC, false
++    );
+     static final FunctionDescriptor OCSP_resp_get0$FUNC = FunctionDescriptor.of(C_POINTER,
+         C_POINTER,
+         C_INT
+@@ -73,16 +81,6 @@ class constants$27 {
+         "(Ljdk/incubator/foreign/MemoryAddress;)V",
+         constants$27.OCSP_RESPONSE_free$FUNC, false
+     );
+-    static final FunctionDescriptor d2i_OCSP_RESPONSE$FUNC = FunctionDescriptor.of(C_POINTER,
+-        C_POINTER,
+-        C_POINTER,
+-        C_LONG
+-    );
+-    static final MethodHandle d2i_OCSP_RESPONSE$MH = RuntimeHelper.downcallHandle(
+-        openssl_h.LIBRARIES, "d2i_OCSP_RESPONSE",
+-        "(Ljdk/incubator/foreign/MemoryAddress;Ljdk/incubator/foreign/MemoryAddress;J)Ljdk/incubator/foreign/MemoryAddress;",
+-        constants$27.d2i_OCSP_RESPONSE$FUNC, false
+-    );
+ }
+ 
+ 
+
+==================================================
+openssl_h.java
+index 8716ab1941..be6bc7e5af 100644
+--- a/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/constants$28.java
++++ b/modules/openssl-java17/src/main/java/org/apache/tomcat/util/openssl/constants$28.java
+@@ -26,6 +26,16 @@ import jdk.incubator.foreign.*;
+ import static jdk.incubator.foreign.CLinker.*;
+ class constants$28 {
+ 
++    static final FunctionDescriptor d2i_OCSP_RESPONSE$FUNC = FunctionDescriptor.of(C_POINTER,
++        C_POINTER,
++        C_POINTER,
++        C_LONG
++    );
++    static final MethodHandle d2i_OCSP_RESPONSE$MH = RuntimeHelper.downcallHandle(
++        openssl_h.LIBRARIES, "d2i_OCSP_RESPONSE",
++        "(Ljdk/incubator/foreign/MemoryAddress;Ljdk/incubator/foreign/MemoryAddress;J)Ljdk/incubator/foreign/MemoryAddress;",
++        constants$28.d2i_OCSP_RESPONSE$FUNC, false
++    );
+     static final FunctionDescriptor OCSP_CERTID_free$FUNC = FunctionDescriptor.ofVoid(
+         C_POINTER
+     );
+@@ -57,7 +67,7 @@ class constants$28 {
+         "(Ljdk/incubator/foreign/MemoryAddress;Ljdk/incubator/foreign/MemoryAddress;)I",
+         constants$28.i2d_OCSP_REQUEST$FUNC, false
+     );
+-    static final MemorySegment OPENSSL_FILE$SEGMENT = CLinker.toCString("/tmp/jextract$18067138764655173084.h", ResourceScope.newImplicitScope());
++    static final MemorySegment OPENSSL_FILE$SEGMENT = CLinker.toCString("/tmp/jextract$18358922675719620067.h", ResourceScope.newImplicitScope());
+ }
+ 
+ 
+
+==================================================

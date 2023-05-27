@@ -1,0 +1,373 @@
+527ace4321400d0e0baa6325186e6ff7d51b068c
+==================================================
+Make NamingResources implement MBeanLifecycle
+==================================================
+Mark Emlyn
+==================================================
+Tue Feb 8 14:30:17 2011 +0000
+==================================================
+StandardContext.java
+index 2dc2da5123..f369df624b 100644
+--- a/java/org/apache/catalina/core/LocalStrings.properties
++++ b/java/org/apache/catalina/core/LocalStrings.properties
+@@ -122,6 +122,8 @@ standardContext.loginConfig.loginWarning=WARNING: Form login page {0} must start
+ standardContext.loginConfig.required=LoginConfig cannot be null
+ standardContext.manager=Configured a manager of class [{0}]
+ standardContext.mappingError=MAPPING configuration error for relative URI {0}
++standardContext.namingResource.init.fail=Failed to init new naming resources
++standardContext.namingResource.destroy.fail=Failed to destroy old naming resources
+ standardContext.noResourceJar=Resource JARs are not supported. The JAR found at [{0}] will not be used to provide static content for context with name [{1}]
+ standardContext.notFound=The requested resource ({0}) is not available.
+ standardContext.notReloadable=Reloading is disabled on this Context
+
+==================================================
+StandardServer.java
+index ffe79cb8c8..fb4ec795d2 100644
+--- a/java/org/apache/catalina/core/StandardContext.java
++++ b/java/org/apache/catalina/core/StandardContext.java
+@@ -448,7 +448,6 @@ public class StandardContext extends ContainerBase
+      * The naming resources for this web application.
+      */
+     private NamingResources namingResources = null;
+-    private ObjectName onameNamingResources;
+ 
+     /**
+      * The message destinations for this web application.
+@@ -1934,16 +1933,29 @@ public class StandardContext extends ContainerBase
+         // Process the property setting change
+         NamingResources oldNamingResources = this.namingResources;
+         this.namingResources = namingResources;
+-        namingResources.setContainer(this);
++        if (namingResources != null) {
++            namingResources.setContainer(this);
++        }
+         support.firePropertyChange("namingResources",
+                                    oldNamingResources, this.namingResources);
+         
+         // If set from server.xml, getObjectKeyPropertiesNameOnly() will
+         // trigger an NPE. Initial registration takes place on INIT. 
+         if (getState() != LifecycleState.NEW) {
+-            unregister(onameNamingResources);
+-            onameNamingResources = register(namingResources,
+-                    "type=NamingResources," + getObjectKeyPropertiesNameOnly());
++            if (oldNamingResources != null) {
++                try {
++                    oldNamingResources.destroy();
++                } catch (LifecycleException e) {
++                    log.warn("standardContext.namingResource.destroy.fail", e);
++                }
++            }
++            if (namingResources != null) {
++                try {
++                    namingResources.init();
++                } catch (LifecycleException e) {
++                    log.warn("standardContext.namingResource.init.fail", e);
++                }
++            }
+         }
+     }
+ 
+@@ -5435,7 +5447,9 @@ public class StandardContext extends ContainerBase
+                              sequenceNumber.getAndIncrement());
+         broadcaster.sendNotification(notification);
+ 
+-        unregister(onameNamingResources);
++        if (namingResources != null) {
++            namingResources.destroy();
++        }
+ 
+         synchronized (instanceListenersLock) {
+             instanceListeners = new String[0];
+@@ -6087,8 +6101,7 @@ public class StandardContext extends ContainerBase
+ 
+         // Register the naming resources
+         if (namingResources != null) {
+-            onameNamingResources = register(namingResources,
+-                    "type=NamingResources," + getObjectNameKeyProperties());
++            namingResources.init();
+         }
+ 
+         // Send j2ee.object.created notification 
+
+==================================================
+NamingResources.java
+index c4f0e43f54..245da9c73b 100644
+--- a/java/org/apache/catalina/deploy/LocalStrings.properties
++++ b/java/org/apache/catalina/deploy/LocalStrings.properties
+@@ -42,3 +42,7 @@ webXml.multipleOther=Multiple others entries in ordering
+ webxml.unrecognisedPublicId=The public ID [{0}] did not match any of the known public ID's for web.xml files so the version could not be identified
+ webXml.version.nfe=Unable to parse [{0}] from the version string [{1}]. This component of the version string will be ignored. 
+ webXml.wrongFragmentName=Used a wrong fragment name {0} at web.xml absolute-ordering tag!
++
++namingResources.mbeanCreateFail=Failed to create MBean for naming resource [{0}]
++namingResoucres.mbeanDestroyFail=Failed to destroy MBean for naming resource [{1}]
++
+
+==================================================
+MBeanUtils.java
+index 6a83920a50..dff9541906 100644
+--- a/java/org/apache/catalina/deploy/NamingResources.java
++++ b/java/org/apache/catalina/deploy/NamingResources.java
+@@ -25,9 +25,17 @@ import java.io.Serializable;
+ import java.util.HashMap;
+ import java.util.Hashtable;
+ 
++import org.apache.catalina.Container;
+ import org.apache.catalina.Context;
+ import org.apache.catalina.Engine;
++import org.apache.catalina.LifecycleException;
++import org.apache.catalina.LifecycleState;
+ import org.apache.catalina.Server;
++import org.apache.catalina.mbeans.MBeanUtils;
++import org.apache.catalina.util.LifecycleMBeanBase;
++import org.apache.juli.logging.Log;
++import org.apache.juli.logging.LogFactory;
++import org.apache.tomcat.util.res.StringManager;
+ 
+ 
+ /**
+@@ -38,9 +46,16 @@ import org.apache.catalina.Server;
+  * @version $Id$
+  */
+ 
+-public class NamingResources implements Serializable {
++public class NamingResources extends LifecycleMBeanBase implements Serializable {
+ 
+     private static final long serialVersionUID = 1L;
++    
++    private static final Log log = LogFactory.getLog(NamingResources.class);
++    
++    private static final StringManager sm =
++        StringManager.getManager(Constants.Package);
++
++    private volatile boolean resourceRequireExplicitRegistration = false;
+ 
+     // ----------------------------------------------------------- Constructors
+ 
+@@ -238,6 +253,15 @@ public class NamingResources implements Serializable {
+         }
+         support.firePropertyChange("environment", null, environment);
+ 
++        // Register with JMX
++        if (resourceRequireExplicitRegistration) {
++            try {
++                MBeanUtils.createMBean(environment);
++            } catch (Exception e) {
++                log.warn(sm.getString("namingResources.mbeanCreateFail",
++                        environment.getName()), e);
++            }
++        }
+     }
+ 
+     // Container should be an instance of Server or Context. If it is anything
+@@ -330,6 +354,15 @@ public class NamingResources implements Serializable {
+         }
+         support.firePropertyChange("resource", null, resource);
+ 
++        // Register with JMX
++        if (resourceRequireExplicitRegistration) {
++            try {
++                MBeanUtils.createMBean(resource);
++            } catch (Exception e) {
++                log.warn(sm.getString("namingResources.mbeanCreateFail",
++                        resource.getName()), e);
++            }
++        }
+     }
+ 
+ 
+@@ -378,6 +411,15 @@ public class NamingResources implements Serializable {
+         }
+         support.firePropertyChange("resourceLink", null, resourceLink);
+ 
++        // Register with JMX
++        if (resourceRequireExplicitRegistration) {
++            try {
++                MBeanUtils.createMBean(resourceLink);
++            } catch (Exception e) {
++                log.warn(sm.getString("namingResources.mbeanCreateFail",
++                        resourceLink.getName()), e);
++            }
++        }
+     }
+ 
+ 
+@@ -689,9 +731,17 @@ public class NamingResources implements Serializable {
+         }
+         if (environment != null) {
+             support.firePropertyChange("environment", environment, null);
++            // De-register with JMX
++            if (resourceRequireExplicitRegistration) {
++                try {
++                    MBeanUtils.destroyMBean(environment);
++                } catch (Exception e) {
++                    log.warn(sm.getString("namingResources.mbeanDestroyFail",
++                            environment.getName()), e);
++                }
++            }
+             environment.setNamingResources(null);
+         }
+-
+     }
+ 
+ 
+@@ -765,9 +815,17 @@ public class NamingResources implements Serializable {
+         }
+         if (resource != null) {
+             support.firePropertyChange("resource", resource, null);
++            // De-register with JMX
++            if (resourceRequireExplicitRegistration) {
++                try {
++                    MBeanUtils.destroyMBean(resource);
++                } catch (Exception e) {
++                    log.warn(sm.getString("namingResources.mbeanDestroyFail",
++                            resource.getName()), e);
++                }
++            }
+             resource.setNamingResources(null);
+         }
+-
+     }
+ 
+ 
+@@ -808,9 +866,17 @@ public class NamingResources implements Serializable {
+         }
+         if (resourceLink != null) {
+             support.firePropertyChange("resourceLink", resourceLink, null);
++            // De-register with JMX
++            if (resourceRequireExplicitRegistration) {
++                try {
++                    MBeanUtils.destroyMBean(resourceLink);
++                } catch (Exception e) {
++                    log.warn(sm.getString("namingResources.mbeanDestroyFail",
++                            resourceLink.getName()), e);
++                }
++            }
+             resourceLink.setNamingResources(null);
+         }
+-
+     }
+ 
+ 
+@@ -835,4 +901,119 @@ public class NamingResources implements Serializable {
+     }
+ 
+ 
++    // ------------------------------------------------------- Lifecycle methods
++    
++    @Override
++    protected void initInternal() throws LifecycleException {
++        super.initInternal();
++        
++        // Set this before we register currently known naming resources to avoid
++        // timing issues. Duplication registration is not an issue.
++        resourceRequireExplicitRegistration = true;
++        
++        for (ContextResource cr : resources.values()) {
++            try {
++                MBeanUtils.createMBean(cr);
++            } catch (Exception e) {
++                log.warn(sm.getString(
++                        "namingResources.mbeanCreateFail", cr.getName()), e);
++            }
++        }
++        
++        for (ContextEnvironment ce : envs.values()) {
++            try {
++                MBeanUtils.createMBean(ce);
++            } catch (Exception e) {
++                log.warn(sm.getString(
++                        "namingResources.mbeanCreateFail", ce.getName()), e);
++            }
++        }
++        
++        for (ContextResourceLink crl : resourceLinks.values()) {
++            try {
++                MBeanUtils.createMBean(crl);
++            } catch (Exception e) {
++                log.warn(sm.getString(
++                        "namingResources.mbeanCreateFail", crl.getName()), e);
++            }
++        }
++    }
++
++
++    @Override
++    protected void startInternal() throws LifecycleException {
++        fireLifecycleEvent(CONFIGURE_START_EVENT, null);
++        setState(LifecycleState.STARTING);
++    }
++
++
++    @Override
++    protected void stopInternal() throws LifecycleException {
++        setState(LifecycleState.STOPPING);
++        fireLifecycleEvent(CONFIGURE_STOP_EVENT, null);
++    }
++
++    
++    @Override
++    protected void destroyInternal() throws LifecycleException {
++
++        // Set this before we de-register currently known naming resources to
++        // avoid timing issues. Duplication de-registration is not an issue.
++        resourceRequireExplicitRegistration = false;
++
++        // Destroy in reverse order to create, although it should not matter
++        for (ContextResourceLink crl : resourceLinks.values()) {
++            try {
++                MBeanUtils.destroyMBean(crl);
++            } catch (Exception e) {
++                log.warn(sm.getString(
++                        "namingResources.mbeanDestroyFail", crl.getName()), e);
++            }
++        }
++        
++        for (ContextEnvironment ce : envs.values()) {
++            try {
++                MBeanUtils.destroyMBean(ce);
++            } catch (Exception e) {
++                log.warn(sm.getString(
++                        "namingResources.mbeanDestroyFail", ce.getName()), e);
++            }
++        }
++        
++        for (ContextResource cr : resources.values()) {
++            try {
++                MBeanUtils.destroyMBean(cr);
++            } catch (Exception e) {
++                log.warn(sm.getString(
++                        "namingResources.mbeanDestroyFail", cr.getName()), e);
++            }
++        }
++        
++        super.destroyInternal();
++    }
++
++
++    @Override
++    protected String getDomainInternal() {
++        // Use the same domain as our associated container if we have one
++        Object c = getContainer();
++        
++        if (c instanceof LifecycleMBeanBase) {
++            return ((LifecycleMBeanBase) c).getDomain();
++        }
++
++        return null;
++    }
++
++
++    @Override
++    protected String getObjectNameKeyProperties() {
++        Object c = getContainer();
++        if (c instanceof Container) {
++            return "type=NamingResources" +
++                    MBeanUtils.getContainerKeyProperties((Container) c);
++        }
++        // Server or just unknown
++        return "type=NamingResources";
++    }
+ }
+
+==================================================

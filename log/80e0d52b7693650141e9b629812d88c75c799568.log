@@ -1,0 +1,294 @@
+80e0d52b7693650141e9b629812d88c75c799568
+==================================================
+Revert r765727 (fix for https://issues.apache.org/bugzilla/show_bug.cgi?id=46538) - it fixes the reported issue but introduces other issues.
+==================================================
+Mark Emlyn
+==================================================
+Fri Apr 17 08:43:34 2009 +0000
+==================================================
+Constants.java
+Revert r765727 (fix for https://issues.apache.org/bugzilla/show_bug.cgi?id=46538) - it fixes the reported issue but introduces other issues.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@765902 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Http11AprProcessor.java
+index 048611511b..ff07a60d10 100644
+--- a/java/org/apache/coyote/http11/Constants.java
++++ b/java/org/apache/coyote/http11/Constants.java
+@@ -148,10 +148,7 @@ public final class Constants {
+         ByteChunk.convertToBytes("400");
+     public static final byte[] _404_BYTES = 
+         ByteChunk.convertToBytes("404");
+-    public static final String VARY = "Vary";
+-    public static final String VARY_UNSPECIFIED = "*";
+-    public static final String ACCEPT_ENCODING = "Accept-Encoding";
+-    public static final String ETAG = "ETag";
++    
+ 
+     /**
+      * Identity filters (input and output).
+
+==================================================
+Http11NioProcessor.java
+index 2b369161c7..2276785944 100644
+--- a/java/org/apache/coyote/http11/Http11AprProcessor.java
++++ b/java/org/apache/coyote/http11/Http11AprProcessor.java
+@@ -1486,9 +1486,16 @@ public class Http11AprProcessor implements ActionHook {
+ 
+ 
+     /**
+-     * Check if browser allows compression
++     * Check for compression
+      */
+-    private boolean isCompressableBrowser() {
++    private boolean isCompressable() {
++
++        // Nope Compression could works in HTTP 1.0 also
++        // cf: mod_deflate
++
++        // Compression only since HTTP 1.1
++        // if (! http11)
++        //    return false;
+ 
+         // Check if browser support gzip encoding
+         MessageBytes acceptEncodingMB =
+@@ -1498,7 +1505,15 @@ public class Http11AprProcessor implements ActionHook {
+             || (acceptEncodingMB.indexOf("gzip") == -1))
+             return false;
+ 
+-        // If force mode, always compress (test purposes only)
++        // Check if content is not allready gzipped
++        MessageBytes contentEncodingMB =
++            response.getMimeHeaders().getValue("Content-Encoding");
++
++        if ((contentEncodingMB != null)
++            && (contentEncodingMB.indexOf("gzip") != -1))
++            return false;
++
++        // If force mode, allways compress (test purposes only)
+         if (compressionLevel == 2)
+            return true;
+ 
+@@ -1515,23 +1530,8 @@ public class Http11AprProcessor implements ActionHook {
+                         return false;
+             }
+         }
+-        return true;
+-    }
+-    
+-    /*
+-     * Check if response allows compression
+-     */
+-    private boolean isCompressableResponse() {
+-        
+-        // Check if content is not already gzipped
+-        MessageBytes contentEncodingMB =
+-            response.getMimeHeaders().getValue("Content-Encoding");
+-
+-        if ((contentEncodingMB != null)
+-            && (contentEncodingMB.indexOf("gzip") != -1))
+-            return false;
+ 
+-        // Check if sufficient length to trigger the compression
++        // Check if suffisant len to trig the compression
+         long contentLength = response.getContentLengthLong();
+         if ((contentLength == -1)
+             || (contentLength > compressionMinSize)) {
+@@ -1598,35 +1598,18 @@ public class Http11AprProcessor implements ActionHook {
+                     ((Long) request.getAttribute("org.apache.tomcat.sendfile.end")).longValue();
+             }
+         }
+-
+-        MimeHeaders headers = response.getMimeHeaders();
+-
++        
+         // Check for compression
+         boolean useCompression = false;
+         if (entityBody && (compressionLevel > 0) && (sendfileData == null)) {
+-            if (isCompressableResponse()) {
+-                // Always send the Vary header when response could be compressed
+-                MessageBytes varyHeader = headers.getValue(Constants.VARY);
+-                if (varyHeader == null) {
+-                    headers.addValue(Constants.VARY).setString(
+-                            Constants.ACCEPT_ENCODING);
+-                } else {
+-                    if (varyHeader.indexOf(Constants.ACCEPT_ENCODING) == -1 &&
+-                            !varyHeader.equals(Constants.VARY_UNSPECIFIED)) {
+-                        varyHeader.setString(varyHeader.toString() + "," +
+-                                Constants.ACCEPT_ENCODING);
+-                    }
+-                }
+-            }            
+-            
+-            useCompression = isCompressableBrowser();
+-            
++            useCompression = isCompressable();
+             // Change content-length to -1 to force chunking
+             if (useCompression) {
+                 response.setContentLength(-1);
+             }
+         }
+ 
++        MimeHeaders headers = response.getMimeHeaders();
+         if (!entityBody) {
+             response.setContentLength(-1);
+         } else {
+@@ -1662,22 +1645,8 @@ public class Http11AprProcessor implements ActionHook {
+         if (useCompression) {
+             outputBuffer.addActiveFilter(outputFilters[Constants.GZIP_FILTER]);
+             headers.setValue("Content-Encoding").setString("gzip");
+-            
+-            // Ensure eTag for compressed content is different to eTag for
+-            // uncompressed content
+-            MessageBytes eTagHeader = headers.getValue(Constants.ETAG);
+-            if (eTagHeader != null) {
+-                String eTag = eTagHeader.toString();
+-                int len = eTag.length();
+-                if (len > 1 && eTag.charAt(len - 1) == '"') {
+-                    // Add compression marker before closing quote
+-                    eTag = eTag.substring(0, len -1) + "-gz\"";
+-                } else {
+-                    // Unquoted ETag - shouldn't happen - TODO complain
+-                    eTag = eTag + "-gz";
+-                }
+-                eTagHeader.setString(eTag);
+-            }
++            // Make Proxies happy via Vary (from mod_deflate)
++            headers.setValue("Vary").setString("Accept-Encoding");
+         }
+ 
+         // Add date header
+
+==================================================
+Http11Processor.java
+index 3110553b51..93f5d2c92c 100644
+--- a/java/org/apache/coyote/http11/Http11NioProcessor.java
++++ b/java/org/apache/coyote/http11/Http11NioProcessor.java
+@@ -1529,9 +1529,16 @@ public class Http11NioProcessor implements ActionHook {
+ 
+ 
+     /**
+-     * Check if browser allows compression
++     * Check for compression
+      */
+-    private boolean isCompressableBrowser() {
++    private boolean isCompressable() {
++
++        // Nope Compression could works in HTTP 1.0 also
++        // cf: mod_deflate
++
++        // Compression only since HTTP 1.1
++        // if (! http11)
++        //    return false;
+ 
+         // Check if browser support gzip encoding
+         MessageBytes acceptEncodingMB =
+@@ -1541,7 +1548,15 @@ public class Http11NioProcessor implements ActionHook {
+             || (acceptEncodingMB.indexOf("gzip") == -1))
+             return false;
+ 
+-        // If force mode, always compress (test purposes only)
++        // Check if content is not allready gzipped
++        MessageBytes contentEncodingMB =
++            response.getMimeHeaders().getValue("Content-Encoding");
++
++        if ((contentEncodingMB != null)
++            && (contentEncodingMB.indexOf("gzip") != -1))
++            return false;
++
++        // If force mode, allways compress (test purposes only)
+         if (compressionLevel == 2)
+            return true;
+ 
+@@ -1558,23 +1573,8 @@ public class Http11NioProcessor implements ActionHook {
+                         return false;
+             }
+         }
+-        return true;
+-    }
+-    
+-    /*
+-     * Check if response allows compression
+-     */
+-    private boolean isCompressableResponse() {
+-        
+-        // Check if content is not already gzipped
+-        MessageBytes contentEncodingMB =
+-            response.getMimeHeaders().getValue("Content-Encoding");
+ 
+-        if ((contentEncodingMB != null)
+-            && (contentEncodingMB.indexOf("gzip") != -1))
+-            return false;
+-
+-        // Check if sufficient length to trigger the compression
++        // Check if suffisant len to trig the compression
+         long contentLength = response.getContentLengthLong();
+         if ((contentLength == -1)
+             || (contentLength > compressionMinSize)) {
+@@ -1639,33 +1639,19 @@ public class Http11NioProcessor implements ActionHook {
+             }
+         }
+ 
+-        MimeHeaders headers = response.getMimeHeaders();
++
+ 
+         // Check for compression
+         boolean useCompression = false;
+         if (entityBody && (compressionLevel > 0) && (sendfileData == null)) {
+-            if (isCompressableResponse()) {
+-                // Always send the Vary header when response could be compressed
+-                MessageBytes varyHeader = headers.getValue(Constants.VARY);
+-                if (varyHeader == null) {
+-                    headers.addValue(Constants.VARY).setString(
+-                            Constants.ACCEPT_ENCODING);
+-                } else {
+-                    if (varyHeader.indexOf(Constants.ACCEPT_ENCODING) == -1 &&
+-                            !varyHeader.equals(Constants.VARY_UNSPECIFIED)) {
+-                        varyHeader.setString(varyHeader.toString() + "," +
+-                                Constants.ACCEPT_ENCODING);
+-                    }
+-                }
+-            }
+-            useCompression = isCompressableBrowser();
+-            
++            useCompression = isCompressable();
+             // Change content-length to -1 to force chunking
+             if (useCompression) {
+                 response.setContentLength(-1);
+             }
+         }
+ 
++        MimeHeaders headers = response.getMimeHeaders();
+         if (!entityBody) {
+             response.setContentLength(-1);
+         } else {
+@@ -1701,22 +1687,8 @@ public class Http11NioProcessor implements ActionHook {
+         if (useCompression) {
+             outputBuffer.addActiveFilter(outputFilters[Constants.GZIP_FILTER]);
+             headers.setValue("Content-Encoding").setString("gzip");
+-            
+-            // Ensure eTag for compressed content is different to eTag for
+-            // uncompressed content
+-            MessageBytes eTagHeader = headers.getValue(Constants.ETAG);
+-            if (eTagHeader != null) {
+-                String eTag = eTagHeader.toString();
+-                int len = eTag.length();
+-                if (len > 1 && eTag.charAt(len - 1) == '"') {
+-                    // Add compression marker before closing quote
+-                    eTag = eTag.substring(0, len -1) + "-gz\"";
+-                } else {
+-                    // Unquoted ETag - shouldn't happen - TODO complain
+-                    eTag = eTag + "-gz";
+-                }
+-                eTagHeader.setString(eTag);
+-            }
++            // Make Proxies happy via Vary (from mod_deflate)
++            headers.setValue("Vary").setString("Accept-Encoding");
+         }
+ 
+         // Add date header
+
+==================================================

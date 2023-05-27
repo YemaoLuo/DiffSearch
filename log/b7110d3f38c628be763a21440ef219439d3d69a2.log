@@ -1,0 +1,925 @@
+b7110d3f38c628be763a21440ef219439d3d69a2
+==================================================
+Refactor setting handling so common validation is applied to local and remote
+==================================================
+Mark Thomas
+==================================================
+Thu Aug 20 10:36:25 2015 +0000
+==================================================
+AbstractStream.java
+Refactor setting handling so common validation is applied to local and remote
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1696754 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+ConnectionSettingsBase.java
+index 2193620d97..80df244fe7 100644
+--- a/java/org/apache/coyote/http2/AbstractStream.java
++++ b/java/org/apache/coyote/http2/AbstractStream.java
+@@ -35,7 +35,7 @@ abstract class AbstractStream {
+ 
+     private volatile AbstractStream parentStream = null;
+     private final Set<AbstractStream> childStreams = new HashSet<>();
+-    private long windowSize = ConnectionSettingsRemote.DEFAULT_INITIAL_WINDOW_SIZE;
++    private long windowSize = ConnectionSettingsBase.DEFAULT_INITIAL_WINDOW_SIZE;
+ 
+     public Integer getIdentifier() {
+         return identifier;
+@@ -119,7 +119,7 @@ abstract class AbstractStream {
+                     getIdentifier(), Integer.toString(increment), Long.toString(windowSize)));
+         }
+ 
+-        if (windowSize > ConnectionSettingsRemote.MAX_WINDOW_SIZE) {
++        if (windowSize > ConnectionSettingsBase.MAX_WINDOW_SIZE) {
+             String msg = sm.getString("abstractStream.windowSizeTooBig", getConnectionId(), identifier,
+                     Integer.toString(increment), Long.toString(windowSize));
+             if (identifier.intValue() == 0) {
+
+==================================================
+ConnectionSettingsLocal.java
+index 56d829b3c6..65de6835ee 100644
+--- a/java/org/apache/coyote/http2/ConnectionSettingsBase.java
++++ b/java/org/apache/coyote/http2/ConnectionSettingsBase.java
+@@ -16,6 +16,198 @@
+  */
+ package org.apache.coyote.http2;
+ 
+-public abstract class ConnectionSettingsBase {
++import java.util.HashMap;
++import java.util.Map;
+ 
++import org.apache.juli.logging.Log;
++import org.apache.juli.logging.LogFactory;
++import org.apache.tomcat.util.res.StringManager;
++
++public abstract class ConnectionSettingsBase<T extends Throwable> {
++
++    private final Log log = LogFactory.getLog(ConnectionSettingsBase.class);
++    private final StringManager sm = StringManager.getManager(ConnectionSettingsBase.class);
++
++    // Limits
++    protected static final int MAX_WINDOW_SIZE = (1 << 31) - 1;
++    protected static final int MIN_MAX_FRAME_SIZE = 1 << 14;
++    protected static final int MAX_MAX_FRAME_SIZE = (1 << 24) - 1;
++    protected static final long UNLIMITED = ((long)1 << 32); // Use the maximum possible
++
++    // Defaults
++    protected static final int DEFAULT_HEADER_TABLE_SIZE = 4096;
++    protected static final boolean DEFAULT_ENABLE_PUSH = true;
++    protected static final long DEFAULT_MAX_CONCURRENT_STREAMS = UNLIMITED;
++    protected static final int DEFAULT_INITIAL_WINDOW_SIZE = (1 << 16) - 1;
++    protected static final int DEFAULT_MAX_FRAME_SIZE = MIN_MAX_FRAME_SIZE;
++    protected static final long DEFAULT_MAX_HEADER_LIST_SIZE = UNLIMITED;
++
++    protected Map<Setting,Long> current = new HashMap<>();
++    protected Map<Setting,Long> pending = new HashMap<>();
++
++
++    public ConnectionSettingsBase() {
++        // Set up the defaults
++        current.put(Setting.HEADER_TABLE_SIZE,      Long.valueOf(DEFAULT_HEADER_TABLE_SIZE));
++        current.put(Setting.ENABLE_PUSH,            Long.valueOf(DEFAULT_ENABLE_PUSH ? 1 : 0));
++        current.put(Setting.MAX_CONCURRENT_STREAMS, Long.valueOf(DEFAULT_MAX_CONCURRENT_STREAMS));
++        current.put(Setting.INITIAL_WINDOW_SIZE,    Long.valueOf(DEFAULT_INITIAL_WINDOW_SIZE));
++        current.put(Setting.MAX_FRAME_SIZE,         Long.valueOf(DEFAULT_MAX_FRAME_SIZE));
++        current.put(Setting.MAX_HEADER_LIST_SIZE,   Long.valueOf(DEFAULT_MAX_HEADER_LIST_SIZE));
++    }
++
++
++    public void set(Setting setting, long value) throws T {
++        if (log.isDebugEnabled()) {
++            log.debug(sm.getString("connectionSettings.debug", setting, Long.toString(value)));
++        }
++
++        switch(setting) {
++        case HEADER_TABLE_SIZE:
++            validateHeaderTableSize(value);
++            break;
++        case ENABLE_PUSH:
++            validateEnablePush(value);
++            break;
++        case MAX_CONCURRENT_STREAMS:
++            // No further validation required
++            break;
++        case INITIAL_WINDOW_SIZE:
++            validateInitialWindowSize(value);
++            break;
++        case MAX_FRAME_SIZE:
++            validateMaxFrameSize(value);
++            break;
++        case MAX_HEADER_LIST_SIZE:
++            // No further validation required
++            break;
++        case UNKNOWN:
++            // Unrecognised. Ignore it.
++            log.warn(sm.getString("connectionSettings.unknown", setting, Long.toString(value)));
++            return;
++        }
++
++        set(setting, Long.valueOf(value));
++    }
++
++
++    synchronized void set(Setting setting, Long value) {
++        current.put(setting, value);
++    }
++
++
++    public int getHeaderTableSize() {
++        return getMinInt(Setting.HEADER_TABLE_SIZE);
++    }
++
++
++    public boolean getEnablePush() {
++        long result = getMin(Setting.ENABLE_PUSH);
++        return result != 0;
++    }
++
++
++    public long getMaxConcurrentStreams() {
++        return getMax(Setting.MAX_CONCURRENT_STREAMS);
++    }
++
++
++    public int getInitialWindowSize() {
++        return getMaxInt(Setting.INITIAL_WINDOW_SIZE);
++    }
++
++
++    public int getMaxFrameSize() {
++        return getMaxInt(Setting.MAX_FRAME_SIZE);
++    }
++
++
++    public long getMaxHeaderListSize() {
++        return getMax(Setting.MAX_HEADER_LIST_SIZE);
++    }
++
++
++    private synchronized long getMin(Setting setting) {
++        Long pendingValue = pending.get(setting);
++        long currentValue = current.get(setting).longValue();
++        if (pendingValue == null) {
++            return currentValue;
++        } else {
++            return Long.min(pendingValue.longValue(), currentValue);
++        }
++    }
++
++
++    private synchronized int getMinInt(Setting setting) {
++        long result = getMin(setting);
++        if (result > Integer.MAX_VALUE) {
++            return Integer.MAX_VALUE;
++        } else {
++            return (int) result;
++        }
++    }
++
++
++    private synchronized long getMax(Setting setting) {
++        Long pendingValue = pending.get(setting);
++        long currentValue = current.get(setting).longValue();
++        if (pendingValue == null) {
++            return currentValue;
++        } else {
++            return Long.max(pendingValue.longValue(), currentValue);
++        }
++    }
++
++
++    private synchronized int getMaxInt(Setting setting) {
++        long result = getMax(setting);
++        if (result > Integer.MAX_VALUE) {
++            return Integer.MAX_VALUE;
++        } else {
++            return (int) result;
++        }
++    }
++
++
++    private void validateHeaderTableSize(long headerTableSize) throws T {
++        // Need to put a sensible limit on this. Start with 16k (default is 4k)
++        if (headerTableSize > (16 * 1024)) {
++            String msg = sm.getString("connectionSettings.headerTableSizeLimit",
++                    Long.toString(headerTableSize));
++            throwException(msg, Http2Error.PROTOCOL_ERROR);
++        }
++    }
++
++
++    private void validateEnablePush(long enablePush) throws T {
++        // Can't be less than zero since the result of the byte->long conversion
++        // will never be negative
++        if (enablePush > 1) {
++            String msg = sm.getString("connectionSettings.enablePushInvalid",
++                    Long.toString(enablePush));
++            throwException(msg, Http2Error.PROTOCOL_ERROR);
++        }
++    }
++
++
++    private void validateInitialWindowSize(long initialWindowSize) throws T {
++        if (initialWindowSize > MAX_WINDOW_SIZE) {
++            String msg = sm.getString("connectionSettings.windowSizeTooBig",
++                    Long.toString(initialWindowSize), Long.toString(MAX_WINDOW_SIZE));
++            throwException(msg, Http2Error.FLOW_CONTROL_ERROR);
++        }
++    }
++
++
++    private void validateMaxFrameSize(long maxFrameSize) throws T {
++        if (maxFrameSize < MIN_MAX_FRAME_SIZE || maxFrameSize > MAX_MAX_FRAME_SIZE) {
++            String msg = sm.getString("connectionSettings.maxFrameSizeInvalid",
++                    Long.toString(maxFrameSize), Integer.toString(MIN_MAX_FRAME_SIZE),
++                    Integer.toString(MAX_MAX_FRAME_SIZE));
++            throwException(msg, Http2Error.PROTOCOL_ERROR);
++        }
++    }
++
++
++    abstract void throwException(String msg, Http2Error error) throws T;
+ }
+
+==================================================
+ConnectionSettingsRemote.java
+index 3ef403bad1..3ff7c0f374 100644
+--- a/java/org/apache/coyote/http2/ConnectionSettingsLocal.java
++++ b/java/org/apache/coyote/http2/ConnectionSettingsLocal.java
+@@ -16,7 +16,6 @@
+  */
+ package org.apache.coyote.http2;
+ 
+-import java.util.HashMap;
+ import java.util.Map;
+ 
+ /**
+@@ -31,92 +30,17 @@ import java.util.Map;
+  * client will respond (almost certainly by closing the connection) as defined
+  * in the HTTP/2 specification.
+  */
+-public class ConnectionSettingsLocal extends ConnectionSettingsBase {
++public class ConnectionSettingsLocal extends ConnectionSettingsBase<IllegalArgumentException> {
+ 
+-    private static final Integer KEY_HEADER_TABLE_SIZE = Integer.valueOf(1);
+-    private static final Integer KEY_ENABLE_PUSH = Integer.valueOf(2);
+-    private static final Integer KEY_MAX_CONCURRENT_STREAMS = Integer.valueOf(3);
+-    private static final Integer KEY_INITIAL_WINDOW_SIZE = Integer.valueOf(4);
+-    private static final Integer KEY_MAX_FRAME_SIZE = Integer.valueOf(5);
+-    private static final Integer KEY_MAX_HEADER_LIST_SIZE = Integer.valueOf(6);
++    private boolean sendInProgress = false;
+ 
+-    private static final Long DEFAULT_HEADER_TABLE_SIZE =
+-            Long.valueOf(ConnectionSettingsRemote.DEFAULT_HEADER_TABLE_SIZE);
+-    private static final Long DEFAULT_ENABLE_PUSH = Long.valueOf(1);
+-    private static final Long DEFAULT_MAX_CONCURRENT_STREAMS =
+-            Long.valueOf(ConnectionSettingsRemote.UNLIMITED);
+-    private static final Long DEFAULT_INITIAL_WINDOW_SIZE =
+-            Long.valueOf(ConnectionSettingsRemote.DEFAULT_INITIAL_WINDOW_SIZE);
+-    private static final Long DEFAULT_MAX_FRAME_SIZE =
+-            Long.valueOf(ConnectionSettingsRemote.DEFAULT_MAX_FRAME_SIZE);
+-    private static final Long DEFAULT_MAX_HEADER_LIST_SIZE =
+-            Long.valueOf(ConnectionSettingsRemote.UNLIMITED);
+-
+-    boolean sendInProgress = false;
+-
+-    private Map<Integer,Long> current = new HashMap<>();
+-    private Map<Integer,Long> pending = new HashMap<>();
+-
+-
+-    public ConnectionSettingsLocal() {
+-        // Set up the defaults
+-        current.put(KEY_HEADER_TABLE_SIZE,      DEFAULT_HEADER_TABLE_SIZE);
+-        current.put(KEY_ENABLE_PUSH,            DEFAULT_ENABLE_PUSH);
+-        current.put(KEY_MAX_CONCURRENT_STREAMS, DEFAULT_MAX_CONCURRENT_STREAMS);
+-        current.put(KEY_INITIAL_WINDOW_SIZE,    DEFAULT_INITIAL_WINDOW_SIZE);
+-        current.put(KEY_MAX_FRAME_SIZE,         DEFAULT_MAX_FRAME_SIZE);
+-        current.put(KEY_MAX_HEADER_LIST_SIZE,   DEFAULT_MAX_HEADER_LIST_SIZE);
+-    }
+-
+-
+-    private synchronized void set(Integer key, long value) {
++    @Override
++    protected synchronized void set(Setting setting, Long value) {
+         checkSend();
+-        if (current.get(key).longValue() == value) {
+-            pending.remove(key);
+-        } else {
+-            pending.put(key, Long.valueOf(value));
+-        }
+-    }
+-
+-
+-    private synchronized long getMin(Integer key) {
+-        Long pendingValue = pending.get(key);
+-        long currentValue = current.get(key).longValue();
+-        if (pendingValue == null) {
+-            return currentValue;
+-        } else {
+-            return Long.min(pendingValue.longValue(), currentValue);
+-        }
+-    }
+-
+-
+-    private int getMinInt(Integer key) {
+-        long result = getMin(key);
+-        if (result > Integer.MAX_VALUE) {
+-            return Integer.MAX_VALUE;
+-        } else {
+-            return (int) result;
+-        }
+-    }
+-
+-
+-    private synchronized long getMax(Integer key) {
+-        Long pendingValue = pending.get(key);
+-        long currentValue = current.get(key).longValue();
+-        if (pendingValue == null) {
+-            return currentValue;
+-        } else {
+-            return Long.max(pendingValue.longValue(), currentValue);
+-        }
+-    }
+-
+-
+-    private int getMaxInt(Integer key) {
+-        long result = getMax(key);
+-        if (result > Integer.MAX_VALUE) {
+-            return Integer.MAX_VALUE;
++        if (current.get(setting).longValue() == value.longValue()) {
++            pending.remove(setting);
+         } else {
+-            return (int) result;
++            pending.put(setting, value);
+         }
+     }
+ 
+@@ -132,8 +56,8 @@ public class ConnectionSettingsLocal extends ConnectionSettingsBase {
+         // Stream is zero
+         // Payload
+         int pos = 9;
+-        for (Map.Entry<Integer,Long> setting : pending.entrySet()) {
+-            ByteUtil.setTwoBytes(result, pos, setting.getKey().intValue());
++        for (Map.Entry<Setting,Long> setting : pending.entrySet()) {
++            ByteUtil.setTwoBytes(result, pos, setting.getKey().getId());
+             pos += 2;
+             ByteUtil.setFourBytes(result, pos, setting.getValue().longValue());
+             pos += 4;
+@@ -163,51 +87,8 @@ public class ConnectionSettingsLocal extends ConnectionSettingsBase {
+     }
+ 
+ 
+-    public int getHeaderTableSize() {
+-        return getMinInt(KEY_HEADER_TABLE_SIZE);
+-    }
+-    public void setHeaderTableSize(long headerTableSize) {
+-        set(KEY_HEADER_TABLE_SIZE, headerTableSize);
+-    }
+-
+-
+-    public boolean getEnablePush() {
+-        long result = getMin(KEY_ENABLE_PUSH);
+-        return result != 0;
+-    }
+-    public void setEnablePush(long enablePush) {
+-        set(KEY_ENABLE_PUSH, enablePush);
+-    }
+-
+-
+-    public long getMaxConcurrentStreams() {
+-        return getMax(KEY_MAX_CONCURRENT_STREAMS);
+-    }
+-    public void setMaxConcurrentStreams(long maxConcurrentStreams) {
+-        set(KEY_MAX_CONCURRENT_STREAMS, maxConcurrentStreams);
+-    }
+-
+-
+-    public int getInitialWindowSize() {
+-        return getMaxInt(KEY_INITIAL_WINDOW_SIZE);
+-    }
+-    public void setInitialWindowSize(long initialWindowSize) {
+-        set(KEY_INITIAL_WINDOW_SIZE, initialWindowSize);
+-    }
+-
+-
+-    public int getMaxFrameSize() {
+-        return getMaxInt(KEY_MAX_FRAME_SIZE);
+-    }
+-    public void setMaxFrameSize(long maxFrameSize) {
+-        set(KEY_MAX_FRAME_SIZE, maxFrameSize);
+-    }
+-
+-
+-    public long getMaxHeaderListSize() {
+-        return getMax(KEY_MAX_HEADER_LIST_SIZE);
+-    }
+-    public void setMaxHeaderListSize(long maxHeaderListSize) {
+-        set(KEY_MAX_HEADER_LIST_SIZE, maxHeaderListSize);
++    @Override
++    void throwException(String msg, Http2Error error) throws IllegalArgumentException {
++        throw new IllegalArgumentException(msg);
+     }
+ }
+
+==================================================
+Http2Parser.java
+index 4aadc3ccd1..4879368eb2 100644
+--- a/java/org/apache/coyote/http2/ConnectionSettingsRemote.java
++++ b/java/org/apache/coyote/http2/ConnectionSettingsRemote.java
+@@ -16,134 +16,14 @@
+  */
+ package org.apache.coyote.http2;
+ 
+-import org.apache.juli.logging.Log;
+-import org.apache.juli.logging.LogFactory;
+-import org.apache.tomcat.util.res.StringManager;
+-
+ /**
+  * Represents the remote connection settings: i.e. the settings the server must
+  * use when communicating with the client.
+  */
+-public class ConnectionSettingsRemote extends ConnectionSettingsBase {
+-
+-    private final Log log = LogFactory.getLog(ConnectionSettingsRemote.class);
+-    private final StringManager sm = StringManager.getManager(ConnectionSettingsRemote.class);
+-
+-    public static final int DEFAULT_INITIAL_WINDOW_SIZE = (1 << 16) - 1;
+-    static final long UNLIMITED = ((long)1 << 32); // Use the maximum possible
+-    static final int MAX_WINDOW_SIZE = (1 << 31) - 1;
+-
+-    private static final int MIN_MAX_FRAME_SIZE = 1 << 14;
+-    private static final int MAX_MAX_FRAME_SIZE = (1 << 24) - 1;
+-    static final int DEFAULT_MAX_FRAME_SIZE = MIN_MAX_FRAME_SIZE;
+-
+-    static final int DEFAULT_HEADER_TABLE_SIZE = 4096;
+-    private volatile int headerTableSize = DEFAULT_HEADER_TABLE_SIZE;
+-
+-    private volatile boolean enablePush = true;
+-    private volatile long maxConcurrentStreams = UNLIMITED;
+-    private volatile int initialWindowSize = DEFAULT_INITIAL_WINDOW_SIZE;
+-    private volatile int maxFrameSize = DEFAULT_MAX_FRAME_SIZE;
+-    private volatile long maxHeaderListSize = UNLIMITED;
+-
+-    public void set(int parameterId, long value) throws ConnectionException {
+-        if (log.isDebugEnabled()) {
+-            log.debug(sm.getString("connectionSettings.debug",
+-                    Integer.toString(parameterId), Long.toString(value)));
+-        }
+-
+-        switch(parameterId) {
+-        case 1:
+-            setHeaderTableSize(value);
+-            break;
+-        case 2:
+-            setEnablePush(value);
+-            break;
+-        case 3:
+-            setMaxConcurrentStreams(value);
+-            break;
+-        case 4:
+-            setInitialWindowSize(value);
+-            break;
+-        case 5:
+-            setMaxFrameSize(value);
+-            break;
+-        case 6:
+-            setMaxHeaderListSize(value);
+-            break;
+-        default:
+-            // Unrecognised. Ignore it.
+-            log.warn(sm.getString("connectionSettings.unknown",
+-                    Integer.toString(parameterId), Long.toString(value)));
+-        }
+-    }
+-
+-
+-    public int getHeaderTableSize() {
+-        return headerTableSize;
+-    }
+-    public void setHeaderTableSize(long headerTableSize) throws ConnectionException {
+-        // Need to put a sensible limit on this. Start with 16k (default is 4k)
+-        if (headerTableSize > (16 * 1024)) {
+-            throw new ConnectionException(sm.getString("connectionSettings.headerTableSizeLimit",
+-                    Long.toString(headerTableSize)), Http2Error.PROTOCOL_ERROR);
+-        }
+-        this.headerTableSize = (int) headerTableSize;
+-    }
+-
++public class ConnectionSettingsRemote extends ConnectionSettingsBase<ConnectionException> {
+ 
+-    public boolean getEnablePush() {
+-        return enablePush;
+-    }
+-    public void setEnablePush(long enablePush) throws ConnectionException {
+-        // Can't be less than zero since the result of the byte->long conversion
+-        // will never be negative
+-        if (enablePush > 1) {
+-            throw new ConnectionException(sm.getString("connectionSettings.enablePushInvalid",
+-                    Long.toString(enablePush)), Http2Error.PROTOCOL_ERROR);
+-        }
+-        this.enablePush = (enablePush  == 1);
+-    }
+-
+-
+-    public long getMaxConcurrentStreams() {
+-        return maxConcurrentStreams;
+-    }
+-    public void setMaxConcurrentStreams(long maxConcurrentStreams) {
+-        this.maxConcurrentStreams = maxConcurrentStreams;
+-    }
+-
+-
+-    public int getInitialWindowSize() {
+-        return initialWindowSize;
+-    }
+-    public void setInitialWindowSize(long initialWindowSize) throws ConnectionException {
+-        if (initialWindowSize > MAX_WINDOW_SIZE) {
+-            throw new ConnectionException(sm.getString("connectionSettings.windowSizeTooBig",
+-                    Long.toString(initialWindowSize), Long.toString(MAX_WINDOW_SIZE)),
+-                    Http2Error.FLOW_CONTROL_ERROR);
+-        }
+-        this.initialWindowSize = (int) initialWindowSize;
+-    }
+-
+-
+-    public int getMaxFrameSize() {
+-        return maxFrameSize;
+-    }
+-    public void setMaxFrameSize(long maxFrameSize) throws ConnectionException {
+-        if (maxFrameSize < MIN_MAX_FRAME_SIZE || maxFrameSize > MAX_MAX_FRAME_SIZE) {
+-            throw new ConnectionException(sm.getString("connectionSettings.maxFrameSizeInvalid",
+-                    Long.toString(maxFrameSize), Integer.toString(MIN_MAX_FRAME_SIZE),
+-                    Integer.toString(MAX_MAX_FRAME_SIZE)), Http2Error.PROTOCOL_ERROR);
+-        }
+-        this.maxFrameSize = (int) maxFrameSize;
+-    }
+-
+-
+-    public long getMaxHeaderListSize() {
+-        return maxHeaderListSize;
+-    }
+-    public void setMaxHeaderListSize(long maxHeaderListSize) {
+-        this.maxHeaderListSize = maxHeaderListSize;
++    @Override
++    void throwException(String msg, Http2Error error) throws ConnectionException {
++        throw new ConnectionException(msg, error);
+     }
+ }
+
+==================================================
+Http2UpgradeHandler.java
+index f0b4e0eae9..66e4f0a3d7 100644
+--- a/java/org/apache/coyote/http2/Http2Parser.java
++++ b/java/org/apache/coyote/http2/Http2Parser.java
+@@ -44,8 +44,6 @@ class Http2Parser {
+     private volatile int headersCurrentStream = -1;
+     private volatile boolean headersEndStream = false;
+ 
+-    private volatile int maxPayloadSize = ConnectionSettingsRemote.DEFAULT_MAX_FRAME_SIZE;
+-
+ 
+     Http2Parser(String connectionId, Input input, Output output) {
+         this.connectionId = connectionId;
+@@ -308,7 +306,7 @@ class Http2Parser {
+                 input.fill(true, setting);
+                 int id = ByteUtil.getTwoBytes(setting, 0);
+                 long value = ByteUtil.getFourBytes(setting, 2);
+-                output.setting(id, value);
++                output.setting(Setting.valueOf(id), value);
+             }
+         }
+         output.settingsEnd(ack);
+@@ -486,9 +484,10 @@ class Http2Parser {
+                     expected, frameType), Http2Error.PROTOCOL_ERROR, streamId);
+         }
+ 
+-        if (payloadSize > maxPayloadSize) {
++        int maxFrameSize = input.getMaxFrameSize();
++        if (payloadSize > maxFrameSize) {
+             throw new ConnectionException(sm.getString("http2Parser.payloadTooBig",
+-                    Integer.toString(payloadSize), Integer.toString(maxPayloadSize)),
++                    Integer.toString(payloadSize), Integer.toString(maxFrameSize)),
+                     Http2Error.FRAME_SIZE_ERROR);
+         }
+ 
+@@ -573,6 +572,8 @@ class Http2Parser {
+             }
+             return result;
+         }
++
++        int getMaxFrameSize();
+     }
+ 
+ 
+@@ -601,7 +602,7 @@ class Http2Parser {
+         void reset(int streamId, long errorCode) throws Http2Exception;
+ 
+         // Settings frames
+-        void setting(int identifier, long value) throws ConnectionException;
++        void setting(Setting setting, long value) throws ConnectionException;
+         void settingsEnd(boolean ack) throws IOException;
+ 
+         // Ping frames
+
+==================================================
+Setting.java
+index 1a07c8d91c..d2f0e7b32d 100644
+--- a/java/org/apache/coyote/http2/Http2UpgradeHandler.java
++++ b/java/org/apache/coyote/http2/Http2UpgradeHandler.java
+@@ -195,7 +195,7 @@ public class Http2UpgradeHandler extends AbstractStream implements InternalHttpU
+                 for (int i = 0; i < settings.length % 6; i++) {
+                     int id = ByteUtil.getTwoBytes(settings, i * 6);
+                     long value = ByteUtil.getFourBytes(settings, (i * 6) + 2);
+-                    remoteSettings.set(id, value);
++                    remoteSettings.set(Setting.valueOf(id), value);
+                 }
+             } catch (Http2Exception | IOException ioe) {
+                 throw new ProtocolException(
+@@ -812,12 +812,12 @@ public class Http2UpgradeHandler extends AbstractStream implements InternalHttpU
+ 
+ 
+     public void setMaxConcurrentStreams(long maxConcurrentStreams) {
+-        localSettings.setMaxConcurrentStreams(maxConcurrentStreams);
++        localSettings.set(Setting.MAX_CONCURRENT_STREAMS, maxConcurrentStreams);
+     }
+ 
+ 
+     public void setInitialWindowSize(int initialWindowSize) {
+-        localSettings.setInitialWindowSize(initialWindowSize);
++        localSettings.set(Setting.INITIAL_WINDOW_SIZE, initialWindowSize);
+     }
+ 
+ 
+@@ -852,6 +852,12 @@ public class Http2UpgradeHandler extends AbstractStream implements InternalHttpU
+     }
+ 
+ 
++    @Override
++    public int getMaxFrameSize() {
++        return localSettings.getMaxFrameSize();
++    }
++
++
+     // ---------------------------------------------- Http2Parser.Output methods
+ 
+     @Override
+@@ -976,8 +982,8 @@ public class Http2UpgradeHandler extends AbstractStream implements InternalHttpU
+ 
+ 
+     @Override
+-    public void setting(int identifier, long value) throws ConnectionException {
+-        remoteSettings.set(identifier, value);
++    public void setting(Setting setting, long value) throws ConnectionException {
++        remoteSettings.set(setting, value);
+     }
+ 
+ 
+
+==================================================
+Http2TestBase.java
+new file mode 100644
+index 0000000000..574e0cde6a
+--- /dev/null
++++ b/java/org/apache/coyote/http2/Setting.java
+@@ -0,0 +1,52 @@
++package org.apache.coyote.http2;
++
++public enum Setting {
++    HEADER_TABLE_SIZE(1),
++    ENABLE_PUSH(2),
++    MAX_CONCURRENT_STREAMS(3),
++    INITIAL_WINDOW_SIZE(4),
++    MAX_FRAME_SIZE(5),
++    MAX_HEADER_LIST_SIZE(6),
++    UNKNOWN(Integer.MAX_VALUE);
++
++    private final int id;
++
++    private Setting (int id) {
++        this.id = id;
++    }
++
++    public int getId() {
++        return id;
++    }
++
++    @Override
++    public String toString() {
++        return Integer.toString(id);
++    }
++
++    public static Setting valueOf(int i) {
++        switch(i) {
++        case 1: {
++            return HEADER_TABLE_SIZE;
++        }
++        case 2: {
++            return ENABLE_PUSH;
++        }
++        case 3: {
++            return MAX_CONCURRENT_STREAMS;
++        }
++        case 4: {
++            return INITIAL_WINDOW_SIZE;
++        }
++        case 5: {
++            return MAX_FRAME_SIZE;
++        }
++        case 6: {
++            return MAX_HEADER_LIST_SIZE;
++        }
++        default: {
++            return Setting.UNKNOWN;
++        }
++        }
++    }
++}
+
+==================================================
+TestHttp2Section_4_2.java
+index 632df2e8dc..563f8994ef 100644
+--- a/test/org/apache/coyote/http2/Http2TestBase.java
++++ b/test/org/apache/coyote/http2/Http2TestBase.java
+@@ -395,7 +395,7 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+         input = new TestInput(is);
+         output = new TestOutput();
+         parser = new Http2Parser("-1", input, output);
+-        hpackEncoder = new HpackEncoder(ConnectionSettingsRemote.DEFAULT_HEADER_TABLE_SIZE);
++        hpackEncoder = new HpackEncoder(ConnectionSettingsBase.DEFAULT_HEADER_TABLE_SIZE);
+     }
+ 
+ 
+@@ -634,7 +634,7 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+     }
+ 
+ 
+-    void sendSettings(int streamId, boolean ack, Setting... settings) throws IOException {
++    void sendSettings(int streamId, boolean ack, SettingValue... settings) throws IOException {
+         // length
+         int settingsCount;
+         if (settings == null) {
+@@ -694,6 +694,13 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+             }
+             return true;
+         }
++
++
++        @Override
++        public int getMaxFrameSize() {
++            // Hard-coded to use the default
++            return ConnectionSettingsBase.DEFAULT_MAX_FRAME_SIZE;
++        }
+     }
+ 
+ 
+@@ -759,9 +766,9 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+ 
+ 
+         @Override
+-        public void setting(int identifier, long value) throws ConnectionException {
+-            trace.append("0-Settings-[" + identifier + "]-[" + value + "]\n");
+-            remoteSettings.set(identifier, value);
++        public void setting(Setting setting, long value) throws ConnectionException {
++            trace.append("0-Settings-[" + setting + "]-[" + value + "]\n");
++            remoteSettings.set(setting, value);
+         }
+ 
+ 
+@@ -923,11 +930,11 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+     }
+ 
+ 
+-    static class Setting {
++    static class SettingValue {
+         private final int setting;
+         private final long value;
+ 
+-        public Setting(int setting, long value) {
++        public SettingValue(int setting, long value) {
+             this.setting = setting;
+             this.value = value;
+         }
+
+==================================================
+TestHttp2Section_5_2.java
+index 7c5e7beca9..f99dd9fe81 100644
+--- a/test/org/apache/coyote/http2/TestHttp2Section_4_2.java
++++ b/test/org/apache/coyote/http2/TestHttp2Section_4_2.java
+@@ -35,7 +35,7 @@ public class TestHttp2Section_4_2 extends Http2TestBase {
+ 
+         // Overly large settings
+         // Settings have to be a multiple of six
+-        int settingsCount = (ConnectionSettingsRemote.DEFAULT_MAX_FRAME_SIZE / 6) + 1;
++        int settingsCount = (ConnectionSettingsBase.DEFAULT_MAX_FRAME_SIZE / 6) + 1;
+         int size = settingsCount * 6;
+         byte[] settings = new byte[size + 9];
+         // Header
+
+==================================================
+TestHttp2Section_5_3.java
+index db863ca558..545825fe36 100644
+--- a/test/org/apache/coyote/http2/TestHttp2Section_5_2.java
++++ b/test/org/apache/coyote/http2/TestHttp2Section_5_2.java
+@@ -41,7 +41,7 @@ public class TestHttp2Section_5_2 extends Http2TestBase {
+         http2Connect();
+ 
+         // Set the default window size to 1024 bytes
+-        sendSettings(0, false, new Setting(4, 1024));
++        sendSettings(0, false, new SettingValue(4, 1024));
+         // Wait for the ack
+         parser.readFrame(true);
+         output.clearTrace();
+
+==================================================
+TestHttp2Section_5_5.java
+index 91bb77e479..092b4ccdfe 100644
+--- a/test/org/apache/coyote/http2/TestHttp2Section_5_3.java
++++ b/test/org/apache/coyote/http2/TestHttp2Section_5_3.java
+@@ -67,7 +67,7 @@ public class TestHttp2Section_5_3 extends Http2TestBase {
+         }
+ 
+         // Set the default window size to 1024 bytes
+-        sendSettings(0, false, new Setting(4, 1024));
++        sendSettings(0, false, new SettingValue(4, 1024));
+         // Wait for the ack
+         parser.readFrame(true);
+         // Debugging Gump failure
+
+==================================================
+TestHttp2Section_6_5.java
+index c22c59d608..ec212e1970 100644
+--- a/test/org/apache/coyote/http2/TestHttp2Section_5_5.java
++++ b/test/org/apache/coyote/http2/TestHttp2Section_5_5.java
+@@ -53,7 +53,7 @@ public class TestHttp2Section_5_5 extends Http2TestBase {
+         http2Connect();
+ 
+         // Unknown setting (should be ack'd)
+-        sendSettings(0, false, new Setting(1 << 15, 0));
++        sendSettings(0, false, new SettingValue(1 << 15, 0));
+ 
+         parser.readFrame(true);
+ 
+
+==================================================
+TestHttp2Section_6_9.java
+index 2ee1fd05a9..c2b102dd49 100644
+--- a/test/org/apache/coyote/http2/TestHttp2Section_6_5.java
++++ b/test/org/apache/coyote/http2/TestHttp2Section_6_5.java
+@@ -34,7 +34,7 @@ public class TestHttp2Section_6_5 extends Http2TestBase {
+         // HTTP2 upgrade
+         http2Connect();
+ 
+-        sendSettings(0, true, new Setting(1,1));
++        sendSettings(0, true, new SettingValue(1,1));
+ 
+         // Go away
+         parser.readFrame(true);
+@@ -50,7 +50,7 @@ public class TestHttp2Section_6_5 extends Http2TestBase {
+         http2Connect();
+ 
+         sendPriority(3, 0, 15);
+-        sendSettings(3, true, new Setting(1,1));
++        sendSettings(3, true, new SettingValue(1,1));
+ 
+         // Go away
+         parser.readFrame(true);
+@@ -93,7 +93,7 @@ public class TestHttp2Section_6_5 extends Http2TestBase {
+         // HTTP2 upgrade
+         http2Connect();
+ 
+-        sendSettings(0, false, new Setting(0x2,0x2));
++        sendSettings(0, false, new SettingValue(0x2,0x2));
+ 
+         // Go away
+         parser.readFrame(true);
+@@ -108,7 +108,7 @@ public class TestHttp2Section_6_5 extends Http2TestBase {
+         // HTTP2 upgrade
+         http2Connect();
+ 
+-        sendSettings(0, false, new Setting(0x4,1 << 31));
++        sendSettings(0, false, new SettingValue(0x4,1 << 31));
+ 
+         // Go away
+         parser.readFrame(true);
+@@ -123,7 +123,7 @@ public class TestHttp2Section_6_5 extends Http2TestBase {
+         // HTTP2 upgrade
+         http2Connect();
+ 
+-        sendSettings(0, false, new Setting(0x5,1 << 31));
++        sendSettings(0, false, new SettingValue(0x5,1 << 31));
+ 
+         // Go away
+         parser.readFrame(true);
+@@ -138,7 +138,7 @@ public class TestHttp2Section_6_5 extends Http2TestBase {
+         // HTTP2 upgrade
+         http2Connect();
+ 
+-        sendSettings(0, false, new Setting(0xFF,0xFF));
++        sendSettings(0, false, new SettingValue(0xFF,0xFF));
+ 
+         // Ack
+         parser.readFrame(true);
+
+==================================================

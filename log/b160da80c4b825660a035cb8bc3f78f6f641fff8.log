@@ -1,0 +1,146 @@
+b160da80c4b825660a035cb8bc3f78f6f641fff8
+==================================================
+Make code calling user provided listeners more robust.
+==================================================
+Mark Thomas
+==================================================
+Tue Feb 10 20:05:12 2015 +0000
+==================================================
+UpgradeProcessor.java
+index d9b2bf6f77..0c1985f9da 100644
+--- a/java/org/apache/coyote/http11/upgrade/LocalStrings.properties
++++ b/java/org/apache/coyote/http11/upgrade/LocalStrings.properties
+@@ -14,16 +14,18 @@
+ # limitations under the License.
+ 
+ upgradeProcessor.isCloseFail=Failed to close input stream associated with upgraded connection
+-upgradeProcessor.onDataAvailableFail=Failed to process data available event
+-upgradeProcessor.onWritePossibleFail=Failed to process write possible event
+ upgradeProcessor.osCloseFail=Failed to close output stream associated with upgraded connection
+ 
++upgrade.sis.errorCloseFail=Failed to close InputStream cleanly after a previous error
+ upgrade.sis.isFinished.ise=It is illegal to call isFinished() when the ServletInputStream is not in non-blocking mode (i.e. setReadListener() must be called first)
+ upgrade.sis.isReady.ise=It is illegal to call isReady() when the ServletInputStream is not in non-blocking mode (i.e. setReadListener() must be called first)
++upgrade.sis.onErrorFail=onError processing for the registered ReadListener triggered this further error which was swallowed
+ upgrade.sis.readListener.null=It is illegal to pass null to setReadListener()
+ upgrade.sis.readListener.set=It is illegal to call setReadListener() more than once for the same upgraded connection
+ upgrade.sis.read.ise=It is illegal to call any of the read() methods in non-blocking mode without first checking that there is data available by calling isReady()
++upgrade.sos.errorCloseFail=Failed to close OutputStream cleanly after a previous error
+ upgrade.sos.canWrite.ise=It is illegal to call canWrite() when the ServletOutputStream is not in non-blocking mode (i.e. setWriteListener() must be called first)
++upgrade.sos.onErrorFail=onError processing for the registered WriteListener triggered this further error which was swallowed
+ upgrade.sos.writeListener.null=It is illegal to pass null to setWriteListener()
+ upgrade.sos.writeListener.set=It is illegal to call setWriteListener() more than once for the same upgraded connection
+ upgrade.sis.write.ise=It is illegal to call any of the write() methods in non-blocking mode without first checking that there is space available by calling isReady()
+
+==================================================
+UpgradeServletInputStream.java
+index 593f9bb7a2..90bd3080c5 100644
+--- a/java/org/apache/coyote/http11/upgrade/UpgradeProcessor.java
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeProcessor.java
+@@ -98,24 +98,10 @@ public class UpgradeProcessor implements Processor, WebConnection {
+     @Override
+     public final SocketState upgradeDispatch(SocketStatus status) {
+         if (status == SocketStatus.OPEN_READ) {
+-            try {
+-                upgradeServletInputStream.onDataAvailable();
+-                upgradeServletOutputStream.checkWriteDispatch();
+-            } catch (IOException ioe) {
+-                // The error handling within the ServletInputStream should have
+-                // marked the stream for closure which will get picked up below,
+-                // triggering the clean-up of this processor.
+-                log.debug(sm.getString("upgradeProcessor.onDataAvailableFail"), ioe);
+-            }
++            upgradeServletInputStream.onDataAvailable();
++            upgradeServletOutputStream.checkWriteDispatch();
+         } else if (status == SocketStatus.OPEN_WRITE) {
+-            try {
+-                upgradeServletOutputStream.onWritePossible();
+-            } catch (IOException ioe) {
+-                // The error handling within the ServletOutputStream should have
+-                // marked the stream for closure which will get picked up below,
+-                // triggering the clean-up of this processor.
+-                log.debug(sm.getString("upgradeProcessor.onWritePossibleFail"), ioe);
+-            }
++            upgradeServletOutputStream.onWritePossible();
+         } else if (status == SocketStatus.STOP) {
+             try {
+                 upgradeServletInputStream.close();
+
+==================================================
+UpgradeServletOutputStream.java
+index 207ffbe1fa..5ba3bc6ad7 100644
+--- a/java/org/apache/coyote/http11/upgrade/UpgradeServletInputStream.java
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeServletInputStream.java
+@@ -21,12 +21,16 @@ import java.io.IOException;
+ import javax.servlet.ReadListener;
+ import javax.servlet.ServletInputStream;
+ 
++import org.apache.juli.logging.Log;
++import org.apache.juli.logging.LogFactory;
++import org.apache.tomcat.util.ExceptionUtils;
+ import org.apache.tomcat.util.net.SocketWrapperBase;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+ public class UpgradeServletInputStream extends ServletInputStream {
+ 
+-    protected static final StringManager sm =
++    private static final Log log = LogFactory.getLog(UpgradeServletInputStream.class);
++    private static final StringManager sm =
+             StringManager.getManager(UpgradeServletInputStream.class);
+ 
+     private final SocketWrapperBase<?> socketWrapper;
+@@ -176,7 +180,7 @@ public class UpgradeServletInputStream extends ServletInputStream {
+     }
+ 
+ 
+-    protected final void onDataAvailable() throws IOException {
++    final void onDataAvailable() {
+         if (listener == null) {
+             return;
+         }
+@@ -186,13 +190,16 @@ public class UpgradeServletInputStream extends ServletInputStream {
+         try {
+             thread.setContextClassLoader(applicationLoader);
+             listener.onDataAvailable();
++        } catch (Throwable t) {
++            ExceptionUtils.handleThrowable(t);
++            onError(t);
+         } finally {
+             thread.setContextClassLoader(originalClassLoader);
+         }
+     }
+ 
+ 
+-    protected final void onError(Throwable t) {
++    private final void onError(Throwable t) {
+         if (listener == null) {
+             return;
+         }
+@@ -201,14 +208,24 @@ public class UpgradeServletInputStream extends ServletInputStream {
+         try {
+             thread.setContextClassLoader(applicationLoader);
+             listener.onError(t);
++        } catch (Throwable t2) {
++            ExceptionUtils.handleThrowable(t2);
++            log.warn(sm.getString("upgrade.sis.onErrorFail"), t2);
+         } finally {
+             thread.setContextClassLoader(originalClassLoader);
+         }
++        try {
++            close();
++        } catch (IOException ioe) {
++            if (log.isDebugEnabled()) {
++                log.debug(sm.getString("upgrade.sis.errorCloseFail"), ioe);
++            }
++        }
+         ready = Boolean.FALSE;
+     }
+ 
+ 
+-    protected final boolean isCloseRequired() {
++    final boolean isCloseRequired() {
+         return closeRequired;
+     }
+ }
+
+==================================================

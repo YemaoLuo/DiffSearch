@@ -1,0 +1,314 @@
+9cea5547b31f8b3025acb4564d045f3e8d56ed16
+==================================================
+Restore mutate() to a single parameter method
+==================================================
+Mark Emlyn
+==================================================
+Thu Sep 25 19:33:29 2014 +0000
+==================================================
+CredentialHandler.java
+Restore mutate() to a single parameter method
+CHBase only of digest CH's so rename it
+Add support for nested CH
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1627611 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+DigestCredentialHandlerBase.java
+index a530f016fd..e3dc221cff 100644
+--- a/java/org/apache/catalina/CredentialHandler.java
++++ b/java/org/apache/catalina/CredentialHandler.java
+@@ -38,13 +38,9 @@ public interface CredentialHandler {
+      * credentials.
+      *
+      * @param inputCredentials  User provided credentials
+-     * @param salt              Salt, if any
+-     * @param iterations        Number of iterations of the algorithm associated
+-     *                          with this CredentialHandler applied to the
+-     *                          inputCredentials to generate the equivalent
+-     *                          stored credentials
++     *
+      * @return  The equivalent stored credentials for the given input
+      *          credentials
+      */
+-    String mutate(String inputCredentials, byte[] salt, int iterations);
++    String mutate(String inputCredentials);
+ }
+
+==================================================
+MessageDigestCredentialHandler.java
+similarity index 55%
+rename from java/org/apache/catalina/realm/CredentialHandlerBase.java
+rename to java/org/apache/catalina/realm/DigestCredentialHandlerBase.java
+index 02c56e4bc0..77229768a7 100644
+--- a/java/org/apache/catalina/realm/CredentialHandlerBase.java
++++ b/java/org/apache/catalina/realm/DigestCredentialHandlerBase.java
+@@ -28,17 +28,22 @@ import org.apache.tomcat.util.res.StringManager;
+ /**
+  * Base implementation for the Tomcat provided {@link CredentialHandler}s.
+  */
+-public abstract class CredentialHandlerBase implements CredentialHandler {
++public abstract class DigestCredentialHandlerBase implements CredentialHandler {
+ 
+     protected static final StringManager sm = StringManager.getManager(Constants.Package);
+ 
++    public static final int DEFAULT_SALT_LENGTH = 32;
++
+     private int iterations = getDefaultIterations();
+-    private Random random = null;
++    private int saltLength = getDefaultSaltLength();
++    private final Object randomLock = new Object();
++    private volatile Random random = null;
++    private boolean logInvalidStoredCredentials = false;
+ 
+ 
+     /**
+      * Return the number of iterations of the associated algorithm that will be
+-     * used to convert the plain text credential into the stored credential.
++     * used when creating a new stored credential for a given input credential.
+      */
+     public int getIterations() {
+         return iterations;
+@@ -47,7 +52,7 @@ public abstract class CredentialHandlerBase implements CredentialHandler {
+ 
+     /**
+      * Set the number of iterations of the associated algorithm that will be
+-     * used to convert the plain text credential into the stored credential.
++     * used when creating a new stored credential for a given input credential.
+      */
+     public void setIterations(int iterations) {
+         this.iterations = iterations;
+@@ -55,24 +60,61 @@ public abstract class CredentialHandlerBase implements CredentialHandler {
+ 
+ 
+     /**
+-     * Generate a stored credential from the given plain text credential.
+-     *
+-     * @param saltLength        Length of random salt to be generated and used
+-     *                          as part of the transformation
+-     * @param userCredential    The plain text credential
+-     *
+-     * @return  The credential to be stored
++     * Return the salt length that will be used when creating a new stored
++     * credential for a given input credential.
++     */
++    public int getSaltLength() {
++        return saltLength;
++    }
++
++
++    /**
++     * Set the salt length that will be used when creating a new stored
++     * credential for a given input credential.
++     */
++    public void setSaltLength(int saltLength) {
++        this.saltLength = saltLength;
++    }
++
++
++    /**
++     * When checking input credentials against stored credentials will a warning
++     * message be logged if invalid stored credentials are discovered?
++     */
++    public boolean getLogInvalidStoredCredentials() {
++        return logInvalidStoredCredentials;
++    }
++
++
++    /**
++     * Set whether a warning message will be logged if invalid stored
++     * credentials are discovered while checking input credentials against
++     * stored credentials?
+      */
+-    public String generate(int saltLength, String userCredential) {
++    public void setLogInvalidStoredCredentials(boolean logInvalidStoredCredentials) {
++        this.logInvalidStoredCredentials = logInvalidStoredCredentials;
++    }
++
++
++    @Override
++    public String mutate(String userCredential) {
+         byte[] salt = null;
+         int iterations = getIterations();
++        int saltLength = getSaltLength();
+         if (saltLength == 0) {
+             salt = new byte[0];
+         } else if (saltLength > 0) {
++            // Double checked locking. OK since random is volatile.
+             if (random == null) {
+-                random = new SecureRandom();
++                synchronized (randomLock) {
++                    if (random == null) {
++                        random = new SecureRandom();
++                    }
++                }
+             }
+             salt = new byte[saltLength];
++            // Concurrent use of this random is unlikely to be a performance
++            // issue as it is only used during stored password generation.
+             random.nextBytes(salt);
+         }
+ 
+@@ -107,10 +149,13 @@ public abstract class CredentialHandlerBase implements CredentialHandler {
+ 
+         if (sep1 < 0 || sep2 < 0) {
+             // Stored credentials are invalid
+-            // Logging credentials could be a security concern but they are
+-            // invalid and that is a bigger problem
+-            getLog().warn(sm.getString("credentialHandler.invalidStoredCredential",
+-                    storedCredentials));
++            // This may be expected if nested credential handlers are being used
++            if (logInvalidStoredCredentials) {
++                // Logging credentials could be a security concern but they are
++                // invalid and that is probably a bigger problem
++                getLog().warn(sm.getString("credentialHandler.invalidStoredCredential",
++                        storedCredentials));
++            }
+             return false;
+         }
+ 
+@@ -127,6 +172,30 @@ public abstract class CredentialHandlerBase implements CredentialHandler {
+     }
+ 
+ 
++    /**
++     * Get the default salt length used by the {@link CredentialHandler}.
++     */
++    protected int getDefaultSaltLength() {
++        return DEFAULT_SALT_LENGTH;
++    }
++
++
++    /**
++     * Generates the equivalent stored credentials for the given input
++     * credentials, salt and iterations.
++     *
++     * @param inputCredentials  User provided credentials
++     * @param salt              Salt, if any
++     * @param iterations        Number of iterations of the algorithm associated
++     *                          with this CredentialHandler applied to the
++     *                          inputCredentials to generate the equivalent
++     *                          stored credentials
++     *
++     * @return  The equivalent stored credentials for the given input
++     *          credentials
++     */
++    protected abstract String mutate(String inputCredentials, byte[] salt, int iterations);
++
+     /**
+      * Set the algorithm used to convert input credentials to stored
+      * credentials.
+
+==================================================
+NestedCredentialHandler.java
+index 2f03672f3b..dd16997842 100644
+--- a/java/org/apache/catalina/realm/MessageDigestCredentialHandler.java
++++ b/java/org/apache/catalina/realm/MessageDigestCredentialHandler.java
+@@ -52,7 +52,7 @@ import org.apache.tomcat.util.security.ConcurrentMessageDigest;
+  * <p>
+  * If the stored password form does not include salt then no salt is used.
+  */
+-public class MessageDigestCredentialHandler extends CredentialHandlerBase {
++public class MessageDigestCredentialHandler extends DigestCredentialHandlerBase {
+ 
+     private static final Log log = LogFactory.getLog(MessageDigestCredentialHandler.class);
+ 
+@@ -157,7 +157,7 @@ public class MessageDigestCredentialHandler extends CredentialHandlerBase {
+ 
+ 
+     @Override
+-    public String mutate(String inputCredentials, byte[] salt, int iterations) {
++    protected String mutate(String inputCredentials, byte[] salt, int iterations) {
+         if (algorithm == null) {
+             return inputCredentials;
+         } else {
+
+==================================================
+PBECredentialHandler.java
+new file mode 100644
+index 0000000000..c44298de00
+--- /dev/null
++++ b/java/org/apache/catalina/realm/NestedCredentialHandler.java
+@@ -0,0 +1,55 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.catalina.realm;
++
++import java.util.ArrayList;
++import java.util.List;
++
++import org.apache.catalina.CredentialHandler;
++
++public class NestedCredentialHandler implements CredentialHandler {
++
++    private final List<CredentialHandler> credentialHandlers = new ArrayList<>();
++
++
++    @Override
++    public boolean matches(String inputCredentials, String storedCredentials) {
++        for (CredentialHandler handler : credentialHandlers) {
++            if (handler.matches(inputCredentials, storedCredentials)) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++
++    /**
++     * The input credentials will be passed to the first nested
++     * {@link CredentialHandler}. If no nested {@link CredentialHandler} are
++     * configured then <code>null</code> will be returned.
++     *
++     * {@inheritDoc}
++     */
++    @Override
++    public String mutate(String inputCredentials) {
++        if (credentialHandlers.isEmpty()) {
++            return null;
++        }
++
++        return credentialHandlers.get(0).mutate(inputCredentials);
++    }
++}
+
+==================================================
+RealmBase.java
+index 7ad2c3fa9c..0a1a123e06 100644
+--- a/java/org/apache/catalina/realm/PBECredentialHandler.java
++++ b/java/org/apache/catalina/realm/PBECredentialHandler.java
+@@ -27,7 +27,7 @@ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.buf.HexUtils;
+ 
+-public class PBECredentialHandler extends CredentialHandlerBase {
++public class PBECredentialHandler extends DigestCredentialHandlerBase {
+ 
+     private static final Log log = LogFactory.getLog(PBECredentialHandler.class);
+ 
+@@ -35,6 +35,7 @@ public class PBECredentialHandler extends CredentialHandlerBase {
+     public static final int DEFAULT_KEY_LENGTH = 160;
+     public static final int DEFAULT_ITERATIONS = 20000;
+ 
++
+     private SecretKeyFactory secretKeyFactory;
+     private int keyLength = DEFAULT_KEY_LENGTH;
+ 
+
+==================================================

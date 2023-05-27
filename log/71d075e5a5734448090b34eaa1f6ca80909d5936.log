@@ -1,0 +1,891 @@
+71d075e5a5734448090b34eaa1f6ca80909d5936
+==================================================
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=54379
+==================================================
+Mark Emlyn
+==================================================
+Thu Jan 10 11:39:46 2013 +0000
+==================================================
+Context.java
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=54379
+Implement support for post-construct and pre-destroy elements in web.xml
+Patch by  Violeta Georgieva.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1431293 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+DefaultInstanceManager.java
+index ed2b252788..717e8a083c 100644
+--- a/java/org/apache/catalina/Context.java
++++ b/java/org/apache/catalina/Context.java
+@@ -18,6 +18,7 @@ package org.apache.catalina;
+ 
+ import java.net.URL;
+ import java.util.Locale;
++import java.util.Map;
+ import java.util.Set;
+ 
+ import javax.servlet.ServletContainerInitializer;
+@@ -1420,5 +1421,101 @@ public interface Context extends Container {
+      * JAR.
+      */
+     public boolean getAddWebinfClassesResources();
+-}
+ 
++    /**
++     * Add a post construct method definition for the given class, if there is
++     * an existing definition for the specified class - IllegalArgumentException
++     * will be thrown.
++     *
++     * @param clazz Fully qualified class name
++     * @param method
++     *            Post construct method name
++     * @throws IllegalArgumentException
++     *             if the fully qualified class name or method name are
++     *             <code>NULL</code>; if there is already post construct method
++     *             definition for the given class
++     */
++    public void addPostConstructMethod(String clazz, String method);
++
++    /**
++     * Add a pre destroy method definition for the given class, if there is an
++     * existing definition for the specified class - IllegalArgumentException
++     * will be thrown.
++     *
++     * @param clazz Fully qualified class name
++     * @param method
++     *            Post construct method name
++     * @throws IllegalArgumentException
++     *             if the fully qualified class name or method name are
++     *             <code>NULL</code>; if there is already pre destroy method
++     *             definition for the given class
++     */
++    public void addPreDestroyMethod(String clazz, String method);
++
++    /**
++     * Removes the post construct method definition for the given class, if it
++     * exists; otherwise, no action is taken.
++     *
++     * @param clazz
++     *            Fully qualified class name
++     */
++    public void removePostConstructMethod(String clazz);
++
++    /**
++     * Removes the pre destroy method definition for the given class, if it
++     * exists; otherwise, no action is taken.
++     *
++     * @param clazz
++     *            Fully qualified class name
++     */
++    public void removePreDestroyMethod(String clazz);
++
++    /**
++     * Returns the method name that is specified as post construct method for
++     * the given class, if it exists; otherwise <code>NULL</code> will be
++     * returned.
++     *
++     * @param clazz
++     *            Fully qualified class name
++     *
++     * @return the method name that is specified as post construct method for
++     *         the given class, if it exists; otherwise <code>NULL</code> will
++     *         be returned.
++     */
++    public String findPostConstructMethod(String clazz);
++
++    /**
++     * Returns the method name that is specified as pre destroy method for the
++     * given class, if it exists; otherwise <code>NULL</code> will be returned.
++     *
++     * @param clazz
++     *            Fully qualified class name
++     *
++     * @return the method name that is specified as pre destroy method for the
++     *         given class, if it exists; otherwise <code>NULL</code> will be
++     *         returned.
++     */
++    public String findPreDestroyMethod(String clazz);
++
++    /**
++     * Returns a map with keys - fully qualified class names of the classes that
++     * have post construct methods and the values are the corresponding method
++     * names. If there are no such classes an empty map will be returned.
++     *
++     * @return a map with keys - fully qualified class names of the classes that
++     *         have post construct methods and the values are the corresponding
++     *         method names.
++     */
++    public Map<String, String> findPostConstructMethods();
++
++    /**
++     * Returns a map with keys - fully qualified class names of the classes that
++     * have pre destroy methods and the values are the corresponding method
++     * names. If there are no such classes an empty map will be returned.
++     *
++     * @return a map with keys - fully qualified class names of the classes that
++     *         have pre destroy methods and the values are the corresponding
++     *         method names.
++     */
++    public Map<String, String> findPreDestroyMethods();
++}
+
+==================================================
+StandardContext.java
+index 367c49bbcb..55e550c433 100644
+--- a/java/org/apache/catalina/core/LocalStrings.properties
++++ b/java/org/apache/catalina/core/LocalStrings.properties
+@@ -119,6 +119,10 @@ standardContext.notWrapper=Child of a Context must be a Wrapper
+ standardContext.parameter.duplicate=Duplicate context initialization parameter {0}
+ standardContext.parameter.required=Both parameter name and parameter value are required
+ standardContext.pathInvalid=A context path must either be an empty string or start with a ''/''. The path [{0}] does not meet these criteria and has been changed to [{1}]
++standardContext.postconstruct.duplicate=Duplicate post construct method definition for class {0}
++standardContext.postconstruct.required=Both fully qualified class name and method name are required
++standardContext.predestroy.duplicate=Duplicate pre destroy method definition for class {0}
++standardContext.predestroy.required=Both fully qualified class name and method name are required
+ standardContext.reloadingCompleted=Reloading Context with name [{0}] is completed
+ standardContext.reloadingStarted=Reloading Context with name [{0}] has started
+ standardContext.resourcesStart=Error starting static Resources
+
+==================================================
+WebXml.java
+index 0b2fef563d..85ddef4892 100644
+--- a/java/org/apache/catalina/core/StandardContext.java
++++ b/java/org/apache/catalina/core/StandardContext.java
+@@ -823,6 +823,10 @@ public class StandardContext extends ContainerBase
+ 
+     private boolean jndiExceptionOnFailedWrite = true;
+ 
++    private Map<String, String> postConstructMethods = new HashMap<>();
++    private Map<String, String> preDestroyMethods = new HashMap<>();
++
++
+     // ----------------------------------------------------- Context Properties
+ 
+     @Override
+@@ -5844,6 +5848,72 @@ public class StandardContext extends ContainerBase
+     }
+ 
+ 
++    @Override
++    public void addPostConstructMethod(String clazz, String method) {
++        if (clazz == null || method == null)
++            throw new IllegalArgumentException(
++                    sm.getString("standardContext.postconstruct.required"));
++        if (postConstructMethods.get(clazz) != null)
++            throw new IllegalArgumentException(sm.getString(
++                    "standardContext.postconstruct.duplicate", clazz));
++
++        postConstructMethods.put(clazz, method);
++        fireContainerEvent("addPostConstructMethod", clazz);
++    }
++
++
++    @Override
++    public void removePostConstructMethod(String clazz) {
++        postConstructMethods.remove(clazz);
++        fireContainerEvent("removePostConstructMethod", clazz);
++    }
++
++
++    @Override
++    public void addPreDestroyMethod(String clazz, String method) {
++        if (clazz == null || method == null)
++            throw new IllegalArgumentException(
++                    sm.getString("standardContext.predestroy.required"));
++        if (preDestroyMethods.get(clazz) != null)
++            throw new IllegalArgumentException(sm.getString(
++                    "standardContext.predestroy.duplicate", clazz));
++
++        preDestroyMethods.put(clazz, method);
++        fireContainerEvent("addPreDestroyMethod", clazz);
++    }
++
++
++    @Override
++    public void removePreDestroyMethod(String clazz) {
++        preDestroyMethods.remove(clazz);
++        fireContainerEvent("removePreDestroyMethod", clazz);
++    }
++
++
++    @Override
++    public String findPostConstructMethod(String clazz) {
++        return postConstructMethods.get(clazz);
++    }
++
++
++    @Override
++    public String findPreDestroyMethod(String clazz) {
++        return preDestroyMethods.get(clazz);
++    }
++
++
++    @Override
++    public Map<String, String> findPostConstructMethods() {
++        return postConstructMethods;
++    }
++
++
++    @Override
++    public Map<String, String> findPreDestroyMethods() {
++        return preDestroyMethods;
++    }
++
++
+     /**
+      * Set the appropriate context attribute for our work directory.
+      */
+
+==================================================
+FailedContext.java
+index be53efb937..1248deb216 100644
+--- a/java/org/apache/catalina/deploy/WebXml.java
++++ b/java/org/apache/catalina/deploy/WebXml.java
+@@ -559,6 +559,27 @@ public class WebXml {
+         return localeEncodingMappings;
+     }
+ 
++    // post-construct elements
++    private Map<String, String> postConstructMethods = new HashMap<>();
++    public void addPostConstructMethods(String clazz, String method) {
++        if (!postConstructMethods.containsKey(clazz)) {
++            postConstructMethods.put(clazz, method);
++        }
++    }
++    public Map<String, String> getPostConstructMethods() {
++        return postConstructMethods;
++    }
++
++    // pre-destroy elements
++    private Map<String, String> preDestroyMethods = new HashMap<>();
++    public void addPreDestroyMethods(String clazz, String method) {
++        if (!preDestroyMethods.containsKey(clazz)) {
++            preDestroyMethods.put(clazz, method);
++        }
++    }
++    public Map<String, String> getPreDestroyMethods() {
++        return preDestroyMethods;
++    }
+ 
+     // Attributes not defined in web.xml or web-fragment.xml
+ 
+@@ -1066,6 +1087,32 @@ public class WebXml {
+         }
+         sb.append('\n');
+ 
++        if (!postConstructMethods.isEmpty()) {
++            for (Entry<String, String> entry : postConstructMethods
++                    .entrySet()) {
++                sb.append("  <post-construct>\n");
++                appendElement(sb, INDENT4, "lifecycle-callback-class",
++                        entry.getKey());
++                appendElement(sb, INDENT4, "lifecycle-callback-method",
++                        entry.getValue());
++                sb.append("  </post-construct>\n");
++            }
++            sb.append('\n');
++        }
++
++        if (!preDestroyMethods.isEmpty()) {
++            for (Entry<String, String> entry : preDestroyMethods
++                    .entrySet()) {
++                sb.append("  <pre-destroy>\n");
++                appendElement(sb, INDENT4, "lifecycle-callback-class",
++                        entry.getKey());
++                appendElement(sb, INDENT4, "lifecycle-callback-method",
++                        entry.getValue());
++                sb.append("  </pre-destroy>\n");
++            }
++            sb.append('\n');
++        }
++
+         for (MessageDestinationRef mdr : messageDestinationRefs.values()) {
+             sb.append("  <message-destination-ref>\n");
+             appendElement(sb, INDENT4, "description", mdr.getDescription());
+@@ -1365,6 +1412,14 @@ public class WebXml {
+                 }
+             }
+         }
++
++        for (Entry<String, String> entry : postConstructMethods.entrySet()) {
++            context.addPostConstructMethod(entry.getKey(), entry.getValue());
++        }
++
++        for (Entry<String, String> entry : preDestroyMethods.entrySet()) {
++            context.addPreDestroyMethod(entry.getKey(), entry.getValue());
++        }
+     }
+ 
+     /**
+@@ -1860,6 +1915,28 @@ public class WebXml {
+             }
+         }
+ 
++        if (postConstructMethods.isEmpty()) {
++            for (WebXml fragment : fragments) {
++                if (!mergeLifecycleCallback(fragment.getPostConstructMethods(),
++                        temp.getPostConstructMethods(), fragment,
++                        "Post Construct Methods")) {
++                    return false;
++                }
++            }
++            postConstructMethods.putAll(temp.getPostConstructMethods());
++        }
++
++        if (preDestroyMethods.isEmpty()) {
++            for (WebXml fragment : fragments) {
++                if (!mergeLifecycleCallback(fragment.getPreDestroyMethods(),
++                        temp.getPreDestroyMethods(), fragment,
++                        "Pre Destroy Methods")) {
++                    return false;
++                }
++            }
++            preDestroyMethods.putAll(temp.getPreDestroyMethods());
++        }
++
+         return true;
+     }
+ 
+@@ -2084,6 +2161,26 @@ public class WebXml {
+     }
+ 
+ 
++    private static <T> boolean mergeLifecycleCallback(
++            Map<String, String> fragmentMap, Map<String, String> tempMap,
++            WebXml fragment, String mapName) {
++        for (Entry<String, String> entry : fragmentMap.entrySet()) {
++            final String key = entry.getKey();
++            final String value = entry.getValue();
++            if (tempMap.containsKey(key)) {
++                if (value != null && !value.equals(tempMap.get(key))) {
++                    log.error(sm.getString("webXml.mergeConflictString",
++                            mapName, key, fragment.getName(), fragment.getURL()));
++                    return false;
++                }
++            } else {
++                tempMap.put(key, value);
++            }
++        }
++        return true;
++    }
++
++
+     /**
+      * Generates the sub-set of the web-fragment.xml files to be processed in
+      * the order that the fragments must be processed as per the rules in the
+
+==================================================
+WebRuleSet.java
+index 7d62dbcd16..e8cd9d2c03 100644
+--- a/java/org/apache/catalina/startup/LocalStrings.properties
++++ b/java/org/apache/catalina/startup/LocalStrings.properties
+@@ -130,6 +130,8 @@ webAnnotationSet.invalidInjection=Invalid method resource injection annotation.
+ webRuleSet.absoluteOrdering=<absolute-ordering> element not valid in web-fragment.xml and will be ignored
+ webRuleSet.absoluteOrderingCount=<absolute-ordering> element is limited to 1 occurrence
+ webRuleSet.nameCount=<name> element is limited to 1 occurrence
++webRuleSet.postconstruct.duplicate=Duplicate post construct method definition for class {0}
++webRuleSet.predestroy.duplicate=Duplicate pre destroy method definition for class {0}
+ webRuleSet.relativeOrdering=<ordering> element not valid in web.xml and will be ignored
+ webRuleSet.relativeOrderingCount=<ordering> element is limited to 1 occurrence
+ xmlErrorHandler.error=Non-fatal error [{0}] reported processing [{1}].
+
+==================================================
+Introspection.java
+index 9b04b25559..37d9e73dcb 100644
+--- a/java/org/apache/catalina/startup/WebRuleSet.java
++++ b/java/org/apache/catalina/startup/WebRuleSet.java
+@@ -473,6 +473,15 @@ public class WebRuleSet extends RuleSetBase {
+         digester.addCallParam(fullPrefix + "/locale-encoding-mapping-list/locale-encoding-mapping/locale", 0);
+         digester.addCallParam(fullPrefix + "/locale-encoding-mapping-list/locale-encoding-mapping/encoding", 1);
+ 
++        digester.addRule(fullPrefix + "/post-construct",
++                new LifecycleCallbackRule("addPostConstructMethods", 2, true));
++        digester.addCallParam(fullPrefix + "/post-construct/lifecycle-callback-class", 0);
++        digester.addCallParam(fullPrefix + "/post-construct/lifecycle-callback-method", 1);
++
++        digester.addRule(fullPrefix + "/pre-destroy",
++                new LifecycleCallbackRule("addPreDestroyMethods", 2, false));
++        digester.addCallParam(fullPrefix + "/pre-destroy/lifecycle-callback-class", 0);
++        digester.addCallParam(fullPrefix + "/pre-destroy/lifecycle-callback-method", 1);
+     }
+ 
+     protected void configureNamingRules(Digester digester) {
+@@ -1293,4 +1302,39 @@ final class MappedNameRule extends Rule {
+         ResourceBase resourceBase = (ResourceBase) digester.peek();
+         resourceBase.setProperty("mappedName", text.trim());
+     }
+-}
+\ No newline at end of file
++}
++
++/**
++ * A rule that fails if more than one post construct or pre destroy methods
++ * are configured per class.
++ */
++final class LifecycleCallbackRule extends CallMethodRule {
++
++    private final boolean postConstruct;
++
++    public LifecycleCallbackRule(String methodName, int paramCount,
++            boolean postConstruct) {
++        super(methodName, paramCount);
++        this.postConstruct = postConstruct;
++    }
++
++    @Override
++    public void end(String namespace, String name) throws Exception {
++        Object[] params = (Object[]) digester.peekParams();
++        if (params != null && params.length == 2) {
++            WebXml webXml = (WebXml) digester.peek();
++            if (postConstruct) {
++                if (webXml.getPostConstructMethods().containsKey(params[0])) {
++                    throw new IllegalArgumentException(WebRuleSet.sm.getString(
++                            "webRuleSet.postconstruct.duplicate", params[0]));
++                }
++            } else {
++                if (webXml.getPreDestroyMethods().containsKey(params[0])) {
++                    throw new IllegalArgumentException(WebRuleSet.sm.getString(
++                            "webRuleSet.predestroy.duplicate", params[0]));
++                }
++            }
++        }
++        super.end(namespace, name);
++    }
++}
+
+==================================================
+TestStandardContext.java
+index 1f096bbcdf..4302b59193 100644
+--- a/java/org/apache/catalina/util/Introspection.java
++++ b/java/org/apache/catalina/util/Introspection.java
+@@ -19,6 +19,7 @@ package org.apache.catalina.util;
+ import java.beans.Introspector;
+ import java.lang.reflect.Field;
+ import java.lang.reflect.Method;
++import java.lang.reflect.Modifier;
+ import java.security.AccessController;
+ import java.security.PrivilegedAction;
+ 
+@@ -68,6 +69,24 @@ public class Introspection {
+         return false;
+     }
+ 
++    /**
++     * Determines if a method is a valid lifecycle callback method.
++     *
++     * @param method
++     *            The method to test
++     *
++     * @return <code>true</code> if the method is a valid lifecycle callback
++     *         method, else <code>false</code>
++     */
++    public static boolean isValidLifecycleCallback(Method method) {
++        if (method.getParameterTypes().length != 0
++                || Modifier.isStatic(method.getModifiers())
++                || method.getExceptionTypes().length > 0
++                || !method.getReturnType().getName().equals("void")) {
++            return false;
++        }
++        return true;
++    }
+ 
+     /**
+      * Obtain the declared fields for a class taking account of any security
+
+==================================================
+TesterContext.java
+index 47f9ddc3f7..7c336346ab 100644
+--- a/test/org/apache/catalina/core/TestStandardContext.java
++++ b/test/org/apache/catalina/core/TestStandardContext.java
+@@ -754,4 +754,38 @@ public class TestStandardContext extends TomcatBaseTest {
+             return false; // Don't care
+         }
+     }
++
++    @Test(expected = IllegalArgumentException.class)
++    public void testAddPostConstructMethodNullClassName() {
++        new StandardContext().addPostConstructMethod(null, "");
++    }
++
++    @Test(expected = IllegalArgumentException.class)
++    public void testAddPostConstructMethodNullMethodName() {
++        new StandardContext().addPostConstructMethod("", null);
++    }
++
++    @Test(expected = IllegalArgumentException.class)
++    public void testAddPostConstructMethodConflicts() {
++        StandardContext standardContext = new StandardContext();
++        standardContext.addPostConstructMethod("a", "a");
++        standardContext.addPostConstructMethod("a", "b");
++    }
++
++    @Test(expected = IllegalArgumentException.class)
++    public void testAddPreDestroyMethodNullClassName() {
++        new StandardContext().addPreDestroyMethod(null, "");
++    }
++
++    @Test(expected = IllegalArgumentException.class)
++    public void testAddPreDestroyMethodNullMethodName() {
++        new StandardContext().addPreDestroyMethod("", null);
++    }
++
++    @Test(expected = IllegalArgumentException.class)
++    public void testAddPreDestroyMethodConflicts() {
++        StandardContext standardContext = new StandardContext();
++        standardContext.addPreDestroyMethod("a", "a");
++        standardContext.addPreDestroyMethod("a", "b");
++    }
+ }
+
+==================================================
+TestWebXml.java
+index e1c51bd6bd..1b328d67f2 100644
+--- a/test/org/apache/catalina/core/TesterContext.java
++++ b/test/org/apache/catalina/core/TesterContext.java
+@@ -20,6 +20,7 @@ import java.beans.PropertyChangeListener;
+ import java.io.File;
+ import java.net.URL;
+ import java.util.Locale;
++import java.util.Map;
+ import java.util.Set;
+ 
+ import javax.management.ObjectName;
+@@ -1112,4 +1113,44 @@ public class TesterContext implements Context {
+     public boolean getAddWebinfClassesResources() {
+         return false;
+     }
++
++    @Override
++    public void addPostConstructMethod(String clazz, String method) {
++        // NO-OP
++    }
++
++    @Override
++    public void addPreDestroyMethod(String clazz, String method) {
++        // NO-OP
++    }
++
++    @Override
++    public void removePostConstructMethod(String clazz) {
++        // NO-OP
++    }
++
++    @Override
++    public void removePreDestroyMethod(String clazz) {
++        // NO-OP
++    }
++
++    @Override
++    public String findPostConstructMethod(String clazz) {
++        return null;
++    }
++
++    @Override
++    public String findPreDestroyMethod(String clazz) {
++        return null;
++    }
++
++    @Override
++    public Map<String,String> findPostConstructMethods() {
++        return null;
++    }
++
++    @Override
++    public Map<String,String> findPreDestroyMethods() {
++        return null;
++    }
+ }
+
+==================================================
+TestContextConfig.java
+index 11a3020781..659ced201b 100644
+--- a/test/org/apache/catalina/deploy/TestWebXml.java
++++ b/test/org/apache/catalina/deploy/TestWebXml.java
+@@ -17,8 +17,11 @@
+ 
+ package org.apache.catalina.deploy;
+ 
+-import static org.junit.Assert.assertEquals;
++import java.util.HashSet;
++import java.util.Map;
++import java.util.Set;
+ 
++import org.junit.Assert;
+ import org.junit.Test;
+ 
+ /**
+@@ -32,46 +35,46 @@ public class TestWebXml {
+         WebXml webxml = new WebXml();
+ 
+         // Defaults
+-        assertEquals(3, webxml.getMajorVersion());
+-        assertEquals(0, webxml.getMinorVersion());
++        Assert.assertEquals(3, webxml.getMajorVersion());
++        Assert.assertEquals(0, webxml.getMinorVersion());
+ 
+         // Both get changed
+         webxml.setVersion("2.5");
+-        assertEquals(2, webxml.getMajorVersion());
+-        assertEquals(5, webxml.getMinorVersion());
++        Assert.assertEquals(2, webxml.getMajorVersion());
++        Assert.assertEquals(5, webxml.getMinorVersion());
+ 
+         // Reset
+         webxml.setVersion("0.0");
+-        assertEquals(0, webxml.getMajorVersion());
+-        assertEquals(0, webxml.getMinorVersion());
++        Assert.assertEquals(0, webxml.getMajorVersion());
++        Assert.assertEquals(0, webxml.getMinorVersion());
+ 
+         // null input should be ignored
+         webxml.setVersion(null);
+-        assertEquals(0, webxml.getMajorVersion());
+-        assertEquals(0, webxml.getMinorVersion());
++        Assert.assertEquals(0, webxml.getMajorVersion());
++        Assert.assertEquals(0, webxml.getMinorVersion());
+ 
+         // major only
+         webxml.setVersion("3");
+-        assertEquals(3, webxml.getMajorVersion());
+-        assertEquals(0, webxml.getMinorVersion());
++        Assert.assertEquals(3, webxml.getMajorVersion());
++        Assert.assertEquals(0, webxml.getMinorVersion());
+ 
+         // no minor digit
+         webxml.setVersion("0.0");   // reset
+         webxml.setVersion("3.");
+-        assertEquals(3, webxml.getMajorVersion());
+-        assertEquals(0, webxml.getMinorVersion());
++        Assert.assertEquals(3, webxml.getMajorVersion());
++        Assert.assertEquals(0, webxml.getMinorVersion());
+ 
+         // minor only
+         webxml.setVersion("0.0");   // reset
+         webxml.setVersion(".5");
+-        assertEquals(0, webxml.getMajorVersion());
+-        assertEquals(5, webxml.getMinorVersion());
++        Assert.assertEquals(0, webxml.getMajorVersion());
++        Assert.assertEquals(5, webxml.getMinorVersion());
+ 
+         // leading & training zeros
+         webxml.setVersion("0.0");   // reset
+         webxml.setVersion("002.500");
+-        assertEquals(2, webxml.getMajorVersion());
+-        assertEquals(500, webxml.getMinorVersion());
++        Assert.assertEquals(2, webxml.getMajorVersion());
++        Assert.assertEquals(500, webxml.getMinorVersion());
+     }
+ 
+     @Test
+@@ -81,9 +84,9 @@ public class TestWebXml {
+ 
+         webxml.setPublicId(
+                 org.apache.catalina.startup.Constants.WebDtdPublicId_22);
+-        assertEquals(2, webxml.getMajorVersion());
+-        assertEquals(2, webxml.getMinorVersion());
+-        assertEquals("2.2", webxml.getVersion());
++        Assert.assertEquals(2, webxml.getMajorVersion());
++        Assert.assertEquals(2, webxml.getMinorVersion());
++        Assert.assertEquals("2.2", webxml.getVersion());
+     }
+ 
+     @Test
+@@ -93,9 +96,9 @@ public class TestWebXml {
+ 
+         webxml.setPublicId(
+                 org.apache.catalina.startup.Constants.WebDtdPublicId_23);
+-        assertEquals(2, webxml.getMajorVersion());
+-        assertEquals(3, webxml.getMinorVersion());
+-        assertEquals("2.3", webxml.getVersion());
++        Assert.assertEquals(2, webxml.getMajorVersion());
++        Assert.assertEquals(3, webxml.getMinorVersion());
++        Assert.assertEquals("2.3", webxml.getVersion());
+     }
+ 
+     @Test
+@@ -105,9 +108,9 @@ public class TestWebXml {
+ 
+         webxml.setPublicId(
+                 org.apache.catalina.startup.Constants.WebSchemaPublicId_24);
+-        assertEquals(2, webxml.getMajorVersion());
+-        assertEquals(4, webxml.getMinorVersion());
+-        assertEquals("2.4", webxml.getVersion());
++        Assert.assertEquals(2, webxml.getMajorVersion());
++        Assert.assertEquals(4, webxml.getMinorVersion());
++        Assert.assertEquals("2.4", webxml.getVersion());
+     }
+ 
+     @Test
+@@ -117,9 +120,9 @@ public class TestWebXml {
+ 
+         webxml.setPublicId(
+                 org.apache.catalina.startup.Constants.WebSchemaPublicId_25);
+-        assertEquals(2, webxml.getMajorVersion());
+-        assertEquals(5, webxml.getMinorVersion());
+-        assertEquals("2.5", webxml.getVersion());
++        Assert.assertEquals(2, webxml.getMajorVersion());
++        Assert.assertEquals(5, webxml.getMinorVersion());
++        Assert.assertEquals("2.5", webxml.getVersion());
+     }
+ 
+     @Test
+@@ -129,8 +132,91 @@ public class TestWebXml {
+ 
+         webxml.setPublicId(
+                 org.apache.catalina.startup.Constants.WebSchemaPublicId_30);
+-        assertEquals(3, webxml.getMajorVersion());
+-        assertEquals(0, webxml.getMinorVersion());
+-        assertEquals("3.0", webxml.getVersion());
++        Assert.assertEquals(3, webxml.getMajorVersion());
++        Assert.assertEquals(0, webxml.getMinorVersion());
++        Assert.assertEquals("3.0", webxml.getVersion());
++    }
++
++    @Test
++    public void testLifecycleMethodsWebXml() {
++        WebXml webxml = new WebXml();
++        webxml.addPostConstructMethods("a", "a");
++        webxml.addPreDestroyMethods("b", "b");
++
++        WebXml fragment = new WebXml();
++        fragment.addPostConstructMethods("c", "c");
++        fragment.addPreDestroyMethods("d", "d");
++
++        Set<WebXml> fragments = new HashSet<>();
++        fragments.add(fragment);
++
++        webxml.merge(fragments);
++
++        Map<String, String> postConstructMethods = webxml.getPostConstructMethods();
++        Map<String, String> preDestroyMethods = webxml.getPreDestroyMethods();
++        Assert.assertEquals(1, postConstructMethods.size());
++        Assert.assertEquals(1, preDestroyMethods.size());
++
++        Assert.assertEquals("a", postConstructMethods.get("a"));
++        Assert.assertEquals("b", preDestroyMethods.get("b"));
++    }
++
++    @Test
++    public void testLifecycleMethodsWebFragments() {
++        WebXml webxml = new WebXml();
++
++        WebXml fragment1 = new WebXml();
++        fragment1.addPostConstructMethods("a", "a");
++        fragment1.addPreDestroyMethods("b", "b");
++
++        WebXml fragment2 = new WebXml();
++        fragment2.addPostConstructMethods("c", "c");
++        fragment2.addPreDestroyMethods("d", "d");
++
++        Set<WebXml> fragments = new HashSet<>();
++        fragments.add(fragment1);
++        fragments.add(fragment2);
++
++        webxml.merge(fragments);
++
++        Map<String, String> postConstructMethods = webxml.getPostConstructMethods();
++        Map<String, String> preDestroyMethods = webxml.getPreDestroyMethods();
++        Assert.assertEquals(2, postConstructMethods.size());
++        Assert.assertEquals(2, preDestroyMethods.size());
++
++        Assert.assertEquals("a", postConstructMethods.get("a"));
++        Assert.assertEquals("c", postConstructMethods.get("c"));
++        Assert.assertEquals("b", preDestroyMethods.get("b"));
++        Assert.assertEquals("d", preDestroyMethods.get("d"));
++    }
++
++    @Test
++    public void testLifecycleMethodsWebFragmentsWithConflicts() {
++        WebXml webxml = new WebXml();
++
++        WebXml fragment1 = new WebXml();
++        fragment1.addPostConstructMethods("a", "a");
++        fragment1.addPreDestroyMethods("b", "a");
++
++        WebXml fragment2 = new WebXml();
++        fragment2.addPostConstructMethods("a", "b");
++
++        Set<WebXml> fragments = new HashSet<>();
++        fragments.add(fragment1);
++        fragments.add(fragment2);
++
++        Assert.assertFalse(webxml.merge(fragments));
++
++        Assert.assertEquals(0, webxml.getPostConstructMethods().size());
++
++        WebXml fragment3 = new WebXml();
++        fragment3.addPreDestroyMethods("b", "b");
++
++        fragments.remove(fragment2);
++        fragments.add(fragment3);
++
++        Assert.assertFalse(webxml.merge(fragments));
++
++        Assert.assertEquals(0, webxml.getPreDestroyMethods().size());
+     }
+ }
+
+==================================================
+TestWebRuleSet.java
+index 6c5ab3d829..45a7ef6c8d 100644
+--- a/test/org/apache/catalina/startup/TestContextConfig.java
++++ b/test/org/apache/catalina/startup/TestContextConfig.java
+@@ -32,6 +32,7 @@ import javax.servlet.http.HttpServletResponse;
+ import org.junit.Assert;
+ import org.junit.Test;
+ 
++import org.apache.catalina.Context;
+ import org.apache.catalina.core.StandardContext;
+ import org.apache.tomcat.util.buf.ByteChunk;
+ 
+@@ -106,6 +107,25 @@ public class TestContextConfig extends TomcatBaseTest {
+                 null, HttpServletResponse.SC_NOT_FOUND);
+     }
+ 
++    @Test
++    public void testBug54379() throws Exception {
++        Tomcat tomcat = getTomcatInstance();
++
++        File appDir = new File("test/webapp-3.0-fragments");
++        Context context =
++                tomcat.addWebapp(null, "/test", appDir.getAbsolutePath());
++
++        Tomcat.addServlet(context, "TestServlet",
++                "org.apache.catalina.startup.TesterServletWithLifeCycleMethods");
++        context.addServletMapping("/testServlet", "TestServlet");
++
++        tomcat.enableNaming();
++
++        tomcat.start();
++
++        assertPageContains("/test/testServlet", "postConstruct1()");
++    }
++
+     private static class CustomDefaultServletSCI
+             implements ServletContainerInitializer {
+ 
+
+==================================================
+TesterServletWithLifeCycleMethods.java
+index 55a5dd4bea..f433243db1 100644
+--- a/test/org/apache/catalina/startup/TestWebRuleSet.java
++++ b/test/org/apache/catalina/startup/TestWebRuleSet.java
+@@ -115,6 +115,13 @@ public class TestWebRuleSet {
+         parse(new WebXml(), "web-1ordering.xml", false, true);
+ }
+ 
++    @Test
++    public void testLifecycleMethodsDefinitions() throws Exception {
++        // post-construct and pre-destroy
++        parse(new WebXml(), "web-1lifecyclecallback.xml", false, true);
++        // conflicting post-construct definitions
++        parse(new WebXml(), "web-2lifecyclecallback.xml", false, false);
++    }
+ 
+     private synchronized void parse(WebXml webXml, String target,
+             boolean fragment, boolean expected) throws FileNotFoundException {
+
+==================================================

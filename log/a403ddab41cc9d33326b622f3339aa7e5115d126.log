@@ -1,0 +1,244 @@
+a403ddab41cc9d33326b622f3339aa7e5115d126
+==================================================
+Fix https://bz.apache.org/bugzilla/show_bug.cgi?id=63578
+==================================================
+Mark Thomas
+==================================================
+Tue Jul 23 19:07:19 2019 +0100
+==================================================
+CoyoteAdapter.java
+Fix https://bz.apache.org/bugzilla/show_bug.cgi?id=63578
+
+Various fixes to return 400 responses rather than 500 responses when the
+provided request is invalid.
+
+
+==================================================
+Http11Processor.java
+index 1cc445dab6..5955731271 100644
+--- a/java/org/apache/catalina/connector/CoyoteAdapter.java
++++ b/java/org/apache/catalina/connector/CoyoteAdapter.java
+@@ -727,7 +727,16 @@ public class CoyoteAdapter implements Adapter {
+             }
+ 
+             // Look for session ID in cookies and SSL session
+-            parseSessionCookiesId(request);
++            try {
++                parseSessionCookiesId(request);
++            } catch (IllegalArgumentException e) {
++                // Too many cookies
++                if (!response.isError()) {
++                    response.setError();
++                    response.sendError(400);
++                }
++                return true;
++            }
+             parseSessionSslId(request);
+ 
+             sessionID = request.getRequestedSessionId();
+
+==================================================
+TestCoyoteAdapterRequestFuzzing.java
+index d3480c3adb..39981398f2 100644
+--- a/java/org/apache/coyote/http11/LocalStrings.properties
++++ b/java/org/apache/coyote/http11/LocalStrings.properties
+@@ -24,10 +24,12 @@ http11processor.neverused=This method should never be used
+ http11processor.request.finish=Error finishing request
+ http11processor.request.inconsistentHosts=The host specified in the request line is not consistent with the host header
+ http11processor.request.invalidScheme=The HTTP request contained an absolute URI with an invalid scheme
+-http11processor.request.invalidUri==The HTTP request contained an invalid URI
++http11processor.request.invalidUri=The HTTP request contained an invalid URI
+ http11processor.request.invalidUserInfo=The HTTP request contained an absolute URI with an invalid userinfo
++http11processor.request.multipleContentLength=The request contained multiple content-length headers
+ http11processor.request.multipleHosts=The request contained multiple host headers
+ http11processor.request.noHostHeader=The HTTP/1.1 request did not provide a host header
++http11processor.request.nonNumericContentLength=The request contained a content-length header with a non-numeric value
+ http11processor.request.prepare=Error preparing request
+ http11processor.request.process=Error processing request
+ http11processor.response.finish=Error finishing response
+
+==================================================
+SimpleHttpClient.java
+index 160ff6c991..acd01a75f4 100644
+--- a/test/org/apache/catalina/connector/TestCoyoteAdapterRequestFuzzing.java
++++ b/test/org/apache/catalina/connector/TestCoyoteAdapterRequestFuzzing.java
+@@ -27,11 +27,13 @@ import org.junit.runner.RunWith;
+ import org.junit.runners.Parameterized;
+ import org.junit.runners.Parameterized.Parameter;
+ 
++import static org.apache.catalina.startup.SimpleHttpClient.CRLF;
+ import org.apache.catalina.Context;
+ import org.apache.catalina.servlets.DefaultServlet;
+ import org.apache.catalina.startup.SimpleHttpClient;
+ import org.apache.catalina.startup.Tomcat;
+ import org.apache.catalina.startup.TomcatBaseTest;
++import org.apache.tomcat.unittest.TesterData;
+ 
+ /*
+  * Various requests, usually originating from fuzzing, that have triggered an
+@@ -41,21 +43,61 @@ import org.apache.catalina.startup.TomcatBaseTest;
+ @RunWith(Parameterized.class)
+ public class TestCoyoteAdapterRequestFuzzing extends TomcatBaseTest {
+ 
+-    @Parameterized.Parameters(name = "{index}: uri[{0}], host[{1}], expected[{2}]")
++    private static final String VALUE_16K = TesterData.string('x', 16 * 1024);
++    // Default max header count is 100
++    private static final String HEADER_150 = TesterData.string("X-Tomcat-Test: a" + CRLF, 150);
++    // Default max header count is 200 (need to keep under maxHeaderCount as well)
++    private static final String COOKIE_250 = TesterData.string("Cookie: a=b;c=d;e=f;g=h" + CRLF, 75);
++
++    @Parameterized.Parameters(name = "{index}: requestline[{0}], expected[{2}]")
+     public static Collection<Object[]> parameters() {
+         List<Object[]> parameterSets = new ArrayList<>();
+ 
+-        parameterSets.add(new Object[] { "/", "lÿ#", "400" } );
+-        parameterSets.add(new Object[] { "*;", "", "400" } );
++        parameterSets.add(new Object[] { "GET /00 HTTP/1.1",
++                                         "Host: lÿ#" + CRLF,
++                                         "400" } );
++        parameterSets.add(new Object[] { "GET *; HTTP/1.1",
++                                         "Host: localhost" + CRLF,
++                                         "400" } );
++        parameterSets.add(new Object[] { "GET /02 HTTP/1.1",
++                                         "Host: localhost" + CRLF +
++                                         "Content-Length: \u00A0" + CRLF,
++                                         "400" } );
++        parameterSets.add(new Object[] { "GET /03 HTTP/1.1",
++                                         "Content-Length: 1" + CRLF +
++                                         "Content-Length: 1" + CRLF,
++                                         "400" } );
++        parameterSets.add(new Object[] { "GET /04 HTTP/1.1",
++                                         "Transfer-Encoding: " + VALUE_16K + CRLF,
++                                         "400" } );
++        parameterSets.add(new Object[] { "GET /05 HTTP/1.1",
++                                         "Expect: " + VALUE_16K + CRLF,
++                                         "400" } );
++        parameterSets.add(new Object[] { "GET /06 HTTP/1.1",
++                                         "Connection: " + VALUE_16K + CRLF,
++                                         "400" } );
++        parameterSets.add(new Object[] { "GET /07 HTTP/1.1",
++                                         "User-Agent: " + VALUE_16K + CRLF,
++                                         "400" } );
++        parameterSets.add(new Object[] { "GET /08 HTTP/1.1",
++                                         HEADER_150,
++                                         "400" } );
++        parameterSets.add(new Object[] { "GET http://host/09 HTTP/1.0",
++                                         HEADER_150,
++                                         "400" } );
++        parameterSets.add(new Object[] { "GET /10 HTTP/1.1",
++                                         "Host: localhost" + CRLF +
++                                         COOKIE_250,
++                                         "400" } );
+ 
+         return parameterSets;
+     }
+ 
+     @Parameter(0)
+-    public String uri;
++    public String requestLine;
+ 
+     @Parameter(1)
+-    public String host;
++    public String headers;
+ 
+     @Parameter(2)
+     public String expected;
+@@ -64,6 +106,7 @@ public class TestCoyoteAdapterRequestFuzzing extends TomcatBaseTest {
+     @Test
+     public void doTest() throws Exception {
+         Tomcat tomcat = getTomcatInstance();
++        tomcat.getConnector().setAttribute("restrictedUserAgents", "value-not-important");
+ 
+         File appDir = new File("test/webapp");
+         Context ctxt = tomcat.addContext("", appDir.getAbsolutePath());
+@@ -72,20 +115,15 @@ public class TestCoyoteAdapterRequestFuzzing extends TomcatBaseTest {
+ 
+         tomcat.start();
+ 
+-        String request =
+-                "GET " + uri + " HTTP/1.1" + SimpleHttpClient.CRLF +
+-                "Host: " + host + SimpleHttpClient.CRLF +
+-                 SimpleHttpClient.CRLF;
+-
+         Client client = new Client(tomcat.getConnector().getLocalPort());
+-        client.setRequest(new String[] {request});
++        client.setRequest(new String[] {requestLine + CRLF, headers + CRLF});
+ 
+         client.connect();
+         client.processRequest();
+ 
+         // Expected response
+         String line = client.getResponseLine();
+-        Assert.assertTrue(line, line.startsWith("HTTP/1.1 " + expected + " "));
++        Assert.assertTrue(line + CRLF + client.getResponseBody(), line.startsWith("HTTP/1.1 " + expected + " "));
+     }
+ 
+ 
+@@ -93,6 +131,7 @@ public class TestCoyoteAdapterRequestFuzzing extends TomcatBaseTest {
+ 
+         public Client(int port) {
+             setPort(port);
++            setRequestPause(0);
+         }
+ 
+         @Override
+
+==================================================
+TestHttp2Limits.java
+index 774d955051..b53bb1a7f8 100644
+--- a/test/org/apache/catalina/startup/SimpleHttpClient.java
++++ b/test/org/apache/catalina/startup/SimpleHttpClient.java
+@@ -28,6 +28,7 @@ import java.io.Writer;
+ import java.net.InetSocketAddress;
+ import java.net.Socket;
+ import java.net.SocketAddress;
++import java.net.SocketException;
+ import java.net.UnknownHostException;
+ import java.util.ArrayList;
+ import java.util.List;
+@@ -310,8 +311,15 @@ public abstract class SimpleHttpClient {
+             else {
+                 // not using content length, so just read it line by line
+                 String line = null;
+-                while ((line = readLine()) != null) {
+-                    builder.append(line);
++                try {
++                    while ((line = readLine()) != null) {
++                        builder.append(line);
++                    }
++                } catch (SocketException e) {
++                    // Ignore
++                    // May see a SocketException if the request hasn't been
++                    // fully read when the connection is closed as that may
++                    // trigger a TCP reset.
+                 }
+             }
+         }
+
+==================================================
+TesterData.java
+index 97f7b4e259..2a9ba7498b 100644
+--- a/test/org/apache/coyote/http2/TestHttp2Limits.java
++++ b/test/org/apache/coyote/http2/TestHttp2Limits.java
+@@ -387,15 +387,14 @@ public class TestHttp2Limits extends Http2TestBase {
+             break;
+         }
+         case 1: {
+-            // Check status is 500
++            // Check status is 400
+             parser.readFrame(true);
+             Assert.assertTrue(output.getTrace(), output.getTrace().startsWith(
+-                    "3-HeadersStart\n3-Header-[:status]-[500]"));
++                    "3-HeadersStart\n3-Header-[:status]-[400]"));
+             output.clearTrace();
+-            // Check EOS followed by reset is next
++            // Check EOS followed by error page body
+             parser.readFrame(true);
+-            parser.readFrame(true);
+-            Assert.assertEquals("3-EndOfStream\n3-RST-[2]\n", output.getTrace());
++            Assert.assertTrue(output.getTrace(), output.getTrace().startsWith("3-EndOfStream\n3-Body-<!doctype"));
+             break;
+         }
+         default: {
+
+==================================================

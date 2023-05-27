@@ -1,0 +1,184 @@
+f088f9b56e1bbc08273cd7220d5f67c96eda34ee
+==================================================
+Fix regression caused by a combination of the TLD refactoring and the new resources implementation. TLDs in JARs in packed WARs were not accessible. There were two parts to the fix:
+==================================================
+Mark Emlyn
+==================================================
+Thu Sep 26 22:09:58 2013 +0000
+==================================================
+TldScanner.java
+Fix regression caused by a combination of the TLD refactoring and the new resources implementation. TLDs in JARs in packed WARs were not accessible. There were two parts to the fix:
+- In TldScanner ensure that that the correct URL for the JAR containing the TLD was used
+- In TldResourcePath ensure that the correct URL to the TLD was constructed from the JAR URL and the path to the resource within the JAR
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1526724 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+TldResourcePath.java
+index d2eb14ea97..15fc35db0d 100644
+--- a/java/org/apache/jasper/servlet/TldScanner.java
++++ b/java/org/apache/jasper/servlet/TldScanner.java
+@@ -242,7 +242,7 @@ public class TldScanner {
+             }
+             boolean found = false;
+             Jar jar = JarFactory.newInstance(urlConn.getURL());
+-            URL jarURL = urlConn.getJarFileURL();
++            URL jarURL = jar.getJarFileURL();
+             try {
+                 jar.nextEntry();
+                 for (String entryName = jar.getEntryName();
+
+==================================================
+FileUrlJar.java
+index 9737911483..7de28c338f 100644
+--- a/java/org/apache/tomcat/util/descriptor/tld/TldResourcePath.java
++++ b/java/org/apache/tomcat/util/descriptor/tld/TldResourcePath.java
+@@ -21,6 +21,8 @@ import java.io.InputStream;
+ import java.net.URL;
+ import java.util.Objects;
+ 
++import org.apache.tomcat.util.scan.JarFactory;
++
+ /**
+  * A TLD Resource Path as defined in JSP 7.3.2.
+  * <p/>
+@@ -104,8 +106,7 @@ public class TldResourcePath {
+         if (entryName == null) {
+             return url.openStream();
+         } else {
+-            // TODO: should this use the JarFactory abstraction?
+-            URL entryUrl = new URL("jar:" + url.toExternalForm() + "!/" + entryName);
++            URL entryUrl = JarFactory.getJarEntryURL(url, entryName);
+             return entryUrl.openStream();
+         }
+     }
+
+==================================================
+FileUrlNestedJar.java
+index 0445aa8f18..0c42b56f87 100644
+--- a/java/org/apache/tomcat/util/scan/FileUrlJar.java
++++ b/java/org/apache/tomcat/util/scan/FileUrlJar.java
+@@ -32,6 +32,7 @@ import java.util.zip.ZipEntry;
+ public class FileUrlJar implements Jar {
+ 
+     private final JarFile jarFile;
++    private final URL jarFileURL;
+     private Enumeration<JarEntry> entries;
+     private JarEntry entry = null;
+ 
+@@ -39,8 +40,16 @@ public class FileUrlJar implements Jar {
+         JarURLConnection jarConn = (JarURLConnection) url.openConnection();
+         jarConn.setUseCaches(false);
+         jarFile = jarConn.getJarFile();
++        jarFileURL = jarConn.getJarFileURL();
+     }
+ 
++
++    @Override
++    public URL getJarFileURL() {
++        return jarFileURL;
++    }
++
++
+     @Override
+     public boolean entryExists(String name) {
+         ZipEntry entry = jarFile.getEntry(name);
+
+==================================================
+Jar.java
+index e878e81505..e77fbe3f17 100644
+--- a/java/org/apache/tomcat/util/scan/FileUrlNestedJar.java
++++ b/java/org/apache/tomcat/util/scan/FileUrlNestedJar.java
+@@ -31,12 +31,14 @@ import java.util.jar.JarFile;
+  */
+ public class FileUrlNestedJar implements Jar {
+ 
++    private final URL jarFileURL;
+     private final JarFile warFile;
+     private final JarEntry jarEntry;
+     private NonClosingJarInputStream jarInputStream = null;
+     private JarEntry entry = null;
+ 
+     public FileUrlNestedJar(URL url) throws IOException {
++        jarFileURL = url;
+         JarURLConnection jarConn = (JarURLConnection) url.openConnection();
+         jarConn.setUseCaches(false);
+         warFile = jarConn.getJarFile();
+@@ -50,6 +52,13 @@ public class FileUrlNestedJar implements Jar {
+     }
+ 
+ 
++    @Override
++    public URL getJarFileURL() {
++        return jarFileURL;
++    }
++
++
++
+     @Override
+     public boolean entryExists(String name) throws IOException {
+         JarEntry entry = jarInputStream.getNextJarEntry();
+
+==================================================
+JarFactory.java
+index 70eba1adf2..954740967a 100644
+--- a/java/org/apache/tomcat/util/scan/Jar.java
++++ b/java/org/apache/tomcat/util/scan/Jar.java
+@@ -18,6 +18,7 @@ package org.apache.tomcat.util.scan;
+ 
+ import java.io.IOException;
+ import java.io.InputStream;
++import java.net.URL;
+ 
+ /**
+  * Provides an abstraction for use by the various classes that need to scan
+@@ -30,6 +31,11 @@ import java.io.InputStream;
+  */
+ public interface Jar {
+ 
++    /**
++     * Obtain the URL for accessing the JAR file.
++     */
++    URL getJarFileURL();
++
+     /**
+      * Determines if a specific entry exists within the JAR.
+      *
+
+==================================================
+UrlJar.java
+index 2dc3a478e5..6bfc1fbd3c 100644
+--- a/java/org/apache/tomcat/util/scan/JarFactory.java
++++ b/java/org/apache/tomcat/util/scan/JarFactory.java
+@@ -17,6 +17,7 @@
+ package org.apache.tomcat.util.scan;
+ 
+ import java.io.IOException;
++import java.net.MalformedURLException;
+ import java.net.URL;
+ 
+ /**
+@@ -40,4 +41,19 @@ public class JarFactory {
+             return new UrlJar(url);
+         }
+     }
++
++    public static URL getJarEntryURL(URL baseUrl, String entryName)
++            throws MalformedURLException {
++
++        String baseExternal = baseUrl.toExternalForm();
++
++        if (baseExternal.startsWith("jar")) {
++            // Assume this is pointing to a JAR file within a WAR. Java doesn't
++            // support jar:jar:file:... so switch to Tomcat's war:file:...
++            baseExternal = baseExternal.replaceFirst("^jar:", "war:");
++            baseExternal = baseExternal.replaceFirst("!/", "^/");
++        }
++
++        return new URL("jar:" + baseExternal + "!/" + entryName);
++    }
+ }
+
+==================================================

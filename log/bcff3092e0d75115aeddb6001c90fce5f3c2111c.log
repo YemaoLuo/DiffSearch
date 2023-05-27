@@ -1,0 +1,969 @@
+bcff3092e0d75115aeddb6001c90fce5f3c2111c
+==================================================
+Refactor cookie parsing to make it more pluggable
+==================================================
+Mark Emlyn
+==================================================
+Thu Sep 25 19:38:15 2014 +0000
+==================================================
+Context.java
+Refactor cookie parsing to make it more pluggable
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1627619 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+CoyoteAdapter.java
+index a871b997f2..304e9de145 100644
+--- a/java/org/apache/catalina/Context.java
++++ b/java/org/apache/catalina/Context.java
+@@ -17,7 +17,6 @@
+ package org.apache.catalina;
+ 
+ import java.net.URL;
+-import java.nio.charset.Charset;
+ import java.util.Locale;
+ import java.util.Map;
+ import java.util.Set;
+@@ -38,6 +37,7 @@ import org.apache.tomcat.util.descriptor.web.FilterDef;
+ import org.apache.tomcat.util.descriptor.web.FilterMap;
+ import org.apache.tomcat.util.descriptor.web.LoginConfig;
+ import org.apache.tomcat.util.descriptor.web.SecurityConstraint;
++import org.apache.tomcat.util.http.CookieProcessor;
+ 
+ /**
+  * A <b>Context</b> is a Container that represents a servlet context, and
+@@ -1640,38 +1640,16 @@ public interface Context extends Container {
+     public Object getNamingToken();
+ 
+     /**
+-     * Should this context use the new RFC6265 based cookie parser for
+-     * processing HTTP cookies? The default value is currently false but that
+-     * may change in a future point release.
+-     */
+-    public void setUseRfc6265(boolean useRfc6265);
+-
+-    /**
+-     * Does this context use the new RFC6265 based cookie parser for
+-     * processing HTTP cookies? The default value is currently false but that
+-     * may change in a future point release.
+-     */
+-    public boolean getUseRfc6265();
+-
+-    /**
+-     * Specifies the name of the character encoding to use to convert bytes into
+-     * characters when processing cookies using the RFC6265 based cookie parser.
+-     * It has no effect if the RFC6265 parser is not used.
+-     * If an unrecognised character encoding is specified, a warning will be
+-     * logged and the default value of UTF-8 will be used.
+-     */
+-    public void setCookieEncoding(String encoding);
+-
+-    /**
+-     * Returns the name of the character encoding used to convert bytes into
+-     * characters when processing cookies using the RFC6265 based cookie parser.
+-     * The default value is UTF-8.
++     * Sets the {@link CookieProcessor} that will be used to process cookies
++     * for this Context.
++     *
++     * @param cookieProcessor   The new cookie processor
+      */
+-    public String getCookieEncoding();
++    public void setCookieProcessor(CookieProcessor cookieProcessor);
+ 
+     /**
+-     * Returns the character set used to convert bytes into characters when
+-     * processing cookies using the RFC6265 based cookie parser.
++     * Obtains the {@link CookieProcessor} that will be used to process cookies
++     * for this Context.
+      */
+-    public Charset getCookieEncodingCharset();
++    public CookieProcessor getCookieProcessor();
+ }
+
+==================================================
+Request.java
+index e3ff219cd2..9c7e17886f 100644
+--- a/java/org/apache/catalina/connector/CoyoteAdapter.java
++++ b/java/org/apache/catalina/connector/CoyoteAdapter.java
+@@ -46,8 +46,8 @@ import org.apache.tomcat.util.buf.B2CConverter;
+ import org.apache.tomcat.util.buf.ByteChunk;
+ import org.apache.tomcat.util.buf.CharChunk;
+ import org.apache.tomcat.util.buf.MessageBytes;
+-import org.apache.tomcat.util.http.Cookies;
+ import org.apache.tomcat.util.http.ServerCookie;
++import org.apache.tomcat.util.http.ServerCookies;
+ import org.apache.tomcat.util.net.SSLSupport;
+ import org.apache.tomcat.util.net.SocketStatus;
+ import org.apache.tomcat.util.res.StringManager;
+@@ -903,15 +903,8 @@ public class CoyoteAdapter implements Adapter {
+                 }
+             }
+ 
+-            if (request.getContext().getUseRfc6265()) {
+-                req.getCookies().setUseRfc6265(true);
+-            } else {
+-                req.getCookies().setUseRfc6265(false);
+-            }
+-
+-
+             // Look for session ID in cookies and SSL session
+-            parseSessionCookiesId(req, request);
++            parseSessionCookiesId(request);
+             parseSessionSslId(request);
+ 
+             sessionID = request.getRequestedSessionId();
+@@ -1145,7 +1138,7 @@ public class CoyoteAdapter implements Adapter {
+     /**
+      * Parse session id in URL.
+      */
+-    protected void parseSessionCookiesId(org.apache.coyote.Request req, Request request) {
++    protected void parseSessionCookiesId(Request request) {
+ 
+         // If session tracking via cookies has been disabled for the current
+         // context, don't go looking for a session ID in a cookie as a cookie
+@@ -1159,7 +1152,7 @@ public class CoyoteAdapter implements Adapter {
+         }
+ 
+         // Parse session id from cookies
+-        Cookies serverCookies = req.getCookies();
++        ServerCookies serverCookies = request.getServerCookies();
+         int count = serverCookies.getCookieCount();
+         if (count <= 0) {
+             return;
+
+==================================================
+StandardContext.java
+index 2d24ba4d34..1c7204dce5 100644
+--- a/java/org/apache/catalina/connector/Request.java
++++ b/java/org/apache/catalina/connector/Request.java
+@@ -84,10 +84,11 @@ import org.apache.tomcat.util.ExceptionUtils;
+ import org.apache.tomcat.util.buf.B2CConverter;
+ import org.apache.tomcat.util.buf.ByteChunk;
+ import org.apache.tomcat.util.buf.MessageBytes;
+-import org.apache.tomcat.util.http.Cookies;
++import org.apache.tomcat.util.http.CookieProcessor;
+ import org.apache.tomcat.util.http.FastHttpDateFormat;
+ import org.apache.tomcat.util.http.Parameters;
+ import org.apache.tomcat.util.http.ServerCookie;
++import org.apache.tomcat.util.http.ServerCookies;
+ import org.apache.tomcat.util.http.fileupload.FileItem;
+ import org.apache.tomcat.util.http.fileupload.FileUploadBase;
+ import org.apache.tomcat.util.http.fileupload.FileUploadBase.InvalidContentTypeException;
+@@ -283,11 +284,19 @@ public class Request
+ 
+ 
+     /**
+-     * Cookies parsed flag.
++     * Cookie headers parsed flag. Indicates that the cookie headers have been
++     * parsed into ServerCookies.
+      */
+     protected boolean cookiesParsed = false;
+ 
+ 
++    /**
++     * Cookie parsed flag. Indicates that the ServerCookies have been converted
++     * into user facing Cookie objects.
++     */
++    protected boolean cookiesConverted = false;
++
++
+     /**
+      * Secure flag.
+      */
+@@ -462,6 +471,7 @@ public class Request
+         }
+         partsParseException = null;
+         cookiesParsed = false;
++        cookiesConverted = false;
+         locales.clear();
+         localesParsed = false;
+         secure = false;
+@@ -1668,7 +1678,7 @@ public class Request
+     public void addCookie(Cookie cookie) {
+ 
+         if (!cookiesParsed) {
+-            parseCookies();
++            convertCookies();
+         }
+ 
+         int size = 0;
+@@ -1703,6 +1713,7 @@ public class Request
+      */
+     public void clearCookies() {
+         cookiesParsed = true;
++        cookiesConverted = true;
+         cookies = null;
+     }
+ 
+@@ -1899,17 +1910,27 @@ public class Request
+ 
+ 
+     /**
+-     * Return the set of Cookies received with this Request.
++     * Return the set of Cookies received with this Request. Triggers parsing of
++     * the Cookie HTTP headers followed by conversion to Cookie objects if this
++     * has not already been performed.
+      */
+     @Override
+     public Cookie[] getCookies() {
+-
+-        if (!cookiesParsed) {
+-            parseCookies();
++        if (!cookiesConverted) {
++            convertCookies();
+         }
+-
+         return cookies;
++    }
++
+ 
++    /**
++     * Return the server representation of the cookies associated with this
++     * request. Triggers parsing of the Cookie HTTP headers (but not conversion
++     * to Cookie objects) if the headers have not yet been parsed.
++     */
++    public ServerCookies getServerCookies() {
++        parseCookies();
++        return coyoteRequest.getCookies();
+     }
+ 
+ 
+@@ -2841,13 +2862,37 @@ public class Request
+     }
+ 
+     /**
+-     * Parse cookies.
++     * Parse cookies. This only parses the cookies into the memory efficient
++     * ServerCookies structure. It does not populate the Cookie objects.
+      */
+     protected void parseCookies() {
++        if (cookiesParsed) {
++            return;
++        }
+ 
+         cookiesParsed = true;
+ 
+-        Cookies serverCookies = coyoteRequest.getCookies();
++        ServerCookies serverCookies = coyoteRequest.getCookies();
++        CookieProcessor cookieProcessor = getContext().getCookieProcessor();
++        cookieProcessor.parseCookieHeader(coyoteRequest.getMimeHeaders(), serverCookies);
++    }
++
++    /**
++     * Converts the parsed cookies (parsing the Cookie headers first if they
++     * have not been parsed) into Cookie objects.
++     */
++    protected void convertCookies() {
++        if (cookiesConverted) {
++            return;
++        }
++
++        cookiesConverted = true;
++
++        parseCookies();
++
++        ServerCookies serverCookies = coyoteRequest.getCookies();
++        CookieProcessor cookieProcessor = getContext().getCookieProcessor();
++
+         int count = serverCookies.getCookieCount();
+         if (count <= 0) {
+             return;
+@@ -2865,10 +2910,7 @@ public class Request
+                 Cookie cookie = new Cookie(scookie.getName().toString(),null);
+                 int version = scookie.getVersion();
+                 cookie.setVersion(version);
+-                if (getContext().getUseRfc6265()) {
+-                    scookie.getValue().getByteChunk().setCharset(
+-                            getContext().getCookieEncodingCharset());
+-                }
++                scookie.getValue().getByteChunk().setCharset(cookieProcessor.getCharset());
+                 cookie.setValue(unescape(scookie.getValue().toString()));
+                 cookie.setPath(unescape(scookie.getPath().toString()));
+                 String domain = scookie.getDomain().toString();
+@@ -2888,9 +2930,9 @@ public class Request
+             System.arraycopy(cookies, 0, ncookies, 0, idx);
+             cookies = ncookies;
+         }
+-
+     }
+ 
++
+     /**
+      * Parse request parameters.
+      */
+
+==================================================
+ContextRuleSet.java
+index 64fe28522d..bafd270e59 100644
+--- a/java/org/apache/catalina/core/mbeans-descriptors.xml
++++ b/java/org/apache/catalina/core/mbeans-descriptors.xml
+@@ -103,10 +103,6 @@
+                type="boolean"
+                writeable="false" />
+ 
+-    <attribute name="cookieEncoding"
+-               description="If the new cookie parser is used, which encoding should be used to decode the cookie values?"
+-               type="java.lang.String"/>
+-
+     <attribute name="cookies"
+                description="Should we attempt to use cookies for session id communication?"
+                type="boolean"/>
+@@ -335,11 +331,6 @@
+                is="true"
+                type="boolean"/>
+ 
+-    <attribute name="useNewCookieParser"
+-               description="Use the new RFC6265 based cookie parser"
+-               is="false"
+-               type="boolean"/>
+-
+     <attribute name="webappVersion"
+                description="The version of this web application - used in parallel deployment to differentiate different versions of the same web application"
+                type="java.lang.String"
+
+==================================================
+FailedContext.java
+index b4873a68c0..ea5b7a9a24 100644
+--- a/java/org/apache/catalina/startup/ContextRuleSet.java
++++ b/java/org/apache/catalina/startup/ContextRuleSet.java
+@@ -242,6 +242,13 @@ public class ContextRuleSet extends RuleSetBase {
+                             "setJarScanFilter",
+                             "org.apache.tomcat.JarScanFilter");
+ 
++        digester.addObjectCreate(prefix + "Context/CookieProcessor",
++                                 "org.apache.tomcat.util.http.Cookies",
++                                 "className");
++        digester.addSetProperties(prefix + "Context/CookieProcessor");
++        digester.addSetNext(prefix + "Context/CookieProcessor",
++                            "setCookieProcessor",
++                            "org.apache.tomcat.util.http.CookieProcessor");
+     }
+ 
+ }
+
+==================================================
+Request.java
+index 73c6bf48d3..8993885600 100644
+--- a/java/org/apache/catalina/startup/FailedContext.java
++++ b/java/org/apache/catalina/startup/FailedContext.java
+@@ -19,8 +19,6 @@ package org.apache.catalina.startup;
+ import java.beans.PropertyChangeListener;
+ import java.io.File;
+ import java.net.URL;
+-import java.nio.charset.Charset;
+-import java.nio.charset.StandardCharsets;
+ import java.util.Locale;
+ import java.util.Map;
+ import java.util.Set;
+@@ -63,6 +61,7 @@ import org.apache.tomcat.util.descriptor.web.FilterDef;
+ import org.apache.tomcat.util.descriptor.web.FilterMap;
+ import org.apache.tomcat.util.descriptor.web.LoginConfig;
+ import org.apache.tomcat.util.descriptor.web.SecurityConstraint;
++import org.apache.tomcat.util.http.CookieProcessor;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+ /**
+@@ -758,17 +757,8 @@ public class FailedContext extends LifecycleMBeanBase implements Context {
+     public Object getNamingToken() { return null; }
+ 
+     @Override
+-    public void setUseRfc6265(boolean useRfc6265) { /* NO-OP */ }
++    public void setCookieProcessor(CookieProcessor cookieProcessor) { /* NO-OP */ }
+ 
+     @Override
+-    public boolean getUseRfc6265() {return false; }
+-
+-    @Override
+-    public void setCookieEncoding(String encoding) { /* NO-OP */ }
+-
+-    @Override
+-    public String getCookieEncoding() { return "UTF-8"; }
+-
+-    @Override
+-    public Charset getCookieEncodingCharset() { return StandardCharsets.UTF_8; }
++    public CookieProcessor getCookieProcessor() { return null; }
+ }
+\ No newline at end of file
+
+==================================================
+CookieProcessor.java
+index 15d669baa0..5a5ca94dee 100644
+--- a/java/org/apache/coyote/Request.java
++++ b/java/org/apache/coyote/Request.java
+@@ -25,9 +25,9 @@ import javax.servlet.ReadListener;
+ import org.apache.tomcat.util.buf.ByteChunk;
+ import org.apache.tomcat.util.buf.MessageBytes;
+ import org.apache.tomcat.util.buf.UDecoder;
+-import org.apache.tomcat.util.http.Cookies;
+ import org.apache.tomcat.util.http.MimeHeaders;
+ import org.apache.tomcat.util.http.Parameters;
++import org.apache.tomcat.util.http.ServerCookies;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+ /**
+@@ -62,6 +62,8 @@ public final class Request {
+     private static final StringManager sm =
+             StringManager.getManager(Constants.Package);
+ 
++    // Expected maximum typica number of cookies per request.
++    private static final int INITIAL_COOKIE_SIZE = 4;
+ 
+     // ----------------------------------------------------------- Constructors
+ 
+@@ -121,7 +123,8 @@ public final class Request {
+     private long contentLength = -1;
+     private MessageBytes contentTypeMB = null;
+     private String charEncoding = null;
+-    private final Cookies cookies = new Cookies(headers);
++
++    private final ServerCookies serverCookies = new ServerCookies(INITIAL_COOKIE_SIZE);
+     private final Parameters parameters = new Parameters();
+ 
+     private final MessageBytes remoteUser=MessageBytes.newInstance();
+@@ -381,15 +384,13 @@ public final class Request {
+ 
+     // -------------------- Cookies --------------------
+ 
+-
+-    public Cookies getCookies() {
+-        return cookies;
++    public ServerCookies getCookies() {
++        return serverCookies;
+     }
+ 
+ 
+     // -------------------- Parameters --------------------
+ 
+-
+     public Parameters getParameters() {
+         return parameters;
+     }
+@@ -528,7 +529,7 @@ public final class Request {
+         remotePort = -1;
+         available = 0;
+ 
+-        cookies.recycle();
++        serverCookies.recycle();
+         parameters.recycle();
+ 
+         uriMB.recycle();
+
+==================================================
+Cookies.java
+new file mode 100644
+index 0000000000..7028a049ef
+--- /dev/null
++++ b/java/org/apache/tomcat/util/http/CookieProcessor.java
+@@ -0,0 +1,33 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.tomcat.util.http;
++
++import java.nio.charset.Charset;
++
++public interface CookieProcessor {
++
++    /**
++     * Parse the provided headers into server cookie objects.
++     */
++    void parseCookieHeader(MimeHeaders headers, ServerCookies serverCookies);
++
++    /**
++     * The character set that is to be used to turn the bytes provided in the
++     * cookie header into characters for the cookie value.
++     */
++    Charset getCharset();
++}
+
+==================================================
+Rfc6265CookieProcessor.java
+index fcc5f5bf8f..3b058f23dd 100644
+--- a/java/org/apache/tomcat/util/http/Cookies.java
++++ b/java/org/apache/tomcat/util/http/Cookies.java
+@@ -16,14 +16,13 @@
+  */
+ package org.apache.tomcat.util.http;
+ 
+-import java.io.PrintWriter;
+-import java.io.StringWriter;
++import java.nio.charset.Charset;
++import java.nio.charset.StandardCharsets;
+ 
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.buf.ByteChunk;
+ import org.apache.tomcat.util.buf.MessageBytes;
+-import org.apache.tomcat.util.http.parser.Cookie;
+ import org.apache.tomcat.util.log.UserDataHelper;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+@@ -36,7 +35,7 @@ import org.apache.tomcat.util.res.StringManager;
+  * @author Costin Manolache
+  * @author kevin seguin
+  */
+-public final class Cookies {
++public final class Cookies implements CookieProcessor {
+ 
+     private static final Log log = LogFactory.getLog(Cookies.class);
+ 
+@@ -45,72 +44,16 @@ public final class Cookies {
+     private static final StringManager sm =
+             StringManager.getManager("org.apache.tomcat.util.http");
+ 
+-    // expected average number of cookies per request
+-    public static final int INITIAL_SIZE = 4;
+-    private ServerCookies scookies = new ServerCookies(INITIAL_SIZE);
+-    private boolean unprocessed = true;
+-    private boolean useRfc6265 = false;
+ 
+-    private final MimeHeaders headers;
+-
+-
+-    /**
+-     *  Construct a new cookie collection, that will extract
+-     *  the information from headers.
+-     *
+-     * @param headers Cookies are lazy-evaluated and will extract the
+-     *     information from the provided headers.
+-     */
+-    public Cookies(MimeHeaders headers) {
+-        this.headers = headers;
+-    }
+-
+-
+-    public void recycle() {
+-        scookies.recycle();
+-        unprocessed = true;
+-        useRfc6265 = false;
+-    }
+-
+-
+-    /**
+-     * EXPENSIVE!!!  only for debugging.
+-     */
+     @Override
+-    public String toString() {
+-        StringWriter sw = new StringWriter();
+-        PrintWriter pw = new PrintWriter(sw);
+-        pw.println("=== Cookies ===");
+-        int count = getCookieCount();
+-        for (int i = 0; i < count; ++i) {
+-            pw.println(getCookie(i).toString());
+-        }
+-        return sw.toString();
++    public Charset getCharset() {
++        return StandardCharsets.ISO_8859_1;
+     }
+ 
+ 
+-    /**
+-     * Indexed access.
+-     */
+-    public ServerCookie getCookie(int idx) {
+-        if (unprocessed) {
+-            // This will trigger cookie processing
+-            getCookieCount();
+-        }
+-        return scookies.getCookie(idx);
+-    }
+-
+-
+-    public int getCookieCount() {
+-        if (unprocessed) {
+-            unprocessed = false;
+-            processCookies(headers);
+-        }
+-        return scookies.getCookieCount();
+-    }
+-
++    @Override
++    public void parseCookieHeader(MimeHeaders headers, ServerCookies serverCookies) {
+ 
+-    private void processCookies(MimeHeaders headers) {
+         if (headers == null) {
+             // nothing to process
+             return;
+@@ -135,10 +78,11 @@ public final class Cookies {
+                     if (len > 0) {
+                         byte[] buf = new byte[len];
+                         System.arraycopy(bc.getBytes(), bc.getOffset(), buf, 0, len);
+-                        processCookieHeader(buf, 0, len);
++                        processCookieHeader(buf, 0, len, serverCookies);
+                     }
+                 } else {
+-                    processCookieHeader(bc.getBytes(), bc.getOffset(), bc.getLength());
++                    processCookieHeader(bc.getBytes(), bc.getOffset(), bc.getLength(),
++                            serverCookies);
+                 }
+             }
+ 
+@@ -148,100 +92,15 @@ public final class Cookies {
+     }
+ 
+ 
+-    public void setUseRfc6265(boolean useRfc6265) {
+-        this.useRfc6265 = useRfc6265;
+-    }
+-
+-
+-    // XXX will be refactored soon!
+-    private static boolean equals(String s, byte b[], int start, int end) {
+-        int blen = end-start;
+-        if (b == null || blen != s.length()) {
+-            return false;
+-        }
+-        int boff = start;
+-        for (int i = 0; i < blen; i++) {
+-            if (b[boff++] != s.charAt(i)) {
+-                return false;
+-            }
+-        }
+-        return true;
+-    }
+-
+-
+-    /**
+-     * Returns true if the byte is a whitespace character as
+-     * defined in RFC2619
+-     * JVK
+-     */
+-    private static final boolean isWhiteSpace(final byte c) {
+-        // This switch statement is slightly slower
+-        // for my vm than the if statement.
+-        // Java(TM) 2 Runtime Environment, Standard Edition (build 1.5.0_07-164)
+-        /*
+-        switch (c) {
+-        case ' ':;
+-        case '\t':;
+-        case '\n':;
+-        case '\r':;
+-        case '\f':;
+-            return true;
+-        default:;
+-            return false;
+-        }
+-        */
+-        if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f') {
+-            return true;
+-        } else {
+-            return false;
+-        }
+-    }
+-
+-
+-    /**
+-     * Unescapes any double quotes in the given cookie value.
+-     *
+-     * @param bc The cookie value to modify
+-     */
+-    private static void unescapeDoubleQuotes(ByteChunk bc) {
+-
+-        if (bc == null || bc.getLength() == 0 || bc.indexOf('"', 0) == -1) {
+-            return;
+-        }
+-
+-        int src = bc.getStart();
+-        int end = bc.getEnd();
+-        int dest = src;
+-        byte[] buffer = bc.getBuffer();
+-
+-        while (src < end) {
+-            if (buffer[src] == '\\' && src < end && buffer[src+1]  == '"') {
+-                src++;
+-            }
+-            buffer[dest] = buffer[src];
+-            dest ++;
+-            src ++;
+-        }
+-        bc.setEnd(dest);
+-    }
+-
+-
+-    final void processCookieHeader(byte bytes[], int off, int len) {
+-        if (useRfc6265) {
+-            Cookie.parseCookie(bytes, off, len, scookies);
+-        } else {
+-            doProcessCookieHeaderOriginal(bytes, off, len);
+-        }
+-    }
+-
+-
+     /**
+      * Parses a cookie header after the initial "Cookie:"
+      * [WS][$]token[WS]=[WS](token|QV)[;|,]
+      * RFC 2965 / RFC 2109
+      * JVK
+      */
+-    private void doProcessCookieHeaderOriginal(byte bytes[], int off, int len){
++    private static final void processCookieHeader(byte bytes[], int off, int len,
++            ServerCookies serverCookies) {
++
+         if (len <= 0 || bytes == null) {
+             return;
+         }
+@@ -460,7 +319,7 @@ public final class Cookies {
+                     continue;
+                 }
+ 
+-                sc = scookies.addCookie();
++                sc = serverCookies.addCookie();
+                 sc.setVersion( version );
+                 sc.getName().setBytes( bytes, nameStart,
+                                        nameEnd-nameStart);
+@@ -527,4 +386,76 @@ public final class Cookies {
+         // Error, we have reached the end of the header w/o a end quote
+         return end;
+     }
++
++
++    private static final boolean equals(String s, byte b[], int start, int end) {
++        int blen = end-start;
++        if (b == null || blen != s.length()) {
++            return false;
++        }
++        int boff = start;
++        for (int i = 0; i < blen; i++) {
++            if (b[boff++] != s.charAt(i)) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++
++    /**
++     * Returns true if the byte is a whitespace character as
++     * defined in RFC2619
++     * JVK
++     */
++    private static final boolean isWhiteSpace(final byte c) {
++        // This switch statement is slightly slower
++        // for my vm than the if statement.
++        // Java(TM) 2 Runtime Environment, Standard Edition (build 1.5.0_07-164)
++        /*
++        switch (c) {
++        case ' ':;
++        case '\t':;
++        case '\n':;
++        case '\r':;
++        case '\f':;
++            return true;
++        default:;
++            return false;
++        }
++        */
++        if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f') {
++            return true;
++        } else {
++            return false;
++        }
++    }
++
++
++    /**
++     * Unescapes any double quotes in the given cookie value.
++     *
++     * @param bc The cookie value to modify
++     */
++    private static final void unescapeDoubleQuotes(ByteChunk bc) {
++
++        if (bc == null || bc.getLength() == 0 || bc.indexOf('"', 0) == -1) {
++            return;
++        }
++
++        int src = bc.getStart();
++        int end = bc.getEnd();
++        int dest = src;
++        byte[] buffer = bc.getBuffer();
++
++        while (src < end) {
++            if (buffer[src] == '\\' && src < end && buffer[src+1]  == '"') {
++                src++;
++            }
++            buffer[dest] = buffer[src];
++            dest ++;
++            src ++;
++        }
++        bc.setEnd(dest);
++    }
+ }
+
+==================================================
+TesterContext.java
+new file mode 100644
+index 0000000000..53a01ca9d2
+--- /dev/null
++++ b/java/org/apache/tomcat/util/http/Rfc6265CookieProcessor.java
+@@ -0,0 +1,71 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.tomcat.util.http;
++
++import java.nio.charset.Charset;
++import java.nio.charset.StandardCharsets;
++
++import org.apache.juli.logging.Log;
++import org.apache.juli.logging.LogFactory;
++import org.apache.tomcat.util.buf.ByteChunk;
++import org.apache.tomcat.util.buf.MessageBytes;
++import org.apache.tomcat.util.http.parser.Cookie;
++
++public class Rfc6265CookieProcessor implements CookieProcessor {
++
++    private static final Log log = LogFactory.getLog(Rfc6265CookieProcessor.class);
++
++    @Override
++    public Charset getCharset() {
++        return StandardCharsets.UTF_8;
++    }
++
++
++    @Override
++    public void parseCookieHeader(MimeHeaders headers,
++            ServerCookies serverCookies) {
++
++        if (headers == null) {
++            // nothing to process
++            return;
++        }
++
++        // process each "cookie" header
++        int pos = headers.findHeader("Cookie", 0);
++        while (pos >= 0) {
++            MessageBytes cookieValue = headers.getValue(pos);
++
++            if (cookieValue != null && !cookieValue.isNull() ) {
++                if (cookieValue.getType() != MessageBytes.T_BYTES ) {
++                    Exception e = new Exception();
++                    log.warn("Cookies: Parsing cookie as String. Expected bytes.", e);
++                    cookieValue.toBytes();
++                }
++                if (log.isDebugEnabled()) {
++                    log.debug("Cookies: Parsing b[]: " + cookieValue.toString());
++                }
++                ByteChunk bc = cookieValue.getByteChunk();
++
++                Cookie.parseCookie(bc.getBytes(), bc.getOffset(), bc.getLength(),
++                        serverCookies);
++            }
++
++            // search from the next position
++            pos = headers.findHeader("Cookie", ++pos);
++        }
++    }
++}
+
+==================================================
+TestCookies.java
+index ac4d945bff..eaeb1c6a1e 100644
+--- a/test/org/apache/catalina/core/TesterContext.java
++++ b/test/org/apache/catalina/core/TesterContext.java
+@@ -19,8 +19,6 @@ package org.apache.catalina.core;
+ import java.beans.PropertyChangeListener;
+ import java.io.File;
+ import java.net.URL;
+-import java.nio.charset.Charset;
+-import java.nio.charset.StandardCharsets;
+ import java.util.ArrayList;
+ import java.util.List;
+ import java.util.Locale;
+@@ -64,6 +62,7 @@ import org.apache.tomcat.util.descriptor.web.FilterDef;
+ import org.apache.tomcat.util.descriptor.web.FilterMap;
+ import org.apache.tomcat.util.descriptor.web.LoginConfig;
+ import org.apache.tomcat.util.descriptor.web.SecurityConstraint;
++import org.apache.tomcat.util.http.CookieProcessor;
+ 
+ /**
+  * Minimal implementation for use in unit tests.
+@@ -1220,22 +1219,11 @@ public class TesterContext implements Context {
+     }
+ 
+     @Override
+-    public Object getNamingToken() {
+-        return null;
+-    }
+-
+-    @Override
+-    public void setUseRfc6265(boolean useRfc6265) { /* NO-OP */ }
+-
+-    @Override
+-    public boolean getUseRfc6265() {return false; }
+-
+-    @Override
+-    public void setCookieEncoding(String encoding) { /* NO-OP */ }
++    public Object getNamingToken() { return null; }
+ 
+     @Override
+-    public String getCookieEncoding() { return "UTF-8"; }
++    public void setCookieProcessor(CookieProcessor cookieProcessor) { /* NO-OP */ }
+ 
+     @Override
+-    public Charset getCookieEncodingCharset() { return StandardCharsets.UTF_8; }
++    public CookieProcessor getCookieProcessor() { return null; }
+ }
+
+==================================================
+TesterCookiesPerformance.java
+index 685c294b86..ff663a29d4 100644
+--- a/test/org/apache/tomcat/util/http/TestCookies.java
++++ b/test/org/apache/tomcat/util/http/TestCookies.java
+@@ -472,16 +472,22 @@ public class TestCookies {
+ 
+     private void test(boolean useRfc6265, String header, Cookie... expected) {
+         MimeHeaders mimeHeaders = new MimeHeaders();
+-        Cookies cookies = new Cookies(mimeHeaders);
+-        cookies.setUseRfc6265(useRfc6265);
++        ServerCookies serverCookies = new ServerCookies(4);
++        CookieProcessor cookieProcessor;
++
++        if (useRfc6265) {
++            cookieProcessor = new Rfc6265CookieProcessor();
++        } else {
++            cookieProcessor = new Cookies();
++        }
+         MessageBytes cookieHeaderValue = mimeHeaders.addValue("Cookie");
+         byte[] bytes = header.getBytes(StandardCharsets.UTF_8);
+         cookieHeaderValue.setBytes(bytes, 0, bytes.length);
+-        // Calling getCookieCount() triggers parsing
+-        Assert.assertEquals(expected.length, cookies.getCookieCount());
++        cookieProcessor.parseCookieHeader(mimeHeaders, serverCookies);
++        Assert.assertEquals(expected.length, serverCookies.getCookieCount());
+         for (int i = 0; i < expected.length; i++) {
+             Cookie cookie = expected[i];
+-            ServerCookie actual = cookies.getCookie(i);
++            ServerCookie actual = serverCookies.getCookie(i);
+             Assert.assertEquals(cookie.getVersion(), actual.getVersion());
+             Assert.assertEquals(cookie.getName(), actual.getName().toString());
+             actual.getValue().getByteChunk().setCharset(StandardCharsets.UTF_8);
+
+==================================================

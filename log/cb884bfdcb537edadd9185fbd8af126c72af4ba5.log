@@ -1,0 +1,237 @@
+cb884bfdcb537edadd9185fbd8af126c72af4ba5
+==================================================
+Fix https://bz.apache.org/bugzilla/show_bug.cgi?id=61105
+==================================================
+Violeta Georgieva
+==================================================
+Fri Jun 16 19:17:39 2017 +0000
+==================================================
+AsyncFileHandler.java
+index a2ad9c27ab..39edff6596 100644
+--- a/conf/logging.properties
++++ b/conf/logging.properties
+@@ -25,18 +25,22 @@ handlers = 1catalina.org.apache.juli.AsyncFileHandler, 2localhost.org.apache.jul
+ 1catalina.org.apache.juli.AsyncFileHandler.level = FINE
+ 1catalina.org.apache.juli.AsyncFileHandler.directory = ${catalina.base}/logs
+ 1catalina.org.apache.juli.AsyncFileHandler.prefix = catalina.
++1catalina.org.apache.juli.AsyncFileHandler.maxDays = 90
+ 
+ 2localhost.org.apache.juli.AsyncFileHandler.level = FINE
+ 2localhost.org.apache.juli.AsyncFileHandler.directory = ${catalina.base}/logs
+ 2localhost.org.apache.juli.AsyncFileHandler.prefix = localhost.
++2localhost.org.apache.juli.AsyncFileHandler.maxDays = 90
+ 
+ 3manager.org.apache.juli.AsyncFileHandler.level = FINE
+ 3manager.org.apache.juli.AsyncFileHandler.directory = ${catalina.base}/logs
+ 3manager.org.apache.juli.AsyncFileHandler.prefix = manager.
++3manager.org.apache.juli.AsyncFileHandler.maxDays = 90
+ 
+ 4host-manager.org.apache.juli.AsyncFileHandler.level = FINE
+ 4host-manager.org.apache.juli.AsyncFileHandler.directory = ${catalina.base}/logs
+ 4host-manager.org.apache.juli.AsyncFileHandler.prefix = host-manager.
++4host-manager.org.apache.juli.AsyncFileHandler.maxDays = 90
+ 
+ java.util.logging.ConsoleHandler.level = FINE
+ java.util.logging.ConsoleHandler.formatter = org.apache.juli.OneLineFormatter
+
+==================================================
+FileHandler.java
+index 9a9df62a6a..395e6c3d8e 100644
+--- a/java/org/apache/juli/AsyncFileHandler.java
++++ b/java/org/apache/juli/AsyncFileHandler.java
+@@ -71,11 +71,15 @@ public class AsyncFileHandler extends FileHandler {
+     protected volatile boolean closed = false;
+ 
+     public AsyncFileHandler() {
+-        this(null, null, null);
++        this(null, null, null, DEFAULT_MAX_DAYS);
+     }
+ 
+     public AsyncFileHandler(String directory, String prefix, String suffix) {
+-        super(directory, prefix, suffix);
++        this(directory, prefix, suffix, DEFAULT_MAX_DAYS);
++    }
++
++    public AsyncFileHandler(String directory, String prefix, String suffix, int maxDays) {
++        super(directory, prefix, suffix, maxDays);
+         open();
+     }
+ 
+
+==================================================
+TestFileHandler.java
+index 5edaedcfe0..700e8e959e 100644
+--- a/java/org/apache/juli/FileHandler.java
++++ b/java/org/apache/juli/FileHandler.java
+@@ -26,7 +26,16 @@ import java.io.OutputStream;
+ import java.io.OutputStreamWriter;
+ import java.io.PrintWriter;
+ import java.io.UnsupportedEncodingException;
++import java.nio.file.DirectoryStream;
++import java.nio.file.Files;
++import java.nio.file.Path;
+ import java.sql.Timestamp;
++import java.time.DateTimeException;
++import java.time.LocalDate;
++import java.time.format.DateTimeFormatter;
++import java.time.temporal.ChronoUnit;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
+ import java.util.concurrent.locks.ReadWriteLock;
+ import java.util.concurrent.locks.ReentrantReadWriteLock;
+ import java.util.logging.ErrorManager;
+@@ -36,6 +45,7 @@ import java.util.logging.Handler;
+ import java.util.logging.Level;
+ import java.util.logging.LogManager;
+ import java.util.logging.LogRecord;
++import java.util.regex.Pattern;
+ 
+ /**
+  * Implementation of <b>Handler</b> that appends log messages to a file
+@@ -74,24 +84,37 @@ import java.util.logging.LogRecord;
+  *   <li><code>formatter</code> - The <code>java.util.logging.Formatter</code>
+  *    implementation class name for this Handler. Default value:
+  *    <code>java.util.logging.SimpleFormatter</code></li>
++ *   <li><code>maxDays</code> - The maximum number of days to keep the log
++ *    files. If the specified value is <code>&lt;=0</code> then the log files
++ *    will be kept on the file system forever, otherwise they will be kept the
++ *    specified maximum days. Default value: <code>-1</code>.</li>
+  * </ul>
+  */
+ public class FileHandler extends Handler {
++    public static final int DEFAULT_MAX_DAYS = -1;
++
++    private static final ExecutorService DELETE_FILES_SERVICE = Executors.newSingleThreadExecutor();
+ 
+     // ------------------------------------------------------------ Constructor
+ 
+ 
+     public FileHandler() {
+-        this(null, null, null);
++        this(null, null, null, DEFAULT_MAX_DAYS);
+     }
+ 
+ 
+     public FileHandler(String directory, String prefix, String suffix) {
++        this(directory, prefix, suffix, DEFAULT_MAX_DAYS);
++    }
++
++    public FileHandler(String directory, String prefix, String suffix, int maxDays) {
+         this.directory = directory;
+         this.prefix = prefix;
+         this.suffix = suffix;
++        this.maxDays = maxDays;
+         configure();
+         openWriter();
++        clean();
+     }
+ 
+ 
+@@ -124,11 +147,17 @@ public class FileHandler extends Handler {
+ 
+ 
+     /**
+-     * Determines whether the logfile is rotatable
++     * Determines whether the log file is rotatable
+      */
+     private boolean rotatable = true;
+ 
+ 
++    /**
++     * Maximum number of days to keep the log files
++     */
++    private int maxDays = DEFAULT_MAX_DAYS;
++
++
+     /**
+      * The PrintWriter to which we are currently logging, if any.
+      */
+@@ -147,6 +176,13 @@ public class FileHandler extends Handler {
+     private int bufferSize = -1;
+ 
+ 
++    /**
++     * Represents a file name pattern of type {prefix}{date}{suffix}.
++     * The date is YYYY-MM-DD
++     */
++    private Pattern pattern;
++
++
+     // --------------------------------------------------------- Public Methods
+ 
+ 
+@@ -179,6 +215,7 @@ public class FileHandler extends Handler {
+                         closeWriter();
+                         date = tsDate;
+                         openWriter();
++                        clean();
+                     }
+                 } finally {
+                     // Downgrade to read-lock. This ensures the writer remains valid
+@@ -291,6 +328,16 @@ public class FileHandler extends Handler {
+         if (suffix == null) {
+             suffix = getProperty(className + ".suffix", ".log");
+         }
++        pattern = Pattern.compile("^(" + Pattern.quote(prefix) + ")\\d{4}-\\d{1,2}-\\d{1,2}("
++                + Pattern.quote(suffix) + ")$");
++        String sMaxDays = getProperty(className + ".maxDays", String.valueOf(DEFAULT_MAX_DAYS));
++        if (maxDays <= 0) {
++            try {
++                maxDays = Integer.parseInt(sMaxDays);
++            } catch (NumberFormatException ignore) {
++                // no-op
++            }
++        }
+         String sBufferSize = getProperty(className + ".bufferSize", String.valueOf(bufferSize));
+         try {
+             bufferSize = Integer.parseInt(sBufferSize);
+@@ -408,4 +455,47 @@ public class FileHandler extends Handler {
+             writerLock.writeLock().unlock();
+         }
+     }
++
++    private void clean() {
++        if (maxDays <= 0) {
++            return;
++        }
++        DELETE_FILES_SERVICE.submit(() -> {
++            try (DirectoryStream<Path> files = streamFilesForDelete()) {
++                for (Path file : files) {
++                    Files.delete(file);
++                }
++            } catch (IOException e) {
++                reportError("Unable to delete log files older than [" + maxDays + "] days", null,
++                        ErrorManager.GENERIC_FAILURE);
++            }
++        });
++    }
++
++    private DirectoryStream<Path> streamFilesForDelete() throws IOException {
++        LocalDate maxDaysOffset = LocalDate.now().minus(maxDays, ChronoUnit.DAYS);
++        return Files.newDirectoryStream(new File(directory).toPath(), path -> {
++            boolean result = false;
++            String date = obtainDateFromPath(path);
++            if (date != null) {
++                try {
++                    LocalDate dateFromFile = LocalDate.from(DateTimeFormatter.ISO_LOCAL_DATE.parse(date));
++                    result = dateFromFile.isBefore(maxDaysOffset);
++                } catch (DateTimeException e) {
++                    // no-op
++                }
++            }
++            return result;
++        });
++    }
++
++    private String obtainDateFromPath(Path path) {
++        String date = path.getFileName().toString();
++        if (pattern.matcher(date).matches()) {
++            date = date.substring(prefix.length());
++            return date.substring(0, date.length() - suffix.length());
++        } else {
++            return null;
++        }
++    }
+ }
+
+==================================================

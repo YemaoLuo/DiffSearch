@@ -1,0 +1,208 @@
+d8d2b908959cd5da648125f15c9993a84e3ed572
+==================================================
+Add async-supported impl for Servlets
+==================================================
+Mark Emlyn
+==================================================
+Mon Dec 7 14:17:14 2009 +0000
+==================================================
+Wrapper.java
+Add async-supported impl for Servlets
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@887928 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+ApplicationFilterChain.java
+index bd684374f3..fbefbd3c2e 100644
+--- a/java/org/apache/catalina/Wrapper.java
++++ b/java/org/apache/catalina/Wrapper.java
+@@ -347,5 +347,17 @@ public interface Wrapper extends Container {
+      * Set the multi-part configuration for the associated servlet. To clear the
+      * multi-part configuration specify <code>null</code> as the new value.
+      */
+-    public void setMultipartConfigElement(MultipartConfigElement multipartConfig);
++    public void setMultipartConfigElement(
++            MultipartConfigElement multipartConfig);
++    
++    /**
++     * Does the associated Servlet support async processing? Defaults to
++     * <code>true</code>
++     */
++    public boolean isAsyncSupported();
++    
++    /**
++     * Set the async support for the associated servlet.
++     */
++    public void setAsyncSupported(boolean asyncSupport);
+ }
+
+==================================================
+StandardWrapper.java
+index 0082aada1e..64df629e45 100644
+--- a/java/org/apache/catalina/core/ApplicationFilterChain.java
++++ b/java/org/apache/catalina/core/ApplicationFilterChain.java
+@@ -28,8 +28,10 @@ import javax.servlet.FilterChain;
+ import javax.servlet.Servlet;
+ import javax.servlet.ServletException;
+ import javax.servlet.ServletRequest;
++import javax.servlet.ServletRequestWrapper;
+ import javax.servlet.ServletResponse;
+ import javax.servlet.http.HttpServletRequest;
++import javax.servlet.http.HttpServletRequestWrapper;
+ import javax.servlet.http.HttpServletResponse;
+ 
+ import org.apache.catalina.Globals;
+@@ -273,11 +275,25 @@ final class ApplicationFilterChain implements FilterChain, CometFilterChain {
+ 
+             support.fireInstanceEvent(InstanceEvent.BEFORE_SERVICE_EVENT,
+                                       servlet, request, response);
+-            if ((request instanceof HttpServletRequest) &&
++            ServletRequest wRequest; 
++            if (request.isAsyncSupported()
++                    && !support.getWrapper().isAsyncSupported()) {
++                if (request instanceof HttpServletRequest) {
++                    wRequest = new HttpServletRequestNoAsyc(
++                            (HttpServletRequest) request);
++                } else {
++                    // Must be a ServletRequest
++                    wRequest = new ServletRequestNoAsyc(request);
++                }
++            } else {
++                wRequest = request;
++            }
++            // Use potentially wrapped request from this point
++            if ((wRequest instanceof HttpServletRequest) &&
+                 (response instanceof HttpServletResponse)) {
+                     
+                 if( Globals.IS_SECURITY_ENABLED ) {
+-                    final ServletRequest req = request;
++                    final ServletRequest req = wRequest;
+                     final ServletResponse res = response;
+                     Principal principal = 
+                         ((HttpServletRequest) req).getUserPrincipal();
+@@ -289,11 +305,12 @@ final class ApplicationFilterChain implements FilterChain, CometFilterChain {
+                                                principal);   
+                     args = null;
+                 } else {  
+-                    servlet.service(request, response);
++                    servlet.service(wRequest, response);
+                 }
+             } else {
+-                servlet.service(request, response);
++                servlet.service(wRequest, response);
+             }
++            // Stop using wrapped request now Servlet has been processed
+             support.fireInstanceEvent(InstanceEvent.AFTER_SERVICE_EVENT,
+                                       servlet, request, response);
+         } catch (IOException e) {
+@@ -581,4 +598,30 @@ final class ApplicationFilterChain implements FilterChain, CometFilterChain {
+     }
+ 
+ 
++    // --------------------------------- Wrapper classes for isAsyncSupported()
++    
++    private class HttpServletRequestNoAsyc extends HttpServletRequestWrapper {
++
++        public HttpServletRequestNoAsyc(HttpServletRequest request) {
++            super(request);
++        }
++        
++        @Override
++        public boolean isAsyncSupported() {
++            return false;
++        }
++    }
++
++    private class ServletRequestNoAsyc extends ServletRequestWrapper {
++
++        public ServletRequestNoAsyc(ServletRequest request) {
++            super(request);
++        }
++        
++        @Override
++        public boolean isAsyncSupported() {
++            return false;
++        }
++    }
++
+ }
+
+==================================================
+ServletDef.java
+index 90435d61f2..5b8843443c 100644
+--- a/java/org/apache/catalina/core/StandardWrapper.java
++++ b/java/org/apache/catalina/core/StandardWrapper.java
+@@ -260,6 +260,11 @@ public class StandardWrapper
+      * Multipart config
+      */
+     protected MultipartConfigElement multipartConfigElement = null;
++    
++    /**
++     * Async support
++     */
++    protected boolean asyncSupported = true;
+ 
+     /**
+      * Static class array used when the SecurityManager is turned on and 
+@@ -1502,6 +1507,15 @@ public class StandardWrapper
+         this.multipartConfigElement = multipartConfigElement;
+     }
+ 
++    @Override
++    public boolean isAsyncSupported() {
++        return asyncSupported;
++    }
++    
++    public void setAsyncSupported(boolean asyncSupported) {
++        this.asyncSupported = asyncSupported;
++    }
++
+     // -------------------------------------------------------- Package Methods
+ 
+ 
+
+==================================================
+WebRuleSet.java
+index 9ec90ba0f1..72e2a4b168 100644
+--- a/java/org/apache/catalina/deploy/ServletDef.java
++++ b/java/org/apache/catalina/deploy/ServletDef.java
+@@ -220,4 +220,18 @@ public class ServletDef implements Serializable {
+     public void setMultipartDef(MultipartDef multipartDef) {
+         this.multipartDef = multipartDef;
+     }
++    
++    
++    /**
++     * Does this servlet support async.
++     */
++    private String asyncSupported = null;
++    
++    public String getAsyncSupported() {
++        return this.asyncSupported;
++    }
++    
++    public void setAsyncSupported(String asyncSupported) {
++        this.asyncSupported = asyncSupported;
++    }
+ }
+
+==================================================
+WebXml.java
+index 78a0564cf4..3a3a3d25a7 100644
+--- a/java/org/apache/catalina/startup/WebRuleSet.java
++++ b/java/org/apache/catalina/startup/WebRuleSet.java
+@@ -383,6 +383,10 @@ public class WebRuleSet extends RuleSetBase {
+         digester.addCallMethod(fullPrefix + "/servlet/multipart-config/file-size-threshold",
+                                "setFileSizeThreshold", 0);
+ 
++        digester.addCallMethod(fullPrefix + "/servlet/async-supported",
++                "setAsyncSupported", 0);
++
++        
+         digester.addRule(fullPrefix + "/servlet-mapping",
+                                new CallMethodMultiRule("addServletMapping", 2, 0));
+         digester.addCallParam(fullPrefix + "/servlet-mapping/servlet-name", 1);
+
+==================================================

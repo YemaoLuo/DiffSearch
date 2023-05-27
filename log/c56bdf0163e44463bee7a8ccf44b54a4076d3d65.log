@@ -1,0 +1,692 @@
+c56bdf0163e44463bee7a8ccf44b54a4076d3d65
+==================================================
+bug 51741: Eclipse WTP "Serve modules without publishing" broken with
+==================================================
+Sylvain Laurent
+==================================================
+Fri Dec 2 20:49:50 2011 +0000
+==================================================
+StandardContext.java
+bug 51741: Eclipse WTP "Serve modules without publishing" broken with
+tc7, needs patch in tomcat 
+https://issues.apache.org/bugzilla/show_bug.cgi?id=51741
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1209686 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+WebappClassLoader.java
+index a590cef467..46394cfd04 100644
+--- a/java/org/apache/catalina/core/StandardContext.java
++++ b/java/org/apache/catalina/core/StandardContext.java
+@@ -1177,6 +1177,19 @@ public class StandardContext extends ContainerBase
+         }
+     }
+ 
++    /**
++     * Add a URL for a JAR that contains static resources in a
++     * META-INF/resources directory that should be included in the static
++     * resources for this context.
++     */
++    public void addResourcesDirContext(DirContext altDirContext) {
++        if (webappResources instanceof BaseDirContext) {
++            ((BaseDirContext) webappResources).addAltDirContext(altDirContext);
++        } else {
++            log.error(sm.getString("standardContext.noResourceJar", altDirContext,
++                    getName()));
++        }
++    }
+ 
+     /**
+      * Set the current alias configuration. The list of aliases should be of the
+
+==================================================
+ContextConfig.java
+index 3712d22c8f..94328854cb 100644
+--- a/java/org/apache/catalina/loader/WebappClassLoader.java
++++ b/java/org/apache/catalina/loader/WebappClassLoader.java
+@@ -46,11 +46,11 @@ import java.util.Enumeration;
+ import java.util.HashMap;
+ import java.util.Iterator;
+ import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.ResourceBundle;
+ import java.util.Set;
+-import java.util.Vector;
+ import java.util.concurrent.ThreadPoolExecutor;
+ import java.util.jar.Attributes;
+ import java.util.jar.Attributes.Name;
+@@ -1278,7 +1278,8 @@ public class WebappClassLoader
+         if (log.isDebugEnabled())
+             log.debug("    findResources(" + name + ")");
+ 
+-        Vector<URL> result = new Vector<URL>();
++        //we use a LinkedHashSet instead of a Vector to avoid duplicates with virtualmappings
++        LinkedHashSet<URL> result = new LinkedHashSet<URL>();
+ 
+         int jarFilesLength = jarFiles.length;
+         int repositoriesLength = repositories.length;
+@@ -1291,7 +1292,7 @@ public class WebappClassLoader
+             Enumeration<URL> otherResourcePaths = super.findResources(name);
+ 
+             while (otherResourcePaths.hasMoreElements()) {
+-                result.addElement(otherResourcePaths.nextElement());
++                result.add(otherResourcePaths.nextElement());
+             }
+ 
+         }
+@@ -1303,7 +1304,7 @@ public class WebappClassLoader
+                 // Note : Not getting an exception here means the resource was
+                 // found
+                 try {
+-                    result.addElement(getURI(new File(files[i], name)));
++                    result.add(getURI(new File(files[i], name)));
+                 } catch (MalformedURLException e) {
+                     // Ignore
+                 }
+@@ -1321,7 +1322,7 @@ public class WebappClassLoader
+                         try {
+                             String jarFakeUrl = getURI(jarRealFiles[i]).toString();
+                             jarFakeUrl = "jar:" + jarFakeUrl + "!/" + name;
+-                            result.addElement(new URL(jarFakeUrl));
++                            result.add(new URL(jarFakeUrl));
+                         } catch (MalformedURLException e) {
+                             // Ignore
+                         }
+@@ -1336,12 +1337,24 @@ public class WebappClassLoader
+             Enumeration<URL> otherResourcePaths = super.findResources(name);
+ 
+             while (otherResourcePaths.hasMoreElements()) {
+-                result.addElement(otherResourcePaths.nextElement());
++                result.add(otherResourcePaths.nextElement());
+             }
+ 
+         }
++        
++        final Iterator<URL> iterator = result.iterator();
+ 
+-        return result.elements();
++        return new Enumeration<URL>() {
++            @Override
++            public boolean hasMoreElements() {
++                return iterator.hasNext();
++            }
++
++            @Override
++            public URL nextElement() {
++                return iterator.next();
++            }
++        };
+ 
+     }
+ 
+
+==================================================
+VirtualDirContext.java
+index a1f59c7a4b..3f5e979be3 100644
+--- a/java/org/apache/catalina/startup/ContextConfig.java
++++ b/java/org/apache/catalina/startup/ContextConfig.java
+@@ -46,6 +46,9 @@ import java.util.Properties;
+ import java.util.Set;
+ import java.util.concurrent.ConcurrentHashMap;
+ 
++import javax.naming.Binding;
++import javax.naming.NamingEnumeration;
++import javax.naming.NamingException;
+ import javax.servlet.ServletContainerInitializer;
+ import javax.servlet.ServletContext;
+ import javax.servlet.annotation.HandlesTypes;
+@@ -79,6 +82,7 @@ import org.apache.catalina.util.ContextName;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.naming.resources.DirContextURLConnection;
++import org.apache.naming.resources.FileDirContext;
+ import org.apache.naming.resources.ResourceAttributes;
+ import org.apache.tomcat.JarScanner;
+ import org.apache.tomcat.JarScannerCallback;
+@@ -1197,14 +1201,21 @@ public class ContextConfig
+                 // Step 4. Process /WEB-INF/classes for annotations
+                 // This will add any matching classes to the typeInitializerMap
+                 if (ok) {
+-                    URL webinfClasses;
+                     try {
+-                        webinfClasses = context.getServletContext().getResource(
+-                                "/WEB-INF/classes");
+-                        processAnnotationsUrl(webinfClasses, webXml);
+-                    } catch (MalformedURLException e) {
++                        NamingEnumeration<Binding> listBindings =
++                            context.getResources().listBindings("/WEB-INF/classes");
++                        while (listBindings.hasMoreElements()) {
++                            Binding binding = listBindings.nextElement();
++                            if (binding.getObject() instanceof FileDirContext) {
++                                File webInfCLassDir =
++                                    new File(
++                                        ((FileDirContext) binding.getObject()).getDocBase());
++                                processAnnotationsFile(webInfCLassDir, webXml);
++                            }
++                        }
++                    } catch (NamingException e) {
+                         log.error(sm.getString(
+-                                "contextConfig.webinfClassesUrl"), e);
++                            "contextConfig.webinfClassesUrl"), e);
+                     }
+                 }
+ 
+@@ -1567,10 +1578,25 @@ public class ContextConfig
+                     if (jar.entryExists("META-INF/resources/")) {
+                         context.addResourceJarUrl(url);
+                     }
++                } else if ("file".equals(url.getProtocol())) {
++                    FileDirContext fileDirContext = new FileDirContext();
++                    fileDirContext.setDocBase(new File(url.toURI()).getAbsolutePath());
++                    try {
++                        fileDirContext.lookup("META-INF/resources/");
++                        //lookup succeeded
++                        if(context instanceof StandardContext){
++                            ((StandardContext)context).addResourcesDirContext(fileDirContext);
++                        }
++                    } catch (NamingException e) {
++                        //not found, ignore
++                    }
+                 }
+             } catch (IOException ioe) {
+                 log.error(sm.getString("contextConfig.resourceJarFail", url,
+                         context.getName()));
++            } catch (URISyntaxException e) {
++                log.error(sm.getString("contextConfig.resourceJarFail", url,
++                    context.getName()));
+             } finally {
+                 if (jar != null) {
+                     jar.close();
+
+==================================================
+EchoTag.java
+index 08dd8347a3..8bcf361d5c 100644
+--- a/java/org/apache/naming/resources/VirtualDirContext.java
++++ b/java/org/apache/naming/resources/VirtualDirContext.java
+@@ -18,70 +18,69 @@ package org.apache.naming.resources;
+ 
+ import java.io.File;
+ import java.util.ArrayList;
+-import java.util.Hashtable;
++import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Set;
+ import java.util.StringTokenizer;
+ 
+ import javax.naming.NamingException;
+ import javax.naming.directory.Attributes;
+ 
++import org.apache.catalina.loader.VirtualWebappLoader;
+ import org.apache.naming.NamingEntry;
+ 
+ /**
+- * Extended FileDirContext implementation that will allow loading of tld files
+- * from the META-INF directory (or subdirectories) in classpath. This will fully
+- * mimic the behavior of compressed jars also when using unjarred resources. Tld
+- * files can be loaded indifferently from WEB-INF webapp dir (or subdirs) or
+- * from META-INF dir from jars available in the classpath: using this DirContext
+- * implementation you will be able to use unexpanded jars during development and
+- * to make any tld in them virtually available to the webapp.
+- *
++ * Extended FileDirContext implementation that allows to expose multiple
++ * directories of the filesystem under a single webapp, a feature mainly used
++ * for development with IDEs.
++ * This should be used in conjunction with {@link VirtualWebappLoader}.
++ * 
+  * Sample context xml configuration:
+- *
++ * 
+  * <code>
+- * &lt;Context docBase="\webapps\mydocbase">
++ * &lt;Context path="/mywebapp" docBase="/Users/theuser/mywebapp/src/main/webapp" >
+  *   &lt;Resources className="org.apache.naming.resources.VirtualDirContext"
+- *              virtualClasspath="\dir\classes;\somedir\somejar.jar"/>
+- * &lt;/Resources>
++ *              extraResourcePaths="/pictures=/Users/theuser/mypictures,/movies=/Users/theuser/mymovies" />
++ *   &lt;Loader className="org.apache.catalina.loader.VirtualWebappLoader"
++ *              virtualClasspath="/Users/theuser/mywebapp/target/classes" />
++ *   &lt;JarScanner scanAllDirectories="true" />
++ * &lt;/Context>
+  * </code>
+- *
+- *
++ * 
++ * 
+  * <strong>This is not meant to be used for production.
+  * Its meant to ease development with IDE's without the
+  * need for fully republishing jars in WEB-INF/lib</strong>
+- *
+- *
++ * 
++ * 
+  * @author Fabrizio Giustina
+  * @version $Id$
+  */
+ public class VirtualDirContext extends FileDirContext {
++    private String extraResourcePaths = "";
++    private Map<String, List<String>> mappedResourcePaths;
+ 
+     /**
+-     * Map containing generated virtual names for tld files under WEB-INF and
+-     * the actual file reference.
+-     */
+-    private Map<String, File> virtualMappings;
+-
+-    /**
+-     * Map containing a mapping for tag files that should be loaded from the
+-     * META-INF dir of referenced jar files.
++     * <p>
++     * Allows to map a path of the filesystem to a path in the webapp. Multiple
++     * filesystem paths can be mapped to the same path in the webapp. Filesystem
++     * path and virtual path must be separated by an equal sign. Pairs of paths
++     * must be separated by a comma.
++     * </p>
++     * Example: <code>
++     * /=/Users/slaurent/mywebapp/src/main/webapp;/pictures=/Users/slaurent/sharedpictures
++     * </code>
++     * <p>
++     * The path to the docBase must not be added here, otherwise resources would
++     * be listed twice.
++     * </p>
++     * 
++     * @param path
+      */
+-    private Map<String, File> tagfileMappings;
+-
+-    /**
+-     * <code>;</code> separated list of virtual path elements.
+-     */
+-    private String virtualClasspath;
+-
+-    /**
+-     * <code>virtualClasspath</code> attribute that will be automatically set
+-     * from the <code>Context</code> <code>virtualClasspath</code> attribute
+-     * from the context xml file.
+-     * @param path <code>;</code> separated list of path elements.
+-     */
+-    public void setVirtualClasspath(String path) {
+-        virtualClasspath = path;
++    public void setExtraResourcePaths(String path) {
++        extraResourcePaths = path;
+     }
+ 
+     /**
+@@ -91,19 +90,39 @@ public class VirtualDirContext extends FileDirContext {
+     public void allocate() {
+         super.allocate();
+ 
+-        virtualMappings = new Hashtable<String, File>();
+-        tagfileMappings = new Hashtable<String, File>();
+-
+-        // looks into any META-INF dir found in classpath entries for tld files.
+-        StringTokenizer tkn = new StringTokenizer(virtualClasspath, ";");
++        mappedResourcePaths = new HashMap<String, List<String>>();
++        StringTokenizer tkn = new StringTokenizer(extraResourcePaths, ",");
+         while (tkn.hasMoreTokens()) {
+-            File file = new File(tkn.nextToken(), "META-INF");
++            String resSpec = tkn.nextToken();
++            if (resSpec.length() > 0) {
++                int idx = resSpec.indexOf('=');
++                String path;
++                if (idx <= 0) {
++                    path = "";
++                }
++                else {
++                    if (resSpec.startsWith("/=")) {
++                        resSpec = resSpec.substring(1);
++                        idx--;
++                    }
++                    path = resSpec.substring(0, idx);
++                }
++                String dir = resSpec.substring(idx + 1);
++                List<String> resourcePaths = mappedResourcePaths.get(path);
++                if (resourcePaths == null) {
++                    resourcePaths = new ArrayList<String>();
++                    mappedResourcePaths.put(path, resourcePaths);
++                }
++                resourcePaths.add(dir);
+ 
+-            if (!file.exists() || !file.isDirectory()) {
+-                continue;
++                // Set allowLinking since there can be no canonical path
++                setAllowLinking(true);
+             }
+-            scanForTlds(file);
+         }
++        if (mappedResourcePaths.isEmpty()) {
++            mappedResourcePaths = null;
++        }
++
+     }
+ 
+     /**
+@@ -111,48 +130,124 @@ public class VirtualDirContext extends FileDirContext {
+      */
+     @Override
+     public void release() {
++        mappedResourcePaths = null;
++
+         super.release();
+-        virtualMappings = null;
+     }
+ 
+     @Override
+     public Attributes getAttributes(String name) throws NamingException {
+ 
+-        // handle "virtual" tlds
+-        if (name.startsWith("/WEB-INF/") && name.endsWith(".tld")) {
+-            String tldName = name.substring(name.lastIndexOf("/") + 1);
+-            if (virtualMappings.containsKey(tldName)) {
+-                return new FileResourceAttributes(virtualMappings.get(tldName));
+-            }
+-        } else if (name.startsWith("/META-INF/tags") && name.endsWith(".tag")
+-                || name.endsWith(".tagx")) {
++        NamingException initialException;
++        try {
++            // first try the normal processing, if it fails try with extra
++            // resources
++            Attributes attributes = super.getAttributes(name);
++            return attributes;
++        } catch (NamingException exc) {
++            initialException = exc;
++        }
+ 
+-            // already loaded tag file
+-            if (tagfileMappings.containsKey(name)) {
+-                return new FileResourceAttributes(tagfileMappings.get(name));
++        if (mappedResourcePaths != null) {
++            for (Map.Entry<String, List<String>> mapping : mappedResourcePaths.entrySet()) {
++                String path = mapping.getKey();
++                List<String> dirList = mapping.getValue();
++                String resourcesDir = dirList.get(0);
++                if (name.equals(path)) {
++                    File f = new File(resourcesDir);
++                    if (f.exists() && f.canRead()) {
++                        return new FileResourceAttributes(f);
++                    }
++                }
++                path += "/";
++                if (name.startsWith(path)) {
++                    String res = name.substring(path.length());
++                    File f = new File(resourcesDir + "/" + res);
++                    if (f.exists() && f.canRead()) {
++                        return new FileResourceAttributes(f);
++                    }
++                }
+             }
++        }
++        throw initialException;
++    }
+ 
+-            // unknown tagfile, search for it in virtualClasspath
+-            StringTokenizer tkn = new StringTokenizer(virtualClasspath, ";");
+-            while (tkn.hasMoreTokens()) {
+-                File file = new File(tkn.nextToken(), name);
+-                if (file.exists()) {
+-                    tagfileMappings.put(name, file);
+-                    return new FileResourceAttributes(file);
++    @Override
++    protected File file(String name) {
++        File file = super.file(name);
++        if (file != null || mappedResourcePaths == null) {
++            return file;
++        }
++        // If not found under docBase, try our other resources
++        // Ensure name string begins with a slash
++        if (name.length() > 0 && name.charAt(0) != '/') {
++            name = "/" + name;
++        }
++        for (Map.Entry<String, List<String>> mapping : mappedResourcePaths.entrySet()) {
++            String path = mapping.getKey();
++            List<String> dirList = mapping.getValue();
++            if (name.equals(path)) {
++                for (String resourcesDir : dirList) {
++                    file = new File(resourcesDir);
++                    if (file.exists() && file.canRead()) {
++                        return file;
++                    }
++                }
++            }
++            if (name.startsWith(path + "/")) {
++                String res = name.substring(path.length());
++                for (String resourcesDir : dirList) {
++                    file = new File(resourcesDir, res);
++                    if (file.exists() && file.canRead()) {
++                        return file;
++                    }
+                 }
+             }
+         }
+-
+-        return super.getAttributes(name);
++        return null;
+     }
+ 
+     @Override
+     protected List<NamingEntry> list(File file) {
+         List<NamingEntry> entries = super.list(file);
+ 
+-        // adds virtual tlds for WEB-INF listing
+-        if ("WEB-INF".equals(file.getName())) {
+-            entries.addAll(getVirtualNamingEntries());
++        if (mappedResourcePaths != null && !mappedResourcePaths.isEmpty()) {
++            Set<String> entryNames = new HashSet<String>(entries.size());
++            for (NamingEntry entry : entries) {
++                entryNames.add(entry.name);
++            }
++            // Add appropriate entries from the extra resource paths
++            String absPath = file.getAbsolutePath();
++            if (absPath.startsWith(getDocBase() + File.separator)) {
++                String relPath = absPath.substring(getDocBase().length());
++                String fsRelPath = relPath.replace(File.separatorChar, '/');
++                for (Map.Entry<String, List<String>> mapping : mappedResourcePaths.entrySet()) {
++                    String path = mapping.getKey();
++                    List<String> dirList = mapping.getValue();
++                    String res = null;
++                    if (fsRelPath.equals(path)) {
++                        res = "";
++                    } else if (fsRelPath.startsWith(path + "/")) {
++                        res = relPath.substring(path.length());
++                    }
++                    if (res != null) {
++                        for (String resourcesDir : dirList) {
++                            File f = new File(resourcesDir, res);
++                            if (f.exists() && f.canRead() && f.isDirectory()) {
++                                List<NamingEntry> virtEntries = super.list(f);
++                                for (NamingEntry entry : virtEntries) {
++                                    // filter duplicate
++                                    if (!entryNames.contains(entry.name)) {
++                                        entryNames.add(entry.name);
++                                        entries.add(entry);
++                                    }
++                                }
++
++                            }
++                        }
++                    }
++                }
++            }
+         }
+ 
+         return entries;
+@@ -161,65 +256,47 @@ public class VirtualDirContext extends FileDirContext {
+     @Override
+     protected Object doLookup(String name) {
+ 
+-        // handle "virtual" tlds
+-        if (name.startsWith("/WEB-INF/") && name.endsWith(".tld")) {
+-            String tldName = name.substring(name.lastIndexOf("/") + 1);
+-            if (virtualMappings.containsKey(tldName)) {
+-                return new FileResource(virtualMappings.get(tldName));
+-            }
+-        } else if (name.startsWith("/META-INF/tags") && name.endsWith(".tag")
+-                || name.endsWith(".tagx")) {
+-
+-            // already loaded tag file: we are sure that getAttributes() has
+-            // already been called if we are here
+-            File tagFile = tagfileMappings.get(name);
+-            if (tagFile != null) {
+-                return new FileResource(tagFile);
+-            }
++        Object retSuper = super.doLookup(name);
++        if (retSuper != null || mappedResourcePaths == null) {
++            return retSuper;
+         }
+ 
+-        return super.doLookup(name);
+-    }
+-
+-    /**
+-     * Scan a given dir for tld files. Any found tld will be added to the
+-     * virtualMappings.
+-     * @param dir Dir to scan for tlds
+-     */
+-    private void scanForTlds(File dir) {
+-
+-        File[] files = dir.listFiles();
+-        for (int j = 0; j < files.length; j++) {
+-            File file = files[j];
+-
+-            if (file.isDirectory()) {
+-                scanForTlds(file);
+-            } else if (file.getName().endsWith(".tld")) {
+-                // just generate a random name using the current timestamp, name
+-                // doesn't matter since it needs to be referenced by URI
+-                String virtualTldName = "~" + System.currentTimeMillis() + "~"
+-                        + file.getName();
+-                virtualMappings.put(virtualTldName, file);
++        // Perform lookup using the extra resource paths
++        for (Map.Entry<String, List<String>> mapping : mappedResourcePaths.entrySet()) {
++            String path = mapping.getKey();
++            List<String> dirList = mapping.getValue();
++            if (name.equals(path)) {
++                for (String resourcesDir : dirList) {
++                    File f = new File(resourcesDir);
++                    if (f.exists() && f.canRead()) {
++                        if (f.isFile()) {
++                            return new FileResource(f);
++                        }
++                        else {
++                            // never goes here, if f is a directory the super
++                            // implementation already returned a value
++                        }
++                    }
++                }
++            }
++            path += "/";
++            if (name.startsWith(path)) {
++                String res = name.substring(path.length());
++                for (String resourcesDir : dirList) {
++                    File f = new File(resourcesDir + "/" + res);
++                    if (f.exists() && f.canRead()) {
++                        if (f.isFile()) {
++                            return new FileResource(f);
++                        }
++                        else {
++                            // never goes here, if f is a directory the super
++                            // implementation already returned a value
++                        }
++                    }
++                }
+             }
+         }
+-
+-    }
+-
+-    /**
+-     * Returns a list of virtual naming entries.
+-     * @return list of naming entries, containing tlds in virtualMappings
+-     */
+-    private List<NamingEntry> getVirtualNamingEntries() {
+-        List<NamingEntry> virtual = new ArrayList<NamingEntry>();
+-
+-        for (String name : virtualMappings.keySet()) {
+-
+-            File file = virtualMappings.get(name);
+-            NamingEntry entry = new NamingEntry(name, new FileResource(file),
+-                    NamingEntry.ENTRY);
+-            virtual.add(entry);
+-        }
+-        return virtual;
++        return retSuper;
+     }
+ 
+ }
+
+==================================================
+MyAnnotatedServlet.java
+new file mode 100644
+index 0000000000..3d40b2048e
+--- /dev/null
++++ b/test/org/apache/catalina/loader/EchoTag.java
+@@ -0,0 +1,30 @@
++package org.apache.catalina.loader;
++
++import java.io.IOException;
++
++import javax.servlet.jsp.JspException;
++import javax.servlet.jsp.tagext.TagSupport;
++
++public class EchoTag extends TagSupport {
++    private static final long serialVersionUID = 1L;
++
++    private String echo = null;
++
++    public void setEcho(String echo) {
++        this.echo = echo;
++    }
++
++    public String getEcho() {
++        return echo;
++    }
++
++    @Override
++    public int doStartTag() throws JspException {
++        try {
++            pageContext.getOut().print("<p>" + echo + "</p>");
++        } catch (IOException e) {
++            throw new JspException(e);
++        }
++        return super.doStartTag();
++    }
++}
+
+==================================================
+TestVirtualContext.java
+new file mode 100644
+index 0000000000..06fda716bb
+--- /dev/null
++++ b/test/org/apache/catalina/loader/MyAnnotatedServlet.java
+@@ -0,0 +1,24 @@
++package org.apache.catalina.loader;
++
++import java.io.IOException;
++
++import javax.servlet.ServletException;
++import javax.servlet.annotation.WebServlet;
++import javax.servlet.http.HttpServlet;
++import javax.servlet.http.HttpServletRequest;
++import javax.servlet.http.HttpServletResponse;
++
++@WebServlet(value = "/annotatedServlet")
++public class MyAnnotatedServlet extends HttpServlet {
++
++    static final String MESSAGE = "This is generated by an annotated servlet";
++    private static final long serialVersionUID = 1L;
++
++    @Override
++    protected void doGet(HttpServletRequest req, HttpServletResponse resp)
++        throws ServletException, IOException {
++        resp.setContentType("test/plain");
++        resp.getWriter().println(MESSAGE);
++    }
++
++}
+
+==================================================

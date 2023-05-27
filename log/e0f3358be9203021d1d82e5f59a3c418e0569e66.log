@@ -1,0 +1,139 @@
+e0f3358be9203021d1d82e5f59a3c418e0569e66
+==================================================
+Refactor dispatches processing
+==================================================
+Mark Thomas
+==================================================
+Mon Dec 5 08:55:10 2016 +0000
+==================================================
+AbstractProcessor.java
+Refactor dispatches processing
+
+Processors such as HTTP/2 need to process these per stream so it needs
+to be handled in the Processor, not in the SocketWrapper.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1772604 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AjpProcessor.java
+index 38601a68cb..b74a8e4c73 100644
+--- a/java/org/apache/coyote/AbstractProcessor.java
++++ b/java/org/apache/coyote/AbstractProcessor.java
+@@ -19,6 +19,7 @@ package org.apache.coyote;
+ import java.io.IOException;
+ import java.io.InterruptedIOException;
+ import java.nio.ByteBuffer;
++import java.util.Iterator;
+ import java.util.concurrent.Executor;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ 
+@@ -470,10 +471,7 @@ public abstract class AbstractProcessor extends AbstractProcessorLight implement
+             break;
+         }
+         case DISPATCH_EXECUTE: {
+-            SocketWrapperBase<?> wrapper = socketWrapper;
+-            if (wrapper != null) {
+-                executeDispatches(wrapper);
+-            }
++            executeDispatches();
+             break;
+         }
+ 
+@@ -651,7 +649,36 @@ public abstract class AbstractProcessor extends AbstractProcessorLight implement
+     protected abstract boolean isReady();
+ 
+ 
+-    protected abstract void executeDispatches(SocketWrapperBase<?> wrapper);
++    protected void executeDispatches() {
++        SocketWrapperBase<?> socketWrapper = getSocketWrapper();
++        Iterator<DispatchType> dispatches = getIteratorAndClearDispatches();
++        if (socketWrapper != null) {
++            synchronized (socketWrapper) {
++                /*
++                 * This method is called when non-blocking IO is initiated by defining
++                 * a read and/or write listener in a non-container thread. It is called
++                 * once the non-container thread completes so that the first calls to
++                 * onWritePossible() and/or onDataAvailable() as appropriate are made by
++                 * the container.
++                 *
++                 * Processing the dispatches requires (for APR/native at least)
++                 * that the socket has been added to the waitingRequests queue. This may
++                 * not have occurred by the time that the non-container thread completes
++                 * triggering the call to this method. Therefore, the coded syncs on the
++                 * SocketWrapper as the container thread that initiated this
++                 * non-container thread holds a lock on the SocketWrapper. The container
++                 * thread will add the socket to the waitingRequests queue before
++                 * releasing the lock on the socketWrapper. Therefore, by obtaining the
++                 * lock on socketWrapper before processing the dispatches, we can be
++                 * sure that the socket has been added to the waitingRequests queue.
++                 */
++                while (dispatches != null && dispatches.hasNext()) {
++                    DispatchType dispatchType = dispatches.next();
++                    socketWrapper.processSocket(dispatchType.getSocketStatus(), false);
++                }
++            }
++        }
++    }
+ 
+ 
+     /**
+
+==================================================
+Http11Processor.java
+index e521839fe1..55138caf13 100644
+--- a/java/org/apache/coyote/ajp/AjpProcessor.java
++++ b/java/org/apache/coyote/ajp/AjpProcessor.java
+@@ -1264,12 +1264,6 @@ public class AjpProcessor extends AbstractProcessor {
+     }
+ 
+ 
+-    @Override
+-    protected final void executeDispatches(SocketWrapperBase<?> wrapper) {
+-        wrapper.executeNonBlockingDispatches(getIteratorAndClearDispatches());
+-    }
+-
+-
+     /**
+      * Read at least the specified amount of bytes, and place them
+      * in the input buffer. Note that if any data is available to read then this
+
+==================================================
+StreamProcessor.java
+index f89b721c66..b1491f04dd 100644
+--- a/java/org/apache/coyote/http11/Http11Processor.java
++++ b/java/org/apache/coyote/http11/Http11Processor.java
+@@ -1564,12 +1564,6 @@ public class Http11Processor extends AbstractProcessor {
+     }
+ 
+ 
+-    @Override
+-    protected final void executeDispatches(SocketWrapperBase<?> wrapper) {
+-        wrapper.executeNonBlockingDispatches(getIteratorAndClearDispatches());
+-    }
+-
+-
+     @Override
+     public UpgradeToken getUpgradeToken() {
+         return upgradeToken;
+
+==================================================
+SocketWrapperBase.java
+index 823468754c..a4020dfa1c 100644
+--- a/java/org/apache/coyote/http2/StreamProcessor.java
++++ b/java/org/apache/coyote/http2/StreamProcessor.java
+@@ -168,9 +168,9 @@ class StreamProcessor extends AbstractProcessor {
+ 
+ 
+     @Override
+-    protected final void executeDispatches(SocketWrapperBase<?> wrapper) {
++    protected final void executeDispatches() {
+         StreamRunnable streamRunnable = new StreamRunnable(this, SocketEvent.OPEN_READ);
+-        wrapper.getEndpoint().getExecutor().execute(streamRunnable);
++        getSocketWrapper().getEndpoint().getExecutor().execute(streamRunnable);
+     }
+ 
+ 
+
+==================================================

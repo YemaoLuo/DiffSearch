@@ -1,0 +1,268 @@
+575bceeab2089a5f040f402feb8bc5d0792e8204
+==================================================
+First pass at differentiating between errors that are fatal to a multiplexed stream vs fatal to a multiplexed connection.
+==================================================
+Mark Thomas
+==================================================
+Thu Oct 1 13:33:25 2015 +0000
+==================================================
+AbstractProcessor.java
+First pass at differentiating between errors that are fatal to a multiplexed stream vs fatal to a multiplexed connection.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1706246 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+ErrorState.java
+index 9398104b74..6534bbef16 100644
+--- a/java/org/apache/coyote/AbstractProcessor.java
++++ b/java/org/apache/coyote/AbstractProcessor.java
+@@ -237,7 +237,7 @@ public abstract class AbstractProcessor implements ActionHook, Processor {
+                 setErrorState(ErrorState.CLOSE_NOW, null);
+             }
+         } catch (InterruptedIOException e) {
+-            setErrorState(ErrorState.CLOSE_NOW, e);
++            setErrorState(ErrorState.CLOSE_CONNECTION_NOW, e);
+         } catch (Throwable t) {
+             ExceptionUtils.handleThrowable(t);
+             setErrorState(ErrorState.CLOSE_NOW, t);
+
+==================================================
+AjpProcessor.java
+index 1f93803260..67cb3ffa87 100644
+--- a/java/org/apache/coyote/ErrorState.java
++++ b/java/org/apache/coyote/ErrorState.java
+@@ -21,7 +21,7 @@ public enum ErrorState {
+     /**
+      * Not in an error state.
+      */
+-    NONE(false, 0, true),
++    NONE(false, 0, true, true),
+ 
+     /**
+      * The current request/response is in an error state and while it is safe to
+@@ -29,22 +29,36 @@ public enum ErrorState {
+      * existing connection which must be closed once the response has been
+      * completed.
+      */
+-    CLOSE_CLEAN(true, 1, true),
++    CLOSE_CLEAN(true, 1, true, true),
+ 
+     /**
+      * The current request/response is in an error state and it is not safe to
+-     * continue to use the existing connection which must be closed immediately.
++     * continue to use them. For multiplexed protocols (such as HTTP/2) the
++     * stream/channel must be closed immediately but the connection may
++     * continue. For non-multiplexed protocols (AJP, HTTP/1.x) the current
++     * connection must be closed.
+      */
+-    CLOSE_NOW(true, 2, false);
++    CLOSE_NOW(true, 2, false, true),
++
++    /**
++     * An error has been detected that impacts the underlying network
++     * connection. It is not safe to continue using the network connection which
++     * must be closed immediately. For multiplexed protocols (such as HTTP/2)
++     * this impacts all multiplexed channels.
++     */
++    CLOSE_CONNECTION_NOW(true, 3, false, false);
+ 
+     private final boolean error;
+     private final int severity;
+     private final boolean ioAllowed;
++    private final boolean connectionIoAllowed;
+ 
+-    private ErrorState(boolean error, int severity, boolean ioAllowed) {
++    private ErrorState(boolean error, int severity, boolean ioAllowed,
++            boolean connectionIoAllowed) {
+         this.error = error;
+         this.severity = severity;
+         this.ioAllowed = ioAllowed;
++        this.connectionIoAllowed = connectionIoAllowed;
+     }
+ 
+     public boolean isError() {
+@@ -71,4 +85,8 @@ public enum ErrorState {
+     public boolean isIoAllowed() {
+         return ioAllowed;
+     }
++
++    public boolean isConnectionIoAllowed() {
++        return connectionIoAllowed;
++    }
+ }
+
+==================================================
+Http11Processor.java
+index 5130f2e3ba..b2210a015f 100644
+--- a/java/org/apache/coyote/ajp/AjpProcessor.java
++++ b/java/org/apache/coyote/ajp/AjpProcessor.java
+@@ -337,7 +337,7 @@ public class AjpProcessor extends AbstractProcessor {
+                     // Validate and write response headers
+                     prepareResponse();
+                 } catch (IOException e) {
+-                    setErrorState(ErrorState.CLOSE_NOW, e);
++                    setErrorState(ErrorState.CLOSE_CONNECTION_NOW, e);
+                 }
+             }
+             break;
+@@ -347,7 +347,7 @@ public class AjpProcessor extends AbstractProcessor {
+             try {
+                 finish();
+             } catch (IOException e) {
+-                setErrorState(ErrorState.CLOSE_NOW, e);
++                setErrorState(ErrorState.CLOSE_CONNECTION_NOW, e);
+             }
+             break;
+         }
+@@ -360,7 +360,7 @@ public class AjpProcessor extends AbstractProcessor {
+             try {
+                 flush();
+             } catch (IOException e) {
+-                setErrorState(ErrorState.CLOSE_NOW, e);
++                setErrorState(ErrorState.CLOSE_CONNECTION_NOW, e);
+             }
+             break;
+         }
+@@ -675,7 +675,7 @@ public class AjpProcessor extends AbstractProcessor {
+                         socketWrapper.write(true, pongMessageArray, 0, pongMessageArray.length);
+                         socketWrapper.flush(true);
+                     } catch (IOException e) {
+-                        setErrorState(ErrorState.CLOSE_NOW, e);
++                        setErrorState(ErrorState.CLOSE_CONNECTION_NOW, e);
+                     }
+                     recycle();
+                     continue;
+@@ -685,13 +685,13 @@ public class AjpProcessor extends AbstractProcessor {
+                     if (getLog().isDebugEnabled()) {
+                         getLog().debug("Unexpected message: " + type);
+                     }
+-                    setErrorState(ErrorState.CLOSE_NOW, null);
++                    setErrorState(ErrorState.CLOSE_CONNECTION_NOW, null);
+                     break;
+                 }
+                 keptAlive = true;
+                 request.setStartTime(System.currentTimeMillis());
+             } catch (IOException e) {
+-                setErrorState(ErrorState.CLOSE_NOW, e);
++                setErrorState(ErrorState.CLOSE_CONNECTION_NOW, e);
+                 break;
+             } catch (Throwable t) {
+                 ExceptionUtils.handleThrowable(t);
+@@ -731,7 +731,7 @@ public class AjpProcessor extends AbstractProcessor {
+                     rp.setStage(org.apache.coyote.Constants.STAGE_SERVICE);
+                     getAdapter().service(request, response);
+                 } catch (InterruptedIOException e) {
+-                    setErrorState(ErrorState.CLOSE_NOW, e);
++                    setErrorState(ErrorState.CLOSE_CONNECTION_NOW, e);
+                 } catch (Throwable t) {
+                     ExceptionUtils.handleThrowable(t);
+                     getLog().error(sm.getString("ajpprocessor.request.process"), t);
+@@ -750,6 +750,8 @@ public class AjpProcessor extends AbstractProcessor {
+             if (!finished && getErrorState().isIoAllowed()) {
+                 try {
+                     finish();
++                } catch (IOException ioe){
++                    setErrorState(ErrorState.CLOSE_CONNECTION_NOW, ioe);
+                 } catch (Throwable t) {
+                     ExceptionUtils.handleThrowable(t);
+                     setErrorState(ErrorState.CLOSE_NOW, t);
+@@ -1541,7 +1543,7 @@ public class AjpProcessor extends AbstractProcessor {
+                 try {
+                     prepareResponse();
+                 } catch (IOException e) {
+-                    setErrorState(ErrorState.CLOSE_NOW, e);
++                    setErrorState(ErrorState.CLOSE_CONNECTION_NOW, e);
+                 }
+             }
+ 
+
+==================================================
+StreamProcessor.java
+index 81b3ecb33f..8891d4f9e5 100644
+--- a/java/org/apache/coyote/http11/Http11Processor.java
++++ b/java/org/apache/coyote/http11/Http11Processor.java
+@@ -654,7 +654,7 @@ public class Http11Processor extends AbstractProcessor {
+                     prepareResponse();
+                     outputBuffer.commit();
+                 } catch (IOException e) {
+-                    setErrorState(ErrorState.CLOSE_NOW, e);
++                    setErrorState(ErrorState.CLOSE_CONNECTION_NOW, e);
+                 }
+             }
+             break;
+@@ -664,7 +664,7 @@ public class Http11Processor extends AbstractProcessor {
+             try {
+                 outputBuffer.endRequest();
+             } catch (IOException e) {
+-                setErrorState(ErrorState.CLOSE_NOW, e);
++                setErrorState(ErrorState.CLOSE_CONNECTION_NOW, e);
+             }
+             break;
+         }
+@@ -677,7 +677,7 @@ public class Http11Processor extends AbstractProcessor {
+                 try {
+                     outputBuffer.sendAck();
+                 } catch (IOException e) {
+-                    setErrorState(ErrorState.CLOSE_NOW, e);
++                    setErrorState(ErrorState.CLOSE_CONNECTION_NOW, e);
+                 }
+             }
+             break;
+@@ -687,7 +687,7 @@ public class Http11Processor extends AbstractProcessor {
+             try {
+                 outputBuffer.flush();
+             } catch (IOException e) {
+-                setErrorState(ErrorState.CLOSE_NOW, e);
++                setErrorState(ErrorState.CLOSE_CONNECTION_NOW, e);
+                 response.setErrorException(e);
+             }
+             break;
+@@ -1002,7 +1002,7 @@ public class Http11Processor extends AbstractProcessor {
+                 if (log.isDebugEnabled()) {
+                     log.debug(sm.getString("http11processor.header.parse"), e);
+                 }
+-                setErrorState(ErrorState.CLOSE_NOW, e);
++                setErrorState(ErrorState.CLOSE_CONNECTION_NOW, e);
+                 break;
+             } catch (Throwable t) {
+                 ExceptionUtils.handleThrowable(t);
+@@ -1094,7 +1094,7 @@ public class Http11Processor extends AbstractProcessor {
+                         setErrorState(ErrorState.CLOSE_CLEAN, null);
+                     }
+                 } catch (InterruptedIOException e) {
+-                    setErrorState(ErrorState.CLOSE_NOW, e);
++                    setErrorState(ErrorState.CLOSE_CONNECTION_NOW, e);
+                 } catch (HeadersTooLargeException e) {
+                     // The response should not have been committed but check it
+                     // anyway to be safe
+@@ -1760,7 +1760,7 @@ public class Http11Processor extends AbstractProcessor {
+             try {
+                 inputBuffer.endRequest();
+             } catch (IOException e) {
+-                setErrorState(ErrorState.CLOSE_NOW, e);
++                setErrorState(ErrorState.CLOSE_CONNECTION_NOW, e);
+             } catch (Throwable t) {
+                 ExceptionUtils.handleThrowable(t);
+                 // 500 - Internal Server Error
+@@ -1775,7 +1775,7 @@ public class Http11Processor extends AbstractProcessor {
+             try {
+                 outputBuffer.endRequest();
+             } catch (IOException e) {
+-                setErrorState(ErrorState.CLOSE_NOW, e);
++                setErrorState(ErrorState.CLOSE_CONNECTION_NOW, e);
+             } catch (Throwable t) {
+                 ExceptionUtils.handleThrowable(t);
+                 setErrorState(ErrorState.CLOSE_NOW, t);
+@@ -1809,7 +1809,7 @@ public class Http11Processor extends AbstractProcessor {
+                 if (log.isDebugEnabled()) {
+                     log.debug(sm.getString("http11processor.sendfile.error"));
+                 }
+-                setErrorState(ErrorState.CLOSE_NOW, null);
++                setErrorState(ErrorState.CLOSE_CONNECTION_NOW, null);
+                 return true;
+             }
+         }
+
+==================================================

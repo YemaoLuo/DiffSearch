@@ -1,0 +1,308 @@
+91d9ecef2f01abac22bf99d1479036c86b363342
+==================================================
+Fix https://bz.apache.org/bugzilla/show_bug.cgi?id=62748
+==================================================
+Mark Thomas
+==================================================
+Tue Oct 9 17:23:48 2018 +0000
+==================================================
+SSL.java
+Fix https://bz.apache.org/bugzilla/show_bug.cgi?id=62748
+Add TLS 1.3 support (CLIENT-CERT untested)
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1843314 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+SSLContext.java
+index e2706936c1..b21a73320c 100644
+--- a/java/org/apache/tomcat/jni/SSL.java
++++ b/java/org/apache/tomcat/jni/SSL.java
+@@ -73,7 +73,9 @@ public final class SSL {
+     public static final int SSL_PROTOCOL_TLSV1 = (1<<2);
+     public static final int SSL_PROTOCOL_TLSV1_1 = (1<<3);
+     public static final int SSL_PROTOCOL_TLSV1_2 = (1<<4);
+-    public static final int SSL_PROTOCOL_ALL   = (SSL_PROTOCOL_TLSV1 | SSL_PROTOCOL_TLSV1_1 | SSL_PROTOCOL_TLSV1_2);
++    public static final int SSL_PROTOCOL_TLSV1_3 = (1<<5);
++    public static final int SSL_PROTOCOL_ALL   = (SSL_PROTOCOL_TLSV1 | SSL_PROTOCOL_TLSV1_1 |
++                                                  SSL_PROTOCOL_TLSV1_2 | SSL_PROTOCOL_TLSV1_3);
+ 
+     /*
+      * Define the SSL verify levels
+
+==================================================
+AprEndpoint.java
+index 607d12659e..45fcc482cd 100644
+--- a/java/org/apache/tomcat/jni/SSLContext.java
++++ b/java/org/apache/tomcat/jni/SSLContext.java
+@@ -41,6 +41,7 @@ public final class SSLContext {
+      * {@link SSL#SSL_PROTOCOL_TLSV1}
+      * {@link SSL#SSL_PROTOCOL_TLSV1_1}
+      * {@link SSL#SSL_PROTOCOL_TLSV1_2}
++     * {@link SSL#SSL_PROTOCOL_TLSV1_3}
+      * {@link SSL#SSL_PROTOCOL_ALL} ( == all TLS versions, no SSL)
+      * </PRE>
+      * @param mode SSL mode to use
+
+==================================================
+SSLHostConfig.java
+index 63590d6bd3..5b5e22bbfa 100644
+--- a/java/org/apache/tomcat/util/net/AprEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AprEndpoint.java
+@@ -439,6 +439,8 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
+                     value |= SSL.SSL_PROTOCOL_TLSV1_1;
+                 } else if (Constants.SSL_PROTO_TLSv1_2.equalsIgnoreCase(protocol)) {
+                     value |= SSL.SSL_PROTOCOL_TLSV1_2;
++                } else if (Constants.SSL_PROTO_TLSv1_3.equalsIgnoreCase(protocol)) {
++                    value |= SSL.SSL_PROTOCOL_TLSV1_3;
+                 } else {
+                     // Should not happen since filtering to build
+                     // enabled protocols removes invalid values.
+
+==================================================
+SSLUtilBase.java
+index bfc61e3f6a..74dd13e30e 100644
+--- a/java/org/apache/tomcat/util/net/SSLHostConfig.java
++++ b/java/org/apache/tomcat/util/net/SSLHostConfig.java
+@@ -35,7 +35,6 @@ import javax.net.ssl.TrustManagerFactory;
+ 
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+-import org.apache.tomcat.util.compat.TLS;
+ import org.apache.tomcat.util.net.openssl.OpenSSLConf;
+ import org.apache.tomcat.util.net.openssl.ciphers.Cipher;
+ import org.apache.tomcat.util.net.openssl.ciphers.OpenSSLCipherConfigurationParser;
+@@ -62,9 +61,7 @@ public class SSLHostConfig implements Serializable {
+         SSL_PROTO_ALL_SET.add(Constants.SSL_PROTO_TLSv1);
+         SSL_PROTO_ALL_SET.add(Constants.SSL_PROTO_TLSv1_1);
+         SSL_PROTO_ALL_SET.add(Constants.SSL_PROTO_TLSv1_2);
+-        if (TLS.isTlsv13Available()) {
+-            SSL_PROTO_ALL_SET.add(Constants.SSL_PROTO_TLSv1_3);
+-        }
++        SSL_PROTO_ALL_SET.add(Constants.SSL_PROTO_TLSv1_3);
+     }
+ 
+     private Type configType = null;
+@@ -85,6 +82,10 @@ public class SSLHostConfig implements Serializable {
+     private String[] enabledCiphers;
+     private String[] enabledProtocols;
+     private ObjectName oname;
++    // Need to know if TLS 1.3 has been explicitly requested as a warning needs
++    // to generated if it is explicitly requested for a JVM that does not
++    // support it. Uses a set so it is extensible for TLS 1.4 etc.
++    private Set<String> explicitlyRequestedProtocols = new HashSet<>();
+     // Nested
+     private SSLHostConfigCertificate defaultCertificate = null;
+     private Set<SSLHostConfigCertificate> certificates = new HashSet<>(4);
+@@ -443,6 +444,7 @@ public class SSLHostConfig implements Serializable {
+ 
+     public void setProtocols(String input) {
+         protocols.clear();
++        explicitlyRequestedProtocols.clear();
+ 
+         // List of protocol names, separated by ",", "+" or "-".
+         // Semantics is adding ("+") or removing ("-") from left
+@@ -465,6 +467,7 @@ public class SSLHostConfig implements Serializable {
+                         protocols.addAll(SSL_PROTO_ALL_SET);
+                     } else {
+                         protocols.add(trimmed);
++                        explicitlyRequestedProtocols.add(trimmed);
+                     }
+                 } else if (trimmed.charAt(0) == '-') {
+                     trimmed = trimmed.substring(1).trim();
+@@ -472,6 +475,7 @@ public class SSLHostConfig implements Serializable {
+                         protocols.removeAll(SSL_PROTO_ALL_SET);
+                     } else {
+                         protocols.remove(trimmed);
++                        explicitlyRequestedProtocols.remove(trimmed);
+                     }
+                 } else {
+                     if (trimmed.charAt(0) == ',') {
+@@ -485,6 +489,7 @@ public class SSLHostConfig implements Serializable {
+                         protocols.addAll(SSL_PROTO_ALL_SET);
+                     } else {
+                         protocols.add(trimmed);
++                        explicitlyRequestedProtocols.add(trimmed);
+                     }
+                 }
+             }
+@@ -497,6 +502,11 @@ public class SSLHostConfig implements Serializable {
+     }
+ 
+ 
++    boolean isExplicitlyRequestedProtocol(String protocol) {
++        return explicitlyRequestedProtocols.contains(protocol);
++    }
++
++
+     // ---------------------------------- JSSE specific configuration properties
+ 
+     // TODO: These certificate setters can be removed once it is no longer
+
+==================================================
+JSSEUtil.java
+index ea4a970a7f..93b2697018 100644
+--- a/java/org/apache/tomcat/util/net/SSLUtilBase.java
++++ b/java/org/apache/tomcat/util/net/SSLUtilBase.java
+@@ -48,14 +48,25 @@ public abstract class SSLUtilBase implements SSLUtil {
+ 
+ 
+     protected SSLUtilBase(SSLHostConfigCertificate certificate) {
++        this(certificate, true);
++    }
++
++
++    protected SSLUtilBase(SSLHostConfigCertificate certificate, boolean warnOnSkip) {
+         this.certificate = certificate;
+         SSLHostConfig sslHostConfig = certificate.getSSLHostConfig();
+ 
+         // Calculate the enabled protocols
+         Set<String> configuredProtocols = sslHostConfig.getProtocols();
++        if (!isTls13Available() &&
++                !sslHostConfig.isExplicitlyRequestedProtocol(Constants.SSL_PROTO_TLSv1_3)) {
++            // TLS 1.3 not implemented and not explicitly requested so ignore it
++            // if present
++            configuredProtocols.remove(Constants.SSL_PROTO_TLSv1_3);
++        }
+         Set<String> implementedProtocols = getImplementedProtocols();
+         List<String> enabledProtocols =
+-                getEnabled("protocols", getLog(), true, configuredProtocols, implementedProtocols);
++                getEnabled("protocols", getLog(), warnOnSkip, configuredProtocols, implementedProtocols);
+         if (enabledProtocols.contains("SSLv3")) {
+             log.warn(sm.getString("jsse.ssl3"));
+         }
+@@ -197,4 +208,5 @@ public abstract class SSLUtilBase implements SSLUtil {
+     protected abstract Set<String> getImplementedProtocols();
+     protected abstract Set<String> getImplementedCiphers();
+     protected abstract Log getLog();
++    protected abstract boolean isTls13Available();
+ }
+
+==================================================
+OpenSSLContext.java
+index 4bf6ae902d..d926569e43 100644
+--- a/java/org/apache/tomcat/util/net/jsse/JSSEUtil.java
++++ b/java/org/apache/tomcat/util/net/jsse/JSSEUtil.java
+@@ -58,6 +58,7 @@ import javax.net.ssl.X509KeyManager;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.compat.JreVendor;
++import org.apache.tomcat.util.compat.TLS;
+ import org.apache.tomcat.util.file.ConfigFileLoader;
+ import org.apache.tomcat.util.net.Constants;
+ import org.apache.tomcat.util.net.SSLContext;
+@@ -141,7 +142,12 @@ public class JSSEUtil extends SSLUtilBase {
+ 
+ 
+     public JSSEUtil (SSLHostConfigCertificate certificate) {
+-        super(certificate);
++        this(certificate, true);
++    }
++
++
++    public JSSEUtil (SSLHostConfigCertificate certificate, boolean warnOnSkip) {
++        super(certificate, warnOnSkip);
+         this.sslHostConfig = certificate.getSSLHostConfig();
+     }
+ 
+@@ -164,6 +170,12 @@ public class JSSEUtil extends SSLUtilBase {
+     }
+ 
+ 
++    @Override
++    protected boolean isTls13Available() {
++        return TLS.isTlsv13Available();
++    }
++
++
+     @Override
+     public SSLContext createSSLContext(List<String> negotiableProtocols) throws NoSuchAlgorithmException {
+         return new JSSESSLContext(sslHostConfig.getSslProtocol());
+
+==================================================
+OpenSSLEngine.java
+index da0574e4eb..49a73e30b6 100644
+--- a/java/org/apache/tomcat/util/net/openssl/OpenSSLContext.java
++++ b/java/org/apache/tomcat/util/net/openssl/OpenSSLContext.java
+@@ -153,6 +153,8 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
+                     value |= SSL.SSL_PROTOCOL_TLSV1_1;
+                 } else if (Constants.SSL_PROTO_TLSv1_2.equalsIgnoreCase(protocol)) {
+                     value |= SSL.SSL_PROTOCOL_TLSV1_2;
++                } else if (Constants.SSL_PROTO_TLSv1_3.equalsIgnoreCase(protocol)) {
++                    value |= SSL.SSL_PROTOCOL_TLSV1_3;
+                 } else if (Constants.SSL_PROTO_ALL.equalsIgnoreCase(protocol)) {
+                     value |= SSL.SSL_PROTOCOL_ALL;
+                 } else {
+
+==================================================
+OpenSSLUtil.java
+index 15c6f56aa9..097e6a5c79 100644
+--- a/java/org/apache/tomcat/util/net/openssl/OpenSSLEngine.java
++++ b/java/org/apache/tomcat/util/net/openssl/OpenSSLEngine.java
+@@ -21,7 +21,6 @@ import java.nio.ReadOnlyBufferException;
+ import java.security.Principal;
+ import java.security.cert.Certificate;
+ import java.util.ArrayList;
+-import java.util.Arrays;
+ import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.HashSet;
+@@ -65,6 +64,8 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
+ 
+     public static final Set<String> AVAILABLE_CIPHER_SUITES;
+ 
++    public static final Set<String> IMPLEMENTED_PROTOCOLS_SET;
++
+     static {
+         final Set<String> availableCipherSuites = new LinkedHashSet<>(128);
+         final long aprPool = Pool.create(0);
+@@ -94,6 +95,19 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
+             Pool.destroy(aprPool);
+         }
+         AVAILABLE_CIPHER_SUITES = Collections.unmodifiableSet(availableCipherSuites);
++
++        HashSet<String> protocols = new HashSet<>();
++        protocols.add(Constants.SSL_PROTO_SSLv2Hello);
++        protocols.add(Constants.SSL_PROTO_SSLv2);
++        protocols.add(Constants.SSL_PROTO_SSLv3);
++        protocols.add(Constants.SSL_PROTO_TLSv1);
++        protocols.add(Constants.SSL_PROTO_TLSv1_1);
++        protocols.add(Constants.SSL_PROTO_TLSv1_2);
++        if (SSL.version() >= 0x1010100f) {
++            protocols.add(Constants.SSL_PROTO_TLSv1_3);
++        }
++
++        IMPLEMENTED_PROTOCOLS_SET = Collections.unmodifiableSet(protocols);
+     }
+ 
+     private static final int MAX_PLAINTEXT_LENGTH = 16 * 1024; // 2^14
+@@ -103,17 +117,6 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
+     // Protocols
+     static final int VERIFY_DEPTH = 10;
+ 
+-    private static final String[] IMPLEMENTED_PROTOCOLS = {
+-        Constants.SSL_PROTO_SSLv2Hello,
+-        Constants.SSL_PROTO_SSLv2,
+-        Constants.SSL_PROTO_SSLv3,
+-        Constants.SSL_PROTO_TLSv1,
+-        Constants.SSL_PROTO_TLSv1_1,
+-        Constants.SSL_PROTO_TLSv1_2
+-    };
+-    public static final Set<String> IMPLEMENTED_PROTOCOLS_SET =
+-            Collections.unmodifiableSet(new HashSet<>(Arrays.asList(IMPLEMENTED_PROTOCOLS)));
+-
+     // Header (5) + Data (2^14) + Compression (1024) + Encryption (1024) + MAC (20) + Padding (256)
+     static final int MAX_ENCRYPTED_PACKET_LENGTH = MAX_CIPHERTEXT_LENGTH + 5 + 20 + 256;
+ 
+@@ -760,7 +763,7 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
+ 
+     @Override
+     public String[] getSupportedProtocols() {
+-        return IMPLEMENTED_PROTOCOLS.clone();
++        return IMPLEMENTED_PROTOCOLS_SET.toArray(new String[IMPLEMENTED_PROTOCOLS_SET.size()]);
+     }
+ 
+     @Override
+
+==================================================

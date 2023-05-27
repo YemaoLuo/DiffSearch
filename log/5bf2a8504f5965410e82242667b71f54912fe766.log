@@ -1,0 +1,149 @@
+5bf2a8504f5965410e82242667b71f54912fe766
+==================================================
+Fix https://bz.apache.org/bugzilla/show_bug.cgi?id=63913 Wrap NPEs
+==================================================
+Mark Thomas
+==================================================
+Tue Nov 12 09:11:05 2019 +0000
+==================================================
+PerMessageDeflate.java
+index 4f6f3b7065..744619aafe 100644
+--- a/java/org/apache/tomcat/websocket/LocalStrings.properties
++++ b/java/org/apache/tomcat/websocket/LocalStrings.properties
+@@ -35,6 +35,7 @@ caseInsensitiveKeyMap.nullKey=Null keys are not permitted
+ 
+ futureToSendHandler.timeout=Operation timed out after waiting [{0}] [{1}] to complete
+ 
++perMessageDeflate.alreadyClosed=The transformer has been closed and may no longer be used
+ perMessageDeflate.deflateFailed=Failed to decompress a compressed WebSocket frame
+ perMessageDeflate.duplicateParameter=Duplicate definition of the [{0}] extension parameter
+ perMessageDeflate.invalidState=Invalid state
+
+==================================================
+Transformation.java
+index 90931c5b5b..afcfcf02eb 100644
+--- a/java/org/apache/tomcat/websocket/PerMessageDeflate.java
++++ b/java/org/apache/tomcat/websocket/PerMessageDeflate.java
+@@ -204,6 +204,8 @@ public class PerMessageDeflate implements Transformation {
+                         dest.array(), dest.arrayOffset() + dest.position(), dest.remaining());
+             } catch (DataFormatException e) {
+                 throw new IOException(sm.getString("perMessageDeflate.deflateFailed"), e);
++            } catch (NullPointerException e) {
++                throw new IOException(sm.getString("perMessageDeflate.alreadyClosed"), e);
+             }
+             dest.position(dest.position() + written);
+ 
+@@ -229,7 +231,11 @@ public class PerMessageDeflate implements Transformation {
+             } else if (written == 0) {
+                 if (fin && (isServer && !clientContextTakeover ||
+                         !isServer && !serverContextTakeover)) {
+-                    inflater.reset();
++                    try {
++                        inflater.reset();
++                    } catch (NullPointerException e) {
++                        throw new IOException(sm.getString("perMessageDeflate.alreadyClosed"), e);
++                    }
+                 }
+                 return TransformationResult.END_OF_FRAME;
+             }
+@@ -314,7 +320,7 @@ public class PerMessageDeflate implements Transformation {
+ 
+ 
+     @Override
+-    public List<MessagePart> sendMessagePart(List<MessagePart> uncompressedParts) {
++    public List<MessagePart> sendMessagePart(List<MessagePart> uncompressedParts) throws IOException {
+         List<MessagePart> allCompressedParts = new ArrayList<>();
+ 
+         for (MessagePart uncompressedPart : uncompressedParts) {
+@@ -345,10 +351,14 @@ public class PerMessageDeflate implements Transformation {
+                 while (deflateRequired) {
+                     ByteBuffer compressedPayload = writeBuffer;
+ 
+-                    int written = deflater.deflate(compressedPayload.array(),
+-                            compressedPayload.arrayOffset() + compressedPayload.position(),
+-                            compressedPayload.remaining(), flush);
+-                    compressedPayload.position(compressedPayload.position() + written);
++                    try {
++                        int written = deflater.deflate(compressedPayload.array(),
++                                compressedPayload.arrayOffset() + compressedPayload.position(),
++                                compressedPayload.remaining(), flush);
++                        compressedPayload.position(compressedPayload.position() + written);
++                    } catch (NullPointerException e) {
++                        throw new IOException(sm.getString("perMessageDeflate.alreadyClosed"), e);
++                    }
+ 
+                     if (!uncompressedPart.isFin() && compressedPayload.hasRemaining() && deflater.needsInput()) {
+                         // This message part has been fully processed by the
+@@ -401,7 +411,12 @@ public class PerMessageDeflate implements Transformation {
+                         // - in middle of EOM bytes
+                         // - about to write EOM bytes
+                         // - more data to write
+-                        int eomBufferWritten = deflater.deflate(EOM_BUFFER, 0, EOM_BUFFER.length, Deflater.SYNC_FLUSH);
++                        int eomBufferWritten;
++                        try {
++                            eomBufferWritten = deflater.deflate(EOM_BUFFER, 0, EOM_BUFFER.length, Deflater.SYNC_FLUSH);
++                        } catch (NullPointerException e) {
++                            throw new IOException(sm.getString("perMessageDeflate.alreadyClosed"), e);
++                        }
+                         if (eomBufferWritten < EOM_BUFFER.length) {
+                             // EOM has just been completed
+                             compressedPayload.limit(compressedPayload.limit() - EOM_BYTES.length + eomBufferWritten);
+@@ -447,11 +462,15 @@ public class PerMessageDeflate implements Transformation {
+     }
+ 
+ 
+-    private void startNewMessage() {
++    private void startNewMessage() throws IOException {
+         firstCompressedFrameWritten = false;
+         emptyMessage = true;
+         if (isServer && !serverContextTakeover || !isServer && !clientContextTakeover) {
+-            deflater.reset();
++            try {
++                deflater.reset();
++            } catch (NullPointerException e) {
++                throw new IOException(sm.getString("perMessageDeflate.alreadyClosed"), e);
++            }
+         }
+     }
+ 
+
+==================================================
+WsRemoteEndpointImplBase.java
+index 5186181b65..14d809303f 100644
+--- a/java/org/apache/tomcat/websocket/Transformation.java
++++ b/java/org/apache/tomcat/websocket/Transformation.java
+@@ -101,8 +101,11 @@ public interface Transformation {
+      * @return  The list of messages after this any any subsequent
+      *          transformations have been applied. The size of the returned list
+      *          may be bigger or smaller than the size of the input list
++     *
++     * @throws IOException If an error occurs during the transformation of the
++     *                     message parts
+      */
+-    List<MessagePart> sendMessagePart(List<MessagePart> messageParts);
++    List<MessagePart> sendMessagePart(List<MessagePart> messageParts) throws IOException;
+ 
+     /**
+      * Clean-up any resources that were used by the transformation.
+
+==================================================
+TestPerMessageDeflate.java
+index de6bf7252e..f022132bb1 100644
+--- a/java/org/apache/tomcat/websocket/WsRemoteEndpointImplBase.java
++++ b/java/org/apache/tomcat/websocket/WsRemoteEndpointImplBase.java
+@@ -338,7 +338,12 @@ public abstract class WsRemoteEndpointImplBase implements RemoteEndpoint {
+                 intermediateMessageHandler,
+                 new EndMessageHandler(this, handler), -1));
+ 
+-        messageParts = transformation.sendMessagePart(messageParts);
++        try {
++            messageParts = transformation.sendMessagePart(messageParts);
++        } catch (IOException ioe) {
++            handler.onResult(new SendResult(ioe));
++            return;
++        }
+ 
+         // Some extensions/transformations may buffer messages so it is possible
+         // that no message parts will be returned. If this is the case the
+
+==================================================

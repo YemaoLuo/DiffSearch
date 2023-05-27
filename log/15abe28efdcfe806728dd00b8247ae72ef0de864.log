@@ -1,0 +1,214 @@
+15abe28efdcfe806728dd00b8247ae72ef0de864
+==================================================
+backport from trunk, prevent premature session expiration
+==================================================
+Filip Hanik
+==================================================
+Thu Aug 9 23:46:47 2007 +0000
+==================================================
+ReplicatedContext.java
+backport from trunk, prevent premature session expiration
+
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/tc6.0.x/trunk@564428 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+BackupManager.java
+index 370b054fdd..402ea41ac2 100644
+--- a/java/org/apache/catalina/ha/context/ReplicatedContext.java
++++ b/java/org/apache/catalina/ha/context/ReplicatedContext.java
+@@ -36,12 +36,14 @@ import org.apache.catalina.LifecycleListener;
+ import java.util.Enumeration;
+ import java.util.concurrent.ConcurrentHashMap;
+ import org.apache.catalina.util.Enumerator;
++import org.apache.catalina.tribes.tipis.AbstractReplicatedMap.MapOwner;
++import org.apache.catalina.ha.session.DeltaSession;
+ 
+ /**
+  * @author Filip Hanik
+  * @version 1.0
+  */
+-public class ReplicatedContext extends StandardContext implements LifecycleListener {
++public class ReplicatedContext extends StandardContext implements LifecycleListener,MapOwner {
+     private int mapSendOptions = Channel.SEND_OPTIONS_DEFAULT;
+     public static org.apache.juli.logging.Log log = org.apache.juli.logging.LogFactory.getLog( ReplicatedContext.class );
+     protected boolean startComplete = false;
+@@ -193,5 +195,10 @@ public class ReplicatedContext extends StandardContext implements LifecycleListe
+ 
+         }
+     }
++    
++    public void objectMadePrimay(Object key, Object value) {
++        //noop
++    }
++
+ 
+ }
+\ No newline at end of file
+
+==================================================
+AbstractReplicatedMap.java
+index c4bc697f80..7e84a3aaea 100644
+--- a/java/org/apache/catalina/ha/session/BackupManager.java
++++ b/java/org/apache/catalina/ha/session/BackupManager.java
+@@ -28,12 +28,14 @@ import org.apache.catalina.session.StandardManager;
+ import org.apache.catalina.tribes.Channel;
+ import org.apache.catalina.tribes.io.ReplicationStream;
+ import org.apache.catalina.tribes.tipis.LazyReplicatedMap;
++import org.apache.catalina.tribes.tipis.AbstractReplicatedMap.MapOwner;
++import org.apache.catalina.tribes.tipis.AbstractReplicatedMap;
+ 
+ /**
+  *@author Filip Hanik
+  *@version 1.0
+  */
+-public class BackupManager extends StandardManager implements ClusterManager
++public class BackupManager extends StandardManager implements ClusterManager, MapOwner
+ {
+     public static org.apache.juli.logging.Log log = org.apache.juli.logging.LogFactory.getLog( BackupManager.class );
+ 
+@@ -133,6 +135,15 @@ public class BackupManager extends StandardManager implements ClusterManager
+ //=========================================================================
+ // OVERRIDE THESE METHODS TO IMPLEMENT THE REPLICATION
+ //=========================================================================
++    public void objectMadePrimay(Object key, Object value) {
++        if (value!=null && value instanceof DeltaSession) {
++            DeltaSession session = (DeltaSession)value;
++            synchronized (session) {
++                session.access();
++                session.endAccess();
++            }
++        }
++    }
+ 
+     public Session createEmptySession() {
+         return new DeltaSession(this);
+
+==================================================
+LazyReplicatedMap.java
+index 3ad4fa4268..f8ba082bd5 100644
+--- a/java/org/apache/catalina/tribes/tipis/AbstractReplicatedMap.java
++++ b/java/org/apache/catalina/tribes/tipis/AbstractReplicatedMap.java
+@@ -113,7 +113,7 @@ public abstract class AbstractReplicatedMap extends ConcurrentHashMap implements
+     /**
+      * The owner of this map, ala a SessionManager for example
+      */
+-    protected transient Object mapOwner;
++    protected transient MapOwner mapOwner;
+     /**
+      * External class loaders if serialization and deserialization is to be performed successfully.
+      */
+@@ -137,7 +137,14 @@ public abstract class AbstractReplicatedMap extends ConcurrentHashMap implements
+      * Readable string of the mapContextName value
+      */
+     protected transient String mapname = "";
++
++//------------------------------------------------------------------------------
++//              map owner interface
++//------------------------------------------------------------------------------
+     
++    public static interface MapOwner {
++        public void objectMadePrimay(Object key, Object value);
++    }
+ 
+ //------------------------------------------------------------------------------
+ //              CONSTRUCTORS
+@@ -152,7 +159,7 @@ public abstract class AbstractReplicatedMap extends ConcurrentHashMap implements
+      * @param loadFactor float - load factor, see HashMap
+      * @param cls - a list of classloaders to be used for deserialization of objects.
+      */
+-    public AbstractReplicatedMap(Object owner,
++    public AbstractReplicatedMap(MapOwner owner,
+                                  Channel channel, 
+                                  long timeout, 
+                                  String mapContextName, 
+@@ -185,7 +192,7 @@ public abstract class AbstractReplicatedMap extends ConcurrentHashMap implements
+      * @param channelSendOptions int
+      * @param cls ClassLoader[]
+      */
+-    protected void init(Object owner, Channel channel, String mapContextName, long timeout, int channelSendOptions,ClassLoader[] cls) {
++    protected void init(MapOwner owner, Channel channel, String mapContextName, long timeout, int channelSendOptions,ClassLoader[] cls) {
+         log.info("Initializing AbstractReplicatedMap with context name:"+mapContextName);
+         this.mapOwner = owner;
+         this.externalLoaders = cls;
+@@ -741,6 +748,8 @@ public abstract class AbstractReplicatedMap extends ConcurrentHashMap implements
+                     entry.setProxy(false);
+                     Member[] backup = publishEntryInfo(entry.getKey(), entry.getValue());
+                     entry.setBackupNodes(backup);
++                    mapOwner.objectMadePrimay(entry.getKey(),entry.getValue());
++                    
+                 } catch (ChannelException x) {
+                     log.error("Unable to relocate[" + entry.getKey() + "] to a new backup node", x);
+                 }
+@@ -1420,7 +1429,7 @@ public abstract class AbstractReplicatedMap extends ConcurrentHashMap implements
+         return stateTransferred;
+     }
+ 
+-    public Object getMapOwner() {
++    public MapOwner getMapOwner() {
+         return mapOwner;
+     }
+ 
+@@ -1436,7 +1445,7 @@ public abstract class AbstractReplicatedMap extends ConcurrentHashMap implements
+         return accessTimeout;
+     }
+ 
+-    public void setMapOwner(Object mapOwner) {
++    public void setMapOwner(MapOwner mapOwner) {
+         this.mapOwner = mapOwner;
+     }
+ 
+
+==================================================
+ReplicatedMap.java
+index 59f2d75f26..4b8296cd00 100644
+--- a/java/org/apache/catalina/tribes/tipis/LazyReplicatedMap.java
++++ b/java/org/apache/catalina/tribes/tipis/LazyReplicatedMap.java
+@@ -26,6 +26,7 @@ import org.apache.catalina.tribes.MembershipListener;
+ import org.apache.catalina.tribes.group.RpcCallback;
+ import org.apache.catalina.tribes.util.Arrays;
+ import org.apache.catalina.tribes.UniqueId;
++import org.apache.catalina.tribes.tipis.AbstractReplicatedMap.MapOwner;
+ 
+ /**
+  * A smart implementation of a stateful replicated map. uses primary/secondary backup strategy. 
+@@ -68,7 +69,7 @@ public class LazyReplicatedMap extends AbstractReplicatedMap
+     implements RpcCallback, ChannelListener, MembershipListener {
+     protected static org.apache.juli.logging.Log log = org.apache.juli.logging.LogFactory.getLog(LazyReplicatedMap.class);
+     
+-    
++
+     
+ //------------------------------------------------------------------------------    
+ //              CONSTRUCTORS / DESTRUCTORS
+@@ -81,7 +82,7 @@ public class LazyReplicatedMap extends AbstractReplicatedMap
+          * @param initialCapacity int - the size of this map, see HashMap
+          * @param loadFactor float - load factor, see HashMap
+          */
+-        public LazyReplicatedMap(Object owner, Channel channel, long timeout, String mapContextName, int initialCapacity, float loadFactor, ClassLoader[] cls) {
++        public LazyReplicatedMap(MapOwner owner, Channel channel, long timeout, String mapContextName, int initialCapacity, float loadFactor, ClassLoader[] cls) {
+             super(owner,channel,timeout,mapContextName,initialCapacity,loadFactor, Channel.SEND_OPTIONS_DEFAULT,cls);
+         }
+ 
+@@ -92,7 +93,7 @@ public class LazyReplicatedMap extends AbstractReplicatedMap
+          * @param mapContextName String - unique name for this map, to allow multiple maps per channel
+          * @param initialCapacity int - the size of this map, see HashMap
+          */
+-        public LazyReplicatedMap(Object owner, Channel channel, long timeout, String mapContextName, int initialCapacity, ClassLoader[] cls) {
++        public LazyReplicatedMap(MapOwner owner, Channel channel, long timeout, String mapContextName, int initialCapacity, ClassLoader[] cls) {
+             super(owner, channel,timeout,mapContextName,initialCapacity, LazyReplicatedMap.DEFAULT_LOAD_FACTOR, Channel.SEND_OPTIONS_DEFAULT, cls);
+         }
+ 
+@@ -102,7 +103,7 @@ public class LazyReplicatedMap extends AbstractReplicatedMap
+          * @param timeout long - timeout for RPC messags
+          * @param mapContextName String - unique name for this map, to allow multiple maps per channel
+          */
+-        public LazyReplicatedMap(Object owner, Channel channel, long timeout, String mapContextName, ClassLoader[] cls) {
++        public LazyReplicatedMap(MapOwner owner, Channel channel, long timeout, String mapContextName, ClassLoader[] cls) {
+             super(owner, channel,timeout,mapContextName, LazyReplicatedMap.DEFAULT_INITIAL_CAPACITY,LazyReplicatedMap.DEFAULT_LOAD_FACTOR,Channel.SEND_OPTIONS_DEFAULT, cls);
+         }
+ 
+
+==================================================

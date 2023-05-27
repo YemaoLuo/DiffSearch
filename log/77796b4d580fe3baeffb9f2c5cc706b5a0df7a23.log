@@ -1,0 +1,176 @@
+77796b4d580fe3baeffb9f2c5cc706b5a0df7a23
+==================================================
+Refactor session creation and endpoint event firing
+==================================================
+Mark Emlyn
+==================================================
+Thu Jan 24 11:01:52 2013 +0000
+==================================================
+WsFrameBase.java
+Refactor session creation and endpoint event firing
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1437947 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+WsSession.java
+index 1fe031ffe1..4eb30dbca5 100644
+--- a/java/org/apache/tomcat/websocket/WsFrameBase.java
++++ b/java/org/apache/tomcat/websocket/WsFrameBase.java
+@@ -275,8 +275,7 @@ public abstract class WsFrameBase {
+                     reason = controlBufferText.toString();
+                 }
+             }
+-            wsSession.onClose(
+-                    new CloseReason(Util.getCloseCode(code), reason));
++            wsSession.close(new CloseReason(Util.getCloseCode(code), reason));
+         } else if (opCode == Constants.OPCODE_PING) {
+             if (wsSession.isOpen()) {
+                 wsSession.getRemote().sendPong(controlBufferBinary);
+@@ -498,7 +497,6 @@ public abstract class WsFrameBase {
+                                 Integer.valueOf(inputBuffer.length),
+                                 Long.valueOf(payloadLength)));
+                 wsSession.close(cr);
+-                wsSession.onClose(cr);
+                 throw new IOException(cr.getReasonPhrase());
+             }
+             makeRoom();
+
+==================================================
+WsWebSocketContainer.java
+index 644a89f1fd..f740350781 100644
+--- a/java/org/apache/tomcat/websocket/WsSession.java
++++ b/java/org/apache/tomcat/websocket/WsSession.java
+@@ -43,14 +43,29 @@ public class WsSession implements Session {
+     private static final Charset UTF8 = Charset.forName("UTF8");
+ 
+     private final Endpoint localEndpoint;
+-    private WsRemoteEndpointBase wsRemoteEndpoint;
++    private final WsRemoteEndpointBase wsRemoteEndpoint;
++    private final ClassLoader applicationClassLoader;
++
+     private MessageHandler textMessageHandler = null;
+     private MessageHandler binaryMessageHandler = null;
+     private MessageHandler.Basic<PongMessage> pongMessageHandler = null;
+     private volatile boolean open = true;
+ 
+-    public WsSession(Endpoint localEndpoint) {
++
++    /**
++     * Creates a new WebSocket session for communication between the two
++     * provided end points. The result of {@link Thread#getContextClassLoader()}
++     * at the time this constructor is called will be used when calling
++     * {@link Endpoint#onClose(Session, CloseReason)}.
++     *
++     * @param localEndpoint
++     * @param wsRemoteEndpoint
++     */
++    public WsSession(Endpoint localEndpoint,
++            WsRemoteEndpointBase wsRemoteEndpoint) {
+         this.localEndpoint = localEndpoint;
++        this.wsRemoteEndpoint = wsRemoteEndpoint;
++        applicationClassLoader = Thread.currentThread().getContextClassLoader();
+     }
+ 
+ 
+@@ -201,17 +216,29 @@ public class WsSession implements Session {
+ 
+ 
+     @Override
+-    public void close(CloseReason closeStatus) throws IOException {
++    public void close(CloseReason closeReason) throws IOException {
+         open = false;
++
++        // Send the close message
+         // 125 is maximum size for the payload of a control message
+         ByteBuffer msg = ByteBuffer.allocate(125);
+-        msg.putShort((short) closeStatus.getCloseCode().getCode());
+-        String reason = closeStatus.getReasonPhrase();
++        msg.putShort((short) closeReason.getCloseCode().getCode());
++        String reason = closeReason.getReasonPhrase();
+         if (reason != null && reason.length() > 0) {
+             msg.put(reason.getBytes(UTF8));
+         }
+         msg.flip();
+         wsRemoteEndpoint.sendMessageBlocking(Constants.OPCODE_CLOSE, msg, true);
++
++        // Fire the onClose event
++        Thread t = Thread.currentThread();
++        ClassLoader cl = t.getContextClassLoader();
++        t.setContextClassLoader(applicationClassLoader);
++        try {
++            localEndpoint.onClose(this, closeReason);
++        } finally {
++            t.setContextClassLoader(cl);
++        }
+     }
+ 
+ 
+@@ -250,11 +277,6 @@ public class WsSession implements Session {
+     }
+ 
+ 
+-    public void setRemote(WsRemoteEndpointBase wsRemoteEndpoint) {
+-        this.wsRemoteEndpoint = wsRemoteEndpoint;
+-    }
+-
+-
+     protected MessageHandler getTextMessageHandler() {
+         return textMessageHandler;
+     }
+@@ -269,15 +291,6 @@ public class WsSession implements Session {
+         return pongMessageHandler;
+     }
+ 
+-    public void onClose(CloseReason closeReason) {
+-        localEndpoint.onClose(this, closeReason);
+-    }
+-
+-
+-    public Endpoint getLocalEndpoint() {
+-        return localEndpoint;
+-    }
+-
+ 
+     // Protected so unit tests can use it
+     protected static Class<?> getMessageType(MessageHandler listener) {
+
+==================================================
+WsProtocolHandler.java
+index 8a0ad8bf1f..7ec435ee53 100644
+--- a/java/org/apache/tomcat/websocket/WsWebSocketContainer.java
++++ b/java/org/apache/tomcat/websocket/WsWebSocketContainer.java
+@@ -63,7 +63,7 @@ public class WsWebSocketContainer implements WebSocketContainer {
+ 
+ 
+     @Override
+-    public Session connectToServer(Class<? extends Endpoint> endpoint,
++    public Session connectToServer(Class<? extends Endpoint> clazz,
+             ClientEndpointConfiguration clientEndpointConfiguration, URI path)
+             throws DeploymentException {
+ 
+@@ -134,14 +134,16 @@ public class WsWebSocketContainer implements WebSocketContainer {
+         WsRemoteEndpointClient wsRemoteEndpointClient =
+                 new WsRemoteEndpointClient(channel);
+ 
+-        WsSession wsSession;
++        Endpoint endpoint;
+         try {
+-            wsSession = new WsSession(endpoint.newInstance());
++            endpoint = clazz.newInstance();
+         } catch (InstantiationException | IllegalAccessException e) {
+-            // TODO
+-            throw new DeploymentException("TBD", e);
++            // TODO i18n
++            throw new DeploymentException("TDB", e);
+         }
+-        wsSession.setRemote(wsRemoteEndpointClient);
++        WsSession wsSession = new WsSession(endpoint, wsRemoteEndpointClient);
++
++        endpoint.onOpen(wsSession, clientEndpointConfiguration);
+ 
+         try {
+             // Object creation will trigger input processing
+
+==================================================

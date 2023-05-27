@@ -1,0 +1,321 @@
+f4846a59958669bddb791b48d29159d9b52cda7d
+==================================================
+Expand the HTTP/2 excessive overhead protection
+==================================================
+Mark Thomas
+==================================================
+Tue Aug 13 19:23:03 2019 +0100
+==================================================
+Http2Parser.java
+Expand the HTTP/2 excessive overhead protection
+
+Various abusive behaviours described in
+https://github.com/Netflix/security-bulletins/blob/master/advisories/third-party/2019-002.md
+that don't trigger a DoS in Tomcat but never the less should be blocked.
+Close the connection if detected.
+Detection thresholds are configurable.
+
+
+==================================================
+Http2Protocol.java
+index 367b8093a7..d6bdf0da60 100644
+--- a/java/org/apache/coyote/http2/Http2Parser.java
++++ b/java/org/apache/coyote/http2/Http2Parser.java
+@@ -169,7 +169,7 @@ class Http2Parser {
+                     Integer.toString(streamId), Integer.toString(dataLength), padding));
+         }
+ 
+-        ByteBuffer dest = output.startRequestBodyFrame(streamId, payloadSize);
++        ByteBuffer dest = output.startRequestBodyFrame(streamId, payloadSize, endOfStream);
+         if (dest == null) {
+             swallow(streamId, dataLength, false, buffer);
+             // Process padding before sending any notifications in case padding
+@@ -322,7 +322,10 @@ class Http2Parser {
+                     Http2Error.FRAME_SIZE_ERROR);
+         }
+ 
+-        if (payloadSize != 0) {
++        if (payloadSize == 0 && !ack) {
++            // Ensure empty SETTINGS frame increments the overhead count
++            output.setting(null, 0);
++        } else {
+             // Process the settings
+             byte[] setting = new byte[6];
+             for (int i = 0; i < payloadSize / 6; i++) {
+@@ -426,9 +429,15 @@ class Http2Parser {
+                     Integer.toString(streamId)), Http2Error.PROTOCOL_ERROR);
+         }
+ 
++        boolean endOfHeaders = Flags.isEndOfHeaders(flags);
++
++        // Used to detect abusive clients sending large numbers of small
++        // continuation frames
++        output.headersContinue(payloadSize, endOfHeaders);
++
+         readHeaderPayload(streamId, payloadSize, buffer);
+ 
+-        if (Flags.isEndOfHeaders(flags)) {
++        if (endOfHeaders) {
+             headersCurrentStream = -1;
+             onHeadersComplete(streamId);
+         }
+@@ -719,7 +728,7 @@ class Http2Parser {
+         HpackDecoder getHpackDecoder();
+ 
+         // Data frames
+-        ByteBuffer startRequestBodyFrame(int streamId, int payloadSize) throws Http2Exception;
++        ByteBuffer startRequestBodyFrame(int streamId, int payloadSize, boolean endOfStream) throws Http2Exception;
+         void endRequestBodyFrame(int streamId) throws Http2Exception;
+         void receivedEndOfStream(int streamId) throws ConnectionException;
+         void swallowedPadding(int streamId, int paddingLength) throws ConnectionException, IOException;
+@@ -727,6 +736,7 @@ class Http2Parser {
+         // Header frames
+         HeaderEmitter headersStart(int streamId, boolean headersEndStream)
+                 throws Http2Exception, IOException;
++        void headersContinue(int payloadSize, boolean endOfHeaders);
+         void headersEnd(int streamId) throws ConnectionException;
+ 
+         // Priority frames (also headers)
+
+==================================================
+Http2UpgradeHandler.java
+index 127c75913d..ce84ce53fd 100644
+--- a/java/org/apache/coyote/http2/Http2Protocol.java
++++ b/java/org/apache/coyote/http2/Http2Protocol.java
+@@ -55,6 +55,9 @@ public class Http2Protocol implements UpgradeProtocol {
+     static final int DEFAULT_INITIAL_WINDOW_SIZE = (1 << 16) - 1;
+ 
+     static final int DEFAULT_OVERHEAD_COUNT_FACTOR = 1;
++    static final int DEFAULT_OVERHEAD_CONTINUATION_THRESHOLD = 1024;
++    static final int DEFAULT_OVERHEAD_DATA_THRESHOLD = 1024;
++    static final int DEFAULT_OVERHEAD_WINDOW_UPDATE_THRESHOLD = 1024;
+ 
+     private static final String HTTP_UPGRADE_NAME = "h2c";
+     private static final String ALPN_NAME = "h2";
+@@ -82,6 +85,9 @@ public class Http2Protocol implements UpgradeProtocol {
+     private int maxTrailerCount = Constants.DEFAULT_MAX_TRAILER_COUNT;
+     private int maxTrailerSize = Constants.DEFAULT_MAX_TRAILER_SIZE;
+     private int overheadCountFactor = DEFAULT_OVERHEAD_COUNT_FACTOR;
++    private int overheadContinuationThreshold = DEFAULT_OVERHEAD_CONTINUATION_THRESHOLD;
++    private int overheadDataThreadhold = DEFAULT_OVERHEAD_DATA_THRESHOLD;
++    private int overheadWindowUpdateThreadhold = DEFAULT_OVERHEAD_WINDOW_UPDATE_THRESHOLD;
+ 
+     private boolean initiatePingDisabled = false;
+     private boolean useSendfile = true;
+@@ -320,6 +326,36 @@ public class Http2Protocol implements UpgradeProtocol {
+     }
+ 
+ 
++    public int getOverheadContinuationThreshhold() {
++        return overheadContinuationThreshold;
++    }
++
++
++    public void setOverheadContinuationThreshhold(int overheadContinuationThreshold) {
++        this.overheadContinuationThreshold = overheadContinuationThreshold;
++    }
++
++
++    public int getOverheadDataThreadhold() {
++        return overheadDataThreadhold;
++    }
++
++
++    public void setOverheadDataThreadhold(int overheadDataThreadhold) {
++        this.overheadDataThreadhold = overheadDataThreadhold;
++    }
++
++
++    public int getOverheadWindowUpdateThreadhold() {
++        return overheadWindowUpdateThreadhold;
++    }
++
++
++    public void setOverheadWindowUpdateThreadhold(int overheadWindowUpdateThreadhold) {
++        this.overheadWindowUpdateThreadhold = overheadWindowUpdateThreadhold;
++    }
++
++
+     public void setInitiatePingDisabled(boolean initiatePingDisabled) {
+         this.initiatePingDisabled = initiatePingDisabled;
+     }
+
+==================================================
+Http2TestBase.java
+index f27a79e438..b13176571b 100644
+--- a/java/org/apache/coyote/http2/Http2UpgradeHandler.java
++++ b/java/org/apache/coyote/http2/Http2UpgradeHandler.java
+@@ -1332,8 +1332,25 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
+ 
+ 
+     @Override
+-    public ByteBuffer startRequestBodyFrame(int streamId, int payloadSize) throws Http2Exception {
++    public ByteBuffer startRequestBodyFrame(int streamId, int payloadSize, boolean endOfStream) throws Http2Exception {
++        // DATA frames reduce the overhead count ...
+         reduceOverheadCount();
++
++        // .. but lots of small payloads are inefficient so that will increase
++        // the overhead count unless it is the final DATA frame where small
++        // payloads are expected.
++        if (!endOfStream) {
++            int overheadThreshold = protocol.getOverheadDataThreadhold();
++            if (payloadSize < overheadThreshold) {
++                if (payloadSize == 0) {
++                    // Avoid division by zero
++                    overheadCount.addAndGet(overheadThreshold);
++                } else {
++                    overheadCount.addAndGet(overheadThreshold / payloadSize);
++                }
++            }
++        }
++
+         Stream stream = getStream(streamId, true);
+         stream.checkState(FrameType.DATA);
+         stream.receivedData(payloadSize);
+@@ -1377,8 +1394,6 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
+         // determines if a new stream is created or if this stream is ignored.
+         checkPauseState();
+ 
+-        reduceOverheadCount();
+-
+         if (connectionState.get().isNewStreamAllowed()) {
+             Stream stream = getStream(streamId, false);
+             if (stream == null) {
+@@ -1394,16 +1409,21 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
+             closeIdleStreams(streamId);
+             if (localSettings.getMaxConcurrentStreams() < activeRemoteStreamCount.incrementAndGet()) {
+                 setConnectionTimeoutForStreamCount(activeRemoteStreamCount.decrementAndGet());
++                // Ignoring maxConcurrentStreams increases the overhead count
++                increaseOverheadCount();
+                 throw new StreamException(sm.getString("upgradeHandler.tooManyRemoteStreams",
+                         Long.toString(localSettings.getMaxConcurrentStreams())),
+                         Http2Error.REFUSED_STREAM, streamId);
+             }
++            // Valid new stream reduces the overhead count
++            reduceOverheadCount();
+             return stream;
+         } else {
+             if (log.isDebugEnabled()) {
+                 log.debug(sm.getString("upgradeHandler.noNewStreams",
+                         connectionId, Integer.toString(streamId)));
+             }
++            reduceOverheadCount();
+             // Stateless so a static can be used to save on GC
+             return HEADER_SINK;
+         }
+@@ -1444,6 +1464,25 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
+     }
+ 
+ 
++    @Override
++    public void headersContinue(int payloadSize, boolean endOfHeaders) {
++        // Generally, continuation frames don't impact the overhead count but if
++        // they are small and the frame isn't the final header frame then that
++        // is indicative of an abusive client
++        if (!endOfHeaders) {
++            int overheadThreshold = getProtocol().getOverheadContinuationThreshhold();
++            if (payloadSize < overheadThreshold) {
++                if (payloadSize == 0) {
++                    // Avoid division by zero
++                    overheadCount.addAndGet(overheadThreshold);
++                } else {
++                    overheadCount.addAndGet(overheadThreshold / payloadSize);
++                }
++            }
++        }
++    }
++
++
+     @Override
+     public void headersEnd(int streamId) throws ConnectionException {
+         Stream stream = getStream(streamId, connectionState.get().isNewStreamAllowed());
+@@ -1478,6 +1517,11 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
+ 
+         increaseOverheadCount();
+ 
++        // Possible with empty settings frame
++        if (setting == null) {
++            return;
++        }
++
+         // Special handling required
+         if (setting == Setting.INITIAL_WINDOW_SIZE) {
+             long oldValue = remoteSettings.getInitialWindowSize();
+@@ -1538,10 +1582,30 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
+ 
+     @Override
+     public void incrementWindowSize(int streamId, int increment) throws Http2Exception {
++        int overheadThreshold = protocol.getOverheadWindowUpdateThreadhold();
++
+         if (streamId == 0) {
++            // Check for small increments which are inefficient
++            if (increment < overheadThreshold) {
++                // The smaller the increment, the larger the overhead
++                overheadCount.addAndGet(overheadThreshold / increment);
++            }
++
+             incrementWindowSize(increment);
+         } else {
+             Stream stream = getStream(streamId, true);
++
++            // Check for small increments which are inefficient
++            if (increment < overheadThreshold) {
++                // For Streams, client might only release the minimum so check
++                // against current demand
++                BacklogTracker tracker = backLogStreams.get(stream);
++                if (tracker == null || increment < tracker.getRemainingReservation()) {
++                    // The smaller the increment, the larger the overhead
++                    overheadCount.addAndGet(overheadThreshold / increment);
++                }
++            }
++
+             stream.checkState(FrameType.WINDOW_UPDATE);
+             stream.incrementWindowSize(increment);
+         }
+
+==================================================
+TestHttp2Section_5_2.java
+index b095733125..92ee6e023b 100644
+--- a/test/org/apache/coyote/http2/Http2TestBase.java
++++ b/test/org/apache/coyote/http2/Http2TestBase.java
+@@ -969,7 +969,7 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+ 
+ 
+         @Override
+-        public ByteBuffer startRequestBodyFrame(int streamId, int payloadSize) {
++        public ByteBuffer startRequestBodyFrame(int streamId, int payloadSize, boolean endOfStream) {
+             lastStreamId = Integer.toString(streamId);
+             bytesRead += payloadSize;
+             if (traceBody) {
+@@ -1047,6 +1047,12 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+         }
+ 
+ 
++        @Override
++        public void headersContinue(int payloadSize, boolean endOfHeaders) {
++            // NO-OP: Logging occurs per header
++        }
++
++
+         @Override
+         public void headersEnd(int streamId) {
+             trace.append(streamId + "-HeadersEnd\n");
+
+==================================================
+TestHttp2Section_5_3.java
+index 545825fe36..ad55980724 100644
+--- a/test/org/apache/coyote/http2/TestHttp2Section_5_2.java
++++ b/test/org/apache/coyote/http2/TestHttp2Section_5_2.java
+@@ -40,6 +40,10 @@ public class TestHttp2Section_5_2 extends Http2TestBase {
+ 
+         http2Connect();
+ 
++        // This test uses small window updates that will trigger the excessive
++        // overhead protection so disable it.
++        http2Protocol.setOverheadWindowUpdateThreadhold(0);
++
+         // Set the default window size to 1024 bytes
+         sendSettings(0, false, new SettingValue(4, 1024));
+         // Wait for the ack
+
+==================================================

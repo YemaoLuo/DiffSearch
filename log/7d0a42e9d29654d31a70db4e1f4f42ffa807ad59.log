@@ -1,0 +1,1613 @@
+7d0a42e9d29654d31a70db4e1f4f42ffa807ad59
+==================================================
+Add a hook for JIO, NIO, APR that allows SSL connections to negotiate an alternative protocol, if the SSL layer supports it.
+==================================================
+Costin Manolache
+==================================================
+Thu Mar 29 04:40:43 2012 +0000
+==================================================
+AjpNioProtocol.java
+Add a hook for JIO, NIO, APR that allows SSL connections to negotiate an alternative protocol, if the SSL layer supports it.
+Updates/fixes/cleanups to the spdy implementation.
+
+
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1306715 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AjpProtocol.java
+index 78d94bddc6..3aa56ed3cf 100644
+--- a/java/org/apache/coyote/ajp/AjpNioProtocol.java
++++ b/java/org/apache/coyote/ajp/AjpNioProtocol.java
+@@ -19,6 +19,8 @@ package org.apache.coyote.ajp;
+ import java.nio.channels.SocketChannel;
+ import java.util.Iterator;
+ 
++import javax.net.ssl.SSLEngine;
++
+ import org.apache.coyote.AbstractProtocol;
+ import org.apache.coyote.Processor;
+ import org.apache.juli.logging.Log;
+@@ -176,5 +178,9 @@ public class AjpNioProtocol extends AbstractAjpProtocol {
+             register(processor);
+             return processor;
+         }
++
++        @Override
++        public void onCreateSSLEngine(SSLEngine engine) {
++        }
+     }
+ }
+
+==================================================
+AbstractHttp11Protocol.java
+index fd26368552..b9744ef21b 100644
+--- a/java/org/apache/coyote/ajp/AjpProtocol.java
++++ b/java/org/apache/coyote/ajp/AjpProtocol.java
+@@ -140,5 +140,9 @@ public class AjpProtocol extends AbstractAjpProtocol {
+             register(processor);
+             return processor;
+         }
++
++        @Override
++        public void beforeHandshake(SocketWrapper<Socket> socket) {
++        }
+     }
+ }
+
+==================================================
+Http11AprProtocol.java
+index 797ab08e22..2ea2464adb 100644
+--- a/java/org/apache/coyote/http11/AbstractHttp11Protocol.java
++++ b/java/org/apache/coyote/http11/AbstractHttp11Protocol.java
+@@ -183,4 +183,15 @@ public abstract class AbstractHttp11Protocol extends AbstractProtocol {
+     public void setMaxKeepAliveRequests(int mkar) {
+         endpoint.setMaxKeepAliveRequests(mkar);
+     }
++    
++    protected NpnHandler npnHandler;
++    public void setNpnHandler(String impl) {
++        try {
++            Class<?> c = Class.forName(impl);
++            npnHandler = (NpnHandler) c.newInstance();
++        } catch (Exception ex) {
++            getLog().warn("Failed to init light protocol " + impl, ex);
++        }
++    }
++
+ }
+
+==================================================
+Http11NioProtocol.java
+index 7bce8e0d3c..c3f5e496e6 100644
+--- a/java/org/apache/coyote/http11/Http11AprProtocol.java
++++ b/java/org/apache/coyote/http11/Http11AprProtocol.java
+@@ -45,16 +45,6 @@ public class Http11AprProtocol extends AbstractHttp11Protocol {
+ 
+     private static final Log log = LogFactory.getLog(Http11AprProtocol.class);
+ 
+-    /**
+-     * Interface specific for protocols that negotiate at NPN level, like
+-     * SPDY. This is only available for APR, will replace the HTTP framing.
+-     */
+-    public static interface NpnHandler {
+-        SocketState process(SocketWrapper<Long> socket, SocketStatus status,
+-                Http11AprProtocol proto, AbstractEndpoint endpoint);
+-        public void init(final AbstractEndpoint ep, long sslContext, Adapter adapter);
+-    }
+-
+     @Override
+     protected Log getLog() { return log; }
+ 
+@@ -75,7 +65,6 @@ public class Http11AprProtocol extends AbstractHttp11Protocol {
+     }
+ 
+     private final Http11ConnectionHandler cHandler;
+-    private NpnHandler npnHandler;
+ 
+     public boolean getUseSendfile() { return ((AprEndpoint)endpoint).getUseSendfile(); }
+     public void setUseSendfile(boolean useSendfile) { ((AprEndpoint)endpoint).setUseSendfile(useSendfile); }
+@@ -184,16 +173,6 @@ public class Http11AprProtocol extends AbstractHttp11Protocol {
+     public int getSSLVerifyDepth() { return ((AprEndpoint)endpoint).getSSLVerifyDepth(); }
+     public void setSSLVerifyDepth(int SSLVerifyDepth) { ((AprEndpoint)endpoint).setSSLVerifyDepth(SSLVerifyDepth); }
+ 
+-    // TODO: map of protocols
+-    public void setNpnHandler(String impl) {
+-        try {
+-            Class<?> c = Class.forName(impl);
+-            npnHandler = (NpnHandler) c.newInstance();
+-        } catch (Exception ex) {
+-            getLog().warn("Failed to init light protocol " + impl, ex);
+-        }
+-    }
+-
+     // ----------------------------------------------------- JMX related methods
+ 
+     @Override
+@@ -269,8 +248,7 @@ public class Http11AprProtocol extends AbstractHttp11Protocol {
+                 }
+                 if (processor == null) {
+                     // if not null - this is a former comet request, handled by http11
+-                    SocketState socketState = proto.npnHandler.process(socket, status,
+-                            proto, proto.endpoint);
++                    SocketState socketState = proto.npnHandler.process(socket, status);
+                     // handled by npn protocol.
+                     if (socketState == SocketState.CLOSED ||
+                             socketState == SocketState.LONG) {
+@@ -296,7 +274,6 @@ public class Http11AprProtocol extends AbstractHttp11Protocol {
+                 // Async
+                 socket.setAsync(true);
+             } else if (processor.isComet() && proto.endpoint.isRunning()) {
+-                // Comet
+                 ((AprEndpoint) proto.endpoint).getCometPoller().add(
+                         socket.getSocket().longValue(), false);
+             } else {
+
+==================================================
+Http11Protocol.java
+index 5196c91bd5..545792b5a3 100644
+--- a/java/org/apache/coyote/http11/Http11NioProtocol.java
++++ b/java/org/apache/coyote/http11/Http11NioProtocol.java
+@@ -20,6 +20,8 @@ import java.io.IOException;
+ import java.nio.channels.SocketChannel;
+ import java.util.Iterator;
+ 
++import javax.net.ssl.SSLEngine;
++
+ import org.apache.coyote.AbstractProtocol;
+ import org.apache.coyote.Processor;
+ import org.apache.coyote.http11.upgrade.UpgradeInbound;
+@@ -27,11 +29,13 @@ import org.apache.coyote.http11.upgrade.UpgradeNioProcessor;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.net.AbstractEndpoint;
++import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
+ import org.apache.tomcat.util.net.NioChannel;
+ import org.apache.tomcat.util.net.NioEndpoint;
+ import org.apache.tomcat.util.net.NioEndpoint.Handler;
+ import org.apache.tomcat.util.net.SSLImplementation;
+ import org.apache.tomcat.util.net.SecureNioChannel;
++import org.apache.tomcat.util.net.SocketStatus;
+ import org.apache.tomcat.util.net.SocketWrapper;
+ 
+ 
+@@ -73,7 +77,14 @@ public class Http11NioProtocol extends AbstractHttp11JsseProtocol {
+         return ((NioEndpoint)endpoint);
+     }
+ 
+-
++    @Override
++    public void start() throws Exception {
++        super.start();
++        if (npnHandler != null) {
++            npnHandler.init(getEndpoint(), 0, adapter);
++        }
++    }
++    
+     // -------------------- Properties--------------------
+ 
+     private Http11ConnectionHandler cHandler;
+@@ -201,6 +212,17 @@ public class Http11NioProtocol extends AbstractHttp11JsseProtocol {
+             }
+         }
+ 
++        public SocketState process(SocketWrapper<NioChannel> socket,
++                SocketStatus status) {
++            if (proto.npnHandler != null) {
++                SocketState ss = proto.npnHandler.process(socket, status);
++                if (ss != SocketState.OPEN) {
++                    return ss;
++                }
++            }
++            return super.process(socket, status);
++        }
++        
+ 
+         /**
+          * Expected to be used by the handler once the processor is no longer
+@@ -286,5 +308,12 @@ public class Http11NioProtocol extends AbstractHttp11JsseProtocol {
+             return new UpgradeNioProcessor(socket, inbound,
+                     ((Http11NioProtocol) getProtocol()).getEndpoint().getSelectorPool());
+         }
++
++        @Override
++        public void onCreateSSLEngine(SSLEngine engine) {
++            if (proto.npnHandler != null) {
++                proto.npnHandler.onCreateEngine(engine);
++            }
++        }
+     }
+ }
+
+==================================================
+NpnHandler.java
+index 4a21048f3f..e8a169f761 100644
+--- a/java/org/apache/coyote/http11/Http11Protocol.java
++++ b/java/org/apache/coyote/http11/Http11Protocol.java
+@@ -25,9 +25,11 @@ import org.apache.coyote.http11.upgrade.UpgradeBioProcessor;
+ import org.apache.coyote.http11.upgrade.UpgradeInbound;
+ import org.apache.juli.logging.Log;
+ import org.apache.tomcat.util.net.AbstractEndpoint;
++import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
+ import org.apache.tomcat.util.net.JIoEndpoint;
+ import org.apache.tomcat.util.net.JIoEndpoint.Handler;
+ import org.apache.tomcat.util.net.SSLImplementation;
++import org.apache.tomcat.util.net.SocketStatus;
+ import org.apache.tomcat.util.net.SocketWrapper;
+ 
+ 
+@@ -89,6 +91,14 @@ public class Http11Protocol extends AbstractHttp11JsseProtocol {
+             this.disableKeepAlivePercentage = disableKeepAlivePercentage;
+         }
+     }
++    
++    @Override
++    public void start() throws Exception {
++        super.start();
++        if (npnHandler != null) {
++            npnHandler.init(endpoint, 0, adapter);
++        }
++    }
+ 
+     // ----------------------------------------------------- JMX related methods
+ 
+@@ -124,6 +134,17 @@ public class Http11Protocol extends AbstractHttp11JsseProtocol {
+             return proto.sslImplementation;
+         }
+ 
++        public SocketState process(SocketWrapper<Socket> socket,
++                SocketStatus status) {
++            if (proto.npnHandler != null) {
++                SocketState ss = proto.npnHandler.process(socket, status);
++                if (ss != SocketState.OPEN) {
++                    return ss;
++                }
++            }
++            return super.process(socket, status);
++        }
++        
+         /**
+          * Expected to be used by the handler once the processor is no longer
+          * required.
+@@ -191,5 +212,9 @@ public class Http11Protocol extends AbstractHttp11JsseProtocol {
+                 throws IOException {
+             return new UpgradeBioProcessor(socket, inbound);
+         }
++
++        @Override
++        public void beforeHandshake(SocketWrapper<Socket> socket) {
++        }
+     }
+ }
+
+==================================================
+SpdyAprNpnHandler.java
+new file mode 100644
+index 0000000000..40f127d252
+--- /dev/null
++++ b/java/org/apache/coyote/http11/NpnHandler.java
+@@ -0,0 +1,43 @@
++/*
++ */
++package org.apache.coyote.http11;
++
++import org.apache.coyote.Adapter;
++import org.apache.tomcat.util.net.AbstractEndpoint;
++import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
++import org.apache.tomcat.util.net.SocketStatus;
++import org.apache.tomcat.util.net.SocketWrapper;
++
++/**
++ * Interface specific for protocols that negotiate at NPN level, like
++ * SPDY. This is only available for APR, will replace the HTTP framing.
++ */
++public interface NpnHandler {
++    
++    /** 
++     * Check if the socket has negotiated the right NPN and process it.
++     *  
++     * @param socket
++     * @param status
++     * @return OPEN if the socket doesn't have the right npn.
++     *    CLOSE if processing is done. LONG to request read polling.
++     */
++    SocketState process(SocketWrapper<?> socket, SocketStatus status);
++    
++    /**
++     * Initialize the npn handler.
++     * 
++     * @param ep
++     * @param sslContext
++     * @param adapter
++     */
++    public void init(final AbstractEndpoint ep, long sslContext, Adapter adapter);
++
++    /** 
++     * Called when a SSLSocket or SSLEngine are first used, to initialize 
++     * NPN extension.
++     * 
++     * @param socket SSLEngine or SSLSocket
++     */
++    void onCreateEngine(Object socket);
++}
+\ No newline at end of file
+
+==================================================
+SpdyProcessor.java
+index 423dc08a50..a513dc9dfb 100644
+--- a/java/org/apache/coyote/spdy/SpdyAprNpnHandler.java
++++ b/java/org/apache/coyote/spdy/SpdyAprNpnHandler.java
+@@ -20,12 +20,14 @@ import java.io.IOException;
+ 
+ import org.apache.coyote.Adapter;
+ import org.apache.coyote.http11.Http11AprProtocol;
++import org.apache.coyote.http11.NpnHandler;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.jni.SSLExt;
++import org.apache.tomcat.spdy.NetSupportOpenSSL;
+ import org.apache.tomcat.spdy.SpdyConnection;
+ import org.apache.tomcat.spdy.SpdyContext;
+-import org.apache.tomcat.spdy.SpdyContextJni;
++import org.apache.tomcat.spdy.SpdyContext.SpdyHandler;
+ import org.apache.tomcat.spdy.SpdyStream;
+ import org.apache.tomcat.util.net.AbstractEndpoint;
+ import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
+@@ -57,66 +59,57 @@ import org.apache.tomcat.util.net.SocketWrapper;
+  * negotiated by TLS.
+  *
+  */
+-public class SpdyAprNpnHandler implements Http11AprProtocol.NpnHandler {
++public class SpdyAprNpnHandler implements NpnHandler {
+ 
+     private static final Log log = LogFactory.getLog(AprEndpoint.class);
+ 
+-    private SpdyContextApr spdyContext;
+-
+-    boolean ssl = true;
++    private SpdyContext spdyContext;
+ 
+     @Override
+     public void init(final AbstractEndpoint ep, long sslContext,
+             final Adapter adapter) {
++        spdyContext = new SpdyContext();
+         if (sslContext == 0) {
+-            // Apr endpoint without SSL.
+-            ssl = false;
+-            spdyContext = new SpdyContextApr(ep, adapter);
+-            spdyContext.setExecutor(ep.getExecutor());
++            // Apr endpoint without SSL - proxy mode.
++            spdyContext.setTlsComprression(false, false);
+             return;
+         }
+-        if (0 == SSLExt.setNPN(sslContext, SpdyContext.SPDY_NPN_OUT)) {
+-            spdyContext = new SpdyContextApr(ep, adapter);
+-            spdyContext.setExecutor(ep.getExecutor());
+-        } else {
++        if (0 != SSLExt.setNPN(sslContext, SpdyContext.SPDY_NPN_OUT)) {
+             log.warn("SPDY/NPN not supported");
+         }
+-    }
+-
+-
+-    private final class SpdyContextApr extends SpdyContextJni {
+-        private final AbstractEndpoint ep;
+-
+-        private final Adapter adapter;
+-
+-        private SpdyContextApr(AbstractEndpoint ep, Adapter adapter) {
+-            this.ep = ep;
+-            this.adapter = adapter;
+-        }
+-
+-        @Override
+-        protected void onSynStream(SpdyConnection con, SpdyStream ch) throws IOException {
+-            SpdyProcessor sp = new SpdyProcessor(con, ep);
+-            sp.setAdapter(adapter);
+-            sp.onSynStream(ch);
+-        }
++        spdyContext.setNetSupport(new NetSupportOpenSSL());
++        spdyContext.setExecutor(ep.getExecutor());
++        spdyContext.setHandler(new SpdyHandler() {
++            @Override
++            public void onStream(SpdyConnection con, SpdyStream ch)
++                    throws IOException {
++                SpdyProcessor sp = new SpdyProcessor(con, ep);
++                sp.setAdapter(adapter);
++                sp.onSynStream(ch);
++            }
++        });
+     }
+ 
+     @Override
+-    public SocketState process(SocketWrapper<Long> socketO, SocketStatus status,
+-            Http11AprProtocol proto, AbstractEndpoint endpoint) {
++    public SocketState process(SocketWrapper<?> socketO, SocketStatus status) {
+ 
+-        SocketWrapper<Long> socketW = socketO;
++        SocketWrapper<Long> socketW = (SocketWrapper<Long>) socketO;
+         long socket = socketW.getSocket().longValue();
++        
++        if (! spdyContext.getNetSupport().isSpdy(socketW.getSocket())) {
++            return SocketState.OPEN;            
++        }
+ 
+         try {
+-            spdyContext.onAccept(socket);
++            ((NetSupportOpenSSL) spdyContext.getNetSupport()).onAcceptLong(socket);
+         } catch (IOException e) {
+         }
+         // No need to keep tomcat thread busy - but socket will be handled by apr socket context.
+         return SocketState.LONG;
+     }
+ 
+-    public void onClose(SocketWrapper<Long> socketWrapper) {
++
++    @Override
++    public void onCreateEngine(Object socket) {
+     }
+ }
+
+==================================================
+SpdyProxyProtocol.java
+index 7b1b524a29..d1e0594d8c 100644
+--- a/java/org/apache/coyote/spdy/SpdyProcessor.java
++++ b/java/org/apache/coyote/spdy/SpdyProcessor.java
+@@ -97,15 +97,21 @@ public class SpdyProcessor extends AbstractProcessor<Object> implements
+                 inFrame = spdyStream.getDataFrame(endpoint.getSoTimeout());
+             }
+             if (inFrame == null) {
++                return -1; // timeout
++            }
++            if (inFrame.remaining() == 0 && inFrame.isHalfClose()) {
+                 return -1;
+             }
+-
+-            int rd = Math.min(inFrame.endData, bchunk.getBytes().length);
++            
++            int rd = Math.min(inFrame.remaining(), bchunk.getBytes().length);
+             System.arraycopy(inFrame.data, inFrame.off, bchunk.getBytes(),
+                     bchunk.getStart(), rd);
+             inFrame.advance(rd);
+-            if (inFrame.off == inFrame.endData) {
++            if (inFrame.remaining() == 0) {
+                 spdy.getSpdyContext().releaseFrame(inFrame);
++                if (!inFrame.isHalfClose()) {
++                    inFrame = null;
++                }
+             }
+             bchunk.setEnd(bchunk.getEnd() + rd);
+             return rd;
+
+==================================================
+AprSocketContext.java
+index ecfb0cd0e8..1a58eb80b7 100644
+--- a/java/org/apache/coyote/spdy/SpdyProxyProtocol.java
++++ b/java/org/apache/coyote/spdy/SpdyProxyProtocol.java
+@@ -23,8 +23,10 @@ import org.apache.coyote.AbstractProtocol;
+ import org.apache.coyote.ajp.Constants;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
++import org.apache.tomcat.spdy.NetSupportSocket;
+ import org.apache.tomcat.spdy.SpdyConnection;
+-import org.apache.tomcat.spdy.SpdyContextProxy;
++import org.apache.tomcat.spdy.SpdyContext;
++import org.apache.tomcat.spdy.SpdyContext.SpdyHandler;
+ import org.apache.tomcat.spdy.SpdyStream;
+ import org.apache.tomcat.util.net.AbstractEndpoint.Handler;
+ import org.apache.tomcat.util.net.JIoEndpoint;
+@@ -51,7 +53,7 @@ public class SpdyProxyProtocol extends AbstractProtocol {
+     private static final Log log = LogFactory.getLog(SpdyProxyProtocol.class);
+ 
+     JIoEndpoint.Handler cHandler = new TomcatJioHandler();
+-    SpdyContextProxy spdyContext;
++    SpdyContext spdyContext;
+ 
+     public SpdyProxyProtocol() {
+         endpoint = new JIoEndpoint();
+@@ -84,14 +86,17 @@ public class SpdyProxyProtocol extends AbstractProtocol {
+     @Override
+     public void start() throws Exception {
+         super.start();
+-        spdyContext = new SpdyContextProxy() {
++        spdyContext = new SpdyContext();
++        spdyContext.setTlsComprression(false, false);
++        spdyContext.setHandler(new SpdyHandler() {
+             @Override
+-            protected void onSynStream(SpdyConnection con, SpdyStream ch) throws IOException {
++            public void onStream(SpdyConnection con, SpdyStream ch) throws IOException {
+                 SpdyProcessor sp = new SpdyProcessor(con, endpoint);
+                 sp.setAdapter(adapter);
+                 sp.onSynStream(ch);
+             }
+-        };
++        });
++        spdyContext.setNetSupport(new NetSupportSocket());
+         spdyContext.setExecutor(endpoint.getExecutor());
+     }
+ 
+@@ -109,8 +114,11 @@ public class SpdyProxyProtocol extends AbstractProtocol {
+         @Override
+         public SocketState process(SocketWrapper<Socket> socket,
+                 SocketStatus status) {
+-            SpdyConnection ch = spdyContext.getConnection(socket.getSocket());
+-            ch.onBlockingSocket();
++            try {
++                spdyContext.getNetSupport().onAccept(socket.getSocket());
++            } catch (IOException e) {
++                e.printStackTrace();
++            }
+             return SocketState.CLOSED;
+         }
+ 
+@@ -119,5 +127,9 @@ public class SpdyProxyProtocol extends AbstractProtocol {
+             return null;
+         }
+ 
++        @Override
++        public void beforeHandshake(SocketWrapper<Socket> socket) {
++        }
++
+     }
+ }
+
+==================================================
+CompressDeflater6.java
+index 6103293cb5..c3b9077feb 100644
+--- a/java/org/apache/tomcat/jni/socket/AprSocketContext.java
++++ b/java/org/apache/tomcat/jni/socket/AprSocketContext.java
+@@ -417,6 +417,9 @@ public class AprSocketContext {
+ 
+     public AprSocket socket(long socket) throws IOException {
+         AprSocket sock = newSocket(this);
++        // Tomcat doesn't set this
++        SSLExt.sslSetMode(socket, SSLExt.SSL_MODE_ENABLE_PARTIAL_WRITE |
++                SSLExt.SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+         sock.setStatus(AprSocket.ACCEPTED);
+         sock.socket = socket;
+         return sock;
+@@ -429,7 +432,7 @@ public class AprSocketContext {
+             if (socket.socket != 0) {
+                 long s = socket.socket;
+                 socket.socket = 0;
+-                System.err.println("DESTROY: " + Long.toHexString(s));
++                log.info("DESTROY: " + Long.toHexString(s));
+                 Socket.destroy(s);
+             }
+         }
+@@ -583,7 +586,7 @@ public class AprSocketContext {
+             if (rootPool == 0) {
+                 return;
+             }
+-            System.err.println("DESTROY " + rootPool);
++            log.info("Destroy root pool " + rootPool);
+             //Pool.destroy(rootPool);
+             //rootPool = 0;
+         }
+@@ -1226,7 +1229,9 @@ public class AprSocketContext {
+                 updateIOThread(ch);
+             } else {
+                 synchronized (this) {
+-                    updates.add(ch);
++                    if (!updates.contains(ch)) {
++                        updates.add(ch);
++                    }
+                     interruptPoll();
+                 }
+                 if (debugPoll) {
+@@ -1276,6 +1281,9 @@ public class AprSocketContext {
+             boolean failed = false;
+             int rv;
+             synchronized (channels) {
++                if (up.isClosed()) {
++                    return;
++                }
+                 rv = Poll.add(serverPollset, up.socket, req);
+                 if (rv != Status.APR_SUCCESS) {
+                     up.poller = null;
+
+==================================================
+NetSupportOpenSSL.java
+index 9ff1db9290..71ba474176 100644
+--- a/java/org/apache/tomcat/spdy/CompressDeflater6.java
++++ b/java/org/apache/tomcat/spdy/CompressDeflater6.java
+@@ -26,11 +26,11 @@ import org.apache.tomcat.spdy.SpdyConnection.CompressSupport;
+ /**
+  * Java6 Deflater with the workaround from tomcat http filters.
+  */
+-public class CompressDeflater6 implements CompressSupport {
++class CompressDeflater6 implements CompressSupport {
+     public static long DICT_ID = 3751956914L;
+ 
+     // Make sure to use the latest from net/spdy/spdy_framer.cc, not from spec
+-    private static String SPDY_DICT_S = "optionsgetheadpostputdeletetraceacceptaccept-charsetaccept-encodingaccept-"
++    static String SPDY_DICT_S = "optionsgetheadpostputdeletetraceacceptaccept-charsetaccept-encodingaccept-"
+             + "languageauthorizationexpectfromhostif-modified-sinceif-matchif-none-matchi"
+             + "f-rangeif-unmodifiedsincemax-forwardsproxy-authorizationrangerefererteuser"
+             + "-agent10010120020120220320420520630030130230330430530630740040140240340440"
+@@ -67,6 +67,11 @@ public class CompressDeflater6 implements CompressSupport {
+     public CompressDeflater6() {
+     }
+ 
++    public static CompressDeflater6 get() {
++        // TODO: code to plug in v7-specific. It is marginally faster.
++        return new CompressDeflater6();
++    }
++    
+     public void recycle() {
+         // TODO
+     }
+@@ -143,7 +148,6 @@ public class CompressDeflater6 implements CompressSupport {
+         decOff = start;
+ 
+         int off = start;
+-        int max = frame.data.length;
+ 
+         zipIn.setInput(frame.data, start, decMax - start);
+ 
+
+==================================================
+NetSupportSocket.java
+similarity index 78%
+rename from java/org/apache/tomcat/spdy/SpdyContextJni.java
+rename to java/org/apache/tomcat/spdy/NetSupportOpenSSL.java
+index 04f86267cb..7387ee7706 100644
+--- a/java/org/apache/tomcat/spdy/SpdyContextJni.java
++++ b/java/org/apache/tomcat/spdy/NetSupportOpenSSL.java
+@@ -1,37 +1,29 @@
+ /*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+  */
+ package org.apache.tomcat.spdy;
+ 
+ import java.io.IOException;
++import java.net.Socket;
++import java.nio.channels.ByteChannel;
++import java.util.Arrays;
++import java.util.List;
+ 
++import javax.net.ssl.SSLEngine;
++
++import org.apache.tomcat.jni.SSLExt;
+ import org.apache.tomcat.jni.Status;
+ import org.apache.tomcat.jni.socket.AprSocket;
+ import org.apache.tomcat.jni.socket.AprSocketContext;
+ import org.apache.tomcat.jni.socket.AprSocketContext.NonBlockingPollHandler;
+ import org.apache.tomcat.jni.socket.AprSocketContext.TlsCertVerifier;
+ 
+-public class SpdyContextJni extends SpdyContext {
+-    AprSocketContext con;
+ 
+-    //AprSocketContext socketCtx;
++public class NetSupportOpenSSL extends SpdyContext.NetSupport {
+ 
+-    public SpdyContextJni() {
+-        compression = true;
+-        tls = true;
++    List<String> protos = Arrays.asList(new String[] {"spdy/2", "http/1.1"});
++    AprSocketContext con;
++
++    public NetSupportOpenSSL() {
+         con = new AprSocketContext();
+         //if (insecureCerts) {
+         con.customVerification(new TlsCertVerifier() {
+@@ -40,14 +32,21 @@ public class SpdyContextJni extends SpdyContext {
+             }
+         });
+         //}
+-        con.setNpn("spdy/2");
++        con.setNpn("spdy/2");        
+     }
+-
++    
++    @Override
++    public boolean isSpdy(Object socketW) {
++        byte[] proto = new byte[32];
++        int len = SSLExt.getNPN((Long) socketW, proto);
++        return len == 6; // todo: check spdy/2
++    }
++    
+     @Override
+     public SpdyConnection getConnection(String host, int port) throws IOException {
+-        SpdyConnectionAprSocket spdy = new SpdyConnectionAprSocket(this);
++        SpdyConnectionAprSocket spdy = new SpdyConnectionAprSocket(ctx);
+ 
+-        AprSocket ch = con.socket(host, port, tls);
++        AprSocket ch = con.socket(host, port, ctx.tls);
+ 
+         spdy.setSocket(ch);
+ 
+@@ -65,8 +64,13 @@ public class SpdyContextJni extends SpdyContext {
+         return spdy;
+     }
+ 
+-    public void onAccept(long socket) throws IOException {
+-        SpdyConnectionAprSocket spdy = new SpdyConnectionAprSocket(SpdyContextJni.this);
++    @Override
++    public void onAccept(Object socket) throws IOException {
++        onAcceptLong((Long) socket);
++    }
++    
++    public void onAcceptLong(long socket) throws IOException {
++        SpdyConnectionAprSocket spdy = new SpdyConnectionAprSocket(ctx);
+         AprSocket s = con.socket(socket);
+         spdy.setSocket(s);
+ 
+@@ -75,12 +79,17 @@ public class SpdyContextJni extends SpdyContext {
+         handler.process(s, true, true, false);
+     }
+ 
++    public AprSocketContext getAprContext() {
++        return con;
++    }
++
++
+     @Override
+     public void listen(final int port, String cert, String key) throws IOException {
+         con = new AprSocketContext() {
+             @Override
+             protected void onSocket(AprSocket s) throws IOException {
+-                SpdyConnectionAprSocket spdy = new SpdyConnectionAprSocket(SpdyContextJni.this);
++                SpdyConnectionAprSocket spdy = new SpdyConnectionAprSocket(ctx);
+                 spdy.setSocket(s);
+ 
+                 SpdySocketHandler handler = new SpdySocketHandler(spdy);
+@@ -99,12 +108,8 @@ public class SpdyContextJni extends SpdyContext {
+         con.stop();
+     }
+ 
+-    public AprSocketContext getAprContext() {
+-        return con;
+-    }
+-
+     // NB
+-    class SpdySocketHandler implements NonBlockingPollHandler {
++    static class SpdySocketHandler implements NonBlockingPollHandler {
+         SpdyConnection con;
+ 
+         SpdySocketHandler(SpdyConnection con) {
+@@ -194,4 +199,5 @@ public class SpdyContextJni extends SpdyContext {
+         }
+     }
+ 
++    
+ }
+
+==================================================
+SpdyConnection.java
+similarity index 64%
+rename from java/org/apache/tomcat/spdy/SpdyContextProxy.java
+rename to java/org/apache/tomcat/spdy/NetSupportSocket.java
+index b7497a04a4..9e333f47cb 100644
+--- a/java/org/apache/tomcat/spdy/SpdyContextProxy.java
++++ b/java/org/apache/tomcat/spdy/NetSupportSocket.java
+@@ -1,18 +1,4 @@
+ /*
+- *  Licensed to the Apache Software Foundation (ASF) under one or more
+- *  contributor license agreements.  See the NOTICE file distributed with
+- *  this work for additional information regarding copyright ownership.
+- *  The ASF licenses this file to You under the Apache License, Version 2.0
+- *  (the "License"); you may not use this file except in compliance with
+- *  the License.  You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- *  Unless required by applicable law or agreed to in writing, software
+- *  distributed under the License is distributed on an "AS IS" BASIS,
+- *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- *  See the License for the specific language governing permissions and
+- *  limitations under the License.
+  */
+ package org.apache.tomcat.spdy;
+ 
+@@ -20,41 +6,107 @@ import java.io.IOException;
+ import java.net.ServerSocket;
+ import java.net.Socket;
+ import java.net.SocketTimeoutException;
++import java.security.NoSuchAlgorithmException;
+ 
+-/**
+- * Spdy context for 'proxy' or test mode spdy - no NPN, no SSL, no compression.
+- *
+- * This can be supported without JNI dependencies.
+- * It can be modified to support SSL and compression - but so far the only way
+- * to use NPN is via JNI.
+- */
+-public class SpdyContextProxy extends SpdyContext {
++import javax.net.ssl.SSLContext;
++import javax.net.ssl.SSLSocket;
+ 
+-    protected Socket getSocket(String host, int port) throws IOException {
+-        return new Socket(host, port);
++
++public class NetSupportSocket extends SpdyContext.NetSupport {
++
++    public void onCreateEngine(Object engine) {
++    }
++    
++    public boolean isSpdy(Object socketW) {
++        return false;
+     }
+ 
+-    @Override
+     public SpdyConnection getConnection(String host, int port) throws IOException {
+         try {
+             Socket sock = getSocket(host, port);
+ 
+             sock.getInputStream();
+-            SpdyConnectionSocket con = new SpdyConnectionSocket(this, sock);
++            SpdyConnectionSocket con = new SpdyConnectionSocket(ctx, sock);
+ 
+-            getExecutor().execute(con.inputThread);
++            ctx.getExecutor().execute(con.inputThread);
+             return con;
+         } catch (IOException ex) {
+             ex.printStackTrace();
+             throw ex;
+         }
++        
++    }
++    
++
++    protected Socket getSocket(String host, int port) throws IOException {
++        try {
++            if (ctx.tls) {
++                SSLContext sslCtx = SSLContext.getDefault();
++                SSLSocket socket = (SSLSocket) sslCtx.getSocketFactory().createSocket(host, port);
++                //socket.setEnabledProtocols(new String[] {"TLS1"});
++                socket.startHandshake();
++                return socket;
++            } else {
++                return new Socket(host, port);            
++            }
++        } catch (NoSuchAlgorithmException e) {
++            throw new IOException(e);
++        }
++        
++    }
++
++    boolean running = true;
++    ServerSocket serverSocket;
++
++    @Override
++    public void stop() throws IOException {
++        running = false;
++        serverSocket.close();
++    }
++
++    public void onAccept(Object socket) {
++        SpdyConnectionSocket ch = new SpdyConnectionSocket(ctx, (Socket) socket);
++        ctx.getExecutor().execute(ch.inputThread);
++        ch.onBlockingSocket();
++    }
+ 
++    
++    @Override
++    public void listen(final int port, String cert, String key) throws IOException {
++        ctx.getExecutor().execute(new Runnable() {
++            @Override
++            public void run() {
++                accept(port);
++            }
++        });
+     }
+ 
+-    public SpdyConnection getConnection(Socket socket) {
+-        return new SpdyConnectionSocket(this, socket);
++    private void accept(int port) {
++        try {
++            serverSocket = new ServerSocket(port);
++            while (running) {
++                final Socket socket = serverSocket.accept();
++                ctx.getExecutor().execute(new Runnable() {
++                    @Override
++                    public void run() {
++                        onAccept(socket);
++                        try {
++                            socket.close();
++                        } catch (IOException e) {
++                            e.printStackTrace();
++                        }
++                    }
++                });
++            }
++        } catch (IOException ex) {
++            if (running) {
++                ex.printStackTrace();
++            }
++            running = false;
++        }
+     }
+ 
++
+     public static class SpdyConnectionSocket extends SpdyConnection {
+         Socket socket;
+ 
+@@ -101,54 +153,6 @@ public class SpdyContextProxy extends SpdyContext {
+             }
+         }
+     }
+-
+-
+-    boolean running = true;
+-    ServerSocket serverSocket;
+-
+-    @Override
+-    public void stop() throws IOException {
+-        running = false;
+-        serverSocket.close();
+-    }
+-
+-    /**
+-     *  For small servers/testing: run in server mode.
+-     *  Need to override onSynStream() to implement the logic.
+-     */
+-    @Override
+-    public void listen(final int port, String cert, String key) throws IOException {
+-        getExecutor().execute(new Runnable() {
+-            @Override
+-            public void run() {
+-                accept(port);
+-            }
+-        });
+-    }
+-
+-    private void accept(int port) {
+-        try {
+-            serverSocket = new ServerSocket(port);
+-            while (running) {
+-                final Socket socket = serverSocket.accept();
+-                final SpdyConnection con = getConnection(socket);
+-                getExecutor().execute(new Runnable() {
+-                    @Override
+-                    public void run() {
+-                        con.onBlockingSocket();
+-                        try {
+-                            socket.close();
+-                        } catch (IOException e) {
+-                            e.printStackTrace();
+-                        }
+-                    }
+-                });
+-            }
+-        } catch (IOException ex) {
+-            if (running) {
+-                ex.printStackTrace();
+-            }
+-            running = false;
+-        }
+-    }
++    
+ }
++
+
+==================================================
+SpdyContext.java
+index 821d39e936..f5e902ef16 100644
+--- a/java/org/apache/tomcat/spdy/SpdyConnection.java
++++ b/java/org/apache/tomcat/spdy/SpdyConnection.java
+@@ -23,12 +23,13 @@ import java.util.HashMap;
+ import java.util.LinkedList;
+ import java.util.List;
+ import java.util.Map;
+-import java.util.concurrent.locks.Condition;
+ import java.util.concurrent.locks.Lock;
+ import java.util.concurrent.locks.ReentrantLock;
+ import java.util.logging.Level;
+ import java.util.logging.Logger;
+ 
++import org.apache.tomcat.util.net.NioSelectorPool;
++
+ /**
+  * Main class implementing SPDY protocol. Works with both blocking and
+  * non-blocking sockets. To simplify integration in various endpoints there is
+@@ -119,14 +120,10 @@ public abstract class SpdyConnection { // implements Runnable {
+ 
+     LinkedList<SpdyFrame> outQueue = new LinkedList<SpdyFrame>();
+ 
+-    Lock framerLock = new ReentrantLock();
+-
+     // --------------
+ 
+     public static byte[] NPN = "spdy/2".getBytes();
+ 
+-    private Condition outCondition;
+-
+     public static final int LONG = 1;
+ 
+     public static final int CLOSE = -1;
+@@ -142,9 +139,8 @@ public abstract class SpdyConnection { // implements Runnable {
+ 
+     public SpdyConnection(SpdyContext spdyContext) {
+         this.spdyContext = spdyContext;
+-        outCondition = framerLock.newCondition();
+         if (spdyContext.compression) {
+-            setCompressSupport(new CompressDeflater6());
++            setCompressSupport(CompressDeflater6.get());
+         }
+     }
+ 
+@@ -215,9 +211,7 @@ public abstract class SpdyConnection { // implements Runnable {
+      */
+     private boolean _drain() {
+         while (true) {
+-            framerLock.lock();
+-
+-            try {
++            synchronized (outQueue) {
+                 if (out == null) {
+                     out = prioriyQueue.poll();
+                     if (out == null) {
+@@ -227,49 +221,46 @@ public abstract class SpdyConnection { // implements Runnable {
+                         return false;
+                     }
+                     if (goAway < out.streamId) {
+-
++                        // TODO
+                     }
+-                    SpdyFrame oframe = out;
+                     try {
+-                        if (!oframe.c) {
++                        if (!out.c) {
+                             // late: IDs are assigned as we send ( priorities may affect
+                             // the transmission order )
+-                            if (oframe.stream != null) {
+-                                oframe.streamId = oframe.stream.getRequest().streamId;
++                            if (out.stream != null) {
++                                out.streamId = out.stream.getRequest().streamId;
+                             }
+-                        } else if (oframe.type == TYPE_SYN_STREAM) {
+-                            oframe.fixNV(18);
++                        } else if (out.type == TYPE_SYN_STREAM) {
++                            out.fixNV(18);
+                             if (compressSupport != null) {
+-                                compressSupport.compress(oframe, 18);
++                                compressSupport.compress(out, 18);
+                             }
+-                        } else if (oframe.type == TYPE_SYN_REPLY
+-                                || oframe.type == TYPE_HEADERS) {
+-                            oframe.fixNV(14);
++                        } else if (out.type == TYPE_SYN_REPLY
++                                || out.type == TYPE_HEADERS) {
++                            out.fixNV(14);
+                             if (compressSupport != null) {
+-                                compressSupport.compress(oframe, 14);
++                                compressSupport.compress(out, 14);
+                             }
+                         }
+                     } catch (IOException ex) {
+                         abort("Compress error");
+                         return false;
+                     }
+-                    if (oframe.type == TYPE_SYN_STREAM) {
+-                        oframe.streamId = outStreamId;
++                    if (out.type == TYPE_SYN_STREAM) {
++                        out.streamId = outStreamId;
+                         outStreamId += 2;
+                         synchronized(channels) {
+-                            channels.put(oframe.streamId, oframe.stream);
++                            channels.put(out.streamId, out.stream);
+                         }
+                     }
+ 
+-                    oframe.serializeHead();
++                    out.serializeHead();
+ 
+                 }
+                 if (out.endData == out.off) {
+                     out = null;
+                     continue;
+                 }
+-            } finally {
+-                framerLock.unlock();
+             }
+ 
+             if (SpdyContext.debug) {
+@@ -292,13 +283,6 @@ public abstract class SpdyConnection { // implements Runnable {
+                         toWrite -= wr;
+                     }
+                 }
+-                // Frame was sent
+-                framerLock.lock();
+-                try {
+-                    outCondition.signalAll();
+-                } finally {
+-                    framerLock.unlock();
+-                }
+ 
+                 synchronized (channels) {
+                     if (out.stream != null) {
+@@ -325,8 +309,9 @@ public abstract class SpdyConnection { // implements Runnable {
+      *
+      * With a nb transport it should call drain directly.
+      */
+-    public void nonBlockingDrain() {
+-        // TODO: if (nonBlocking()) { drain() }
++    public void nonBlockingSend(SpdyFrame oframe, SpdyStream proc) 
++            throws IOException {
++        queueFrame(oframe, proc, oframe.pri == 0 ? outQueue : prioriyQueue);
+         getSpdyContext().getExecutor().execute(nbDrain);
+     }
+ 
+@@ -339,6 +324,10 @@ public abstract class SpdyConnection { // implements Runnable {
+         }
+     };
+ 
++    /**
++     * Add the frame to the queue and send until the queue is empty.
++     * 
++     */
+     public void send(SpdyFrame oframe, SpdyStream proc)
+             throws IOException {
+         queueFrame(oframe, proc, oframe.pri == 0 ? outQueue : prioriyQueue);
+@@ -346,7 +335,7 @@ public abstract class SpdyConnection { // implements Runnable {
+     }
+ 
+     private void queueFrame(SpdyFrame oframe, SpdyStream proc,
+-            LinkedList<SpdyFrame> outQueue) throws IOException {
++            LinkedList<SpdyFrame> queue) throws IOException {
+ 
+         oframe.endData = oframe.off;
+         oframe.off = 0;
+@@ -354,12 +343,9 @@ public abstract class SpdyConnection { // implements Runnable {
+         // we can't compress either - it's stateful.
+         oframe.stream = proc;
+ 
+-        framerLock.lock();
+-        try {
+-            outQueue.add(oframe);
+-            outCondition.signalAll();
+-        } finally {
+-            framerLock.unlock();
++        // all sync for adding/removing is on outQueue
++        synchronized (outQueue) {
++            queue.add(oframe);            
+         }
+     }
+ 
+@@ -555,8 +541,10 @@ public abstract class SpdyConnection { // implements Runnable {
+     }
+ 
+     /**
+-     * Process a SPDY connection. Called in a separate thread.
++     * Process a SPDY connection. Called in the input thread, should not 
++     * block.
+      *
++     * @return
+      * @throws IOException
+      */
+     protected int handleFrame() throws IOException {
+@@ -569,8 +557,8 @@ public abstract class SpdyConnection { // implements Runnable {
+                     int id = inFrame.read24();
+                     int value = inFrame.readInt();
+                 }
++                // TODO: save/interpret settings
+                 break;
+-                // receivedHello = currentInFrame;
+             }
+             case TYPE_GOAWAY: {
+                 int lastStream = inFrame.readInt();
+@@ -585,24 +573,22 @@ public abstract class SpdyConnection { // implements Runnable {
+             case TYPE_RST_STREAM: {
+                 inFrame.streamId = inFrame.read32();
+                 int errCode = inFrame.read32();
+-                trace("> RST "
+-                        + inFrame.streamId
+-                        + " "
+-                        + ((errCode < RST_ERRORS.length) ? RST_ERRORS[errCode]
+-                                : errCode));
++                if (SpdyContext.debug) {
++                    trace("> RST "
++                            + inFrame.streamId
++                            + " "
++                            + ((errCode < RST_ERRORS.length) ? RST_ERRORS[errCode]
++                                    : errCode));
++                }
+                 SpdyStream sch;
+                 synchronized(channels) {
+-                        sch = channels.get(inFrame.streamId);
++                        sch = channels.remove(inFrame.streamId);
+                 }
+-                if (sch == null) {
+-                    abort("Missing channel " + inFrame.streamId);
+-                    return CLOSE;
++                // if RST stream is for a closed channel - we can ignore.
++                if (sch != null) {
++                    sch.onReset();
+                 }
+-                sch.onCtlFrame(inFrame);
+ 
+-                synchronized(channels) {
+-                    channels.remove(inFrame.streamId);
+-                }
+                 inFrame = null;
+                 break;
+             }
+@@ -622,7 +608,7 @@ public abstract class SpdyConnection { // implements Runnable {
+                     abort("Error reading headers " + t);
+                     return CLOSE;
+                 }
+-                spdyContext.onSynStream(this, ch);
++                spdyContext.onStream(this, ch);
+                 break;
+             }
+             case TYPE_SYN_REPLY: {
+@@ -697,7 +683,7 @@ public abstract class SpdyConnection { // implements Runnable {
+      * balancer and tomcat) there is no need for the compression overhead. There
+      * are also multiple possible implementations.
+      */
+-    public static interface CompressSupport {
++    static interface CompressSupport {
+         public void compress(SpdyFrame frame, int start) throws IOException;
+ 
+         public void decompress(SpdyFrame frame, int start) throws IOException;
+
+==================================================
+SpdyFrame.java
+index 853f694eb0..e5214edae0 100644
+--- a/java/org/apache/tomcat/spdy/SpdyContext.java
++++ b/java/org/apache/tomcat/spdy/SpdyContext.java
+@@ -33,7 +33,7 @@ import java.util.concurrent.Executors;
+  * handles SSL and compression. Test with: --user-data-dir=/tmp/test
+  * --use-spdy=no-compress,no-ssl
+  */
+-public class SpdyContext {
++public final class SpdyContext {
+ 
+     public static final byte[] SPDY_NPN;
+ 
+@@ -52,7 +52,45 @@ public class SpdyContext {
+     public static boolean debug = false;
+ 
+     protected boolean tls = true;
+-    protected boolean compression = false;
++    protected boolean compression = true;
++
++    private NetSupport netSupport;
++
++
++    public static abstract class NetSupport {
++        protected SpdyContext ctx;
++        
++        public void setSpdyContext(SpdyContext ctx) {
++            this.ctx = ctx;
++        }
++        
++        public abstract SpdyConnection getConnection(String host, int port) throws IOException;
++
++        public void onCreateEngine(Object engine) {
++        }
++
++        public boolean isSpdy(Object socketW) {
++            return false;
++        }
++
++        public void onAccept(Object socket) throws IOException {
++        }
++
++        public void listen(int port, String cert, String key)
++                throws IOException {
++        }
++
++        public void stop() throws IOException {
++        }
++    }
++    
++    public SpdyContext() {
++    }
++    
++    public void setTlsComprression(boolean tls, boolean compress) {
++        this.tls = tls;
++        this.compression = compress;
++    }
+ 
+     /**
+      * Get a frame - frames are heavy buffers, may be reused.
+@@ -89,6 +127,37 @@ public class SpdyContext {
+         this.executor = executor;
+     }
+ 
++    public void setNetSupport(NetSupport netSupport) {
++        this.netSupport = netSupport;
++        netSupport.setSpdyContext(this);
++    }
++
++    public NetSupport getNetSupport() {
++        if (netSupport == null) {
++            try {
++                Class<?> c0 = Class.forName("org.apache.tomcat.spdy.NetSupportOpenSSL");
++                netSupport = (NetSupport) c0.newInstance();
++                netSupport.setSpdyContext(this);
++                return netSupport;
++            } catch (Throwable t) {
++                // ignore, openssl not supported
++            }
++            try {
++                Class<?> c1 = Class.forName("org.apache.tomcat.spdy.NetSupportJava7");
++                netSupport = (NetSupport) c1.newInstance();
++                netSupport.setSpdyContext(this);
++                return netSupport;
++            } catch (Throwable t) {
++                // ignore, npn not supported
++            }
++            // non-ssl mode must be set explicitly
++            throw new RuntimeException("SSL NextProtoclNegotiation no supported.");
++        }
++        
++        return netSupport;
++    }
++    
++    
+     /**
+      * SPDY is a multiplexed protocol - the SpdyProcessors will be executed on
+      * this executor.
+@@ -103,31 +172,58 @@ public class SpdyContext {
+         return executor;
+     }
+ 
++    SpdyHandler handler;
++    
++    public SpdyHandler getHandler() {
++        return handler;
++    }
++
++    public void setHandler(SpdyHandler handler) {
++        this.handler = handler;
++    }
++
++    public static interface SpdyHandler {
++        public void onStream(SpdyConnection spdyCon, SpdyStream ch) throws IOException;
++        
++    }
++
+     /**
+-     * Override for servers.
+-     * @throws IOException
++     * A handler implementing this interface will be called in the 'io' thread - the
++     * thread reading the multiplexed stream, and in the case of non-blocking 
++     * transports also handling polling the socket.
++     *  
+      */
+-    protected void onSynStream(SpdyConnection spdyCon, SpdyStream ch) throws IOException {
++    public static interface NonBlockingSpdyHandler extends SpdyHandler {
+     }
++    
+ 
+     /**
+      * Client mode: return a connection for host/port.
+      * @throws IOException
+      */
+     public SpdyConnection getConnection(String host, int port) throws IOException {
+-        return null;
++        return netSupport.getConnection(host, port);
+     }
+ 
+     public void releaseConnection(SpdyConnection con) {
+     }
+ 
+-    public void listen(final int port, String cert, String key) throws IOException {
+-        throw new IOException("Not implemented");
++    public final void listen(final int port, String cert, String key) throws IOException {
++        netSupport.listen(port, cert, key);
+     }
+ 
+     /**
+      * Close all pending connections and free resources.
+      */
+-    public void stop() throws IOException {
++    public final void stop() throws IOException {
++        netSupport.stop();
++    }
++
++    public void onStream(SpdyConnection spdyConnection, SpdyStream ch) throws IOException {
++        if (handler instanceof NonBlockingSpdyHandler) {
++            handler.onStream(spdyConnection, ch);
++        } else if (handler instanceof SpdyHandler) {
++            getExecutor().execute(ch);
++        }
+     }
+ }
+
+==================================================
+SpdyStream.java
+index 3448e0e459..680492dc1d 100644
+--- a/java/org/apache/tomcat/spdy/SpdyFrame.java
++++ b/java/org/apache/tomcat/spdy/SpdyFrame.java
+@@ -350,4 +350,5 @@ public class SpdyFrame {
+     public boolean isData() {
+         return !c;
+     }
++    
+ }
+
+==================================================
+JIoEndpoint.java
+index 7d7de6c079..f45a8b0cee 100644
+--- a/java/org/apache/tomcat/spdy/SpdyStream.java
++++ b/java/org/apache/tomcat/spdy/SpdyStream.java
+@@ -17,6 +17,7 @@
+ package org.apache.tomcat.spdy;
+ 
+ import java.io.IOException;
++import java.io.InputStream;
+ import java.io.PrintWriter;
+ import java.nio.charset.Charset;
+ import java.util.Map;
+@@ -37,7 +38,7 @@ import java.util.concurrent.TimeUnit;
+  * The frame must be either consumed or popInFrame must be called, after the
+  * call is done the frame will be reused.
+  */
+-public class SpdyStream {
++public class SpdyStream implements Runnable {
+     public static final Charset UTF8 = Charset.forName("UTF-8");
+ 
+     protected SpdyConnection spdy;
+@@ -84,9 +85,6 @@ public class SpdyStream {
+ 
+     /**
+      * Non-blocking, called when a data frame is received.
+-     *
+-     * The processor must consume the data, or set frame.data to null or a fresh
+-     * buffer ( to avoid a copy ).
+      */
+     public void onDataFrame(SpdyFrame inFrame) {
+         synchronized(this) {
+@@ -110,8 +108,6 @@ public class SpdyStream {
+             reqFrame = frame;
+         } else if (frame.type == SpdyConnection.TYPE_SYN_REPLY) {
+             resFrame = frame;
+-        } else if (frame.type == SpdyConnection.TYPE_RST_STREAM) {
+-            onReset();
+         }
+         synchronized (this) {
+             inData.add(frame);
+@@ -142,7 +138,7 @@ public class SpdyStream {
+     }
+ 
+     /**
+-     * Waits and return the next data frame.
++     * Waits and return the next data frame, null on timeout.
+      */
+     public SpdyFrame getDataFrame(long to) throws IOException {
+         while (true) {
+@@ -150,27 +146,29 @@ public class SpdyStream {
+             if (res == null || res.isData()) {
+                 return res;
+             }
++            if (res.type == SpdyConnection.TYPE_RST_STREAM) {
++                throw new IOException("Reset");
++            }
+         }
+     }
+ 
+     /**
+-     * Waits and return the next frame. First frame will be the control frame
++     * Waits and return the next frame. 
++     * 
++     * First frame will be the control frame
+      */
+     public SpdyFrame getFrame(long to) throws IOException {
+         SpdyFrame in;
+         try {
+             synchronized (this) {
+                 if (inData.size() == 0 && finRcvd) {
+-                    return null;
++                    return END_FRAME;
+                 }
+             }
+             in = inData.poll(to, TimeUnit.MILLISECONDS);
+-            if (in == END_FRAME) {
+-                return null;
+-            }
+             return in;
+         } catch (InterruptedException e) {
+-            throw new IOException(e);
++            return null;
+         }
+     }
+ 
+@@ -250,5 +248,64 @@ public class SpdyStream {
+         spdy.send(reqFrame, this);
+     }
+ 
++    @Override
++    public void run() {
++        try {
++            spdy.spdyContext.handler.onStream(spdy, this);
++        } catch (IOException e) {
++            e.printStackTrace();
++            // TODO: send rst, error processing the stream.
++        }
++    }
++
+ 
++    public InputStream getInputStream() {
++        return new SpdyInputStream();
++    }
++    
++    class SpdyInputStream extends InputStream {
++        SpdyFrame current = null;
++        long to = 10000; // TODO
++        int pos = 0;
++
++        private void fill() throws IOException {
++            if (current == null || current.off == current.endData) {
++                if (current != null) {
++                    spdy.spdyContext.releaseFrame(current);
++                }
++                current = getFrame(to);
++            }
++        }
++        
++        @Override
++        public int read() throws IOException {
++            fill();
++            if (current == null) {
++                return -1;
++            }
++            return current.readByte();
++        }
++        
++        public int read(byte b[], int off, int len) throws IOException {
++            fill();
++            if (current == null) {
++                return -1;
++            }
++            // don't wait for next frame
++            int rd = Math.min(len, current.endData - current.off);
++            System.arraycopy(current.data, current.off, b, off, rd);
++            current.off += rd;
++            return rd;
++        }
++     
++        public int available() throws IOException {
++            return 0;
++        }
++        public void close() throws IOException {
++            // send RST if not closed
++        }
++        
++        
++        
++    }
+ }
+
+==================================================
+NioEndpoint.java
+index d4a2322db1..5de231564a 100644
+--- a/java/org/apache/tomcat/util/net/JIoEndpoint.java
++++ b/java/org/apache/tomcat/util/net/JIoEndpoint.java
+@@ -128,6 +128,7 @@ public class JIoEndpoint extends AbstractEndpoint {
+         public SocketState process(SocketWrapper<Socket> socket,
+                 SocketStatus status);
+         public SSLImplementation getSslImplementation();
++        public void beforeHandshake(SocketWrapper<Socket> socket);        
+     }
+ 
+ 
+@@ -289,7 +290,7 @@ public class JIoEndpoint extends AbstractEndpoint {
+             synchronized (socket) {
+                 try {
+                     SocketState state = SocketState.OPEN;
+-
++                    handler.beforeHandshake(socket);
+                     try {
+                         // SSL handshake
+                         serverSocketFactory.handshake(socket.getSocket());
+
+==================================================

@@ -1,0 +1,249 @@
+33161af9713e5a49880476049c63c218e9878852
+==================================================
+Refactor to redo fix for 63182. The root cause is that the pending flag is released once processing start, and concurrent unsynced access from non container threads can cause awaitBytes to happen concurrently.
+==================================================
+Remy Maucherat
+==================================================
+Thu Feb 21 16:37:20 2019 +0000
+==================================================
+AbstractProcessor.java
+Refactor to redo fix for 63182. The root cause is that the pending flag is released once processing start, and concurrent unsynced access from non container threads can cause awaitBytes to happen concurrently.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1854066 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AbstractProtocol.java
+index 205a7891b2..69582a48c7 100644
+--- a/java/org/apache/coyote/AbstractProcessor.java
++++ b/java/org/apache/coyote/AbstractProcessor.java
+@@ -790,7 +790,7 @@ public abstract class AbstractProcessor extends AbstractProcessorLight implement
+         }
+ 
+         if (!isRequestBodyFullyRead()) {
+-            registerReadInterest();
++            registerReadInterest(true);
+         }
+ 
+         return false;
+@@ -800,7 +800,7 @@ public abstract class AbstractProcessor extends AbstractProcessorLight implement
+     protected abstract boolean isRequestBodyFullyRead();
+ 
+ 
+-    protected abstract void registerReadInterest();
++    protected abstract void registerReadInterest(boolean body);
+ 
+ 
+     protected abstract boolean isReadyForWrite();
+
+==================================================
+AjpProcessor.java
+index 6b9dbea62d..465876c0dc 100644
+--- a/java/org/apache/coyote/AbstractProtocol.java
++++ b/java/org/apache/coyote/AbstractProtocol.java
+@@ -903,7 +903,7 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+                     // processor. Continue to poll for the next request.
+                     connections.remove(socket);
+                     release(processor);
+-                    wrapper.registerReadInterest();
++                    wrapper.registerReadInterest(true);
+                 } else if (state == SocketState.SENDFILE) {
+                     // Sendfile in progress. If it fails, the socket will be
+                     // closed. If it works, the socket either be added to the
+@@ -993,7 +993,7 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+                 //  - this is an upgraded connection
+                 //  - the request line/headers have not been completely
+                 //    read
+-                socket.registerReadInterest();
++                socket.registerReadInterest(true);
+             }
+         }
+ 
+
+==================================================
+Http11Processor.java
+index a56fb7a306..064cc88d85 100644
+--- a/java/org/apache/coyote/ajp/AjpProcessor.java
++++ b/java/org/apache/coyote/ajp/AjpProcessor.java
+@@ -1134,8 +1134,8 @@ public class AjpProcessor extends AbstractProcessor {
+ 
+ 
+     @Override
+-    protected final void registerReadInterest() {
+-        socketWrapper.registerReadInterest();
++    protected final void registerReadInterest(boolean body) {
++        socketWrapper.registerReadInterest(!body);
+     }
+ 
+ 
+
+==================================================
+UpgradeServletInputStream.java
+index c5f198cb72..8985ad8301 100644
+--- a/java/org/apache/coyote/http11/Http11Processor.java
++++ b/java/org/apache/coyote/http11/Http11Processor.java
+@@ -1215,8 +1215,8 @@ public class Http11Processor extends AbstractProcessor {
+ 
+ 
+     @Override
+-    protected final void registerReadInterest() {
+-        socketWrapper.registerReadInterest();
++    protected final void registerReadInterest(boolean body) {
++        socketWrapper.registerReadInterest(!body);
+     }
+ 
+ 
+
+==================================================
+StreamProcessor.java
+index 1c1ddb6c03..956038ee60 100644
+--- a/java/org/apache/coyote/http11/upgrade/UpgradeServletInputStream.java
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeServletInputStream.java
+@@ -107,7 +107,7 @@ public class UpgradeServletInputStream extends ServletInputStream {
+         if (ContainerThreadMarker.isContainerThread()) {
+             processor.addDispatch(DispatchType.NON_BLOCKING_READ);
+         } else {
+-            socketWrapper.registerReadInterest();
++            socketWrapper.registerReadInterest(true);
+         }
+ 
+         // Switching to non-blocking. Don't know if data is available.
+
+==================================================
+AprEndpoint.java
+index 89cad0abe8..09478a320b 100644
+--- a/java/org/apache/coyote/http2/StreamProcessor.java
++++ b/java/org/apache/coyote/http2/StreamProcessor.java
+@@ -263,7 +263,7 @@ class StreamProcessor extends AbstractProcessor {
+ 
+ 
+     @Override
+-    protected final void registerReadInterest() {
++    protected final void registerReadInterest(boolean body) {
+         // Should never be called for StreamProcessor as isReadyForRead() is
+         // overridden
+         throw new UnsupportedOperationException();
+
+==================================================
+Nio2Endpoint.java
+index a5d7c9ced7..0bb73675e4 100644
+--- a/java/org/apache/tomcat/util/net/AprEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AprEndpoint.java
+@@ -2724,7 +2724,7 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
+ 
+ 
+         @Override
+-        public void registerReadInterest() {
++        public void registerReadInterest(boolean polling) {
+             // Make sure an already closed socket is not added to the poller
+             synchronized (closedLock) {
+                 if (closed) {
+
+==================================================
+NioEndpoint.java
+index b1dd850232..8323bfed0d 100644
+--- a/java/org/apache/tomcat/util/net/Nio2Endpoint.java
++++ b/java/org/apache/tomcat/util/net/Nio2Endpoint.java
+@@ -590,7 +590,7 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel,AsynchronousS
+             this.readCompletionHandler = new CompletionHandler<Integer, ByteBuffer>() {
+                 @Override
+                 public void completed(Integer nBytes, ByteBuffer attachment) {
+-                    boolean notify = false;
++                    boolean readNotify = false;
+                     if (log.isDebugEnabled()) {
+                         log.debug("Socket: [" + Nio2SocketWrapper.this + "], Interest: [" + readInterest + "]");
+                     }
+@@ -599,16 +599,16 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel,AsynchronousS
+                             failed(new EOFException(), attachment);
+                         } else {
+                             if (readInterest && !Nio2Endpoint.isInline()) {
+-                                readInterest = false;
+-                                notify = true;
++                                readNotify = true;
+                             } else {
+                                 // Release here since there will be no
+                                 // notify/dispatch to do the release.
+                                 readPending.release();
+                             }
++                            readInterest = false;
+                         }
+                     }
+-                    if (notify) {
++                    if (readNotify) {
+                         getEndpoint().processSocket(Nio2SocketWrapper.this, SocketEvent.OPEN_READ, false);
+                     }
+                 }
+@@ -810,7 +810,7 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel,AsynchronousS
+                     socketBufferHandler.configureReadBufferForRead();
+                     nRead = Math.min(nRead, len);
+                     socketBufferHandler.getReadBuffer().get(b, off, nRead);
+-                } else if (nRead == 0 && !block && ContainerThreadMarker.isContainerThread()) {
++                } else if (nRead == 0 && !block) {
+                     readInterest = true;
+                 }
+                 if (log.isDebugEnabled()) {
+@@ -873,7 +873,7 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel,AsynchronousS
+                     // data that was just read
+                     if (nRead > 0) {
+                         nRead = populateReadBuffer(to);
+-                    } else if (nRead == 0 && !block && ContainerThreadMarker.isContainerThread()) {
++                    } else if (nRead == 0 && !block) {
+                         readInterest = true;
+                     }
+                 }
+@@ -1475,11 +1475,11 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel,AsynchronousS
+ 
+ 
+         @Override
+-        public void registerReadInterest() {
++        public void registerReadInterest(boolean polling) {
+             synchronized (readCompletionHandler) {
+                 if (readPending.availablePermits() == 0) {
+                     readInterest = true;
+-                } else {
++                } else if (polling) {
+                     // If no read is pending, start waiting for data
+                     awaitBytes();
+                 }
+
+==================================================
+SocketWrapperBase.java
+index 621dd63d48..3bae5378f2 100644
+--- a/java/org/apache/tomcat/util/net/NioEndpoint.java
++++ b/java/org/apache/tomcat/util/net/NioEndpoint.java
+@@ -1243,7 +1243,7 @@ public class NioEndpoint extends AbstractJsseEndpoint<NioChannel,SocketChannel>
+ 
+ 
+         @Override
+-        public void registerReadInterest() {
++        public void registerReadInterest(boolean polling) {
+             getPoller().add(getSocket(), SelectionKey.OP_READ);
+         }
+ 
+@@ -1420,7 +1420,7 @@ public class NioEndpoint extends AbstractJsseEndpoint<NioChannel,SocketChannel>
+                 } else if (handshake == -1 ) {
+                     close(socket, key);
+                 } else if (handshake == SelectionKey.OP_READ){
+-                    socketWrapper.registerReadInterest();
++                    socketWrapper.registerReadInterest(true);
+                 } else if (handshake == SelectionKey.OP_WRITE){
+                     socketWrapper.registerWriteInterest();
+                 }
+
+==================================================
+TestNonBlockingAPI.java
+index c60ec885a6..8d6253d458 100644
+--- a/java/org/apache/tomcat/util/net/SocketWrapperBase.java
++++ b/java/org/apache/tomcat/util/net/SocketWrapperBase.java
+@@ -763,7 +763,7 @@ public abstract class SocketWrapperBase<E> {
+     }
+ 
+ 
+-    public abstract void registerReadInterest();
++    public abstract void registerReadInterest(boolean polling);
+ 
+     public abstract void registerWriteInterest();
+ 
+
+==================================================

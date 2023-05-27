@@ -1,0 +1,666 @@
+59b17c1e3241c72153ebcb542f89b3a89f751c00
+==================================================
+add in ability to pass through credentials
+==================================================
+Filip Hanik
+==================================================
+Mon Jan 3 22:14:21 2011 +0000
+==================================================
+ConnectionPool.java
+index 3b2b65d243..ff613bd7d6 100644
+--- a/modules/jdbc-pool/doc/jdbc-pool.xml
++++ b/modules/jdbc-pool/doc/jdbc-pool.xml
+@@ -416,6 +416,19 @@
+            logged and a JMX notification gets sent once. 
+       </p>
+     </attribute>
++    <attribute name="alternateUsernameAllowed" required="false">
++      <p>(boolean) By default, the jdbc-pool will ignore the 
++         <a href="http://download.oracle.com/javase/6/docs/api/javax/sql/DataSource.html#getConnection(java.lang.String,%20java.lang.String)"><code>DataSource.getConnection(username,password)</code></a>
++         call, and simply return a previously pooled connection under the globally configured properties <code>username</code> and <code>password</code>, for performance reasons.
++         The pool can however be used with different credentials each time a connection is used. Should you request a connection with the credentials user1/password1 and the connection
++         was previously connected using user2/password2, the connection will be closed, and reopened with the requested credentials. This way, the pool size is still managed
++         on a global level, and not on a per schema level. To enable the functionality described in the 
++         <a href="http://download.oracle.com/javase/6/docs/api/javax/sql/DataSource.html#getConnection(java.lang.String,%20java.lang.String)"><code>DataSource.getConnection(username,password)</code></a>
++         call, simply set the property <code>alternateUsernameAllowed</code> to true. <br/>
++         The default value is <code>false</code>.<br/>
++         This property was added as an enhancement to <a href="https://issues.apache.org/bugzilla/show_bug.cgi?id=50025">bug 50025</a>.
++      </p>
++    </attribute>
+     <attribute name="dataSource" required="false">
+       <p>(javax.sql.DataSource)  
+       </p>
+
+==================================================
+DataSourceFactory.java
+index 8b1cca37b9..db63722d45 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/ConnectionPool.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/ConnectionPool.java
+@@ -161,10 +161,29 @@ public class ConnectionPool {
+      */
+     public Connection getConnection() throws SQLException {
+         //check out a connection
+-        PooledConnection con = borrowConnection(-1);
++        PooledConnection con = borrowConnection(-1,null,null);
+         return setupConnection(con);
+     }
+ 
++       
++    /**
++     * Borrows a connection from the pool. If a connection is available (in the
++     * idle queue) or the pool has not reached {@link PoolProperties#maxActive
++     * maxActive} connections a connection is returned immediately. If no
++     * connection is available, the pool will attempt to fetch a connection for
++     * {@link PoolProperties#maxWait maxWait} milliseconds.
++     * 
++     * @return Connection - a java.sql.Connection/javax.sql.PooledConnection
++     *         reflection proxy, wrapping the underlying object.
++     * @throws SQLException
++     *             - if the wait times out or a failure occurs creating a
++     *             connection
++     */
++    public Connection getConnection(String username, String password) throws SQLException {
++        // check out a connection
++        PooledConnection con = borrowConnection(-1, username, password);
++        return setupConnection(con);
++    }
+     
+     /**
+      * Returns the name of this pool
+@@ -422,7 +441,7 @@ public class ConnectionPool {
+         PooledConnection[] initialPool = new PooledConnection[poolProperties.getInitialSize()];
+         try {
+             for (int i = 0; i < initialPool.length; i++) {
+-                initialPool[i] = this.borrowConnection(0); //don't wait, should be no contention
++                initialPool[i] = this.borrowConnection(0, null, null); //don't wait, should be no contention
+             } //for
+ 
+         } catch (SQLException x) {
+@@ -529,7 +548,7 @@ public class ConnectionPool {
+      * @return PooledConnection
+      * @throws SQLException
+      */
+-    private PooledConnection borrowConnection(int wait) throws SQLException {
++    private PooledConnection borrowConnection(int wait, String username, String password) throws SQLException {
+ 
+         if (isClosed()) {
+             throw new SQLException("Connection pool closed.");
+@@ -543,7 +562,7 @@ public class ConnectionPool {
+         while (true) {
+             if (con!=null) {
+                 //configure the connection and return it
+-                PooledConnection result = borrowConnection(now, con);
++                PooledConnection result = borrowConnection(now, con, username, password);
+                 //null should never be returned, but was in a previous impl.
+                 if (result!=null) return result;
+             }
+@@ -559,7 +578,7 @@ public class ConnectionPool {
+                     size.decrementAndGet();
+                 } else {
+                     //create a connection, we're below the limit
+-                    return createConnection(now, con);
++                    return createConnection(now, con, username, password);
+                 }
+             } //end if
+ 
+@@ -608,10 +627,11 @@ public class ConnectionPool {
+      * @return a PooledConnection that has been connected
+      * @throws SQLException
+      */
+-    protected PooledConnection createConnection(long now,
+-            PooledConnection notUsed) throws SQLException {
++    protected PooledConnection createConnection(long now, PooledConnection notUsed, String username, String password) throws SQLException {
+         //no connections where available we'll create one
+         PooledConnection con = create();
++        if (username!=null) con.getAttributes().put(con.PROP_USER, username);
++        if (password!=null) con.getAttributes().put(con.PROP_PASSWORD, password);
+         boolean error = false;
+         try {
+             //connect and validate the connection
+@@ -660,13 +680,14 @@ public class ConnectionPool {
+      * @return con
+      * @throws SQLException if a validation error happens
+      */
+-    protected PooledConnection borrowConnection(long now, PooledConnection con) throws SQLException {
++    protected PooledConnection borrowConnection(long now, PooledConnection con, String username, String password) throws SQLException {
+         //we have a connection, lets set it up
+         
+         //flag to see if we need to nullify
+         boolean setToNull = false;
+         try {
+             con.lock();
++            boolean usercheck = con.checkUser(username, password);
+             
+             if (con.isReleased()) {
+                 return null;
+@@ -676,20 +697,23 @@ public class ConnectionPool {
+                 //attempt to connect
+                 con.connect();
+             }
+-            if ((!con.isDiscarded()) && con.validate(PooledConnection.VALIDATE_BORROW)) {
+-                //set the timestamp
+-                con.setTimestamp(now);
+-                if (getPoolProperties().isLogAbandoned()) {
+-                    //set the stack trace for this pool
+-                    con.setStackTrace(getThreadDump());
+-                }
+-                if (!busy.offer(con)) {
+-                    log.debug("Connection doesn't fit into busy array, connection will not be traceable.");
++            
++            if (usercheck) {
++                if ((!con.isDiscarded()) && con.validate(PooledConnection.VALIDATE_BORROW)) {
++                    //set the timestamp
++                    con.setTimestamp(now);
++                    if (getPoolProperties().isLogAbandoned()) {
++                        //set the stack trace for this pool
++                        con.setStackTrace(getThreadDump());
++                    }
++                    if (!busy.offer(con)) {
++                        log.debug("Connection doesn't fit into busy array, connection will not be traceable.");
++                    }
++                    return con;
+                 }
+-                return con;
+             }
+             //if we reached here, that means the connection
+-            //is either discarded or validation failed.
++            //is either has another principal, is discarded or validation failed.
+             //we will make one more attempt
+             //in order to guarantee that the thread that just acquired
+             //the connection shouldn't have to poll again.
+@@ -1051,7 +1075,7 @@ public class ConnectionPool {
+                 if (result!=null) return result;
+                 if (configured.compareAndSet(false, true)) {
+                     try {
+-                        pc = borrowConnection(System.currentTimeMillis(),pc);
++                        pc = borrowConnection(System.currentTimeMillis(),pc, null, null);
+                         result = ConnectionPool.this.setupConnection(pc);
+                     } catch (SQLException x) {
+                         cause = x;
+
+==================================================
+DataSourceProxy.java
+index 87eea63ad3..32e5a4ed66 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/DataSourceFactory.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/DataSourceFactory.java
+@@ -112,6 +112,8 @@ public class DataSourceFactory implements ObjectFactory {
+     
+     protected static final String PROP_SUSPECT_TIMEOUT = "suspectTimeout";
+     
++    protected static final String PROP_ALTERNATE_USERNAME_ALLOWED = "alternateUsernameAllowed";
++    
+     
+     public static final int UNKNOWN_TRANSACTIONISOLATION = -1;
+     
+@@ -159,6 +161,7 @@ public class DataSourceFactory implements ObjectFactory {
+         PROP_USE_CON_LOCK,
+         PROP_DATASOURCE,
+         PROP_DATASOURCE_JNDI,
++        PROP_ALTERNATE_USERNAME_ALLOWED
+     };
+ 
+     // -------------------------------------------------- ObjectFactory Methods
+@@ -465,6 +468,12 @@ public class DataSourceFactory implements ObjectFactory {
+         if (value != null) {
+             poolProperties.setSuspectTimeout(Integer.parseInt(value));
+         }
++        
++        value = properties.getProperty(PROP_ALTERNATE_USERNAME_ALLOWED);
++        if (value != null) {
++            poolProperties.setAlternateUsernameAllowed(Boolean.parseBoolean(value));
++        }
++        
+         return poolProperties;
+     }
+ 
+
+==================================================
+PoolConfiguration.java
+index c7966fe1e8..27c4d27f44 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/DataSourceProxy.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/DataSourceProxy.java
+@@ -74,7 +74,13 @@ public class DataSourceProxy implements PoolConfiguration {
+      * {@link javax.sql.DataSource#getConnection()}
+      */
+     public Connection getConnection(String username, String password) throws SQLException {
+-        return getConnection();
++        if (this.getPoolProperties().isAlternateUsernameAllowed()) {
++            if (pool == null)
++                return createPool().getConnection(username,password);
++            return pool.getConnection(username,password);
++        } else {
++            return getConnection();
++        }
+     }
+ 
+     public PoolConfiguration getPoolProperties() {
+@@ -1060,5 +1066,19 @@ public class DataSourceProxy implements PoolConfiguration {
+     public String getDataSourceJNDI() {
+         return getPoolProperties().getDataSourceJNDI();
+     }
++
++    /** 
++     * {@inheritDoc}
++     */
++    public boolean isAlternateUsernameAllowed() {
++        return getPoolProperties().isAlternateUsernameAllowed();
++    }
++
++    /** 
++     * {@inheritDoc}
++     */
++    public void setAlternateUsernameAllowed(boolean alternateUsernameAllowed) {
++        getPoolProperties().setAlternateUsernameAllowed(alternateUsernameAllowed);
++    }
+     
+ }
+
+==================================================
+PoolProperties.java
+index 7e4cd74285..b8d2515cb2 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/PoolConfiguration.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/PoolConfiguration.java
+@@ -770,5 +770,22 @@ public interface PoolConfiguration {
+      */
+     public String getDataSourceJNDI();
+     
++    /**
++     * Returns true if the call {@link DataSource#getConnection(String, String) getConnection(username,password)} is 
++     * allowed. This is used for when the pool is used by an application accessing multiple schemas.
++     * There is a performance impact turning this option on.
++     * @return true if {@link DataSource#getConnection(String, String) getConnection(username,password)} is honored, false if it is ignored.
++     */
++    public boolean isAlternateUsernameAllowed();
++    
++    /**
++     * Set to true if the call {@link DataSource#getConnection(String, String) getConnection(username,password)} is 
++     * allowed and honored.. This is used for when the pool is used by an application accessing multiple schemas.
++     * There is a performance impact turning this option on, even when not used due to username checks.
++     * @param alternateUsernameAllowed - set true if {@link DataSource#getConnection(String, String) getConnection(username,password)} is honored, 
++     * false if it is to be ignored.
++     */
++    public void setAlternateUsernameAllowed(boolean alternateUsernameAllowed);
++    
+ 
+ }
+\ No newline at end of file
+
+==================================================
+PooledConnection.java
+index 931ae1cdc9..2caf50bba9 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/PoolProperties.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/PoolProperties.java
+@@ -80,6 +80,7 @@ public class PoolProperties implements PoolConfiguration {
+     protected int suspectTimeout = 0;
+     protected Object dataSource = null;
+     protected String dataSourceJNDI = null;
++    protected boolean alternateUsernameAllowed = false;
+     
+     
+     /** 
+@@ -1032,4 +1033,19 @@ public class PoolProperties implements PoolConfiguration {
+         }
+         return props;
+     }
++    
++    /** 
++     * {@inheritDoc}
++     */
++    public boolean isAlternateUsernameAllowed() {
++        return alternateUsernameAllowed;
++    }
++    
++    /** 
++     * {@inheritDoc}
++     */
++    public void setAlternateUsernameAllowed(boolean alternateUsernameAllowed) {
++        this.alternateUsernameAllowed = alternateUsernameAllowed;
++    }
++    
+ }
+
+==================================================
+ConnectionPool.java
+index 69f79978d3..526bc60c0f 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/PooledConnection.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/PooledConnection.java
+@@ -20,6 +20,7 @@ package org.apache.tomcat.jdbc.pool;
+ import java.sql.SQLException;
+ import java.sql.Statement;
+ import java.util.HashMap;
++import java.util.Properties;
+ import java.util.concurrent.locks.ReentrantReadWriteLock;
+ 
+ import org.apache.juli.logging.Log;
+@@ -40,6 +41,10 @@ public class PooledConnection {
+      */
+     private static final Log log = LogFactory.getLog(PooledConnection.class);
+ 
++    public static final String PROP_USER = "user";
++    
++    public static final String PROP_PASSWORD = "password";
++    
+     /**
+      * Validate when connection is borrowed flag
+      */
+@@ -122,6 +127,26 @@ public class PooledConnection {
+         this.parent = parent;
+     }
+ 
++    public boolean checkUser(String username, String password) {
++        if (!getPoolProperties().isAlternateUsernameAllowed()) return true;
++        
++        if (username==null) username = poolProperties.getUsername();
++        if (password==null) password = poolProperties.getPassword();
++        
++        String storedUsr = (String)getAttributes().get(PROP_USER);
++        String storedPwd = (String)getAttributes().get(PROP_PASSWORD);
++        
++        boolean result = (username==null && storedUsr==null);
++        result = (result || (username!=null && username.equals(storedUsr)));
++                
++        result = result && ((password==null && storedPwd==null) || (password!=null && password.equals(storedPwd)));
++        
++        if (username==null)  getAttributes().remove(PROP_USER); else getAttributes().put(PROP_USER, username);
++        if (password==null)  getAttributes().remove(PROP_PASSWORD); else getAttributes().put(PROP_PASSWORD, password);
++        
++        return result;
++    }
++    
+     /**
+      * Connects the underlying connection to the database.
+      * @throws SQLException if the method {@link #release()} has been called.
+@@ -162,10 +187,24 @@ public class PooledConnection {
+     }
+     
+     protected void connectUsingDataSource() throws SQLException {
++        String usr = null;
++        String pwd = null;
++        if (getAttributes().containsKey(PROP_USER)) {
++            usr = (String) getAttributes().get(PROP_USER);
++        } else {
++            usr = poolProperties.getUsername();
++            getAttributes().put(PROP_USER, usr);
++        }
++        if (getAttributes().containsKey(PROP_PASSWORD)) {
++            pwd = (String) getAttributes().get(PROP_PASSWORD);
++        } else {
++            pwd = poolProperties.getPassword();
++            getAttributes().put(PROP_PASSWORD, pwd);
++        }
+         if (poolProperties.getDataSource() instanceof javax.sql.XADataSource) {
+             javax.sql.XADataSource xds = (javax.sql.XADataSource)poolProperties.getDataSource();
+-            if (poolProperties.getUsername()!=null && poolProperties.getPassword()!=null) {
+-                xaConnection = xds.getXAConnection(poolProperties.getUsername(), poolProperties.getPassword());
++            if (usr!=null && pwd!=null) {
++                xaConnection = xds.getXAConnection(usr, pwd);
+                 connection = xaConnection.getConnection();
+             } else {
+                 xaConnection = xds.getXAConnection();
+@@ -173,15 +212,15 @@ public class PooledConnection {
+             }
+         } else if (poolProperties.getDataSource() instanceof javax.sql.DataSource){
+             javax.sql.DataSource ds = (javax.sql.DataSource)poolProperties.getDataSource();
+-            if (poolProperties.getUsername()!=null && poolProperties.getPassword()!=null) {
+-                connection = ds.getConnection(poolProperties.getUsername(), poolProperties.getPassword());
++            if (usr!=null && pwd!=null) {
++                connection = ds.getConnection(usr, pwd);
+             } else {
+                 connection = ds.getConnection();
+             }
+         } else if (poolProperties.getDataSource() instanceof javax.sql.ConnectionPoolDataSource){
+             javax.sql.ConnectionPoolDataSource ds = (javax.sql.ConnectionPoolDataSource)poolProperties.getDataSource();
+-            if (poolProperties.getUsername()!=null && poolProperties.getPassword()!=null) {
+-                connection = ds.getPooledConnection(poolProperties.getUsername(), poolProperties.getPassword()).getConnection();
++            if (usr!=null && pwd!=null) {
++                connection = ds.getPooledConnection(usr, pwd).getConnection();
+             } else {
+                 connection = ds.getPooledConnection().getConnection();
+             }
+@@ -203,17 +242,26 @@ public class PooledConnection {
+             throw ex;
+         }
+         String driverURL = poolProperties.getUrl();
+-        String usr = poolProperties.getUsername();
+-        String pwd = poolProperties.getPassword();
+-        if (usr != null) {
+-            poolProperties.getDbProperties().setProperty("user", usr);
++        String usr = null;
++        String pwd = null;
++        if (getAttributes().containsKey(PROP_USER)) {
++            usr = (String) getAttributes().get(PROP_USER);
++        } else {
++            usr = poolProperties.getUsername();
++            getAttributes().put(PROP_USER, usr);
+         }
+-        if (pwd != null) {
+-            poolProperties.getDbProperties().setProperty("password", pwd);
++        if (getAttributes().containsKey(PROP_PASSWORD)) {
++            pwd = (String) getAttributes().get(PROP_PASSWORD);
++        } else {
++            pwd = poolProperties.getPassword();
++            getAttributes().put(PROP_PASSWORD, pwd);
+         }
+-        
++        Properties properties = clone(poolProperties.getDbProperties());
++        if (usr != null) properties.setProperty(PROP_USER, usr);
++        if (pwd != null) properties.setProperty(PROP_PASSWORD, pwd);
++
+         try {
+-            connection = driver.connect(driverURL, poolProperties.getDbProperties());
++            connection = connection = driver.connect(driverURL, properties);
+         } catch (Exception x) {
+             if (log.isDebugEnabled()) {
+                 log.debug("Unable to connect to database.", x);
+@@ -235,6 +283,12 @@ public class PooledConnection {
+         }
+     }
+     
++    private Properties clone(Properties p) {
++        Properties c = new Properties();
++        c.putAll(p);
++        return c;
++    }
++    
+     /**
+      * 
+      * @return true if connect() was called successfully and disconnect has not yet been called
+
+==================================================
+AlternateUsernameTest.java
+index b10878dd9f..52c766bd84 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/jmx/ConnectionPool.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/jmx/ConnectionPool.java
+@@ -622,5 +622,19 @@ public class ConnectionPool extends NotificationBroadcasterSupport implements Co
+     public String getDataSourceJNDI() {
+         return getPoolProperties().getDataSourceJNDI();
+     }
++    
++    /** 
++     * {@inheritDoc}
++     */
++    public boolean isAlternateUsernameAllowed() {
++        return getPoolProperties().isAlternateUsernameAllowed();
++    }
++    
++    /** 
++     * {@inheritDoc}
++     */
++    public void setAlternateUsernameAllowed(boolean alternateUsernameAllowed) {
++        //noop
++    }
+ 
+ }
+
+==================================================
+Connection.java
+new file mode 100644
+index 0000000000..c72bd6e283
+--- /dev/null
++++ b/modules/jdbc-pool/test/org/apache/tomcat/jdbc/test/AlternateUsernameTest.java
+@@ -0,0 +1,132 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++
++package org.apache.tomcat.jdbc.test;
++
++import java.sql.SQLException;
++import java.util.Arrays;
++import java.util.List;
++import java.util.Random;
++import java.util.concurrent.Callable;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
++
++import javax.sql.PooledConnection;
++
++import org.apache.tomcat.jdbc.test.driver.Connection;
++import org.apache.tomcat.jdbc.test.driver.Driver;
++
++
++public class AlternateUsernameTest extends DefaultTestCase {
++
++    private static final int iterations = (new Random(System.currentTimeMillis())).nextInt(100000)+1000;
++    public AlternateUsernameTest(String name) {
++        super(name);
++    }
++    
++    public void testGeneric() throws Exception {
++        
++        this.init();
++        this.datasource.setDriverClassName(Driver.class.getName());
++        this.datasource.setUrl("jdbc:tomcat:test");
++        this.datasource.setAlternateUsernameAllowed(true);
++        this.datasource.getConnection().close();
++        int withoutuser =10;
++        int withuser = withoutuser;
++        TestRunner[] runners = new TestRunner[withuser+withoutuser];
++        for (int i=0; i<withuser; i++) {
++            TestRunner with = new TestRunner("foo","bar",datasource.getPoolProperties().getUsername(),datasource.getPoolProperties().getPassword());
++            TestRunner without = new TestRunner(null,null,datasource.getPoolProperties().getUsername(),datasource.getPoolProperties().getPassword());
++            runners[i] = with;
++            runners[i+withuser] = without;
++        }
++        ExecutorService svc = Executors.newFixedThreadPool(withuser+withoutuser);
++        List<Future<TestResult>> results =  svc.invokeAll(Arrays.asList(runners));
++        int failures = 0;
++        int total = 0;
++        for (int i=0; i<withuser; i++) {
++            failures += results.get(i).get().failures;
++            total+=results.get(i).get().iterations;
++            failures += results.get(i+withuser).get().failures;
++            total+=results.get(i+withuser).get().iterations;
++        }
++        assertEquals("Nr of failures was:"+failures,0, failures);
++        svc.shutdownNow();
++        this.datasource.close();
++        System.out.println("Nr of connect() calls:"+Driver.connectCount.get());
++        System.out.println("Nr of disconnect() calls:"+Driver.disconnectCount.get());
++        System.out.println("Nr of iterations:"+total);
++
++    }
++    
++    public static class TestResult {
++        public int iterations;
++        public int failures;
++        public String lastMessage;
++    }
++    
++    public class TestRunner implements Callable<TestResult> {
++        String username;
++        String password;
++        volatile boolean done = false;
++        TestResult result = null;
++        boolean useuser = true;
++        
++        public TestRunner(String user, String pass, String guser, String gpass) {
++            username = user==null?guser : user;
++            password = pass==null?gpass : pass;
++            useuser = user!=null;
++        }
++        
++        public TestResult call() {
++            TestResult test = new TestResult();
++            PooledConnection pcon = null;
++            for (int i=0; (!done) && (i<iterations); i++) {
++                test.iterations = i+1;
++                try {
++                    
++                    
++                    pcon = useuser ? (PooledConnection)AlternateUsernameTest.this.datasource.getConnection(username, password) :
++                                     (PooledConnection)AlternateUsernameTest.this.datasource.getConnection();
++                    
++                    Connection con = (Connection)pcon.getConnection();
++                    
++                    assertTrue("Username mismatch: Requested User:"+username+" Actual user:"+con.getUsername(), con.getUsername().equals(username));
++                    assertTrue("Password mismatch: Requested Password:"+password+" Actual password:"+con.getPassword(), con.getPassword().equals(password));
++                }catch (SQLException x) {
++                    test.failures++;
++                    test.lastMessage = x.getMessage();
++                    done = true;
++                    x.printStackTrace();
++                }catch (Exception x) {
++                    test.failures++;
++                    test.lastMessage = x.getMessage();
++                    x.printStackTrace();
++                } finally {
++                    if (pcon!=null) {
++                        try {pcon.close(); }catch (Exception ignore) {}
++                        pcon = null;
++                    }
++                }
++            }
++            done = true;
++            result = test;
++            return result;
++        }
++    }
++}
+
+==================================================
+Driver.java
+index b37d37d405..8fc3888229 100644
+--- a/modules/jdbc-pool/test/org/apache/tomcat/jdbc/test/driver/Connection.java
++++ b/modules/jdbc-pool/test/org/apache/tomcat/jdbc/test/driver/Connection.java
+@@ -33,8 +33,23 @@ import java.sql.Struct;
+ import java.util.Map;
+ import java.util.Properties;
+ 
+-public class Connection implements java.sql.Connection {
++import org.apache.tomcat.jdbc.pool.PooledConnection;
+ 
++public class Connection implements java.sql.Connection {
++    Properties info;
++    
++    public Connection(Properties info) {
++        this.info = info;
++    }
++    
++    public String getUsername() {
++        return info.getProperty(PooledConnection.PROP_USER);
++    }
++    
++    public String getPassword() {
++        return info.getProperty(PooledConnection.PROP_PASSWORD);
++    }
++    
+     public void clearWarnings() throws SQLException {
+     }
+ 
+
+==================================================

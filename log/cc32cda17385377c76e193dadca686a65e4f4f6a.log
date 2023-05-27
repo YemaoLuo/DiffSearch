@@ -1,0 +1,254 @@
+cc32cda17385377c76e193dadca686a65e4f4f6a
+==================================================
+Add the following features
+==================================================
+Filip Hanik
+==================================================
+Thu Apr 30 19:41:07 2009 +0000
+==================================================
+ConnectionPool.java
+index 84cf4eac92..a0a54bfb77 100644
+--- a/modules/jdbc-pool/doc/jdbc-pool.xml
++++ b/modules/jdbc-pool/doc/jdbc-pool.xml
+@@ -73,6 +73,15 @@
+           that has over 200 source files(last time we checked), Tomcat jdbc has a core of 8 files, the connection pool itself is about half 
+           that. As bugs may occur, they will be faster to track down, and easier to fix. Complexity reduction has been a focus from inception.</li>
+       <li>Asynchronous connection retrieval - you can queue your request for a connection and receive a Future&lt;Connection&gt; back.</li>    
++      <li>Better idle connection handling. Instead of closing connections directly, it can still pool connections and sizes the idle pool with a smarter algorithm.</li>    
++      <li>You can decide at what moment connections are considered abandoned, is it when the pool is full, or directly at a timeout
++          by specifying a threshold.
++      </li>    
++      <li>The abandon connection timer will reset upon a statement/query activity. Allowing a connections that is in use for a long time to not timeout.
++          This is achieved using the ResetAbandonedTimer
++      </li>    
++      <li>Close connections after they have been connected for a certain time. Age based close upon return to the pool.
++      </li>    
+     </ol>
+   </p>
+ 
+@@ -338,6 +347,14 @@
+          as <code>removeAbandonedTimeout</code> has been reached.</p>
+     </attribute>
+ 
++    <attribute name="maxAge" required="false">
++      <p>(long) Time in milliseconds to keep this connection. When a connection is returned to the pool,
++         the pool will check to see if the <code>now - time-when-connected > maxAge</code> has been reached,
++         and if so, it closes the connection rather than returning it to the pool.
++         The default value is <code>0</code>, which implies that connections will be left open and no age check
++         will be done upon returning the connection to the pool.</p>
++    </attribute>
++
+     <attribute name="useEquals" required="false">
+       <p>(boolean) Set to true if you wish the <code>ProxyConnection</code> class to use <code>String.equals</code> instead of 
+          <code>==</code> when comparing method names. This property does not apply to added interceptors as those are configured individually.
+
+==================================================
+DataSource.java
+index f5a39a2553..1989d5e886 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/ConnectionPool.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/ConnectionPool.java
+@@ -609,6 +609,17 @@ public class ConnectionPool {
+         }
+     }
+ 
++    protected boolean shouldClose(PooledConnection con, int action) {
++        if (con.isDiscarded()) return true;
++        if (isClosed()) return true;
++        if (!con.validate(action)) return true;
++        if (getPoolProperties().getMaxAge()>0 ) {
++            return (System.currentTimeMillis()-con.getLastConnected()) > getPoolProperties().getMaxAge();
++        } else {
++            return false;
++        }
++    }
++    
+     /**
+      * Returns a connection to the pool
+      * @param con PooledConnection
+@@ -626,8 +637,8 @@ public class ConnectionPool {
+                 con.lock();
+ 
+                 if (busy.remove(con)) {
+-                    if ((!con.isDiscarded()) && (!isClosed()) &&
+-                            con.validate(PooledConnection.VALIDATE_RETURN)) {
++                    
++                    if (!shouldClose(con,PooledConnection.VALIDATE_RETURN)) {
+                         con.setStackTrace(null);
+                         con.setTimestamp(System.currentTimeMillis());
+                         if (((idle.size()>=poolProperties.getMaxIdle()) && !poolProperties.isPoolSweeperEnabled()) || (!idle.offer(con))) {
+@@ -654,12 +665,11 @@ public class ConnectionPool {
+         } //end if
+     } //checkIn
+ 
+-    public boolean shouldAbandon() {
++    protected boolean shouldAbandon() {
+         if (poolProperties.getAbandonWhenPercentageFull()==0) return true;
+         float used = (float)busy.size();
+         float max  = (float)poolProperties.getMaxActive();
+         float perc = (float)poolProperties.getAbandonWhenPercentageFull();
+-        System.out.println("Abandon rate:"+(used/max*100f));
+         return (used/max*100f)>=perc;
+     }
+     
+
+==================================================
+DataSourceFactory.java
+index 65eb82ddd5..c4cc4af8ac 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/DataSource.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/DataSource.java
+@@ -249,6 +249,14 @@ public class DataSource extends DataSourceProxy implements MBeanRegistration,jav
+             throw new RuntimeException(x);
+         }
+     }
++    
++    public long getMaxAge() {
++        try {
++            return createPool().getPoolProperties().getMaxAge();
++        }catch (SQLException x) {
++            throw new RuntimeException(x);
++        }
++    }    
+ 
+     public String getName() {
+         try {
+
+==================================================
+PoolProperties.java
+index ac09e202cd..54e45c858e 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/DataSourceFactory.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/DataSourceFactory.java
+@@ -78,6 +78,7 @@ public class DataSourceFactory implements ObjectFactory {
+     protected final static String PROP_MINIDLE = "minIdle";
+     protected final static String PROP_INITIALSIZE = "initialSize";
+     protected final static String PROP_MAXWAIT = "maxWait";
++    protected final static String PROP_MAXAGE = "maxAge";
+     
+     protected final static String PROP_TESTONBORROW = "testOnBorrow";
+     protected final static String PROP_TESTONRETURN = "testOnReturn";
+@@ -149,7 +150,8 @@ public class DataSourceFactory implements ObjectFactory {
+         PROP_FAIR_QUEUE,
+         PROP_USE_EQUALS,
+         OBJECT_NAME,
+-        PROP_ABANDONWHENPERCENTAGEFULL
++        PROP_ABANDONWHENPERCENTAGEFULL,
++        PROP_MAXAGE
+     };
+ 
+     // -------------------------------------------------- ObjectFactory Methods
+@@ -417,6 +419,11 @@ public class DataSourceFactory implements ObjectFactory {
+             poolProperties.setAbandonWhenPercentageFull(Integer.parseInt(value));
+         }
+         
++        value = properties.getProperty(PROP_MAXAGE);
++        if (value != null) {
++            poolProperties.setMaxAge(Long.parseLong(value));
++        }
++        
+         return poolProperties;
+     }
+ 
+
+==================================================
+PooledConnection.java
+index 37e01d244f..9d47b9b021 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/PoolProperties.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/PoolProperties.java
+@@ -71,6 +71,7 @@ public class PoolProperties {
+     protected boolean fairQueue = true;
+     protected boolean useEquals = false;
+     protected int abandonWhenPercentageFull = 0;
++    protected long maxAge = 0;
+ 
+     private InterceptorDefinition[] interceptors = null;
+     
+@@ -523,4 +524,14 @@ public class PoolProperties {
+         this.useEquals = useEquals;
+     }
+ 
++    public long getMaxAge() {
++        return maxAge;
++    }
++
++    public void setMaxAge(long maxAge) {
++        this.maxAge = maxAge;
++    }
++    
++    
++
+ }
+
+==================================================
+ConnectionPool.java
+index bc051d342b..429e6af1a4 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/PooledConnection.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/PooledConnection.java
+@@ -85,6 +85,10 @@ public class PooledConnection {
+      * Set to true if this connection has been discarded by the pool
+      */
+     protected boolean discarded = false;
++    /**
++     * The Timestamp when the last time the connect() method was called successfully
++     */
++    protected volatile long lastConnected = -1;
+     /**
+      * timestamp to keep track of validation intervals
+      */
+@@ -163,6 +167,7 @@ public class PooledConnection {
+             if (poolProperties.getDefaultTransactionIsolation()!=DataSourceFactory.UNKNOWN_TRANSACTIONISOLATION) connection.setTransactionIsolation(poolProperties.getDefaultTransactionIsolation());
+         }        
+         this.discarded = false;
++        this.lastConnected = System.currentTimeMillis();
+     }
+     
+     /**
+@@ -193,6 +198,7 @@ public class PooledConnection {
+             }
+         }
+         connection = null;
++        lastConnected = -1;
+         if (finalize) parent.finalize(this);
+     }
+ 
+@@ -381,6 +387,12 @@ public class PooledConnection {
+     public java.sql.Connection getConnection() {
+         return this.connection;
+     }
++    
++    
++
++    public long getLastConnected() {
++        return lastConnected;
++    }
+ 
+     /**
+      * Returns the first handler in the interceptor chain
+
+==================================================
+ConnectionPoolMBean.java
+index cdc18a1fc2..577d887fd5 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/jmx/ConnectionPool.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/jmx/ConnectionPool.java
+@@ -276,5 +276,8 @@ public class ConnectionPool extends NotificationBroadcasterSupport implements Co
+     public int getAbandonWhenPercentageFull() {
+         return pool.getPoolProperties().getAbandonWhenPercentageFull();
+     }
++    public long getMaxAge() {
++        return pool.getPoolProperties().getMaxAge();
++    }
+ 
+ }
+
+==================================================
+AbandonPercentageTest.java
+index 1b8711bfa6..aab9f24ad3 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/jmx/ConnectionPoolMBean.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/jmx/ConnectionPoolMBean.java
+@@ -118,4 +118,6 @@ public interface ConnectionPoolMBean  {
+ 
+     public int getAbandonWhenPercentageFull();
+     
++    public long getMaxAge();
++    
+ }
+
+==================================================

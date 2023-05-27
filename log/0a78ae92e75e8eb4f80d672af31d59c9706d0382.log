@@ -1,0 +1,235 @@
+0a78ae92e75e8eb4f80d672af31d59c9706d0382
+==================================================
+Fully replace Stream with RecycledStream
+==================================================
+Mark Thomas
+==================================================
+Fri Sep 25 12:26:40 2020 +0100
+==================================================
+AbstractNonZeroStream.java
+Fully replace Stream with RecycledStream
+
+Profiler (YourKit) suggests retain memory for Stream ~60k whereas
+RecycledStream ins ~300 bytes.
+
+
+==================================================
+Http2UpgradeHandler.java
+index 084de33d76..bbdfa333d3 100644
+--- a/java/org/apache/coyote/http2/AbstractNonZeroStream.java
++++ b/java/org/apache/coyote/http2/AbstractNonZeroStream.java
+@@ -33,19 +33,17 @@ abstract class AbstractNonZeroStream extends AbstractStream {
+ 
+     protected final StreamStateMachine state;
+ 
+-    private volatile int weight;
++    private volatile int weight = Constants.DEFAULT_WEIGHT;
+ 
+ 
+     AbstractNonZeroStream(String connectionId, Integer identifier) {
+         super(identifier);
+-        this.weight = Constants.DEFAULT_WEIGHT;
+         this.state = new StreamStateMachine(connectionId, getIdAsString());
+     }
+ 
+ 
+-    AbstractNonZeroStream(Integer identifier, int weight, StreamStateMachine state) {
++    AbstractNonZeroStream(Integer identifier, StreamStateMachine state) {
+         super(identifier);
+-        this.weight = weight;
+         this.state = state;
+     }
+ 
+@@ -56,6 +54,13 @@ abstract class AbstractNonZeroStream extends AbstractStream {
+     }
+ 
+ 
++    /*
++     * General method used when reprioritising a stream and care needs to be
++     * taken not to create circular references.
++     *
++     * Changes to the priority tree need to be sychronized at the connection
++     * level. This is the caller's responsibility.
++     */
+     final void rePrioritise(AbstractStream parent, boolean exclusive, int weight) {
+         if (log.isDebugEnabled()) {
+             log.debug(sm.getString("stream.reprioritisation.debug",
+@@ -90,6 +95,9 @@ abstract class AbstractNonZeroStream extends AbstractStream {
+     /*
+      * Used when removing closed streams from the tree and we know there is no
+      * need to check for circular references.
++     *
++     * Changes to the priority tree need to be sychronized at the connection
++     * level. This is the caller's responsibility.
+      */
+     final void rePrioritise(AbstractStream parent, int weight) {
+         if (log.isDebugEnabled()) {
+@@ -103,6 +111,27 @@ abstract class AbstractNonZeroStream extends AbstractStream {
+     }
+ 
+ 
++    /*
++     * Used when "recycling" a stream and replacing a Stream instance with a
++     * RecycledStream instance.
++     *
++     * Replace this stream with the provided stream in the parent/child
++     * hierarchy.
++     *
++     * Changes to the priority tree need to be sychronized at the connection
++     * level. This is the caller's responsibility.
++     */
++    void replaceStream(AbstractNonZeroStream replacement) {
++        replacement.setParentStream(getParentStream());
++        detachFromParent();
++        for (AbstractNonZeroStream child : getChildStreams()) {
++            replacement.addChild(child);
++        }
++        getChildStreams().clear();
++        replacement.weight = weight;
++    }
++
++
+     final boolean isClosedFinal() {
+         return state.isClosedFinal();
+     }
+
+==================================================
+RecycledStream.java
+index 77dc339dad..a023fe0531 100644
+--- a/java/org/apache/coyote/http2/Http2UpgradeHandler.java
++++ b/java/org/apache/coyote/http2/Http2UpgradeHandler.java
+@@ -94,6 +94,8 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
+ 
+     private static final HeaderSink HEADER_SINK = new HeaderSink();
+ 
++    private final Object priorityTreeLock = new Object();
++
+     protected final String connectionId;
+ 
+     protected final Http2Protocol protocol;
+@@ -104,8 +106,7 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
+     private volatile Http2Parser parser;
+ 
+     // Simple state machine (sequence of states)
+-    private AtomicReference<ConnectionState> connectionState =
+-            new AtomicReference<>(ConnectionState.NEW);
++    private AtomicReference<ConnectionState> connectionState = new AtomicReference<>(ConnectionState.NEW);
+     private volatile long pausedNanoTime = Long.MAX_VALUE;
+ 
+     /**
+@@ -1175,7 +1176,7 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
+         newStreamsSinceLastPrune = 0;
+ 
+         // RFC 7540, 5.3.4 endpoints should maintain state for at least the
+-        // maximum number of concurrent streams
++        // maximum number of concurrent streams.
+         long max = localSettings.getMaxConcurrentStreams();
+ 
+         final int size = streams.size();
+@@ -1184,9 +1185,13 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
+                     Long.toString(max), Integer.toString(size)));
+         }
+ 
+-        // Allow an additional 10% for closed streams that are used in the
+-        // priority tree
+-        max = max + max / 10;
++        // Only need ~+10% for streams that are in the priority tree,
++        // Ideally need to retain information for a "significant" amount of time
++        // after sending END_STREAM (RFC 7540, page 20) so we detect potential
++        // connection error. 5x seems reasonable. The client will have had
++        // plenty of opportunity to process the END_STREAM if another 5x max
++        // concurrent streams have been processed.
++        max = max * 5;
+         if (max > Integer.MAX_VALUE) {
+             max = Integer.MAX_VALUE;
+         }
+@@ -1284,27 +1289,29 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
+ 
+ 
+     private void removeStreamFromPriorityTree(Integer streamIdToRemove) {
+-        AbstractNonZeroStream streamToRemove = streams.remove(streamIdToRemove);
+-        // Move the removed Stream's children to the removed Stream's
+-        // parent.
+-        Set<AbstractNonZeroStream> children = streamToRemove.getChildStreams();
+-        if (children.size() == 1) {
+-            // Shortcut
+-            children.iterator().next().rePrioritise(
+-                    streamToRemove.getParentStream(), streamToRemove.getWeight());
+-        } else {
+-            int totalWeight = 0;
+-            for (AbstractNonZeroStream child : children) {
+-                totalWeight += child.getWeight();
+-            }
+-            for (AbstractNonZeroStream child : children) {
++        synchronized (priorityTreeLock) {
++            AbstractNonZeroStream streamToRemove = streams.remove(streamIdToRemove);
++            // Move the removed Stream's children to the removed Stream's
++            // parent.
++            Set<AbstractNonZeroStream> children = streamToRemove.getChildStreams();
++            if (children.size() == 1) {
++                // Shortcut
+                 children.iterator().next().rePrioritise(
+-                        streamToRemove.getParentStream(),
+-                        streamToRemove.getWeight() * child.getWeight() / totalWeight);
++                        streamToRemove.getParentStream(), streamToRemove.getWeight());
++            } else {
++                int totalWeight = 0;
++                for (AbstractNonZeroStream child : children) {
++                    totalWeight += child.getWeight();
++                }
++                for (AbstractNonZeroStream child : children) {
++                    children.iterator().next().rePrioritise(
++                            streamToRemove.getParentStream(),
++                            streamToRemove.getWeight() * child.getWeight() / totalWeight);
++                }
+             }
++            streamToRemove.detachFromParent();
++            children.clear();
+         }
+-        streamToRemove.detachFromParent();
+-        children.clear();
+     }
+ 
+ 
+@@ -1544,7 +1551,9 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
+         if (parentStream == null) {
+             parentStream = this;
+         }
+-        abstractNonZeroStream.rePrioritise(parentStream, exclusive, weight);
++        synchronized (priorityTreeLock) {
++            abstractNonZeroStream.rePrioritise(parentStream, exclusive, weight);
++        }
+     }
+ 
+ 
+@@ -1740,7 +1749,10 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
+ 
+ 
+     void replaceStream(AbstractNonZeroStream original, AbstractNonZeroStream replacement) {
+-        streams.replace(original.getIdentifier(), replacement);
++        synchronized (priorityTreeLock) {
++            streams.replace(original.getIdentifier(), replacement);
++            original.replaceStream(replacement);
++        }
+     }
+ 
+ 
+
+==================================================
+Stream.java
+index 9d6177cd1f..b2b3e32ac1 100644
+--- a/java/org/apache/coyote/http2/RecycledStream.java
++++ b/java/org/apache/coyote/http2/RecycledStream.java
+@@ -24,8 +24,8 @@ class RecycledStream extends AbstractNonZeroStream {
+ 
+     private final String connectionId;
+ 
+-    RecycledStream(String connectionId, Integer identifier, int weight, StreamStateMachine state) {
+-        super(identifier, weight, state);
++    RecycledStream(String connectionId, Integer identifier, StreamStateMachine state) {
++        super(identifier, state);
+         this.connectionId = connectionId;
+     }
+ 
+
+==================================================

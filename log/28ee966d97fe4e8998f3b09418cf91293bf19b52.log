@@ -1,0 +1,251 @@
+28ee966d97fe4e8998f3b09418cf91293bf19b52
+==================================================
+Fix BZ 66023 - improve handling of HTTP upgrade with request body
+==================================================
+Mark Thomas
+==================================================
+Fri Apr 29 11:17:39 2022 +0100
+==================================================
+Stream.java
+Fix BZ 66023 - improve handling of HTTP upgrade with request body
+
+https://bz.apache.org/bugzilla/show_bug.cgi?id=66023
+
+The previous fix (BZ 65726) made the saved request body available to the
+request object but didn't update the processor. This patch extends the
+previous fix to make the request and processor objects consistent. It
+addresses the issue identified in 66023 and should address any
+additional, related issues. If a use case has been missed, the fix
+should be as simple as an update to the SavedRequestStreamInputBuffer.
+
+
+==================================================
+Http2TestBase.java
+index a142836e5f..f0d5207e43 100644
+--- a/java/org/apache/coyote/http2/Stream.java
++++ b/java/org/apache/coyote/http2/Stream.java
+@@ -34,6 +34,7 @@ import org.apache.coyote.Request;
+ import org.apache.coyote.Response;
+ import org.apache.coyote.http11.HttpOutputBuffer;
+ import org.apache.coyote.http11.OutputFilter;
++import org.apache.coyote.http11.filters.SavedRequestInputFilter;
+ import org.apache.coyote.http11.filters.VoidOutputFilter;
+ import org.apache.coyote.http2.HpackDecoder.HeaderEmitter;
+ import org.apache.juli.logging.Log;
+@@ -100,12 +101,13 @@ class Stream extends AbstractNonZeroStream implements HeaderEmitter {
+         if (coyoteRequest == null) {
+             // HTTP/2 new request
+             this.coyoteRequest = new Request();
+-            this.inputBuffer = new StreamInputBuffer();
++            this.inputBuffer = new StandardStreamInputBuffer();
+             this.coyoteRequest.setInputBuffer(inputBuffer);
+         } else {
+             // HTTP/2 Push or HTTP/1.1 upgrade
+             this.coyoteRequest = coyoteRequest;
+-            this.inputBuffer = null;
++            this.inputBuffer = new SavedRequestStreamInputBuffer(
++                    (SavedRequestInputFilter) coyoteRequest.getInputBuffer());
+             // Headers have been read by this point
+             state.receivedStartOfHeaders();
+             if (HTTP_UPGRADE_STREAM.equals(identifier)) {
+@@ -1029,7 +1031,27 @@ class Stream extends AbstractNonZeroStream implements HeaderEmitter {
+     }
+ 
+ 
+-    class StreamInputBuffer implements InputBuffer {
++    abstract class StreamInputBuffer implements InputBuffer {
++
++        abstract void receiveReset();
++
++        abstract void swallowUnread() throws IOException;
++
++        abstract void notifyEof();
++
++        abstract ByteBuffer getInBuffer();
++
++        abstract void onDataAvailable() throws IOException;
++
++        abstract boolean isReadyForRead();
++
++        abstract boolean isRequestBodyFullyRead();
++
++        abstract void insertReplayedBody(ByteChunk body);
++    }
++
++
++    class StandardStreamInputBuffer extends StreamInputBuffer {
+ 
+         /* Two buffers are required to avoid various multi-threading issues.
+          * These issues arise from the fact that the Stream (or the
+@@ -1202,7 +1224,7 @@ class Stream extends AbstractNonZeroStream implements HeaderEmitter {
+         }
+ 
+ 
+-        private final ByteBuffer getInBuffer() {
++        final ByteBuffer getInBuffer() {
+             ensureBuffersExist();
+             return inBuffer;
+         }
+@@ -1229,7 +1251,7 @@ class Stream extends AbstractNonZeroStream implements HeaderEmitter {
+         }
+ 
+ 
+-        private final void receiveReset() {
++        final void receiveReset() {
+             if (inBuffer != null) {
+                 synchronized (inBuffer) {
+                     resetReceived = true;
+@@ -1238,7 +1260,7 @@ class Stream extends AbstractNonZeroStream implements HeaderEmitter {
+             }
+         }
+ 
+-        private final void notifyEof() {
++        final void notifyEof() {
+             if (inBuffer != null) {
+                 synchronized (inBuffer) {
+                     inBuffer.notifyAll();
+@@ -1246,7 +1268,7 @@ class Stream extends AbstractNonZeroStream implements HeaderEmitter {
+             }
+         }
+ 
+-        private final void swallowUnread() throws IOException {
++        final void swallowUnread() throws IOException {
+             synchronized (this) {
+                 closed = true;
+             }
+@@ -1272,4 +1294,65 @@ class Stream extends AbstractNonZeroStream implements HeaderEmitter {
+             }
+         }
+     }
++
++
++    class SavedRequestStreamInputBuffer extends StreamInputBuffer {
++
++        private final SavedRequestInputFilter inputFilter;
++
++        SavedRequestStreamInputBuffer(SavedRequestInputFilter inputFilter) {
++            this.inputFilter = inputFilter;
++        }
++
++
++        @Override
++        public int doRead(ApplicationBufferHandler handler) throws IOException {
++            return inputFilter.doRead(handler);
++        }
++
++        @Override
++        public int available() {
++            return inputFilter.available();
++        }
++
++        @Override
++        void receiveReset() {
++            // NO-OP
++        }
++
++        @Override
++        void swallowUnread() throws IOException {
++            // NO-OP
++        }
++
++        @Override
++        void notifyEof() {
++            // NO-OP
++        }
++
++        @Override
++        ByteBuffer getInBuffer() {
++            return null;
++        }
++
++        @Override
++        void onDataAvailable() throws IOException {
++            // NO-OP
++        }
++
++        @Override
++        boolean isReadyForRead() {
++            return true;
++        }
++
++        @Override
++        boolean isRequestBodyFullyRead() {
++            return inputFilter.isFinished();
++        }
++
++        @Override
++        void insertReplayedBody(ByteChunk body) {
++            // NO-OP
++        }
++    }
+ }
+
+==================================================
+TestHttp2UpgradeHandler.java
+index 76da7e0103..5a1cfaa037 100644
+--- a/test/org/apache/coyote/http2/Http2TestBase.java
++++ b/test/org/apache/coyote/http2/Http2TestBase.java
+@@ -20,6 +20,7 @@ import java.io.ByteArrayInputStream;
+ import java.io.ByteArrayOutputStream;
+ import java.io.IOException;
+ import java.io.InputStream;
++import java.io.InputStreamReader;
+ import java.io.OutputStream;
+ import java.io.PrintWriter;
+ import java.net.Socket;
+@@ -1409,20 +1410,44 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+         protected void doGet(HttpServletRequest req, HttpServletResponse resp)
+                 throws ServletException, IOException {
+             // Request bodies are unusal with GET but not illegal
++            doPost(req, resp);
++        }
++
++        @Override
++        protected void doPost(HttpServletRequest req, HttpServletResponse resp)
++                throws ServletException, IOException {
+ 
+             long total = 0;
+             long read = 0;
+-            byte[] buffer = new byte[1024];
+-            try (InputStream is = req.getInputStream()) {
+-                while ((read = is.read(buffer)) > 0) {
+-                    total += read;
++
++            if ("true".equals(req.getParameter("useReader"))) {
++                char[] buffer = new char[1024];
++
++                try (InputStream is = req.getInputStream();
++                        InputStreamReader reader = new InputStreamReader(is, StandardCharsets.UTF_8);) {
++                    while ((read = reader.read(buffer)) > 0) {
++                        total += read;
++                    }
+                 }
+-            }
+ 
+-            resp.setContentType("text/plain");
+-            resp.setCharacterEncoding("UTF-8");
+-            PrintWriter pw = resp.getWriter();
+-            pw.print("Total bytes read from request body [" + total + "]");
++                resp.setContentType("text/plain");
++                resp.setCharacterEncoding("UTF-8");
++                PrintWriter pw = resp.getWriter();
++                pw.print("Total chars read from request body [" + total + "]");
++
++            } else {
++                byte[] buffer = new byte[1024];
++                try (InputStream is = req.getInputStream()) {
++                    while ((read = is.read(buffer)) > 0) {
++                        total += read;
++                    }
++                }
++
++                resp.setContentType("text/plain");
++                resp.setCharacterEncoding("UTF-8");
++                PrintWriter pw = resp.getWriter();
++                pw.print("Total bytes read from request body [" + total + "]");
++            }
+         }
+     }
+ 
+
+==================================================

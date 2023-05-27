@@ -1,0 +1,187 @@
+3ae2323f5ffbb44a009ecb5f5facc181c4af4079
+==================================================
+Servlet 3.1 - Switch to using 303 rather than 302 redirects for HTTP/1.1 requests
+==================================================
+Mark Emlyn
+==================================================
+Mon Jun 17 12:23:51 2013 +0000
+==================================================
+FormAuthenticator.java
+Servlet 3.1 - Switch to using 303 rather than 302 redirects for HTTP/1.1 requests
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1493729 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Response.java
+index 906da251d9..bd649bc72c 100644
+--- a/java/org/apache/catalina/authenticator/FormAuthenticator.java
++++ b/java/org/apache/catalina/authenticator/FormAuthenticator.java
+@@ -32,6 +32,7 @@ import org.apache.catalina.Manager;
+ import org.apache.catalina.Realm;
+ import org.apache.catalina.Session;
+ import org.apache.catalina.connector.Request;
++import org.apache.catalina.connector.Response;
+ import org.apache.catalina.deploy.LoginConfig;
+ import org.apache.coyote.ActionCode;
+ import org.apache.juli.logging.Log;
+@@ -335,7 +336,17 @@ public class FormAuthenticator
+                 response.sendRedirect(response.encodeRedirectURL(uri));
+             }
+         } else {
+-            response.sendRedirect(response.encodeRedirectURL(requestURI));
++            // Until the Servlet API allows specifying the type of redirect to
++            // use.
++            Response internalResponse = request.getResponse();
++            String location = response.encodeRedirectURL(requestURI);
++            if ("HTTP/1.1".equals(request.getProtocol())) {
++                internalResponse.sendRedirect(location,
++                        HttpServletResponse.SC_SEE_OTHER);
++            } else {
++                internalResponse.sendRedirect(location,
++                        HttpServletResponse.SC_FOUND);
++            }
+         }
+         return false;
+ 
+
+==================================================
+TestFormAuthenticator.java
+index 33649211a2..fe1a2f088a 100644
+--- a/java/org/apache/catalina/connector/Response.java
++++ b/java/org/apache/catalina/connector/Response.java
+@@ -1244,7 +1244,15 @@ public class Response
+     @Override
+     public void sendRedirect(String location)
+         throws IOException {
++        sendRedirect(location, SC_FOUND);
++    }
+ 
++    /**
++     * Internal method that allows a redirect to be sent with a status other
++     * than {@link HttpServletResponse#SC_FOUND} (302). No attempt is made to
++     * validate the status code.
++     */
++    public void sendRedirect(String location, int status) throws IOException {
+         if (isCommitted()) {
+             throw new IllegalStateException
+                 (sm.getString("coyoteResponse.sendRedirect.ise"));
+@@ -1261,7 +1269,7 @@ public class Response
+         // Generate a temporary redirect to the specified location
+         try {
+             String absolute = toAbsolute(location);
+-            setStatus(SC_FOUND);
++            setStatus(status);
+             setHeader("Location", absolute);
+             if (getContext().getSendRedirectBody()) {
+                 PrintWriter writer = getWriter();
+
+==================================================
+SimpleHttpClient.java
+index 35fa623be6..3360eff2ec 100644
+--- a/test/org/apache/catalina/authenticator/TestFormAuthenticator.java
++++ b/test/org/apache/catalina/authenticator/TestFormAuthenticator.java
+@@ -75,6 +75,9 @@ public class TestFormAuthenticator extends TomcatBaseTest {
+     protected static final boolean CLIENT_USE_COOKIES = true;
+     protected static final boolean CLIENT_NO_COOKIES = !CLIENT_USE_COOKIES;
+ 
++    protected static final boolean CLIENT_USE_HTTP_11 = true;
++    protected static final boolean CLIENT_USE_HTTP_10 = !CLIENT_USE_HTTP_11;
++
+     protected static final boolean SERVER_USE_COOKIES = true;
+     protected static final boolean SERVER_NO_COOKIES = !SERVER_USE_COOKIES;
+ 
+@@ -236,6 +239,14 @@ public class TestFormAuthenticator extends TomcatBaseTest {
+                 FormAuthClient.LOGIN_REQUIRED, 1);
+     }
+ 
++    // HTTP 1.0 test
++    @Test
++    public void testGetWithCookiesHttp10() throws Exception {
++        doTest("GET", "GET", NO_100_CONTINUE,
++                CLIENT_USE_COOKIES, SERVER_USE_COOKIES, SERVER_CHANGE_SESSID,
++                CLIENT_USE_HTTP_10);
++    }
++
+     /*
+      * Choreograph the steps of the test dialogue with the server
+      *  1. while not authenticated, try to access a protected resource
+@@ -255,9 +266,20 @@ public class TestFormAuthenticator extends TomcatBaseTest {
+             boolean useContinue, boolean clientShouldUseCookies,
+             boolean serverWillUseCookies, boolean serverWillChangeSessid)
+             throws Exception {
++        return doTest(resourceMethod, redirectMethod, useContinue,
++                clientShouldUseCookies, serverWillUseCookies,
++                serverWillChangeSessid, true);
++    }
++
++        private String doTest(String resourceMethod, String redirectMethod,
++                boolean useContinue, boolean clientShouldUseCookies,
++                boolean serverWillUseCookies, boolean serverWillChangeSessid,
++                boolean clientShouldUseHttp11)
++                throws Exception {
+ 
+         client = new FormAuthClient(clientShouldUseCookies,
+-                serverWillUseCookies, serverWillChangeSessid);
++                clientShouldUseHttp11, serverWillUseCookies,
++                serverWillChangeSessid);
+ 
+         // First request for protected resource gets the login page
+         client.setUseContinue(useContinue);
+@@ -279,8 +301,13 @@ public class TestFormAuthenticator extends TomcatBaseTest {
+         // Second request replies to the login challenge
+         client.setUseContinue(useContinue);
+         client.doLoginRequest(loginUri);
+-        assertTrue("login failed " + client.getResponseLine(),
+-                client.isResponse302());
++        if (clientShouldUseHttp11) {
++            assertTrue("login failed " + client.getResponseLine(),
++                    client.isResponse303());
++        } else {
++            assertTrue("login failed " + client.getResponseLine(),
++                    client.isResponse302());
++        }
+         assertTrue(client.isResponseBodyOK());
+         String redirectUri = client.getRedirectUri();
+         client.reset();
+@@ -323,7 +350,7 @@ public class TestFormAuthenticator extends TomcatBaseTest {
+      *     persistence of the authenticated session
+      *
+      * @param resourceMethod HTTP method for accessing the protected resource
+-     * @param protectedUri to access (with or withour sessionid)
++     * @param protectedUri to access (with or without sessionid)
+      * @param useContinue whether the HTTP client should expect a 100 Continue
+      * @param clientShouldUseCookies whether the client should send cookies
+      * @param serverWillUseCookies whether the server should send cookies
+@@ -372,10 +399,15 @@ public class TestFormAuthenticator extends TomcatBaseTest {
+         protected final String SESSION_PARAMETER_START =
+             SESSION_PARAMETER_NAME + "=";
+ 
++        private boolean clientShouldUseHttp11;
++
+         private FormAuthClient(boolean clientShouldUseCookies,
++                boolean clientShouldUseHttp11,
+                 boolean serverShouldUseCookies,
+                 boolean serverShouldChangeSessid) throws Exception {
+ 
++            this.clientShouldUseHttp11 = clientShouldUseHttp11;
++
+             Tomcat tomcat = getTomcatInstance();
+             File appDir = new File(getBuildDirectory(), "webapps/examples");
+             Context ctx = tomcat.addWebapp(null, "/examples",
+@@ -447,7 +479,11 @@ public class TestFormAuthenticator extends TomcatBaseTest {
+                     requestHead.append("?role=bar");
+                 }
+             }
+-            requestHead.append(" HTTP/1.1").append(CRLF);
++            if (clientShouldUseHttp11) {
++                requestHead.append(" HTTP/1.1").append(CRLF);
++            } else {
++                requestHead.append(" HTTP/1.0").append(CRLF);
++            }
+ 
+             // next, add the constant http headers
+             requestHead.append("Host: localhost").append(CRLF);
+
+==================================================

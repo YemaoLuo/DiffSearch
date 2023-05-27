@@ -1,0 +1,161 @@
+8db3eadf24cc930a774087df34d3bcf48b9dfd90
+==================================================
+Fix various problems identified with flushing batched messages:
+==================================================
+Mark Thomas
+==================================================
+Thu Nov 20 06:30:08 2014 +0000
+==================================================
+WsRemoteEndpointImplBase.java
+index 1071976bab..a65f396572 100644
+--- a/java/org/apache/tomcat/websocket/LocalStrings.properties
++++ b/java/org/apache/tomcat/websocket/LocalStrings.properties
+@@ -70,7 +70,7 @@ wsRemoteEndpoint.closedOutputStream=This method may not be called as the OutputS
+ wsRemoteEndpoint.closedWriter=This method may not be called as the Writer has been closed
+ wsRemoteEndpoint.changeType=When sending a fragmented message, all fragments bust be of the same type
+ wsRemoteEndpoint.concurrentMessageSend=Messages may not be sent concurrently even when using the asynchronous send messages. The client must wait for the previous message to complete before sending the next.
+-wsRemoteEndpoint.flushOnCloseFailed=Flushing batched messages before closing the session failed
++wsRemoteEndpoint.flushOnCloseFailed=Batched messages still enabled after session has been closed. Unable to flush remaining batched message.
+ wsRemoteEndpoint.invalidEncoder=The specified encoder of type [{0}] could not be instantiated
+ wsRemoteEndpoint.noEncoder=No encoder specified for object of class [{0}]
+ wsRemoteEndpoint.wrongState=The remote endpoint was in state [{0}] which is an invalid state for called method
+@@ -88,6 +88,7 @@ wsSession.duplicateHandlerBinary=A binary message handler has already been confi
+ wsSession.duplicateHandlerPong=A pong message handler has already been configured
+ wsSession.duplicateHandlerText=A text message handler has already been configured
+ wsSession.invalidHandlerTypePong=A pong message handler must implement MessageHandler.Basic
++wsSession.flushFailOnClose=Failed to flush batched messages on session close
+ wsSession.messageFailed=Unable to write the complete message as the WebSocket connection has been closed
+ wsSession.sendCloseFail=Failed to send close message to remote endpoint
+ wsSession.removeHandlerFailed=Unable to remove the handler [{0}] as it was not registered with this session
+
+==================================================
+WsSession.java
+index ad41d780c5..8aeab6fb15 100644
+--- a/java/org/apache/tomcat/websocket/WsRemoteEndpointImplBase.java
++++ b/java/org/apache/tomcat/websocket/WsRemoteEndpointImplBase.java
+@@ -302,13 +302,10 @@ public abstract class WsRemoteEndpointImplBase implements RemoteEndpoint {
+ 
+         boolean doWrite = false;
+         synchronized (messagePartLock) {
+-            if (Constants.OPCODE_CLOSE == mp.getOpCode()) {
+-                try {
+-                    setBatchingAllowed(false);
+-                } catch (IOException e) {
+-                    log.warn(sm.getString(
+-                            "wsRemoteEndpoint.flushOnCloseFailed"), e);
+-                }
++            if (Constants.OPCODE_CLOSE == mp.getOpCode() && getBatchingAllowed()) {
++                // Should not happen. To late to send batched messages now since
++                // the session has been closed. Complain loudly.
++                log.warn(sm.getString("wsRemoteEndpoint.flushOnCloseFailed"));
+             }
+             if (messagePartInProgress) {
+                 // When a control message is sent while another message is being
+@@ -382,7 +379,10 @@ public abstract class WsRemoteEndpointImplBase implements RemoteEndpoint {
+         if (Constants.INTERNAL_OPCODE_FLUSH == mp.getOpCode()) {
+             nextFragmented = fragmented;
+             nextText = text;
+-            doWrite(mp.getEndHandler(), outputBuffer);
++            outputBuffer.flip();
++            SendHandler flushHandler = new OutputBufferFlushSendHandler(
++                    outputBuffer, mp.getEndHandler());
++            doWrite(flushHandler, outputBuffer);
+             return;
+         }
+ 
+@@ -836,6 +836,30 @@ public abstract class WsRemoteEndpointImplBase implements RemoteEndpoint {
+         }
+     }
+ 
++
++    /**
++     * Ensures that tne output buffer is cleared after it has been flushed.
++     */
++    private static class OutputBufferFlushSendHandler implements SendHandler {
++
++        private final ByteBuffer outputBuffer;
++        private final SendHandler handler;
++
++        public OutputBufferFlushSendHandler(ByteBuffer outputBuffer, SendHandler handler) {
++            this.outputBuffer = outputBuffer;
++            this.handler = handler;
++        }
++
++        @Override
++        public void onResult(SendResult result) {
++            if (result.isOK()) {
++                outputBuffer.clear();
++            }
++            handler.onResult(result);
++        }
++    }
++
++
+     private class WsOutputStream extends OutputStream {
+ 
+         private final WsRemoteEndpointImplBase endpoint;
+
+==================================================
+TesterFirehoseServer.java
+index 6567862991..8f91f2680c 100644
+--- a/java/org/apache/tomcat/websocket/WsSession.java
++++ b/java/org/apache/tomcat/websocket/WsSession.java
+@@ -459,6 +459,13 @@ public class WsSession implements Session {
+                 return;
+             }
+ 
++            try {
++                wsRemoteEndpoint.setBatchingAllowed(false);
++            } catch (IOException e) {
++                log.warn(sm.getString("wsSession.flushFailOnClose"), e);
++                fireEndpointOnError(e);
++            }
++
+             state = State.CLOSING;
+ 
+             sendCloseMessage(closeReasonMessage);
+@@ -487,6 +494,12 @@ public class WsSession implements Session {
+ 
+         synchronized (stateLock) {
+             if (state == State.OPEN) {
++                try {
++                    wsRemoteEndpoint.setBatchingAllowed(false);
++                } catch (IOException e) {
++                    log.warn(sm.getString("wsSession.flushFailOnClose"), e);
++                    fireEndpointOnError(e);
++                }
+                 sendCloseMessage(closeReason);
+                 fireEndpointOnClose(closeReason);
+                 state = State.CLOSED;
+@@ -497,7 +510,6 @@ public class WsSession implements Session {
+         }
+     }
+ 
+-
+     private void fireEndpointOnClose(CloseReason closeReason) {
+ 
+         // Fire the onClose event
+@@ -515,6 +527,21 @@ public class WsSession implements Session {
+     }
+ 
+ 
++
++    private void fireEndpointOnError(Throwable throwable) {
++
++        // Fire the onError event
++        Thread t = Thread.currentThread();
++        ClassLoader cl = t.getContextClassLoader();
++        t.setContextClassLoader(applicationClassLoader);
++        try {
++            localEndpoint.onError(this, throwable);
++        } finally {
++            t.setContextClassLoader(cl);
++        }
++    }
++
++
+     private void sendCloseMessage(CloseReason closeReason) {
+         // 125 is maximum size for the payload of a control message
+         ByteBuffer msg = ByteBuffer.allocate(125);
+
+==================================================

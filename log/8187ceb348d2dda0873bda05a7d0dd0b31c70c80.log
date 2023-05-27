@@ -1,0 +1,1162 @@
+8187ceb348d2dda0873bda05a7d0dd0b31c70c80
+==================================================
+Refactor character encoding and decoding using NIO.
+==================================================
+Remy Maucherat
+==================================================
+Wed Jan 23 21:24:33 2013 +0000
+==================================================
+CoyoteAdapter.java
+Refactor character encoding and decoding using NIO.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1437743 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+InputBuffer.java
+index 6b1a55213b..f49716ceb2 100644
+--- a/java/org/apache/catalina/connector/CoyoteAdapter.java
++++ b/java/org/apache/catalina/connector/CoyoteAdapter.java
+@@ -1044,7 +1044,7 @@ public class CoyoteAdapter implements Adapter {
+             }
+             if (conv != null) {
+                 try {
+-                    conv.convert(bc, cc, cc.getBuffer().length - cc.getEnd());
++                    conv.convert(bc, cc);
+                     uri.setChars(cc.getBuffer(), cc.getStart(),
+                                  cc.getLength());
+                     return;
+
+==================================================
+OutputBuffer.java
+index 75f029b918..f967c65b2a 100644
+--- a/java/org/apache/catalina/connector/InputBuffer.java
++++ b/java/org/apache/catalina/connector/InputBuffer.java
+@@ -373,14 +373,19 @@ public class InputBuffer extends Reader
+         if (markPos == -1) {
+             cb.setOffset(0);
+             cb.setEnd(0);
++        } else {
++            // Make sure there's enough space in the worst case
++            cb.makeSpace(bb.getLength());
++            if ((cb.getBuffer().length - cb.getEnd()) == 0) {
++                // We went over the limit
++                cb.setOffset(0);
++                cb.setEnd(0);
++                markPos = -1;
++            }
+         }
+-        int limit = bb.getLength()+cb.getStart();
+-        if ( cb.getLimit() < limit ) {
+-            cb.setLimit(limit);
+-        }
++
+         state = CHAR_STATE;
+-        conv.convert(bb, cb, bb.getLength());
+-        bb.setOffset(bb.getEnd());
++        conv.convert(bb, cb);
+ 
+         return cb.getLength();
+ 
+
+==================================================
+Response.java
+index 46a9d14096..f589875497 100644
+--- a/java/org/apache/catalina/connector/OutputBuffer.java
++++ b/java/org/apache/catalina/connector/OutputBuffer.java
+@@ -32,6 +32,7 @@ import org.apache.coyote.ActionCode;
+ import org.apache.coyote.Response;
+ import org.apache.tomcat.util.buf.ByteChunk;
+ import org.apache.tomcat.util.buf.C2BConverter;
++import org.apache.tomcat.util.buf.CharChunk;
+ 
+ 
+ /**
+@@ -43,7 +44,7 @@ import org.apache.tomcat.util.buf.C2BConverter;
+  * @author Remy Maucherat
+  */
+ public class OutputBuffer extends Writer
+-    implements ByteChunk.ByteOutputChannel {
++    implements ByteChunk.ByteOutputChannel, CharChunk.CharOutputChannel {
+ 
+ 
+     // -------------------------------------------------------------- Constants
+@@ -63,6 +64,12 @@ public class OutputBuffer extends Writer
+     private final ByteChunk bb;
+ 
+ 
++    /**
++     * The chunk buffer.
++     */
++    private final CharChunk cb;
++
++
+     /**
+      * State of the output buffer.
+      */
+@@ -99,6 +106,12 @@ public class OutputBuffer extends Writer
+     private final ByteChunk outputChunk = new ByteChunk();
+ 
+ 
++    /**
++     * Char chunk used to output chars.
++     */
++    private CharChunk outputCharChunk = new CharChunk();
++
++
+     /**
+      * Encoding to use.
+      */
+@@ -158,6 +171,10 @@ public class OutputBuffer extends Writer
+         bb = new ByteChunk(size);
+         bb.setLimit(size);
+         bb.setByteOutputChannel(this);
++        cb = new CharChunk(size);
++        cb.setLimit(size);
++        cb.setOptimizedWrite(false);
++        cb.setCharOutputChannel(this);
+ 
+     }
+ 
+@@ -216,16 +233,18 @@ public class OutputBuffer extends Writer
+         initial = true;
+         bytesWritten = 0;
+         charsWritten = 0;
+-
++        
+         bb.recycle();
++        cb.recycle();
++        outputCharChunk.setChars(null, 0, 0);
+         closed = false;
+-        doFlush = false;
+         suspended = false;
+-
++        doFlush = false;
++        
+         if (conv!= null) {
+             conv.recycle();
+         }
+-
++        
+         gotEnc = false;
+         enc = null;
+ 
+@@ -257,9 +276,10 @@ public class OutputBuffer extends Writer
+             return;
+         }
+ 
+-        // Flush the convertor if one is in use
+-        if (gotEnc && conv != null) {
+-            conv.flushBuffer();
++        // If there are chars, flush all of them to the byte buffer now as bytes are used to
++        // calculate the content-length (if everything fits into the byte buffer, of course).
++        if (cb.getLength() > 0) {
++            cb.flushBuffer();
+         }
+ 
+         if ((!coyoteResponse.isCommitted())
+@@ -310,17 +330,15 @@ public class OutputBuffer extends Writer
+             return;
+         }
+ 
+-        // Flush the convertor if one is in use
+-        if (gotEnc && conv != null) {
+-            conv.flushBuffer();
+-        }
+-
+         try {
+             doFlush = true;
+             if (initial) {
+                 coyoteResponse.sendHeaders();
+                 initial = false;
+             }
++            if (cb.getLength() > 0) {
++                cb.flushBuffer();
++            }
+             if (bb.getLength() > 0) {
+                 bb.flushBuffer();
+             }
+@@ -429,6 +447,33 @@ public class OutputBuffer extends Writer
+     // ------------------------------------------------- Chars Handling Methods
+ 
+ 
++    /** 
++     * Convert the chars to bytes, then send the data to the client.
++     * 
++     * @param buf Char buffer to be written to the response
++     * @param off Offset
++     * @param len Length
++     * 
++     * @throws IOException An underlying IOException occurred
++     */
++    @Override
++    public void realWriteChars(char buf[], int off, int len)
++        throws IOException {
++
++        outputCharChunk.setChars(buf, off, len);
++        while (outputCharChunk.getLength() > 0) { 
++            conv.convert(outputCharChunk, bb);
++            if (bb.getLength() == 0) {
++                // Break out of the loop if more chars are needed to produce any output
++                break;
++            }
++            if (outputCharChunk.getLength() > 0) {
++                bb.flushBuffer();
++            }
++        }
++
++    }
++
+     @Override
+     public void write(int c)
+         throws IOException {
+@@ -437,7 +482,7 @@ public class OutputBuffer extends Writer
+             return;
+         }
+ 
+-        conv.convert((char) c);
++        cb.append((char) c);
+         charsWritten++;
+ 
+     }
+@@ -464,7 +509,7 @@ public class OutputBuffer extends Writer
+             return;
+         }
+ 
+-        conv.convert(c, off, len);
++        cb.append(c, off, len);
+         charsWritten += len;
+ 
+     }
+@@ -485,7 +530,8 @@ public class OutputBuffer extends Writer
+         if (s == null) {
+             s = "null";
+         }
+-        conv.convert(s, off, len);
++        cb.append(s, off, len);
++        charsWritten += len;
+     }
+ 
+ 
+@@ -500,7 +546,8 @@ public class OutputBuffer extends Writer
+         if (s == null) {
+             s = "null";
+         }
+-        conv.convert(s);
++        cb.append(s);
++        charsWritten += s.length();
+     }
+ 
+ 
+@@ -532,7 +579,6 @@ public class OutputBuffer extends Writer
+         }
+         conv = encoders.get(enc);
+         if (conv == null) {
+-
+             if (Globals.IS_SECURITY_ENABLED){
+                 try{
+                     conv = AccessController.doPrivileged(
+@@ -540,7 +586,7 @@ public class OutputBuffer extends Writer
+ 
+                                 @Override
+                                 public C2BConverter run() throws IOException{
+-                                    return new C2BConverter(bb, enc);
++                                    return new C2BConverter(enc);
+                                 }
+ 
+                             }
+@@ -552,7 +598,7 @@ public class OutputBuffer extends Writer
+                     }
+                 }
+             } else {
+-                conv = new C2BConverter(bb, enc);
++                conv = new C2BConverter(enc);
+             }
+ 
+             encoders.put(enc, conv);
+@@ -589,11 +635,8 @@ public class OutputBuffer extends Writer
+     }
+ 
+     public void reset(boolean resetWriterStreamFlags) {
+-        // If a Writer was being used, there may be bytes in the converter
+-        if (gotEnc && conv != null) {
+-            conv.recycle();
+-        }
+         bb.recycle();
++        cb.recycle();
+         bytesWritten = 0;
+         charsWritten = 0;
+         if (resetWriterStreamFlags) {
+
+==================================================
+B2CConverter.java
+index 2283943002..f22c4c4825 100644
+--- a/java/org/apache/catalina/connector/Response.java
++++ b/java/org/apache/catalina/connector/Response.java
+@@ -1578,17 +1578,16 @@ public class Response
+                 if (!leadingSlash) {
+                     String relativePath = request.getDecodedRequestURI();
+                     int pos = relativePath.lastIndexOf('/');
+-                    relativePath = relativePath.substring(0, pos);
+-
+-                    String encodedURI = null;
++                    CharChunk encodedURI = null;
+                     final String frelativePath = relativePath;
++                    final int fend = pos;
+                     if (SecurityUtil.isPackageProtectionEnabled() ){
+                         try{
+                             encodedURI = AccessController.doPrivileged(
+-                                new PrivilegedExceptionAction<String>(){
++                                new PrivilegedExceptionAction<CharChunk>(){
+                                     @Override
+-                                    public String run() throws IOException{
+-                                        return urlEncoder.encodeURL(frelativePath);
++                                    public CharChunk run() throws IOException{
++                                        return urlEncoder.encodeURL(frelativePath, 0, fend);
+                                     }
+                            });
+                         } catch (PrivilegedActionException pae){
+@@ -1598,9 +1597,10 @@ public class Response
+                             throw iae;
+                         }
+                     } else {
+-                        encodedURI = urlEncoder.encodeURL(relativePath);
++                        encodedURI = urlEncoder.encodeURL(relativePath, 0, pos);
+                     }
+-                    redirectURLCC.append(encodedURI, 0, encodedURI.length());
++                    redirectURLCC.append(encodedURI);
++                    encodedURI.recycle();
+                     redirectURLCC.append('/');
+                 }
+                 redirectURLCC.append(location, 0, location.length());
+
+==================================================
+ByteChunk.java
+index 247b0f31d3..d5cfae07ee 100644
+--- a/java/org/apache/tomcat/util/buf/B2CConverter.java
++++ b/java/org/apache/tomcat/util/buf/B2CConverter.java
+@@ -17,27 +17,20 @@
+ package org.apache.tomcat.util.buf;
+ 
+ import java.io.IOException;
+-import java.io.InputStream;
+-import java.io.InputStreamReader;
+ import java.io.UnsupportedEncodingException;
++import java.nio.ByteBuffer;
++import java.nio.CharBuffer;
+ import java.nio.charset.Charset;
+ import java.nio.charset.CharsetDecoder;
++import java.nio.charset.CoderResult;
+ import java.util.HashMap;
+ import java.util.Locale;
+ import java.util.Map;
+ 
+ import org.apache.tomcat.util.res.StringManager;
+ 
+-/** Efficient conversion of bytes  to character .
+- *
+- *  This uses the standard JDK mechanism - a reader - but provides mechanisms
+- *  to recycle all the objects that are used. It is compatible with JDK1.1
+- *  and up,
+- *  ( nio is better, but it's not available even in 1.2 or 1.3 )
+- *
+- *  Not used in the current code, the performance gain is not very big
+- *  in the current case ( since String is created anyway ), but it will
+- *  be used in a later version or after the remaining optimizations.
++/**
++ * NIO based character decoder.
+  */
+ public class B2CConverter {
+ 
+@@ -101,163 +94,101 @@ public class B2CConverter {
+         return charset;
+     }
+ 
+-    private IntermediateInputStream iis;
+-    private ReadConvertor conv;
+-    private CharsetDecoder decoder;
+-    private final String encoding;
++    protected CharsetDecoder decoder = null;
++    protected ByteBuffer bb = null;
++    protected CharBuffer cb = null;
+ 
+-    /** Create a converter, with bytes going to a byte buffer
++    /**
++     * Leftover buffer used for incomplete characters.
+      */
++    protected ByteBuffer leftovers = null;
++
++    private final String encoding;
++
+     public B2CConverter(String encoding)
+         throws IOException
+     {
+         this.encoding=encoding;
+-        reset();
++        byte[] left = new byte[4];
++        leftovers = ByteBuffer.wrap(left);
++        decoder = getCharset(encoding).newDecoder();
+     }
+ 
+-
+-    /** Reset the internal state, empty the buffers.
+-     *  The encoding remain in effect, the internal buffers remain allocated.
++    /** 
++     * Reset the decoder state.
+      */
+-    public  void recycle() {
+-        conv.recycle();
++    public void recycle() {
+         decoder.reset();
++        leftovers.position(0);
+     }
+ 
+-    static final int BUFFER_SIZE=8192;
+-    final char result[]=new char[BUFFER_SIZE];
++    public boolean isUndeflow() {
++        return (leftovers.position() > 0);
++    }
+ 
+     /**
+-     * Convert a buffer of bytes into a chars.
+-     *
+-     * @param bb    Input byte buffer
+-     * @param cb    Output char buffer
+-     * @param limit Number of bytes to convert
+-     * @throws IOException
++     * Convert the given bytes to characters.
++     * 
++     * @param bc byte input
++     * @param cc char output
+      */
+-    public void convert( ByteChunk bb, CharChunk cb, int limit)
+-        throws IOException
+-    {
+-        iis.setByteChunk( bb );
+-        try {
+-            // read from the reader
+-            int bbLengthBeforeRead = 0;
+-            while( limit > 0 ) {
+-                int size = limit < BUFFER_SIZE ? limit : BUFFER_SIZE;
+-                bbLengthBeforeRead = bb.getLength();
+-                int cnt=conv.read( result, 0, size );
+-                if( cnt <= 0 ) {
+-                    // End of stream ! - we may be in a bad state
+-                    if(log.isDebugEnabled()) {
+-                        log.debug("B2CConverter: EOF");
+-                    }
+-                    return;
+-                }
+-                if(log.isDebugEnabled()) {
+-                    log.debug("B2CConverter: Converted: " +
+-                            new String(result, 0, cnt));
+-                }
+-                cb.append( result, 0, cnt );
+-                limit = limit - (bbLengthBeforeRead - bb.getLength());
+-            }
+-        } catch( IOException ex) {
+-            if(log.isDebugEnabled()) {
+-                log.debug("B2CConverter: Reseting the converter " + ex.toString());
++    public void convert(ByteChunk bc, CharChunk cc) 
++        throws IOException {
++        if ((bb == null) || (bb.array() != bc.getBuffer())) {
++            // Create a new byte buffer if anything changed
++            bb = ByteBuffer.wrap(bc.getBuffer(), bc.getStart(), bc.getLength());
++        } else {
++            // Initialize the byte buffer
++            bb.limit(bc.getEnd());
++            bb.position(bc.getStart());
++        }
++        if ((cb == null) || (cb.array() != cc.getBuffer())) {
++            // Create a new char buffer if anything changed
++            cb = CharBuffer.wrap(cc.getBuffer(), cc.getEnd(), 
++                    cc.getBuffer().length - cc.getEnd());
++        } else {
++            // Initialize the char buffer
++            cb.limit(cc.getBuffer().length);
++            cb.position(cc.getEnd());
++        }
++        CoderResult result = null;
++        // Parse leftover if any are present
++        if (leftovers.position() > 0) {
++            int pos = cb.position();
++            // Loop until one char is decoded or there is a decoder error
++            do {
++                leftovers.put(bc.substractB());
++                leftovers.flip();
++                result = decoder.decode(leftovers, cb, false);
++                leftovers.position(leftovers.limit());
++                leftovers.limit(leftovers.array().length);
++            } while (result.isUnderflow() && (cb.position() == pos));
++            if (result.isError() || result.isMalformed()) {
++                result.throwException();
+             }
+-            reset();
+-            throw ex;
++            bb.position(bc.getStart());
++            leftovers.position(0);
+         }
+-    }
+-
+-
+-    public void reset() throws IOException {
+-        // Re-create the reader and iis
+-        iis = new IntermediateInputStream();
+-        decoder = getCharset(encoding).newDecoder();
+-        conv = new ReadConvertor(iis, decoder);
+-    }
+-
+-}
+-
+-// -------------------- Private implementation --------------------
+-
+-
+-
+-/**
+- *
+- */
+-final class ReadConvertor extends InputStreamReader {
+-
+-    /** Create a converter.
+-     */
+-    public ReadConvertor(IntermediateInputStream in, CharsetDecoder decoder) {
+-        super(in, decoder);
+-    }
+-
+-    /** Overridden - will do nothing but reset internal state.
+-     */
+-    @Override
+-    public  final void close() throws IOException {
+-        // NOTHING
+-        // Calling super.close() would reset out and cb.
+-    }
+-
+-    @Override
+-    public  final int read(char cbuf[], int off, int len)
+-        throws IOException
+-    {
+-        // will do the conversion and call write on the output stream
+-        return super.read( cbuf, off, len );
+-    }
+-
+-    /** Reset the buffer
+-     */
+-    public  final void recycle() {
+-        try {
+-            // Must clear super's buffer.
+-            while (ready()) {
+-                // InputStreamReader#skip(long) will allocate buffer to skip.
+-                read();
++        // Do the decoding and get the results into the byte chunk and the char chunk
++        result = decoder.decode(bb, cb, false);
++        if (result.isError() || result.isMalformed()) {
++            result.throwException();
++        } else if (result.isOverflow()) {
++            // Propagate current positions to the byte chunk and char chunk, if this
++            // continues the char buffer will get resized
++            bc.setOffset(bb.position());
++            cc.setEnd(cb.position());
++        } else if (result.isUnderflow()) {
++            // Propagate current positions to the byte chunk and char chunk
++            bc.setOffset(bb.position());
++            cc.setEnd(cb.position());
++            // Put leftovers in the leftovers byte buffer
++            if (bc.getLength() > 0) {
++                leftovers.limit(leftovers.array().length);
++                leftovers.position(bc.getLength());
++                bc.substract(leftovers.array(), 0, bc.getLength());
+             }
+-        } catch(IOException ioe){
+         }
+     }
+-}
+-
+-
+-/** Special output stream where close() is overridden, so super.close()
+-    is never called.
+-
+-    This allows recycling. It can also be disabled, so callbacks will
+-    not be called if recycling the converter and if data was not flushed.
+-*/
+-final class IntermediateInputStream extends InputStream {
+-    ByteChunk bc = null;
+-
+-    public IntermediateInputStream() {
+-    }
+-
+-    @Override
+-    public  final void close() throws IOException {
+-        // shouldn't be called - we filter it out in writer
+-        throw new IOException("close() called - shouldn't happen ");
+-    }
+-
+-    @Override
+-    public  final  int read(byte cbuf[], int off, int len) throws IOException {
+-        return bc.substract(cbuf, off, len);
+-    }
+-
+-    @Override
+-    public  final int read() throws IOException {
+-        return bc.substract();
+-    }
+-
+-    // -------------------- Internal methods --------------------
+-
+-
+-    void setByteChunk( ByteChunk mb ) {
+-        bc = mb;
+-    }
+ 
+ }
+
+==================================================
+C2BConverter.java
+index bc4341ca05..e0fe2205ac 100644
+--- a/java/org/apache/tomcat/util/buf/ByteChunk.java
++++ b/java/org/apache/tomcat/util/buf/ByteChunk.java
+@@ -369,6 +369,21 @@ public final class ByteChunk implements Cloneable, Serializable {
+ 
+     }
+ 
++    public byte substractB()
++        throws IOException {
++
++        if ((end - start) == 0) {
++            if (in == null)
++                return -1;
++            int n = in.realReadBytes( buff, 0, buff.length );
++            if (n < 0)
++                return -1;
++        }
++
++        return (buff[start++]);
++
++    }
++
+     public int substract( byte src[], int off, int len )
+         throws IOException {
+ 
+
+==================================================
+CharChunk.java
+index d791242cf5..54c530b4ec 100644
+--- a/java/org/apache/tomcat/util/buf/C2BConverter.java
++++ b/java/org/apache/tomcat/util/buf/C2BConverter.java
+@@ -16,22 +16,19 @@
+  */
+ package org.apache.tomcat.util.buf;
+ 
+-import java.io.BufferedWriter;
+ import java.io.IOException;
+-import java.io.OutputStream;
+-import java.io.OutputStreamWriter;
+-import java.nio.charset.Charset;
++import java.nio.ByteBuffer;
++import java.nio.CharBuffer;
++import java.nio.charset.CharsetEncoder;
++import java.nio.charset.CoderResult;
++import java.nio.charset.CodingErrorAction;
+ 
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+ /**
+- * Efficient conversion of character to bytes.
+- *
+- * This uses the standard JDK mechanism - a writer - but provides mechanisms to
+- * recycle all the objects that are used. Input is buffered to improve
+- * performance.
++ * NIO based character encoder.
+  */
+ public final class C2BConverter {
+ 
+@@ -40,196 +37,100 @@ public final class C2BConverter {
+             StringManager.getManager(Constants.Package);
+ 
+     private final String encoding;
+-    private BufferedWriter writer;
+-    private WriteConvertor conv;
+-    private IntermediateOutputStream ios;
+-    private final ByteChunk bb;
+-
+-    /**
+-     * Create a converter, with bytes going to a byte buffer.
+-     */
+-    public C2BConverter(ByteChunk output, String encoding) throws IOException {
+-        this.bb = output;
+-        this.encoding = encoding;
+-        init();
+-    }
+-
+-    /**
+-     * Reset the internal state, empty the buffers.
+-     * The encoding remain in effect, the internal buffers remain allocated.
+-     */
+-    public final void recycle() {
+-        // Disable any output
+-        ios.disable();
+-        // Flush out the BufferedWriter and WriteConvertor
+-        try {
+-            writer.flush();
+-        } catch (IOException e) {
+-            log.warn(sm.getString("c2bConverter.recycleFailed"), e);
+-            try {
+-                init();
+-            } catch (IOException ignore) {
+-                // Should never happen since this means encoding is invalid and
+-                // in that case, the constructor will have failed.
+-            }
+-        }
+-        // Re-enable ready for re-use
+-        ios.enable();
+-        bb.recycle();
+-    }
+-
+-    private void init() throws IOException {
+-        ios = new IntermediateOutputStream(bb);
+-        conv = new WriteConvertor(ios, B2CConverter.getCharset(encoding));
+-        writer = new BufferedWriter(conv);
+-    }
+-
+-    /**
+-     * Generate the bytes using the specified encoding.
+-     */
+-    public final void convert(char c[], int off, int len) throws IOException {
+-        writer.write(c, off, len);
+-    }
++    protected CharsetEncoder encoder = null;
++    protected ByteBuffer bb = null;
++    protected CharBuffer cb = null;
+ 
+     /**
+-     * Generate the bytes using the specified encoding.
++     * Leftover buffer used for multi-characters characters.
+      */
+-    public final void convert(String s, int off, int len) throws IOException {
+-        writer.write(s, off, len);
+-    }
+-
+-    /**
+-     * Generate the bytes using the specified encoding.
+-     */
+-    public final void convert(String s) throws IOException {
+-        writer.write(s);
+-    }
+-
+-    /**
+-     * Generate the bytes using the specified encoding.
+-     */
+-    public final void convert(char c) throws IOException {
+-        writer.write(c);
+-    }
++    protected CharBuffer leftovers = null;
+ 
+-    /**
+-     * Flush any internal buffers into the ByteOutput or the internal byte[].
+-     */
+-    public final void flushBuffer() throws IOException {
+-        writer.flush();
++    public C2BConverter(String encoding) throws IOException {
++        this.encoding = encoding;
++        encoder = B2CConverter.getCharset(encoding).newEncoder();
++        // FIXME: See if unmappable/malformed behavior configuration is needed in practice
++        encoder.onUnmappableCharacter(CodingErrorAction.REPLACE)
++            .onMalformedInput(CodingErrorAction.REPLACE);
++        char[] left = new char[4];
++        leftovers = CharBuffer.wrap(left);
+     }
+-}
+-
+-// -------------------- Private implementation --------------------
+-/**
+- * Special writer class, where close() is overridden. The default implementation
+- * would set byteOutputter to null, and the writer can't be recycled.
+- *
+- * Note that the flush method will empty the internal buffers _and_ call
+- * flush on the output stream - that's why we use an intermediary output stream
+- * that overrides flush(). The idea is to  have full control: flushing the
+- * char->byte converter should be independent of flushing the OutputStream.
+- *
+- * When a WriteConverter is created, it'll allocate one or 2 byte buffers,
+- * with a 8k size that can't be changed ( at least in JDK1.1 -> 1.4 ). It would
+- * also allocate a ByteOutputter or equivalent - again some internal buffers.
+- *
+- * It is essential to keep  this object around and reuse it. You can use either
+- * pools or per thread data - but given that in most cases a converter will be
+- * needed for every thread and most of the time only 1 ( or 2 ) encodings will
+- * be used, it is far better to keep it per thread and eliminate the pool
+- * overhead too.
+- */
+- final class WriteConvertor extends OutputStreamWriter {
+ 
+-    /**
+-     * Create a converter.
++    /** 
++     * Reset the encoder state.
+      */
+-    public WriteConvertor(IntermediateOutputStream out, Charset charset) {
+-        super(out, charset);
++    public void recycle() {
++        encoder.reset();
++        leftovers.position(0);
+     }
+ 
+-    /**
+-     * This is a NOOP.
+-     */
+-    @Override
+-    public final void close() throws IOException {
+-        // NOTHING
+-        // Calling super.close() would reset out and cb.
++    public boolean isUndeflow() {
++        return (leftovers.position() > 0);
+     }
+ 
+     /**
+-     *  Flush the characters only.
++     * Convert the given characters to bytes.
++     * 
++     * @param cc char input
++     * @param bc byte output
+      */
+-    @Override
+-    public final void flush() throws IOException {
+-        // Will flushBuffer and out()
+-        // flushBuffer put any remaining chars in the byte[]
+-        super.flush();
+-    }
+-
+-    @Override
+-    public final void write(char cbuf[], int off, int len) throws IOException {
+-        // Will do the conversion and call write on the output stream
+-        super.write( cbuf, off, len );
+-    }
+-}
+-
+-
+-/**
+- * Special output stream where close() is overridden, so super.close()
+- * is never called.
+- *
+- * This allows recycling. It can also be disabled, so callbacks will
+- * not be called if recycling the converter and if data was not flushed.
+- */
+-final class IntermediateOutputStream extends OutputStream {
+-    private final ByteChunk tbuff;
+-    private boolean enabled = true;
+-
+-    public IntermediateOutputStream(ByteChunk tbuff) {
+-        this.tbuff=tbuff;
+-    }
+-
+-    @Override
+-    public final void close() throws IOException {
+-        // shouldn't be called - we filter it out in writer
+-        throw new IOException("close() called - shouldn't happen ");
+-    }
+-
+-    @Override
+-    public final void flush() throws IOException {
+-        // nothing - write will go directly to the buffer,
+-        // we don't keep any state
+-    }
+-
+-    @Override
+-    public final void write(byte cbuf[], int off, int len) throws IOException {
+-        // will do the conversion and call write on the output stream
+-        if( enabled ) {
+-            tbuff.append( cbuf, off, len );
++    public void convert(CharChunk cc, ByteChunk bc) 
++    throws IOException {
++        if ((bb == null) || (bb.array() != bc.getBuffer())) {
++            // Create a new byte buffer if anything changed
++            bb = ByteBuffer.wrap(bc.getBuffer(), bc.getEnd(), 
++                    bc.getBuffer().length - bc.getEnd());
++        } else {
++            // Initialize the byte buffer
++            bb.limit(bc.getBuffer().length);
++            bb.position(bc.getEnd());
++        }
++        if ((cb == null) || (cb.array() != cc.getBuffer())) {
++            // Create a new char buffer if anything changed
++            cb = CharBuffer.wrap(cc.getBuffer(), cc.getStart(), 
++                    cc.getLength());
++        } else {
++            // Initialize the char buffer
++            cb.limit(cc.getEnd());
++            cb.position(cc.getStart());
++        }
++        CoderResult result = null;
++        // Parse leftover if any are present
++        if (leftovers.position() > 0) {
++            int pos = bb.position();
++            // Loop until one char is encoded or there is a encoder error
++            do {
++                leftovers.put((char) cc.substract());
++                leftovers.flip();
++                result = encoder.encode(leftovers, bb, false);
++                leftovers.position(leftovers.limit());
++                leftovers.limit(leftovers.array().length);
++            } while (result.isUnderflow() && (bb.position() == pos));
++            if (result.isError() || result.isMalformed()) {
++                result.throwException();
++            }
++            cb.position(cc.getStart());
++            leftovers.position(0);
++        }
++        // Do the decoding and get the results into the byte chunk and the char chunk
++        result = encoder.encode(cb, bb, false);
++        if (result.isError() || result.isMalformed()) {
++            result.throwException();
++        } else if (result.isOverflow()) {
++            // Propagate current positions to the byte chunk and char chunk
++            bc.setEnd(bb.position());
++            cc.setOffset(cb.position());
++        } else if (result.isUnderflow()) {
++            // Propagate current positions to the byte chunk and char chunk
++            bc.setEnd(bb.position());
++            cc.setOffset(cb.position());
++            // Put leftovers in the leftovers char buffer
++            if (cc.getLength() > 0) {
++                leftovers.limit(leftovers.array().length);
++                leftovers.position(cc.getLength());
++                cc.substract(leftovers.array(), 0, cc.getLength());
++            }
+         }
+     }
+-
+-    @Override
+-    public final void write(int i) throws IOException {
+-        throw new IOException("write( int ) called - shouldn't happen ");
+-    }
+-
+-    // -------------------- Internal methods --------------------
+-
+-    /**
+-     * Temporary disable - this is used to recycle the converter without
+-     * generating an output if the buffers were not flushed.
+-     */
+-    final void disable() {
+-        enabled = false;
+-    }
+-
+-    /**
+-     * Re-enable - used to recycle the converter.
+-     */
+-    final void enable() {
+-        enabled = true;
+-    }
++    
+ }
+
+==================================================
+UEncoder.java
+index d3086cb5a7..341725ede1 100644
+--- a/java/org/apache/tomcat/util/buf/CharChunk.java
++++ b/java/org/apache/tomcat/util/buf/CharChunk.java
+@@ -397,7 +397,7 @@ public final class CharChunk implements Cloneable, Serializable, CharSequence {
+     /** Make space for len chars. If len is small, allocate
+      *        a reserve space too. Never grow bigger than limit.
+      */
+-    private void makeSpace(int count)
++    public void makeSpace(int count)
+     {
+         char[] tmp = null;
+ 
+
+==================================================
+TestB2CConverter.java
+index 3f4ebe5938..e7aaa301eb 100644
+--- a/java/org/apache/tomcat/util/buf/UEncoder.java
++++ b/java/org/apache/tomcat/util/buf/UEncoder.java
+@@ -16,9 +16,7 @@
+  */
+ package org.apache.tomcat.util.buf;
+ 
+-import java.io.CharArrayWriter;
+ import java.io.IOException;
+-import java.io.Writer;
+ import java.util.BitSet;
+ 
+ /**
+@@ -42,6 +40,8 @@ public final class UEncoder {
+     private BitSet safeChars=null;
+     private C2BConverter c2b=null;
+     private ByteChunk bb=null;
++    private CharChunk cb=null;
++    private CharChunk output=null;
+ 
+     private final String ENCODING = "UTF8";
+ 
+@@ -55,92 +55,65 @@ public final class UEncoder {
+ 
+ 
+     /** URL Encode string, using a specified encoding.
+-     *
+-     * @param buf The writer
+-     * @param s string to be encoded
+-     * @throws IOException If an I/O error occurs
+-     */
+-    public void urlEncode( Writer buf, String s )
+-            throws IOException {
+-        if( c2b==null ) {
+-            bb=new ByteChunk(16); // small enough.
+-            c2b=new C2BConverter( bb, ENCODING );
+-        }
+-
+-        for (int i = 0; i < s.length(); i++) {
+-            int c = s.charAt(i);
+-            if( safeChars.get( c ) ) {
+-                if(log.isDebugEnabled()) {
+-                    log.debug("Encoder: Safe: " + (char)c);
+-                }
+-                buf.write((char)c);
+-            } else {
+-                if(log.isDebugEnabled()) {
+-                    log.debug("Encoder: Unsafe:  " + (char)c);
+-                }
+-                c2b.convert( (char)c );
+-
+-                // "surrogate" - UTF is _not_ 16 bit, but 21 !!!!
+-                // ( while UCS is 31 ). Amazing...
+-                if (c >= 0xD800 && c <= 0xDBFF) {
+-                    if ( (i+1) < s.length()) {
+-                        int d = s.charAt(i+1);
+-                        if (d >= 0xDC00 && d <= 0xDFFF) {
+-                            if(log.isDebugEnabled()) {
+-                                log.debug("Encoder: Unsafe:  " + c);
+-                            }
+-                            c2b.convert( (char)d);
+-                            i++;
+-                        }
+-                    }
+-                }
+-
+-                c2b.flushBuffer();
+-
+-                urlEncode( buf, bb.getBuffer(), bb.getOffset(),
+-                           bb.getLength() );
+-                bb.recycle();
+-            }
+-        }
+-    }
+-
+-    /**
+-     */
+-    public void urlEncode( Writer buf, byte bytes[], int off, int len)
+-            throws IOException {
+-        for( int j=off; j< len; j++ ) {
+-            buf.write( '%' );
+-            char ch = Character.forDigit((bytes[j] >> 4) & 0xF, 16);
+-            if(log.isDebugEnabled()) {
+-                log.debug("Encoder: Encode:  " + ch);
+-            }
+-            buf.write(ch);
+-            ch = Character.forDigit(bytes[j] & 0xF, 16);
+-            if(log.isDebugEnabled()) {
+-                log.debug("Encoder: Encode:  " + ch);
+-            }
+-            buf.write(ch);
+-        }
+-    }
+-
+-    /**
+-     * Utility function to re-encode the URL.
+-     * Still has problems with charset, since UEncoder mostly
+-     * ignores it.
+-     */
+-    public String encodeURL(String uri) {
+-        String outUri=null;
+-        try {
+-            // XXX optimize - recycle, etc
+-            CharArrayWriter out = new CharArrayWriter();
+-            urlEncode(out, uri);
+-            outUri=out.toString();
+-        } catch (IOException iex) {
+-        }
+-        return outUri;
+-    }
+-
+-
++    *
++    * @param buf The writer
++    * @param s string to be encoded
++    * @throws IOException If an I/O error occurs
++    */
++   public CharChunk encodeURL(String s, int start, int end)
++       throws IOException {
++       if (c2b == null) {
++           bb = new ByteChunk(8); // small enough.
++           cb = new CharChunk(2); // small enough.
++           output = new CharChunk(64); // small enough.
++           c2b = new C2BConverter(ENCODING);
++       } else {
++           bb.recycle();
++           cb.recycle();
++       }
++
++       for (int i = start; i < end; i++) {
++           char c = s.charAt(i);
++           if (safeChars.get(c)) {
++               output.append(c);
++           } else {
++               cb.append(c);
++               c2b.convert(cb, bb);
++
++               // "surrogate" - UTF is _not_ 16 bit, but 21 !!!!
++               // ( while UCS is 31 ). Amazing...
++               if (c >= 0xD800 && c <= 0xDBFF) {
++                   if ((i+1) < end) {
++                       char d = s.charAt(i+1);
++                       if (d >= 0xDC00 && d <= 0xDFFF) {
++                           cb.append(d);
++                           c2b.convert(cb, bb);
++                           i++;
++                       }
++                   }
++               }
++
++               urlEncode(output, bb);
++               cb.recycle();
++               bb.recycle();
++           }
++       }
++       
++       return output;
++   }
++
++   protected void urlEncode(CharChunk out, ByteChunk bb)
++       throws IOException {
++       byte[] bytes = bb.getBuffer();
++       for (int j = bb.getStart(); j < bb.getEnd(); j++) {
++           out.append('%');
++           char ch = Character.forDigit((bytes[j] >> 4) & 0xF, 16);
++           out.append(ch);
++           ch = Character.forDigit(bytes[j] & 0xF, 16);
++           out.append(ch);
++       }
++   }
++   
+     // -------------------- Internal implementation --------------------
+ 
+     private void initSafeChars() {
+
+==================================================
+TestWebSocket.java
+index ef35b2a8d3..a8d35aeb58 100644
+--- a/test/org/apache/tomcat/util/buf/TestB2CConverter.java
++++ b/test/org/apache/tomcat/util/buf/TestB2CConverter.java
+@@ -48,8 +48,7 @@ public class TestB2CConverter {
+ 
+         for (int i = 0; i < msgCount; i++) {
+             bc.append(UTF16_MESSAGE, 0, UTF16_MESSAGE.length);
+-            // Note: The limit is the number of characters to read
+-            conv.convert(bc, cc, 3);
++            conv.convert(bc, cc);
+             Assert.assertEquals("ABC", cc.toString());
+             bc.recycle();
+             cc.recycle();
+
+==================================================

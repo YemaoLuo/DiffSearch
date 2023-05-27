@@ -1,0 +1,180 @@
+8843ece4de7f20d2ba12c400ee79045f96fa3192
+==================================================
+Add buffer sizes to the UDP sockets
+==================================================
+Filip Hanik
+==================================================
+Wed Feb 20 17:12:27 2008 +0000
+==================================================
+McastServiceImpl.java
+Add buffer sizes to the UDP sockets
+
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@629539 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AbstractSender.java
+index fd410bde7f..1c4341a520 100644
+--- a/java/org/apache/catalina/tribes/membership/McastServiceImpl.java
++++ b/java/org/apache/catalina/tribes/membership/McastServiceImpl.java
+@@ -421,12 +421,15 @@ public class McastServiceImpl
+                     if ( log.isDebugEnabled() )
+                         log.debug("Invalid member mcast package.",ax);
+                 } catch ( Exception x ) {
+-                    if (errorCounter==0) log.warn("Error receiving mcast package. Sleeping 500ms",x);
+-                    else log.debug("Error receiving mcast package. Sleeping 500ms",x);
+-                    try { Thread.sleep(500); } catch ( Exception ignore ){}
+-                    if ( (++errorCounter)>=recoveryCounter ) {
+-                        errorCounter=0;
+-                        new RecoveryThread(McastServiceImpl.this);
++                    if (x instanceof InterruptedException) interrupted();
++                    else {
++                        if (errorCounter==0) log.warn("Error receiving mcast package. Sleeping 500ms",x);
++                        else log.debug("Error receiving mcast package. Sleeping 500ms",x);
++                        try { Thread.sleep(500); } catch ( Exception ignore ){}
++                        if ( (++errorCounter)>=recoveryCounter ) {
++                            errorCounter=0;
++                            new RecoveryThread(McastServiceImpl.this);
++                        }
+                     }
+                 }
+             }
+
+==================================================
+ReceiverBase.java
+index aa3a2d059e..258dbdaeea 100644
+--- a/java/org/apache/catalina/tribes/transport/AbstractSender.java
++++ b/java/org/apache/catalina/tribes/transport/AbstractSender.java
+@@ -38,6 +38,8 @@ public abstract class AbstractSender implements DataSender {
+     private boolean connected = false;
+     private int rxBufSize = 25188;
+     private int txBufSize = 43800;
++    private int udpRxBufSize = 25188;
++    private int udpTxBufSize = 43800;
+     private boolean directBuffer = false;
+     private int keepAliveCount = -1;
+     private int requestCount = 0;
+@@ -332,4 +334,24 @@ public abstract class AbstractSender implements DataSender {
+         this.udpPort = udpPort;
+     }
+ 
++
++    public int getUdpRxBufSize() {
++        return udpRxBufSize;
++    }
++
++
++    public void setUdpRxBufSize(int udpRxBufSize) {
++        this.udpRxBufSize = udpRxBufSize;
++    }
++
++
++    public int getUdpTxBufSize() {
++        return udpTxBufSize;
++    }
++
++
++    public void setUdpTxBufSize(int udpTxBufSize) {
++        this.udpTxBufSize = udpTxBufSize;
++    }
++
+ }
+\ No newline at end of file
+
+==================================================
+NioReceiver.java
+index 06d4217c33..50c689920d 100644
+--- a/java/org/apache/catalina/tribes/transport/ReceiverBase.java
++++ b/java/org/apache/catalina/tribes/transport/ReceiverBase.java
+@@ -56,6 +56,9 @@ public abstract class ReceiverBase implements ChannelReceiver, ListenCallback, R
+     private int securePort = -1;
+     private int rxBufSize = 43800;
+     private int txBufSize = 25188;
++    private int udpRxBufSize = 43800;
++    private int udpTxBufSize = 25188;
++
+     private boolean listen = false;
+     private RxTaskPool pool;
+     private boolean direct = true;
+@@ -520,4 +523,20 @@ public abstract class ReceiverBase implements ChannelReceiver, ListenCallback, R
+         this.udpPort = udpPort;
+     }
+ 
++    public int getUdpRxBufSize() {
++        return udpRxBufSize;
++    }
++
++    public void setUdpRxBufSize(int udpRxBufSize) {
++        this.udpRxBufSize = udpRxBufSize;
++    }
++
++    public int getUdpTxBufSize() {
++        return udpTxBufSize;
++    }
++
++    public void setUdpTxBufSize(int udpTxBufSize) {
++        this.udpTxBufSize = udpTxBufSize;
++    }
++
+ }
+\ No newline at end of file
+
+==================================================
+NioReplicationTask.java
+index de527633e6..0c91f1f690 100644
+--- a/java/org/apache/catalina/tribes/transport/nio/NioReceiver.java
++++ b/java/org/apache/catalina/tribes/transport/nio/NioReceiver.java
+@@ -250,6 +250,11 @@ public class NioReceiver extends ReceiverBase implements Runnable, ChannelReceiv
+         setListen(true);
+         if (selector!=null && datagramChannel!=null) {
+             ObjectReader oreader = new ObjectReader(MAX_UDP_SIZE); //max size for a datagram packet
++            datagramChannel.socket().setSendBufferSize(getUdpTxBufSize());
++            datagramChannel.socket().setReceiveBufferSize(getUdpRxBufSize());
++            datagramChannel.socket().setReuseAddress(getSoReuseAddress());
++            datagramChannel.socket().setSoTimeout(getTimeout());
++            datagramChannel.socket().setTrafficClass(getSoTrafficClass());
+             registerChannel(selector,datagramChannel,SelectionKey.OP_READ,oreader);
+         }
+ 
+
+==================================================
+NioSender.java
+index 6e37070275..8cb0dbee90 100644
+--- a/java/org/apache/catalina/tribes/transport/nio/NioReplicationTask.java
++++ b/java/org/apache/catalina/tribes/transport/nio/NioReplicationTask.java
+@@ -308,8 +308,12 @@ public class NioReplicationTask extends AbstractRxTask {
+             int total = 0;
+             if (channel instanceof DatagramChannel) {
+                 DatagramChannel dchannel = (DatagramChannel)channel;
+-                while ( total < command.length ) {
+-                    total += dchannel.send(buf, udpaddr);
++                //were using a shared channel, it's not thread safe
++                //TODO check optimization, one channel per thread
++                synchronized (dchannel) {
++                    while ( total < command.length ) {
++                        total += dchannel.send(buf, udpaddr);
++                    }
+                 }
+             } else {
+                 while ( total < command.length ) {
+
+==================================================
+TestUdpPackages.java
+index b8e0479efc..3db44e41e2 100644
+--- a/java/org/apache/catalina/tribes/transport/nio/NioSender.java
++++ b/java/org/apache/catalina/tribes/transport/nio/NioSender.java
+@@ -149,8 +149,8 @@ public class NioSender extends AbstractSender implements DataSender{
+             socketChannel.socket().setSoLinger(getSoLingerOn(),getSoLingerTime());
+             socketChannel.socket().setTrafficClass(getSoTrafficClass());
+         } else if (dataChannel!=null) {
+-            dataChannel.socket().setSendBufferSize(getTxBufSize());
+-            dataChannel.socket().setReceiveBufferSize(getRxBufSize());
++            dataChannel.socket().setSendBufferSize(getUdpTxBufSize());
++            dataChannel.socket().setReceiveBufferSize(getUdpRxBufSize());
+             dataChannel.socket().setSoTimeout((int)getTimeout());
+             dataChannel.socket().setReuseAddress(getSoReuseAddress());
+             dataChannel.socket().setTrafficClass(getSoTrafficClass());
+
+==================================================

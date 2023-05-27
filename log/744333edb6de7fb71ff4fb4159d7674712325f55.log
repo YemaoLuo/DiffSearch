@@ -1,0 +1,323 @@
+744333edb6de7fb71ff4fb4159d7674712325f55
+==================================================
+Fix BZ 65726 - handle HTTP/1.1 upgrade with request body
+==================================================
+Mark Thomas
+==================================================
+Mon Dec 6 23:15:08 2021 +0000
+==================================================
+Http11Processor.java
+Fix BZ 65726 - handle HTTP/1.1 upgrade with request body
+
+https://bz.apache.org/bugzilla/show_bug.cgi?id=65726
+
+
+==================================================
+UpgradeApplicationBufferHandler.java
+index 4f27473836..623631a23c 100644
+--- a/java/org/apache/coyote/http11/Http11Processor.java
++++ b/java/org/apache/coyote/http11/Http11Processor.java
+@@ -47,6 +47,7 @@ import org.apache.coyote.http11.filters.SavedRequestInputFilter;
+ import org.apache.coyote.http11.filters.VoidInputFilter;
+ import org.apache.coyote.http11.filters.VoidOutputFilter;
+ import org.apache.coyote.http11.upgrade.InternalHttpUpgradeHandler;
++import org.apache.coyote.http11.upgrade.UpgradeApplicationBufferHandler;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.ExceptionUtils;
+@@ -58,6 +59,7 @@ import org.apache.tomcat.util.http.parser.HttpParser;
+ import org.apache.tomcat.util.http.parser.TokenList;
+ import org.apache.tomcat.util.log.UserDataHelper;
+ import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
++import org.apache.tomcat.util.net.ApplicationBufferHandler;
+ import org.apache.tomcat.util.net.SSLSupport;
+ import org.apache.tomcat.util.net.SendfileDataBase;
+ import org.apache.tomcat.util.net.SendfileKeepAliveState;
+@@ -336,18 +338,33 @@ public class Http11Processor extends AbstractProcessor {
+                 UpgradeProtocol upgradeProtocol = protocol.getUpgradeProtocol(requestedProtocol);
+                 if (upgradeProtocol != null) {
+                     if (upgradeProtocol.accept(request)) {
+-                        response.setStatus(HttpServletResponse.SC_SWITCHING_PROTOCOLS);
+-                        response.setHeader("Connection", "Upgrade");
+-                        response.setHeader("Upgrade", requestedProtocol);
+-                        action(ActionCode.CLOSE,  null);
+-                        getAdapter().log(request, response, 0);
+-
+-                        InternalHttpUpgradeHandler upgradeHandler =
+-                                upgradeProtocol.getInternalUpgradeHandler(
+-                                        socketWrapper, getAdapter(), cloneRequest(request));
+-                        UpgradeToken upgradeToken = new UpgradeToken(upgradeHandler, null, null, requestedProtocol);
+-                        action(ActionCode.UPGRADE, upgradeToken);
+-                        return SocketState.UPGRADING;
++                        // Create clone of request for upgraded protocol
++                        Request upgradeRequest = null;
++                        try {
++                            upgradeRequest = cloneRequest(request);
++                        } catch (ByteChunk.BufferOverflowException ioe) {
++                            response.setStatus(HttpServletResponse.SC_REQUEST_ENTITY_TOO_LARGE);
++                            setErrorState(ErrorState.CLOSE_CLEAN, null);
++                        } catch (IOException ioe) {
++                            response.setStatus(HttpServletResponse.SC_INTERNAL_SERVER_ERROR);
++                            setErrorState(ErrorState.CLOSE_CLEAN, ioe);
++                        }
++
++                        if (upgradeRequest != null) {
++                            // Complete the HTTP/1.1 upgrade process
++                            response.setStatus(HttpServletResponse.SC_SWITCHING_PROTOCOLS);
++                            response.setHeader("Connection", "Upgrade");
++                            response.setHeader("Upgrade", requestedProtocol);
++                            action(ActionCode.CLOSE,  null);
++                            getAdapter().log(request, response, 0);
++
++                            // Continue processing using new protocol
++                            InternalHttpUpgradeHandler upgradeHandler =
++                                    upgradeProtocol.getInternalUpgradeHandler(socketWrapper, getAdapter(), upgradeRequest);
++                            UpgradeToken upgradeToken = new UpgradeToken(upgradeHandler, null, null, requestedProtocol);
++                            action(ActionCode.UPGRADE, upgradeToken);
++                            return SocketState.UPGRADING;
++                        }
+                     }
+                 }
+             }
+@@ -491,16 +508,39 @@ public class Http11Processor extends AbstractProcessor {
+ 
+         // Transfer the minimal information required for the copy of the Request
+         // that is passed to the HTTP upgrade process
+-
+         dest.decodedURI().duplicate(source.decodedURI());
+         dest.method().duplicate(source.method());
+         dest.getMimeHeaders().duplicate(source.getMimeHeaders());
+         dest.requestURI().duplicate(source.requestURI());
+         dest.queryString().duplicate(source.queryString());
+ 
+-        return dest;
++        // Preparation for reading the request body
++        MimeHeaders headers = source.getMimeHeaders();
++        prepareExpectation(headers);
++        prepareInputFilters(headers);
++        ack(ContinueResponseTiming.ALWAYS);
++
++        // Need to read and buffer the request body, if any. RFC 7230 requires
++        // that the request is fully read before the upgrade takes place.
++        ByteChunk body = new ByteChunk();
++        int maxSavePostSize = protocol.getMaxSavePostSize();
++        if (maxSavePostSize != 0) {
++            body.setLimit(maxSavePostSize);
++            ApplicationBufferHandler buffer = new UpgradeApplicationBufferHandler();
++
++            while (source.getInputBuffer().doRead(buffer) >= 0) {
++                body.append(buffer.getByteBuffer());
++            }
++        }
++
++        // Make the buffered request body available to the upgraded protocol.
++        SavedRequestInputFilter srif = new SavedRequestInputFilter(body);
++        dest.setInputBuffer(srif);
+ 
++        return dest;
+     }
++
++
+     private boolean handleIncompleteRequestLineRead() {
+         // Haven't finished reading the request so keep the socket
+         // open
+@@ -594,8 +634,6 @@ public class Http11Processor extends AbstractProcessor {
+      */
+     private void prepareRequest() throws IOException {
+ 
+-        contentDelimitation = false;
+-
+         if (protocol.isSSLEnabled()) {
+             request.scheme().setString("https");
+         }
+@@ -615,16 +653,7 @@ public class Http11Processor extends AbstractProcessor {
+         }
+ 
+         if (http11) {
+-            MessageBytes expectMB = headers.getValue("expect");
+-            if (expectMB != null && !expectMB.isNull()) {
+-                if (expectMB.toString().trim().equalsIgnoreCase("100-continue")) {
+-                    inputBuffer.setSwallowInput(false);
+-                    request.setExpectation(true);
+-                } else {
+-                    response.setStatus(HttpServletResponse.SC_EXPECTATION_FAILED);
+-                    setErrorState(ErrorState.CLOSE_CLEAN, null);
+-                }
+-            }
++            prepareExpectation(headers);
+         }
+ 
+         // Check user-agent header
+@@ -759,6 +788,34 @@ public class Http11Processor extends AbstractProcessor {
+         }
+ 
+         // Input filter setup
++        prepareInputFilters(headers);
++
++        // Validate host name and extract port if present
++        parseHost(hostValueMB);
++
++        if (!getErrorState().isIoAllowed()) {
++            getAdapter().log(request, response, 0);
++        }
++    }
++
++
++    private void prepareExpectation(MimeHeaders headers) {
++        MessageBytes expectMB = headers.getValue("expect");
++        if (expectMB != null && !expectMB.isNull()) {
++            if (expectMB.toString().trim().equalsIgnoreCase("100-continue")) {
++                inputBuffer.setSwallowInput(false);
++                request.setExpectation(true);
++            } else {
++                response.setStatus(HttpServletResponse.SC_EXPECTATION_FAILED);
++                setErrorState(ErrorState.CLOSE_CLEAN, null);
++            }
++        }
++    }
++
++    private void prepareInputFilters(MimeHeaders headers) throws IOException {
++
++        contentDelimitation = false;
++
+         InputFilter[] inputFilters = inputBuffer.getFilters();
+ 
+         // Parse transfer-encoding header
+@@ -804,9 +861,6 @@ public class Http11Processor extends AbstractProcessor {
+             }
+         }
+ 
+-        // Validate host name and extract port if present
+-        parseHost(hostValueMB);
+-
+         if (!contentDelimitation) {
+             // If there's no content length
+             // (broken HTTP/1.0 or HTTP/1.1), assume
+@@ -814,10 +868,6 @@ public class Http11Processor extends AbstractProcessor {
+             inputBuffer.addActiveFilter(inputFilters[Constants.VOID_FILTER]);
+             contentDelimitation = true;
+         }
+-
+-        if (!getErrorState().isIoAllowed()) {
+-            getAdapter().log(request, response, 0);
+-        }
+     }
+ 
+ 
+
+==================================================
+Stream.java
+new file mode 100644
+index 0000000000..b551aabe11
+--- /dev/null
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeApplicationBufferHandler.java
+@@ -0,0 +1,45 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.coyote.http11.upgrade;
++
++import java.nio.ByteBuffer;
++
++import org.apache.tomcat.util.net.ApplicationBufferHandler;
++
++/**
++ * Trivial implementation of {@link ApplicationBufferHandler} to support saving
++ * of HTTP request bodies during an HTTP/1.1 upgrade.
++ */
++public class UpgradeApplicationBufferHandler implements ApplicationBufferHandler {
++
++    private ByteBuffer byteBuffer;
++
++    @Override
++    public void setByteBuffer(ByteBuffer byteBuffer) {
++        this.byteBuffer = byteBuffer;
++    }
++
++    @Override
++    public ByteBuffer getByteBuffer() {
++        return byteBuffer;
++    }
++
++    @Override
++    public void expand(int size) {
++        // NO-OP
++    }
++}
+
+==================================================
+Http2TestBase.java
+index e3d6fa8e89..ac3dd7234d 100644
+--- a/java/org/apache/coyote/http2/Stream.java
++++ b/java/org/apache/coyote/http2/Stream.java
+@@ -121,7 +121,7 @@ class Stream extends AbstractNonZeroStream implements HeaderEmitter {
+                     coyoteResponse.setError();
+                 }
+             }
+-            // TODO Assuming the body has been read at this point is not valid
++            // Request body, if any, has been read and buffered
+             state.receivedEndOfStream();
+         }
+         this.coyoteRequest.setSendfile(handler.hasAsyncIO() && handler.getProtocol().getUseSendfile());
+
+==================================================
+TestHttp2UpgradeHandler.java
+index f677719cbd..6e97e5a8c6 100644
+--- a/test/org/apache/coyote/http2/Http2TestBase.java
++++ b/test/org/apache/coyote/http2/Http2TestBase.java
+@@ -21,6 +21,7 @@ import java.io.ByteArrayOutputStream;
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.io.OutputStream;
++import java.io.PrintWriter;
+ import java.net.Socket;
+ import java.net.SocketException;
+ import java.nio.ByteBuffer;
+@@ -1384,6 +1385,32 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+     }
+ 
+ 
++    static class ReadRequestBodyServlet extends HttpServlet {
++
++        private static final long serialVersionUID = 1L;
++
++        @Override
++        protected void doGet(HttpServletRequest req, HttpServletResponse resp)
++                throws ServletException, IOException {
++            // Request bodies are unusal with GET but not illegal
++
++            long total = 0;
++            long read = 0;
++            byte[] buffer = new byte[1024];
++            try (InputStream is = req.getInputStream()) {
++                while ((read = is.read(buffer)) > 0) {
++                    total += read;
++                }
++            }
++
++            resp.setContentType("text/plain");
++            resp.setCharacterEncoding("UTF-8");
++            PrintWriter pw = resp.getWriter();
++            pw.print("Total bytes read from request body [" + total + "]");
++        }
++    }
++
++
+     static class SettingValue {
+         private final int setting;
+         private final long value;
+
+==================================================

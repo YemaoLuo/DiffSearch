@@ -1,0 +1,975 @@
+c5e4066fc25c2b8611e476199d3361341c473257
+==================================================
+Complete fix for BZ 63362. Collect stats for h2, websocket and upgrade
+==================================================
+Mark Thomas
+==================================================
+Thu Oct 15 09:45:47 2020 +0100
+==================================================
+Request.java
+Complete fix for BZ 63362. Collect stats for h2, websocket and upgrade
+
+https://bz.apache.org/bugzilla/show_bug.cgi?id=63362
+
+
+==================================================
+AbstractProtocol.java
+index 48e0167c52..2177a92648 100644
+--- a/java/org/apache/catalina/connector/Request.java
++++ b/java/org/apache/catalina/connector/Request.java
+@@ -2017,7 +2017,7 @@ public class Request implements HttpServletRequest {
+             throw new ServletException(e);
+         }
+         UpgradeToken upgradeToken = new UpgradeToken(handler,
+-                getContext(), instanceManager);
++                getContext(), instanceManager, response.getHeader("upgrade"));
+ 
+         coyoteRequest.action(ActionCode.UPGRADE, upgradeToken);
+ 
+
+==================================================
+UpgradeProtocol.java
+index 43c8d64778..83960cbe9c 100644
+--- a/java/org/apache/coyote/LocalStrings.properties
++++ b/java/org/apache/coyote/LocalStrings.properties
+@@ -36,7 +36,6 @@ abstractProcessor.socket.ssl=Exception getting SSL attributes
+ abstractProtocol.mbeanDeregistrationFailed=Failed to deregister MBean named [{0}] from MBean server [{1}]
+ abstractProtocol.processorRegisterError=Error registering request processor
+ abstractProtocol.processorUnregisterError=Error unregistering request processor
+-abstractProtocol.upgradeProtocolDestroyError=Error destroying upgrade protocol
+ abstractProtocol.waitingProcessor.add=Added processor [{0}] to waiting processors
+ abstractProtocol.waitingProcessor.remove=Removed processor [{0}] from waiting processors
+ 
+
+==================================================
+UpgradeToken.java
+index cd2767b126..dc840df9e4 100644
+--- a/java/org/apache/coyote/UpgradeProtocol.java
++++ b/java/org/apache/coyote/UpgradeProtocol.java
+@@ -107,26 +107,4 @@ public interface UpgradeProtocol {
+     public default void setHttp11Protocol(AbstractProtocol<?> protocol) {
+         // NO-OP
+     }
+-
+-
+-    /**
+-     * Initialise the upgrade protocol. Called once the parent HTTP/1.1 protocol
+-     * has initialised.
+-     *
+-     * @throws Exception If initialisation fails
+-     */
+-    public default void init() throws Exception {
+-        // NO-OP
+-    }
+-
+-
+-    /**
+-     * Destroy the upgrade protocol. Called before the parent HTTP/1.1 protocol
+-     * is destroyed.
+-     *
+-     * @throws Exception If the upgrade protocol is not destroyed cleanly
+-     */
+-    public default void destroy() throws Exception {
+-        // NO-OP
+-    }
+ }
+
+==================================================
+AbstractHttp11Protocol.java
+index 729f48a00b..0506f78140 100644
+--- a/java/org/apache/coyote/UpgradeToken.java
++++ b/java/org/apache/coyote/UpgradeToken.java
+@@ -30,12 +30,14 @@ public final class UpgradeToken {
+     private final ContextBind contextBind;
+     private final HttpUpgradeHandler httpUpgradeHandler;
+     private final InstanceManager instanceManager;
++    private final String protocol;
+ 
+-    public UpgradeToken(HttpUpgradeHandler httpUpgradeHandler,
+-            ContextBind contextBind, InstanceManager instanceManager) {
++    public UpgradeToken(HttpUpgradeHandler httpUpgradeHandler, ContextBind contextBind, InstanceManager instanceManager,
++            String protocol) {
+         this.contextBind = contextBind;
+         this.httpUpgradeHandler = httpUpgradeHandler;
+         this.instanceManager = instanceManager;
++        this.protocol = protocol;
+     }
+ 
+     public final ContextBind getContextBind() {
+@@ -50,4 +52,7 @@ public final class UpgradeToken {
+         return instanceManager;
+     }
+ 
++    public final String getProtocol() {
++        return protocol;
++    }
+ }
+
+==================================================
+Http11Processor.java
+index 561ae8eeea..95b602851e 100644
+--- a/java/org/apache/coyote/http11/AbstractHttp11Protocol.java
++++ b/java/org/apache/coyote/http11/AbstractHttp11Protocol.java
+@@ -27,6 +27,10 @@ import java.util.Set;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.regex.Pattern;
+ 
++import javax.management.ObjectInstance;
++import javax.management.ObjectName;
++
++import jakarta.servlet.http.HttpServletRequest;
+ import jakarta.servlet.http.HttpUpgradeHandler;
+ 
+ import org.apache.coyote.AbstractProtocol;
+@@ -38,9 +42,12 @@ import org.apache.coyote.Response;
+ import org.apache.coyote.UpgradeProtocol;
+ import org.apache.coyote.UpgradeToken;
+ import org.apache.coyote.http11.upgrade.InternalHttpUpgradeHandler;
++import org.apache.coyote.http11.upgrade.UpgradeGroupInfo;
+ import org.apache.coyote.http11.upgrade.UpgradeProcessorExternal;
+ import org.apache.coyote.http11.upgrade.UpgradeProcessorInternal;
+ import org.apache.tomcat.util.buf.StringUtils;
++import org.apache.tomcat.util.modeler.Registry;
++import org.apache.tomcat.util.modeler.Util;
+ import org.apache.tomcat.util.net.AbstractEndpoint;
+ import org.apache.tomcat.util.net.SSLHostConfig;
+ import org.apache.tomcat.util.net.SocketWrapperBase;
+@@ -73,6 +80,31 @@ public abstract class AbstractHttp11Protocol<S> extends AbstractProtocol<S> {
+         }
+ 
+         super.init();
++
++        // Set the Http11Protocol (i.e. this) for any upgrade protocols once
++        // this has completed initialisation as the upgrade protocols may expect this
++        // to be initialised when the call is made
++        for (UpgradeProtocol upgradeProtocol : upgradeProtocols) {
++            upgradeProtocol.setHttp11Protocol(this);
++        }
++    }
++
++
++    @Override
++    public void destroy() throws Exception {
++        // There may be upgrade protocols with their own MBeans. These need to
++        // be de-registered.
++        ObjectName rgOname = getGlobalRequestProcessorMBeanName();
++        if (rgOname != null) {
++            Registry registry = Registry.getRegistry(null, null);
++            ObjectName query = new ObjectName(rgOname.getCanonicalName() + ",Upgrade=*");
++            Set<ObjectInstance> upgrades = registry.getMBeanServer().queryMBeans(query, null);
++            for (ObjectInstance upgrade : upgrades) {
++                registry.unregisterComponent(upgrade.getObjectName());
++            }
++        }
++
++        super.destroy();
+     }
+ 
+ 
+@@ -502,8 +534,6 @@ public abstract class AbstractHttp11Protocol<S> extends AbstractProtocol<S> {
+                 }
+             }
+         }
+-
+-        upgradeProtocol.setHttp11Protocol(this);
+     }
+     @Override
+     public UpgradeProtocol getNegotiatedProtocol(String negotiatedName) {
+@@ -515,6 +545,65 @@ public abstract class AbstractHttp11Protocol<S> extends AbstractProtocol<S> {
+     }
+ 
+ 
++    /**
++     * Map of upgrade protocol name to {@link UpgradeGroupInfo} instance.
++     * <p>
++     * HTTP upgrades via {@link HttpServletRequest#upgrade(Class)} do not have
++     * to depend on an {@code UpgradeProtocol}. To enable basic statistics to be
++     * made available for these protocols, a map of protocol name to
++     * {@link UpgradeGroupInfo} instances is maintained here.
++     */
++    private final Map<String,UpgradeGroupInfo> upgradeProtocolGroupInfos = new ConcurrentHashMap<>();
++    public UpgradeGroupInfo getUpgradeGroupInfo(String upgradeProtocol) {
++        if (upgradeProtocol == null) {
++            return null;
++        }
++        UpgradeGroupInfo result = upgradeProtocolGroupInfos.get(upgradeProtocol);
++        if (result == null) {
++            // Protecting against multiple JMX registration, not modification
++            // of the Map.
++            synchronized (upgradeProtocolGroupInfos) {
++                result = upgradeProtocolGroupInfos.get(upgradeProtocol);
++                if (result == null) {
++                    result = new UpgradeGroupInfo();
++                    upgradeProtocolGroupInfos.put(upgradeProtocol, result);
++                    ObjectName oname = getONameForUpgrade(upgradeProtocol);
++                    if (oname != null) {
++                        try {
++                            Registry.getRegistry(null, null).registerComponent(result, oname, null);
++                        } catch (Exception e) {
++                            getLog().warn(sm.getString("abstractHttp11Protocol.upgradeJmxRegistrationFail"), e);
++                            result = null;
++                        }
++                    }
++                }
++            }
++        }
++        return result;
++    }
++
++
++    public ObjectName getONameForUpgrade(String upgradeProtocol) {
++        ObjectName oname = null;
++        ObjectName parentRgOname = getGlobalRequestProcessorMBeanName();
++        if (parentRgOname != null) {
++            StringBuilder name = new StringBuilder(parentRgOname.getCanonicalName());
++            name.append(",Upgrade=");
++            if (Util.objectNameValueNeedsQuote(upgradeProtocol)) {
++                name.append(ObjectName.quote(upgradeProtocol));
++            } else {
++                name.append(upgradeProtocol);
++            }
++            try {
++                oname = new ObjectName(name.toString());
++            } catch (Exception e) {
++                getLog().warn(sm.getString("abstractHttp11Protocol.upgradeJmxNameFail"), e);
++            }
++        }
++        return oname;
++    }
++
++
+     // ------------------------------------------------ HTTP specific properties
+     // ------------------------------------------ passed through to the EndPoint
+ 
+@@ -596,9 +685,9 @@ public abstract class AbstractHttp11Protocol<S> extends AbstractProtocol<S> {
+             UpgradeToken upgradeToken) {
+         HttpUpgradeHandler httpUpgradeHandler = upgradeToken.getHttpUpgradeHandler();
+         if (httpUpgradeHandler instanceof InternalHttpUpgradeHandler) {
+-            return new UpgradeProcessorInternal(socket, upgradeToken);
++            return new UpgradeProcessorInternal(socket, upgradeToken, getUpgradeGroupInfo(upgradeToken.getProtocol()));
+         } else {
+-            return new UpgradeProcessorExternal(socket, upgradeToken);
++            return new UpgradeProcessorExternal(socket, upgradeToken, getUpgradeGroupInfo(upgradeToken.getProtocol()));
+         }
+     }
+ }
+
+==================================================
+InternalHttpUpgradeHandler.java
+index 724a99b486..d880c717af 100644
+--- a/java/org/apache/coyote/http11/LocalStrings.properties
++++ b/java/org/apache/coyote/http11/LocalStrings.properties
+@@ -16,6 +16,8 @@
+ abstractHttp11Protocol.alpnConfigured=The [{0}] connector has been configured to support negotiation to [{1}] via ALPN
+ abstractHttp11Protocol.alpnWithNoAlpn=The upgrade handler [{0}] for [{1}] only supports upgrade via ALPN but has been configured for the [{2}] connector that does not support ALPN.
+ abstractHttp11Protocol.httpUpgradeConfigured=The [{0}] connector has been configured to support HTTP upgrade to [{1}]
++abstractHttp11Protocol.upgradeJmxNameFail=Failed to create ObjectName with which to register upgrade protocol in JMX
++abstractHttp11Protocol.upgradeJmxRegistrationFail=Failed to register upgrade protocol in JMX
+ 
+ http11processor.fallToDebug=\n\
+ \ Note: further occurrences of HTTP request parsing errors will be logged at DEBUG level.
+
+==================================================
+UpgradeGroupInfo.java
+index c852e5ba51..3151d95c8d 100644
+--- a/java/org/apache/coyote/http11/upgrade/InternalHttpUpgradeHandler.java
++++ b/java/org/apache/coyote/http11/upgrade/InternalHttpUpgradeHandler.java
+@@ -43,4 +43,8 @@ public interface InternalHttpUpgradeHandler extends HttpUpgradeHandler {
+     default boolean hasAsyncIO() {
+         return false;
+     }
++
++    default UpgradeInfo getUpgradeInfo() {
++        return null;
++    }
+ }
+\ No newline at end of file
+
+==================================================
+UpgradeInfo.java
+new file mode 100644
+index 0000000000..7d729767d8
+--- /dev/null
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeGroupInfo.java
+@@ -0,0 +1,120 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.coyote.http11.upgrade;
++
++import java.util.ArrayList;
++import java.util.List;
++
++import org.apache.tomcat.util.modeler.BaseModelMBean;
++
++/**
++ *  This aggregates the data collected from each UpgradeInfo instance.
++ */
++public class UpgradeGroupInfo extends BaseModelMBean {
++
++    private final List<UpgradeInfo> upgradeInfos = new ArrayList<>();
++
++    private long deadBytesReceived = 0;
++    private long deadBytesSent = 0;
++    private long deadMsgsReceived = 0;
++    private long deadMsgsSent = 0;
++
++
++    public synchronized void addUpgradeInfo(UpgradeInfo ui) {
++        upgradeInfos.add(ui);
++    }
++
++
++    public synchronized void removeUpgradeInfo(UpgradeInfo ui) {
++        if (ui != null) {
++            deadBytesReceived += ui.getBytesReceived();
++            deadBytesSent += ui.getBytesSent();
++            deadMsgsReceived += ui.getMsgsReceived();
++            deadMsgsSent += ui.getMsgsSent();
++
++            upgradeInfos.remove(ui);
++        }
++    }
++
++
++    public synchronized long getBytesReceived() {
++        long bytes = deadBytesReceived;
++        for (UpgradeInfo ui : upgradeInfos) {
++            bytes += ui.getBytesReceived();
++        }
++        return bytes;
++    }
++    public synchronized void setBytesReceived(long bytesReceived) {
++        deadBytesReceived = bytesReceived;
++        for (UpgradeInfo ui : upgradeInfos) {
++            ui.setBytesReceived(bytesReceived);
++        }
++    }
++
++
++    public synchronized long getBytesSent() {
++        long bytes = deadBytesSent;
++        for (UpgradeInfo ui : upgradeInfos) {
++            bytes += ui.getBytesSent();
++        }
++        return bytes;
++    }
++    public synchronized void setBytesSent(long bytesSent) {
++        deadBytesSent = bytesSent;
++        for (UpgradeInfo ui : upgradeInfos) {
++            ui.setBytesSent(bytesSent);
++        }
++    }
++
++
++    public synchronized long getMsgsReceived() {
++        long msgs = deadMsgsReceived;
++        for (UpgradeInfo ui : upgradeInfos) {
++            msgs += ui.getMsgsReceived();
++        }
++        return msgs;
++    }
++    public synchronized void setMsgsReceived(long msgsReceived) {
++        deadMsgsReceived = msgsReceived;
++        for (UpgradeInfo ui : upgradeInfos) {
++            ui.setMsgsReceived(msgsReceived);
++        }
++    }
++
++
++    public synchronized long getMsgsSent() {
++        long msgs = deadMsgsSent;
++        for (UpgradeInfo ui : upgradeInfos) {
++            msgs += ui.getMsgsSent();
++        }
++        return msgs;
++    }
++    public synchronized void setMsgsSent(long msgsSent) {
++        deadMsgsSent = msgsSent;
++        for (UpgradeInfo ui : upgradeInfos) {
++            ui.setMsgsSent(msgsSent);
++        }
++    }
++
++
++    public void resetCounters() {
++        setBytesReceived(0);
++        setBytesSent(0);
++        setMsgsReceived(0);
++        setMsgsSent(0);
++    }
++}
+
+==================================================
+UpgradeProcessorExternal.java
+new file mode 100644
+index 0000000000..eb3313c6ac
+--- /dev/null
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeInfo.java
+@@ -0,0 +1,96 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.coyote.http11.upgrade;
++
++/**
++ * Structure to hold statistical information about connections that have been
++ * established using the HTTP/1.1 upgrade mechanism. Bytes sent/received will
++ * always be populated. Messages sent/received will be populated if that makes
++ * sense for the protocol and the information is exposed by the protocol
++ * implementation.
++ */
++public class UpgradeInfo  {
++
++    private UpgradeGroupInfo groupInfo = null;
++    private volatile long bytesSent = 0;
++    private volatile long bytesReceived = 0;
++    private volatile long msgsSent = 0;
++    private volatile long msgsReceived = 0;
++
++
++
++    public UpgradeGroupInfo getGlobalProcessor() {
++        return groupInfo;
++    }
++
++
++    public void setGroupInfo(UpgradeGroupInfo groupInfo) {
++        if (groupInfo == null) {
++            if (this.groupInfo != null) {
++                this.groupInfo.removeUpgradeInfo(this);
++                this.groupInfo = null;
++            }
++        } else {
++            this.groupInfo = groupInfo;
++            groupInfo.addUpgradeInfo(this);
++        }
++    }
++
++
++    public long getBytesSent() {
++        return bytesSent;
++    }
++    public void setBytesSent(long bytesSent) {
++        this.bytesSent = bytesSent;
++    }
++    public void addBytesSent(long bytesSent) {
++        this.bytesSent += bytesSent;
++    }
++
++
++    public long getBytesReceived() {
++        return bytesReceived;
++    }
++    public void setBytesReceived(long bytesReceived) {
++        this.bytesReceived = bytesReceived;
++    }
++    public void addBytesReceived(long bytesReceived) {
++        this.bytesReceived += bytesReceived;
++    }
++
++
++    public long getMsgsSent() {
++        return msgsSent;
++    }
++    public void setMsgsSent(long msgsSent) {
++        this.msgsSent = msgsSent;
++    }
++    public void addMsgsSent(long msgsSent) {
++        this.msgsSent += msgsSent;
++    }
++
++
++    public long getMsgsReceived() {
++        return msgsReceived;
++    }
++    public void setMsgsReceived(long msgsReceived) {
++        this.msgsReceived = msgsReceived;
++    }
++    public void addMsgsReceived(long msgsReceived) {
++        this.msgsReceived += msgsReceived;
++    }
++}
+
+==================================================
+UpgradeProcessorInternal.java
+index 11eb465128..dbf744e9c1 100644
+--- a/java/org/apache/coyote/http11/upgrade/UpgradeProcessorExternal.java
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeProcessorExternal.java
+@@ -37,13 +37,15 @@ public class UpgradeProcessorExternal extends UpgradeProcessorBase {
+ 
+     private final UpgradeServletInputStream upgradeServletInputStream;
+     private final UpgradeServletOutputStream upgradeServletOutputStream;
++    private final UpgradeInfo upgradeInfo;
+ 
+-
+-    public UpgradeProcessorExternal(SocketWrapperBase<?> wrapper,
+-            UpgradeToken upgradeToken) {
++    public UpgradeProcessorExternal(SocketWrapperBase<?> wrapper, UpgradeToken upgradeToken,
++            UpgradeGroupInfo upgradeGroupInfo) {
+         super(upgradeToken);
+-        this.upgradeServletInputStream = new UpgradeServletInputStream(this, wrapper);
+-        this.upgradeServletOutputStream = new UpgradeServletOutputStream(this, wrapper);
++        this.upgradeInfo = new UpgradeInfo();
++        upgradeGroupInfo.addUpgradeInfo(upgradeInfo);
++        this.upgradeServletInputStream = new UpgradeServletInputStream(this, wrapper, upgradeInfo);
++        this.upgradeServletOutputStream = new UpgradeServletOutputStream(this, wrapper, upgradeInfo);
+ 
+         /*
+          * Leave timeouts in the hands of the upgraded protocol.
+@@ -65,6 +67,8 @@ public class UpgradeProcessorExternal extends UpgradeProcessorBase {
+     public void close() throws Exception {
+         upgradeServletInputStream.close();
+         upgradeServletOutputStream.close();
++        // Triggers update of stats from UpgradeInfo to UpgradeGroupInfo
++        upgradeInfo.setGroupInfo(null);
+     }
+ 
+ 
+
+==================================================
+UpgradeServletInputStream.java
+index 99fbdb7b05..ddb5759b1f 100644
+--- a/java/org/apache/coyote/http11/upgrade/UpgradeProcessorInternal.java
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeProcessorInternal.java
+@@ -35,8 +35,8 @@ public class UpgradeProcessorInternal extends UpgradeProcessorBase {
+ 
+     private final InternalHttpUpgradeHandler internalHttpUpgradeHandler;
+ 
+-    public UpgradeProcessorInternal(SocketWrapperBase<?> wrapper,
+-            UpgradeToken upgradeToken) {
++    public UpgradeProcessorInternal(SocketWrapperBase<?> wrapper, UpgradeToken upgradeToken,
++            UpgradeGroupInfo upgradeGroupInfo) {
+         super(upgradeToken);
+         this.internalHttpUpgradeHandler = (InternalHttpUpgradeHandler) upgradeToken.getHttpUpgradeHandler();
+         /*
+@@ -46,6 +46,10 @@ public class UpgradeProcessorInternal extends UpgradeProcessorBase {
+         wrapper.setWriteTimeout(INFINITE_TIMEOUT);
+ 
+         internalHttpUpgradeHandler.setSocketWrapper(wrapper);
++        UpgradeInfo upgradeInfo = internalHttpUpgradeHandler.getUpgradeInfo();
++        if (upgradeInfo != null && upgradeGroupInfo != null) {
++            upgradeInfo.setGroupInfo(upgradeGroupInfo);
++        }
+     }
+ 
+ 
+@@ -88,6 +92,10 @@ public class UpgradeProcessorInternal extends UpgradeProcessorBase {
+ 
+     @Override
+     public void close() throws Exception {
++        UpgradeInfo upgradeInfo = internalHttpUpgradeHandler.getUpgradeInfo();
++        if (upgradeInfo != null) {
++            upgradeInfo.setGroupInfo(null);
++        }
+         internalHttpUpgradeHandler.destroy();
+     }
+ 
+
+==================================================
+UpgradeServletOutputStream.java
+index 10b55279c8..b3b7fb5e02 100644
+--- a/java/org/apache/coyote/http11/upgrade/UpgradeServletInputStream.java
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeServletInputStream.java
+@@ -37,6 +37,7 @@ public class UpgradeServletInputStream extends ServletInputStream {
+ 
+     private final UpgradeProcessorBase processor;
+     private final SocketWrapperBase<?> socketWrapper;
++    private final UpgradeInfo upgradeInfo;
+ 
+     private volatile boolean closed = false;
+     private volatile boolean eof = false;
+@@ -45,10 +46,11 @@ public class UpgradeServletInputStream extends ServletInputStream {
+     private volatile ReadListener listener = null;
+ 
+ 
+-    public UpgradeServletInputStream(UpgradeProcessorBase processor,
+-            SocketWrapperBase<?> socketWrapper) {
++    public UpgradeServletInputStream(UpgradeProcessorBase processor, SocketWrapperBase<?> socketWrapper,
++            UpgradeInfo upgradeInfo) {
+         this.processor = processor;
+         this.socketWrapper = socketWrapper;
++        this.upgradeInfo = upgradeInfo;
+     }
+ 
+ 
+@@ -139,7 +141,13 @@ public class UpgradeServletInputStream extends ServletInputStream {
+                 break;
+             }
+         }
+-        return count > 0 ? count : -1;
++
++        if (count > 0) {
++            upgradeInfo.addBytesReceived(count);
++            return count;
++        } else {
++            return -1;
++        }
+     }
+ 
+ 
+@@ -151,6 +159,8 @@ public class UpgradeServletInputStream extends ServletInputStream {
+             int result = socketWrapper.read(listener == null, b, off, len);
+             if (result == -1) {
+                 eof = true;
++            } else {
++                upgradeInfo.addBytesReceived(result);
+             }
+             return result;
+         } catch (IOException ioe) {
+@@ -197,6 +207,7 @@ public class UpgradeServletInputStream extends ServletInputStream {
+             eof = true;
+             return -1;
+         } else {
++            upgradeInfo.addBytesReceived(1);
+             return b[0] & 0xFF;
+         }
+     }
+
+==================================================
+Http2Protocol.java
+index c178e7ecaa..c9dff361e3 100644
+--- a/java/org/apache/coyote/http11/upgrade/UpgradeServletOutputStream.java
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeServletOutputStream.java
+@@ -37,6 +37,7 @@ public class UpgradeServletOutputStream extends ServletOutputStream {
+ 
+     private final UpgradeProcessorBase processor;
+     private final SocketWrapperBase<?> socketWrapper;
++    private final UpgradeInfo upgradeInfo;
+ 
+     // Used to ensure that isReady() and onWritePossible() have a consistent
+     // view of buffer and registered.
+@@ -61,10 +62,11 @@ public class UpgradeServletOutputStream extends ServletOutputStream {
+ 
+ 
+ 
+-    public UpgradeServletOutputStream(UpgradeProcessorBase processor,
+-            SocketWrapperBase<?> socketWrapper) {
++    public UpgradeServletOutputStream(UpgradeProcessorBase processor, SocketWrapperBase<?> socketWrapper,
++            UpgradeInfo upgradeInfo) {
+         this.processor = processor;
+         this.socketWrapper = socketWrapper;
++        this.upgradeInfo = upgradeInfo;
+     }
+ 
+ 
+@@ -210,6 +212,7 @@ public class UpgradeServletOutputStream extends ServletOutputStream {
+         } else {
+             socketWrapper.write(false, b, off, len);
+         }
++        upgradeInfo.addBytesSent(len);
+     }
+ 
+ 
+
+==================================================
+StreamProcessor.java
+index ca6e5afb46..a1c4075a94 100644
+--- a/java/org/apache/coyote/http2/LocalStrings.properties
++++ b/java/org/apache/coyote/http2/LocalStrings.properties
+@@ -72,6 +72,8 @@ http2Parser.processFrameWindowUpdate.debug=Connection [{0}], Stream [{1}], Windo
+ http2Parser.processFrameWindowUpdate.invalidIncrement=Window update frame received with an invalid increment size of [{0}]
+ http2Parser.swallow.debug=Connection [{0}], Stream [{1}], Swallowed [{2}] bytes
+ 
++http2Protocol.jmxRegistration.fail=JMX registration for the HTTP/2 protocol failed
++
+ pingManager.roundTripTime=Connection [{0}] Round trip time measured as [{1}]ns
+ 
+ stream.clientCancel=Client reset the stream before the response was complete
+
+==================================================
+WsFrameBase.java
+index 2c1713cfe0..e23b15be65 100644
+--- a/java/org/apache/coyote/mbeans-descriptors.xml
++++ b/java/org/apache/coyote/mbeans-descriptors.xml
+@@ -59,4 +59,34 @@
+         <operation name="resetCounters" description="Reset counters" impact="ACTION" returnType="void"/>
+ 
+     </mbean>
++
++    <mbean name="UpgradeGroupInfo"
++           description="Runtime information of a group of connections upgraded via the HTTP upgrade process"
++           domain="Catalina"
++           group="Connector"
++           type="org.apache.coyote.http11.upgrade.UpgradeGroupInfo">
++
++        <attribute name="bytesReceived"
++                   description="Amount of data received, in bytes"
++                   type="long"
++                   writeable="false"/>
++
++        <attribute name="bytesSent"
++                   description="Amount of data sent, in bytes"
++                   type="long"
++                   writeable="false"/>
++
++        <attribute name="msgsReceived"
++                   description="Number of messages received where applicable for the given protocol"
++                   type="long"
++                   writeable="false"/>
++
++        <attribute name="msgsSent"
++                   description="Number of messages sent where applicable for the given protocol"
++                   type="long"
++                   writeable="false"/>
++
++        <operation name="resetCounters" description="Reset counters" impact="ACTION" returnType="void"/>
++
++    </mbean>
+ </mbeans-descriptors>
+\ No newline at end of file
+
+==================================================
+WsRemoteEndpointImplBase.java
+index 3bb9bb1729..792dc8f0c1 100644
+--- a/java/org/apache/tomcat/websocket/WsFrameBase.java
++++ b/java/org/apache/tomcat/websocket/WsFrameBase.java
+@@ -307,11 +307,24 @@ public abstract class WsFrameBase {
+                 result = processDataBinary();
+             }
+         }
++        if (result) {
++            updateStats(payloadLength);
++        }
+         checkRoomPayload();
+         return result;
+     }
+ 
+ 
++    /**
++     * Hook for updating server side statistics. Called on every frame received.
++     *
++     * @param payloadLength Size of message payload
++     */
++    protected void updateStats(long payloadLength) {
++        // NO-OP by default
++    }
++
++
+     private boolean processDataControl() throws IOException {
+         TransformationResult tr = transformation.getMoreData(opCode, fin, rsv, controlBufferBinary);
+         if (TransformationResult.UNDERFLOW.equals(tr)) {
+
+==================================================
+WsFrameServer.java
+index 0324e50b75..94b5ccb743 100644
+--- a/java/org/apache/tomcat/websocket/WsRemoteEndpointImplBase.java
++++ b/java/org/apache/tomcat/websocket/WsRemoteEndpointImplBase.java
+@@ -491,6 +491,7 @@ public abstract class WsRemoteEndpointImplBase implements RemoteEndpoint {
+             mask = null;
+         }
+ 
++        int payloadSize = mp.getPayload().remaining();
+         headerBuffer.clear();
+         writeHeader(headerBuffer, mp.isFin(), mp.getRsv(), mp.getOpCode(),
+                 isMasked(), mp.getPayload(), mask, first);
+@@ -508,6 +509,20 @@ public abstract class WsRemoteEndpointImplBase implements RemoteEndpoint {
+             doWrite(mp.getEndHandler(), mp.getBlockingWriteTimeoutExpiry(),
+                     headerBuffer, mp.getPayload());
+         }
++
++        updateStats(payloadSize);
++    }
++
++
++    /**
++     * Hook for updating server side statistics. Called on every frame written
++     * (including when batching is enabled and the frames are buffered locally
++     * until the buffer is full or is flushed).
++     *
++     * @param payloadLength Size of message payload
++     */
++    protected void updateStats(long payloadLength) {
++        // NO-OP by default
+     }
+ 
+ 
+
+==================================================
+WsHttpUpgradeHandler.java
+index c1e369abfc..d29ea047aa 100644
+--- a/java/org/apache/tomcat/websocket/server/WsFrameServer.java
++++ b/java/org/apache/tomcat/websocket/server/WsFrameServer.java
+@@ -20,6 +20,7 @@ import java.io.EOFException;
+ import java.io.IOException;
+ import java.nio.ByteBuffer;
+ 
++import org.apache.coyote.http11.upgrade.UpgradeInfo;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
+@@ -37,13 +38,15 @@ public class WsFrameServer extends WsFrameBase {
+     private static final StringManager sm = StringManager.getManager(WsFrameServer.class);
+ 
+     private final SocketWrapperBase<?> socketWrapper;
++    private final UpgradeInfo upgradeInfo;
+     private final ClassLoader applicationClassLoader;
+ 
+ 
+-    public WsFrameServer(SocketWrapperBase<?> socketWrapper, WsSession wsSession,
++    public WsFrameServer(SocketWrapperBase<?> socketWrapper, UpgradeInfo upgradeInfo, WsSession wsSession,
+             Transformation transformation, ClassLoader applicationClassLoader) {
+         super(wsSession, transformation);
+         this.socketWrapper = socketWrapper;
++        this.upgradeInfo = upgradeInfo;
+         this.applicationClassLoader = applicationClassLoader;
+     }
+ 
+@@ -84,6 +87,13 @@ public class WsFrameServer extends WsFrameBase {
+     }
+ 
+ 
++    @Override
++    protected void updateStats(long payloadLength) {
++        upgradeInfo.addMsgsReceived(1);
++        upgradeInfo.addBytesReceived(payloadLength);
++    }
++
++
+     @Override
+     protected boolean isMasked() {
+         // Data is from the client so it should be masked
+@@ -140,6 +150,7 @@ public class WsFrameServer extends WsFrameBase {
+         socketWrapper.processSocket(SocketEvent.OPEN_READ, true);
+     }
+ 
++
+     SocketState notifyDataAvailable() throws IOException {
+         while (isOpen()) {
+             switch (getReadState()) {
+@@ -167,6 +178,7 @@ public class WsFrameServer extends WsFrameBase {
+         return SocketState.CLOSED;
+     }
+ 
++
+     private SocketState doOnDataAvailable() throws IOException {
+         onDataAvailable();
+         while (isOpen()) {
+
+==================================================
+WsRemoteEndpointImplServer.java
+index c449108d5c..4f28a0e95c 100644
+--- a/java/org/apache/tomcat/websocket/server/WsHttpUpgradeHandler.java
++++ b/java/org/apache/tomcat/websocket/server/WsHttpUpgradeHandler.java
+@@ -30,6 +30,7 @@ import jakarta.websocket.Extension;
+ import jakarta.websocket.server.ServerEndpointConfig;
+ 
+ import org.apache.coyote.http11.upgrade.InternalHttpUpgradeHandler;
++import org.apache.coyote.http11.upgrade.UpgradeInfo;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
+@@ -52,6 +53,7 @@ public class WsHttpUpgradeHandler implements InternalHttpUpgradeHandler {
+     private final ClassLoader applicationClassLoader;
+ 
+     private SocketWrapperBase<?> socketWrapper;
++    private UpgradeInfo upgradeInfo = new UpgradeInfo();
+ 
+     private Endpoint ep;
+     private ServerEndpointConfig serverEndpointConfig;
+@@ -117,7 +119,7 @@ public class WsHttpUpgradeHandler implements InternalHttpUpgradeHandler {
+         ClassLoader cl = t.getContextClassLoader();
+         t.setContextClassLoader(applicationClassLoader);
+         try {
+-            wsRemoteEndpointServer = new WsRemoteEndpointImplServer(socketWrapper, webSocketContainer);
++            wsRemoteEndpointServer = new WsRemoteEndpointImplServer(socketWrapper, upgradeInfo, webSocketContainer);
+             wsSession = new WsSession(ep, wsRemoteEndpointServer,
+                     webSocketContainer, handshakeRequest.getRequestURI(),
+                     handshakeRequest.getParameterMap(),
+@@ -125,7 +127,7 @@ public class WsHttpUpgradeHandler implements InternalHttpUpgradeHandler {
+                     handshakeRequest.getUserPrincipal(), httpSessionId,
+                     negotiatedExtensions, subProtocol, pathParameters, secure,
+                     serverEndpointConfig);
+-            wsFrame = new WsFrameServer(socketWrapper, wsSession, transformation,
++            wsFrame = new WsFrameServer(socketWrapper, upgradeInfo, wsSession, transformation,
+                     applicationClassLoader);
+             // WsFrame adds the necessary final transformations. Copy the
+             // completed transformation chain to the remote end point.
+@@ -140,6 +142,12 @@ public class WsHttpUpgradeHandler implements InternalHttpUpgradeHandler {
+     }
+ 
+ 
++    @Override
++    public UpgradeInfo getUpgradeInfo() {
++        return upgradeInfo;
++    }
++
++
+     @Override
+     public SocketState upgradeDispatch(SocketEvent status) {
+         switch (status) {
+
+==================================================
+TestUpgrade.java
+index d56ba3dbef..fd8e6f4b3c 100644
+--- a/java/org/apache/tomcat/websocket/server/WsRemoteEndpointImplServer.java
++++ b/java/org/apache/tomcat/websocket/server/WsRemoteEndpointImplServer.java
+@@ -27,6 +27,7 @@ import java.util.concurrent.TimeUnit;
+ import jakarta.websocket.SendHandler;
+ import jakarta.websocket.SendResult;
+ 
++import org.apache.coyote.http11.upgrade.UpgradeInfo;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.net.SocketWrapperBase;
+@@ -46,15 +47,17 @@ public class WsRemoteEndpointImplServer extends WsRemoteEndpointImplBase {
+     private final Log log = LogFactory.getLog(WsRemoteEndpointImplServer.class); // must not be static
+ 
+     private final SocketWrapperBase<?> socketWrapper;
++    private final UpgradeInfo upgradeInfo;
+     private final WsWriteTimeout wsWriteTimeout;
+     private volatile SendHandler handler = null;
+     private volatile ByteBuffer[] buffers = null;
+ 
+     private volatile long timeoutExpiry = -1;
+ 
+-    public WsRemoteEndpointImplServer(SocketWrapperBase<?> socketWrapper,
++    public WsRemoteEndpointImplServer(SocketWrapperBase<?> socketWrapper, UpgradeInfo upgradeInfo,
+             WsServerContainer serverContainer) {
+         this.socketWrapper = socketWrapper;
++        this.upgradeInfo = upgradeInfo;
+         this.wsWriteTimeout = serverContainer.getTimeout();
+     }
+ 
+@@ -154,6 +157,13 @@ public class WsRemoteEndpointImplServer extends WsRemoteEndpointImplBase {
+     }
+ 
+ 
++    @Override
++    protected void updateStats(long payloadLength) {
++        upgradeInfo.addMsgsSent(1);
++        upgradeInfo.addBytesSent(payloadLength);
++    }
++
++
+     public void onWritePossible(boolean useDispatch) {
+         // Note: Unused for async IO
+         ByteBuffer[] buffers = this.buffers;
+
+==================================================

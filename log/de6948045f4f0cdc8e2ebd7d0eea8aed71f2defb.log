@@ -1,0 +1,306 @@
+de6948045f4f0cdc8e2ebd7d0eea8aed71f2defb
+==================================================
+Pull up comment processing code
+==================================================
+Mark Thomas
+==================================================
+Tue Oct 20 09:01:20 2015 +0000
+==================================================
+AbstractProcessor.java
+Pull up comment processing code
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1709546 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AbstractProcessorLight.java
+index df6064e8d3..41154dafd4 100644
+--- a/java/org/apache/coyote/AbstractProcessor.java
++++ b/java/org/apache/coyote/AbstractProcessor.java
+@@ -22,7 +22,6 @@ import java.util.concurrent.Executor;
+ 
+ import javax.servlet.RequestDispatcher;
+ 
+-import org.apache.juli.logging.Log;
+ import org.apache.tomcat.util.ExceptionUtils;
+ import org.apache.tomcat.util.net.AbstractEndpoint;
+ import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
+@@ -280,6 +279,4 @@ public abstract class AbstractProcessor extends AbstractProcessorLight implement
+      *         current request has completed
+      */
+     protected abstract SocketState dispatchEndRequest();
+-
+-    protected abstract Log getLog();
+ }
+
+==================================================
+AbstractProtocol.java
+index 388b776e5b..82001db283 100644
+--- a/java/org/apache/coyote/AbstractProcessorLight.java
++++ b/java/org/apache/coyote/AbstractProcessorLight.java
+@@ -22,7 +22,9 @@ import java.util.Set;
+ import java.util.concurrent.CopyOnWriteArraySet;
+ 
+ import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
++import org.apache.juli.logging.Log;
+ import org.apache.tomcat.util.net.DispatchType;
++import org.apache.tomcat.util.net.SocketStatus;
+ import org.apache.tomcat.util.net.SocketWrapperBase;
+ 
+ /**
+@@ -36,9 +38,62 @@ public abstract class AbstractProcessorLight implements Processor {
+ 
+ 
+     @Override
+-    public SocketState process(SocketWrapperBase<?> socketWrapper) throws IOException {
+-        // TODO Auto-generated method stub
+-        return null;
++    public SocketState process(SocketWrapperBase<?> socketWrapper, SocketStatus status)
++            throws IOException {
++
++        SocketState state = SocketState.CLOSED;
++        Iterator<DispatchType> dispatches = null;
++        do {
++            if (status == SocketStatus.CLOSE_NOW) {
++                errorDispatch();
++                state = SocketState.CLOSED;
++            } else if (dispatches != null) {
++                DispatchType nextDispatch = dispatches.next();
++                state = dispatch(nextDispatch.getSocketStatus());
++            } else if (status == SocketStatus.DISCONNECT) {
++                // Do nothing here, just wait for it to get recycled
++            } else if (isAsync() || isUpgrade()) {
++                state = dispatch(status);
++            } else if (state == SocketState.ASYNC_END) {
++                state = dispatch(status);
++                // TODO: In case this request takes a long time to process
++                //       remove the TBD (socket/processor/something else) from
++                //       the waiting requests now else the async timeout will
++                //       fire
++                if (state == SocketState.OPEN) {
++                    // There may be pipe-lined data to read. If the data
++                    // isn't processed now, execution will exit this
++                    // loop and call release() which will recycle the
++                    // processor (and input buffer) deleting any
++                    // pipe-lined data. To avoid this, process it now.
++                    state = service(socketWrapper);
++                }
++            } else if (status == SocketStatus.OPEN_WRITE) {
++                // Extra write event likely after async, ignore
++                state = SocketState.LONG;
++            } else {
++                state = service(socketWrapper);
++            }
++
++            if (state != SocketState.CLOSED && isAsync()) {
++                state = asyncPostProcess();
++            }
++
++            if (getLog().isDebugEnabled()) {
++                getLog().debug("Socket: [" + socketWrapper +
++                        "], Status in: [" + status +
++                        "], State out: [" + state + "]");
++            }
++
++            if (dispatches == null || !dispatches.hasNext()) {
++                // Only returns non-null iterator if there are
++                // dispatches to process.
++                dispatches = getIteratorAndClearDispatches();
++            }
++        } while (state == SocketState.ASYNC_END ||
++                dispatches != null && state != SocketState.CLOSED);
++
++        return state;
+     }
+ 
+ 
+@@ -75,4 +130,7 @@ public abstract class AbstractProcessorLight implements Processor {
+             dispatches.clear();
+         }
+     }
++
++
++    protected abstract Log getLog();
+ }
+
+==================================================
+Processor.java
+index 367ccc85d3..0875fc4e37 100644
+--- a/java/org/apache/coyote/AbstractProtocol.java
++++ b/java/org/apache/coyote/AbstractProtocol.java
+@@ -19,7 +19,6 @@ package org.apache.coyote;
+ import java.io.IOException;
+ import java.net.InetAddress;
+ import java.nio.ByteBuffer;
+-import java.util.Iterator;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.Executor;
+ import java.util.concurrent.atomic.AtomicInteger;
+@@ -40,7 +39,6 @@ import org.apache.tomcat.util.collections.SynchronizedStack;
+ import org.apache.tomcat.util.modeler.Registry;
+ import org.apache.tomcat.util.net.AbstractEndpoint;
+ import org.apache.tomcat.util.net.AbstractEndpoint.Handler;
+-import org.apache.tomcat.util.net.DispatchType;
+ import org.apache.tomcat.util.net.SocketStatus;
+ import org.apache.tomcat.util.net.SocketWrapperBase;
+ import org.apache.tomcat.util.res.StringManager;
+@@ -631,8 +629,7 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+ 
+ 
+         @Override
+-        public SocketState process(SocketWrapperBase<S> wrapper,
+-                SocketStatus status) {
++        public SocketState process(SocketWrapperBase<S> wrapper, SocketStatus status) {
+             if (wrapper == null) {
+                 // Nothing to do. Socket has been closed.
+                 return SocketState.CLOSED;
+@@ -685,52 +682,16 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+                 processor.setSslSupport(
+                         wrapper.getSslSupport(getProtocol().getClientCertProvider()));
+ 
++                // Associate the processor with the connection
++                connections.put(socket, processor);
++
+                 SocketState state = SocketState.CLOSED;
+-                Iterator<DispatchType> dispatches = null;
+                 do {
+-                    if (status == SocketStatus.CLOSE_NOW) {
+-                        processor.errorDispatch();
+-                        state = SocketState.CLOSED;
+-                    } else if (dispatches != null) {
+-                        // Associate the processor with the connection as
+-                        // these calls may result in a nested call to process()
+-                        connections.put(socket, processor);
+-                        DispatchType nextDispatch = dispatches.next();
+-                        state = processor.dispatch(nextDispatch.getSocketStatus());
+-                    } else if (status == SocketStatus.DISCONNECT) {
+-                        // Do nothing here, just wait for it to get recycled
+-                    } else if (processor.isAsync() || processor.isUpgrade()) {
+-                        state = processor.dispatch(status);
+-                    } else if (state == SocketState.ASYNC_END) {
+-                        state = processor.dispatch(status);
+-                        // release() won't get called so in case this request
+-                        // takes a long time to process remove the socket from
+-                        // the waiting requests now else the async timeout will
+-                        // fire
+-                        getProtocol().getEndpoint().removeWaitingRequest(wrapper);
+-                        if (state == SocketState.OPEN) {
+-                            // There may be pipe-lined data to read. If the data
+-                            // isn't processed now, execution will exit this
+-                            // loop and call release() which will recycle the
+-                            // processor (and input buffer) deleting any
+-                            // pipe-lined data. To avoid this, process it now.
+-                            state = processor.service(wrapper);
+-                        }
+-                    } else if (status == SocketStatus.OPEN_WRITE) {
+-                        // Extra write event likely after async, ignore
+-                        state = SocketState.LONG;
+-                    } else {
+-                        state = processor.service(wrapper);
+-                    }
+-
+-                    if (state != SocketState.CLOSED && processor.isAsync()) {
+-                        state = processor.asyncPostProcess();
+-                    }
++                    state = processor.process(wrapper, status);
+ 
+                     if (state == SocketState.UPGRADING) {
+                         // Get the HTTP upgrade handler
+-                        HttpUpgradeHandler httpUpgradeHandler =
+-                                processor.getHttpUpgradeHandler();
++                        HttpUpgradeHandler httpUpgradeHandler = processor.getHttpUpgradeHandler();
+                         // Retrieve leftover input
+                         ByteBuffer leftoverInput = processor.getLeftoverInput();
+                         // Release the Http11 processor to be re-used
+@@ -750,19 +711,7 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+                         // it.
+                         httpUpgradeHandler.init((WebConnection) processor);
+                     }
+-                    if (getLog().isDebugEnabled()) {
+-                        getLog().debug("Socket: [" + wrapper +
+-                                "], Status in: [" + status +
+-                                "], State out: [" + state + "]");
+-                    }
+-                    if (dispatches == null || !dispatches.hasNext()) {
+-                        // Only returns non-null iterator if there are
+-                        // dispatches to process.
+-                        dispatches = processor.getIteratorAndClearDispatches();
+-                    }
+-                } while (state == SocketState.ASYNC_END ||
+-                        state == SocketState.UPGRADING ||
+-                        dispatches != null && state != SocketState.CLOSED);
++                } while ( state == SocketState.UPGRADING);
+ 
+                 if (state == SocketState.LONG) {
+                     // In the middle of processing a request/response. Keep the
+@@ -823,8 +772,7 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+                 // any other exception or error is odd. Here we log it
+                 // with "ERROR" level, so it will show up even on
+                 // less-than-verbose logs.
+-                getLog().error(
+-                        sm.getString("abstractConnectionHandler.error"), e);
++                getLog().error(sm.getString("abstractConnectionHandler.error"), e);
+             } finally {
+                 ContainerThreadMarker.clear();
+             }
+
+==================================================
+UpgradeProcessorExternal.java
+index 3d9d2412bb..9a6b36eb13 100644
+--- a/java/org/apache/coyote/Processor.java
++++ b/java/org/apache/coyote/Processor.java
+@@ -43,6 +43,8 @@ public interface Processor {
+      * not currently being processed.
+      *
+      * @param socketWrapper The connection to process
++     * @param status The status of the connection that triggered this additional
++     *               processing
+      *
+      * @return The state the caller should put the socket in when this method
+      *         returns
+@@ -50,7 +52,7 @@ public interface Processor {
+      * @throws IOException If an I/O error occurs during the processing of the
+      *         request
+      */
+-    SocketState process(SocketWrapperBase<?> socketWrapper) throws IOException;
++    SocketState process(SocketWrapperBase<?> socketWrapper, SocketStatus status) throws IOException;
+ 
+     /**
+      * Service a 'standard' HTTP request. This method is called for both new
+
+==================================================
+UpgradeProcessorInternal.java
+index 68ed98e4da..fd5f0c75cc 100644
+--- a/java/org/apache/coyote/http11/upgrade/UpgradeProcessorExternal.java
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeProcessorExternal.java
+@@ -55,6 +55,12 @@ public class UpgradeProcessorExternal extends UpgradeProcessorBase {
+     }
+ 
+ 
++    @Override
++    protected Log getLog() {
++        return log;
++    }
++
++
+     // --------------------------------------------------- AutoCloseable methods
+ 
+     @Override
+
+==================================================
+StreamProcessor.java
+index 3fe137dc8c..98186e97d8 100644
+--- a/java/org/apache/coyote/http2/LocalStrings.properties
++++ b/java/org/apache/coyote/http2/LocalStrings.properties
+@@ -77,8 +77,6 @@ stream.outputBuffer.flush.debug=Connection [{0}], Stream [{1}], flushing output
+ streamProcessor.error.connection=Connection [{0}], Stream [{1}], An error occurred during processing that was fatal to the connection
+ streamProcessor.error.stream=Connection [{0}], Stream [{1}], An error occurred during processing that was fatal to the stream
+ streamProcessor.httpupgrade.notsupported=HTTP upgrade is not supported within HTTP/2 streams
+-streamProcessor.process.loopend=Connection [{0}], Stream [{1}], loop end, state [{2}], dispatches [{3}]
+-streamProcessor.process.loopstart=Connection [{0}], Stream [{1}], loop start, status [{2}], dispatches [{3}]
+ streamProcessor.ssl.error=Unable to retrieve SSL request attributes
+ 
+ streamStateMachine.debug.change=Connection [{0}], Stream [{1}], State changed from [{2}] to [{3}]
+
+==================================================

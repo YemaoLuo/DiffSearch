@@ -1,0 +1,308 @@
+22e16581cac696d3d0386b229e81a833480b5548
+==================================================
+Add support for a custom URL protocol "war" that is used when accessing
+==================================================
+Mark Emlyn
+==================================================
+Mon Sep 16 13:14:56 2013 +0000
+==================================================
+WebappClassLoader.java
+Add support for a custom URL protocol "war" that is used when accessing
+JARs inside packed WAR files as the jar protocol does not support
+nesting.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1523633 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+JarWarResource.java
+index 905b9c3cd3..1d7523323f 100644
+--- a/java/org/apache/catalina/loader/WebappClassLoader.java
++++ b/java/org/apache/catalina/loader/WebappClassLoader.java
+@@ -65,6 +65,7 @@ import org.apache.catalina.LifecycleListener;
+ import org.apache.catalina.LifecycleState;
+ import org.apache.catalina.WebResource;
+ import org.apache.catalina.WebResourceRoot;
++import org.apache.catalina.webresources.TomcatURLStreamHandlerFactory;
+ import org.apache.tomcat.util.ExceptionUtils;
+ import org.apache.tomcat.util.IntrospectionUtils;
+ import org.apache.tomcat.util.res.StringManager;
+@@ -1750,6 +1751,8 @@ public class WebappClassLoader
+         // Clear the classloader reference in the VM's bean introspector
+         java.beans.Introspector.flushCaches();
+ 
++        // Clear any custom URLStreamHandlers
++        TomcatURLStreamHandlerFactory.release(this);
+     }
+ 
+ 
+
+==================================================
+StandardRoot.java
+index f37384858f..f7aed3482d 100644
+--- a/java/org/apache/catalina/webresources/JarWarResource.java
++++ b/java/org/apache/catalina/webresources/JarWarResource.java
+@@ -46,7 +46,7 @@ public class JarWarResource extends AbstractArchiveResource {
+         super(root, webAppPath, jarEntry);
+         this.base = base;
+         this.archivePath = archivePath;
+-        this.baseUrl = "jar:" + baseUrl;
++        this.baseUrl = "jar:war:" + baseUrl + "^/" + archivePath;
+ 
+         String resourceName = resource.getName();
+         if (resourceName.charAt(resourceName.length() - 1) == '/') {
+
+==================================================
+TomcatURLStreamHandlerFactory.java
+index 9285587942..667e99783e 100644
+--- a/java/org/apache/catalina/webresources/StandardRoot.java
++++ b/java/org/apache/catalina/webresources/StandardRoot.java
+@@ -420,6 +420,10 @@ public class StandardRoot extends LifecycleMBeanBase
+     protected void initInternal() throws LifecycleException {
+         super.initInternal();
+ 
++        // Ensure support for jar:war:file:/ URKLs will be available (required
++        // for resource JARs in packed WAR files).
++        TomcatURLStreamHandlerFactory.register();
++
+         if (context == null) {
+             throw new IllegalStateException(
+                     sm.getString("standardRoot.noContext"));
+
+==================================================
+WarURLConnection.java
+new file mode 100644
+index 0000000000..d6d0118743
+--- /dev/null
++++ b/java/org/apache/catalina/webresources/TomcatURLStreamHandlerFactory.java
+@@ -0,0 +1,119 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.catalina.webresources;
++
++import java.net.URL;
++import java.net.URLStreamHandler;
++import java.net.URLStreamHandlerFactory;
++import java.util.Iterator;
++import java.util.List;
++import java.util.concurrent.CopyOnWriteArrayList;
++
++// TODO Add hook to enable user registered factories to be unloaded on web
++// application stop.
++public class TomcatURLStreamHandlerFactory implements URLStreamHandlerFactory{
++
++    private static final String WAR_PROTOCOL = "war";
++
++    // Singleton instance
++    private static TomcatURLStreamHandlerFactory instance =
++            new TomcatURLStreamHandlerFactory();
++
++    /**
++     * Obtain a reference to the singleton instance,
++     */
++    public static TomcatURLStreamHandlerFactory getInstance() {
++        return instance;
++    }
++
++
++    // List of factories for application defined stream handler factories.
++    private List<URLStreamHandlerFactory> userFactories =
++            new CopyOnWriteArrayList<>();
++
++
++    /**
++     * Register this factory with the JVM. May be called more than once. The
++     * implementation ensures that registration only occurs once.
++     */
++    public static void register() {
++        // Calling this method loads this class which in turn triggers all the
++        // necessary registration.
++    }
++
++
++    /**
++     * Since the JVM only allows a single call to
++     * {@link URL#setURLStreamHandlerFactory(URLStreamHandlerFactory)} and
++     * Tomcat needs to register a handler, provide a mechanism to allow
++     * applications to registertheir own handlers.
++     */
++    public static void addUserFactory(URLStreamHandlerFactory factory) {
++        instance.userFactories.add(factory);
++    }
++
++
++    /**
++     * Release references to any user provided factories that have been loaded
++     * using the provided class loader. Called during web application stop to
++     * prevent memory leaks.
++     */
++    public static void release(ClassLoader classLoader) {
++        Iterator<URLStreamHandlerFactory> iter = instance.userFactories.iterator();
++        while (iter.hasNext()) {
++            ClassLoader factoryLoader = iter.next().getClass().getClassLoader();
++            while (factoryLoader != null) {
++                if (classLoader.equals(factoryLoader)) {
++                    iter.remove();
++                    break;
++                }
++                factoryLoader = factoryLoader.getParent();
++            }
++        }
++    }
++
++
++    private TomcatURLStreamHandlerFactory() {
++        // Hide default constructor
++        // Singleton pattern to ensure there is only one instance of this
++        // factory
++        URL.setURLStreamHandlerFactory(this);
++    }
++
++
++    @Override
++    public URLStreamHandler createURLStreamHandler(String protocol) {
++
++        // Tomcat's handler always takes priority so applications can't override
++        // it.
++        if (WAR_PROTOCOL.equals(protocol)) {
++            return new WarURLStreamHandler();
++        }
++
++        // Application handlers
++        for (URLStreamHandlerFactory factory : userFactories) {
++            URLStreamHandler handler =
++                factory.createURLStreamHandler(protocol);
++            if (handler != null) {
++                return handler;
++            }
++        }
++
++        // Unknown protocol
++        return null;
++    }
++}
+
+==================================================
+WarURLStreamHandler.java
+new file mode 100644
+index 0000000000..332126edc3
+--- /dev/null
++++ b/java/org/apache/catalina/webresources/WarURLConnection.java
+@@ -0,0 +1,49 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.catalina.webresources;
++
++import java.io.IOException;
++import java.io.InputStream;
++import java.net.URL;
++import java.net.URLConnection;
++
++
++public class WarURLConnection extends URLConnection {
++
++    private final URLConnection innerJarUrlConnection;
++    private boolean connected;
++
++    protected WarURLConnection(URL url) throws IOException {
++        super(url);
++        URL innerJarUrl = new URL(url.getFile());
++        innerJarUrlConnection = innerJarUrl.openConnection();
++    }
++
++    @Override
++    public void connect() throws IOException {
++        if (!connected) {
++            innerJarUrlConnection.connect();
++            connected = true;
++        }
++    }
++
++    @Override
++    public InputStream getInputStream() throws IOException {
++        connect();
++        return innerJarUrlConnection.getInputStream();
++    }
++}
+
+==================================================
+TestWarURLConnection.java
+new file mode 100644
+index 0000000000..3f048a524b
+--- /dev/null
++++ b/java/org/apache/catalina/webresources/WarURLStreamHandler.java
+@@ -0,0 +1,43 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.catalina.webresources;
++
++import java.io.IOException;
++import java.net.URL;
++import java.net.URLConnection;
++import java.net.URLStreamHandler;
++
++public class WarURLStreamHandler extends URLStreamHandler{
++
++    @Override
++    protected void parseURL(URL u, String spec, int start, int limit) {
++        // Need to make this look like a JAR URL for the WAR file
++        // Assumes that the spec is absolute and starts war:file:/...
++
++        // Only the path needs to be changed
++        String path = "jar:" + spec.substring(4);
++        path = path.replaceFirst("\\^/", "!/");
++
++        setURL(u, u.getProtocol(), "", -1, null, null,
++                path, null, null);
++    }
++
++    @Override
++    protected URLConnection openConnection(URL u) throws IOException {
++        return new WarURLConnection(u);
++    }
++}
+
+==================================================

@@ -1,0 +1,217 @@
+577c4e6194b71a63be70725bb743c94c7cb082cc
+==================================================
+Part 2 of SPNEGO/Windows authentication support.
+==================================================
+Mark Emlyn
+==================================================
+Tue Mar 29 20:05:04 2011 +0000
+==================================================
+Realm.java
+Part 2 of SPNEGO/Windows authentication support.
+Authorisation support. Works essentially the same way as CLIENT-CERT, i.e. the Realm doesn't actually authenticate the user but it does create the Principal and add the roles.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1086706 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+SpnegoAuthenticator.java
+index f66a91d527..b9e85c1386 100644
+--- a/java/org/apache/catalina/Realm.java
++++ b/java/org/apache/catalina/Realm.java
+@@ -26,6 +26,7 @@ import java.security.cert.X509Certificate;
+ import org.apache.catalina.connector.Request;
+ import org.apache.catalina.connector.Response;
+ import org.apache.catalina.deploy.SecurityConstraint;
++import org.ietf.jgss.GSSContext;
+ /**
+  * A <b>Realm</b> is a read-only facade for an underlying security realm
+  * used to authenticate individual users, and identify the security roles
+@@ -110,7 +111,16 @@ public interface Realm {
+      * Return the Principal associated with the specified chain of X509
+      * client certificates.  If there is none, return <code>null</code>.
+      *
+-     * @param certs Array of client certificates, with the first one in
++     * @param certs The gssContext processed by the {@link Authenticator}.
++     */
++    public Principal authenticate(GSSContext gssContext);
++    
++    
++    /**
++     * Return the Principal associated with the specified {@link GSSContext}.
++     * If there is none, return <code>null</code>.
++     *
++     * @param gssContext Array of client certificates, with the first one in
+      *  the array being the certificate of the client itself.
+      */
+     public Principal authenticate(X509Certificate certs[]);
+
+==================================================
+CombinedRealm.java
+index 3719a6434f..6a3013a798 100644
+--- a/java/org/apache/catalina/authenticator/SpnegoAuthenticator.java
++++ b/java/org/apache/catalina/authenticator/SpnegoAuthenticator.java
+@@ -33,10 +33,10 @@ import javax.security.auth.login.LoginContext;
+ import javax.security.auth.login.LoginException;
+ import javax.servlet.http.HttpServletResponse;
+ 
++import org.apache.catalina.Context;
+ import org.apache.catalina.LifecycleException;
+ import org.apache.catalina.connector.Request;
+ import org.apache.catalina.deploy.LoginConfig;
+-import org.apache.catalina.realm.GenericPrincipal;
+ import org.apache.catalina.startup.Bootstrap;
+ import org.apache.catalina.util.Base64;
+ import org.apache.juli.logging.Log;
+@@ -47,7 +47,7 @@ import org.ietf.jgss.GSSContext;
+ import org.ietf.jgss.GSSCredential;
+ import org.ietf.jgss.GSSException;
+ import org.ietf.jgss.GSSManager;
+-import org.ietf.jgss.GSSName;
++
+ 
+ /**
+  * A SPNEGO authenticator that uses the SPENGO/Kerberos support built in to Java
+@@ -208,7 +208,8 @@ public class SpnegoAuthenticator extends AuthenticatorBase {
+ 
+                 try {
+                     principal = Subject.doAs(serviceSubject,
+-                            new KerberosAuthAction(decoded.getBytes(), response));
++                            new KerberosAuthAction(decoded.getBytes(),
++                                    response, context));
+                 } catch (PrivilegedActionException e) {
+                     // TODO Auto-generated catch block
+                     e.printStackTrace();
+@@ -235,10 +236,13 @@ public class SpnegoAuthenticator extends AuthenticatorBase {
+ 
+         private byte[] inToken;
+         private HttpServletResponse resp;
++        private Context context;
+ 
+-        public KerberosAuthAction(byte[] inToken, HttpServletResponse resp) {
++        public KerberosAuthAction(byte[] inToken, HttpServletResponse resp,
++                Context context) {
+             this.inToken = inToken;
+             this.resp = resp;
++            this.context = context;
+         }
+ 
+         @Override
+@@ -246,7 +250,7 @@ public class SpnegoAuthenticator extends AuthenticatorBase {
+ 
+             // Assume the GSSContext is stateless
+             // TODO: Confirm this assumption
+-            GSSContext context =
++            GSSContext gssContext =
+                 GSSManager.getInstance().createContext((GSSCredential) null);
+ 
+             Principal principal = null;
+@@ -256,26 +260,19 @@ public class SpnegoAuthenticator extends AuthenticatorBase {
+             }
+ 
+             byte[] outToken =
+-                context.acceptSecContext(inToken, 0, inToken.length);
++                gssContext.acceptSecContext(inToken, 0, inToken.length);
+ 
+             if (outToken == null) {
+                 throw new GSSException(GSSException.DEFECTIVE_TOKEN);
+             }
+ 
+-            GSSName initiatorName = context.getSrcName();
+-
+-            if (context.isEstablished()) {
+-                // TODO This (and a lot of the surrounding code) needs to move
+-                // to RealmBase so authorisation will work. This is just a quick
+-                // hack to get authentication working.
+-                principal = new GenericPrincipal(initiatorName.toString(), null);
+-            }
++            principal = context.getRealm().authenticate(gssContext);
+ 
+             // Send response token on success and failure
+             resp.setHeader("WWW-Authenticate", "Negotiate "
+                     + Base64.encode(outToken));
+ 
+-            context.dispose();
++            gssContext.dispose();
+             return principal;
+         }
+     }
+
+==================================================
+LockOutRealm.java
+index 9173ab9799..01fb5a8ef2 100644
+--- a/java/org/apache/catalina/realm/LocalStrings.properties
++++ b/java/org/apache/catalina/realm/LocalStrings.properties
+@@ -73,6 +73,7 @@ realmBase.notAuthenticated=Configuration error:  Cannot perform access control w
+ realmBase.notStarted=This Realm has not yet been started
+ realmBase.authenticateFailure=Username {0} NOT successfully authenticated
+ realmBase.authenticateSuccess=Username {0} successfully authenticated
++realmBase.gssNameFail=Failed to extract name from established GSSContext
+ userDatabaseRealm.authenticateError=Login configuration error authenticating username {0}
+ userDatabaseRealm.lookup=Exception looking up UserDatabase under key {0}
+ userDatabaseRealm.noDatabase=No UserDatabase component found under key {0}
+
+==================================================
+RealmBase.java
+index bd06929ada..7059a85eb5 100644
+--- a/java/org/apache/catalina/realm/LockOutRealm.java
++++ b/java/org/apache/catalina/realm/LockOutRealm.java
+@@ -26,6 +26,9 @@ import java.util.concurrent.atomic.AtomicInteger;
+ import org.apache.catalina.LifecycleException;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
++import org.ietf.jgss.GSSContext;
++import org.ietf.jgss.GSSException;
++import org.ietf.jgss.GSSName;
+ 
+ /**
+  * This class extends the CombinedRealm (hence it can wrap other Realms) to
+@@ -218,6 +221,46 @@ public class LockOutRealm extends CombinedRealm {
+     }
+ 
+ 
++    /**
++     * {@inheritDoc}
++     */
++    @Override
++    public Principal authenticate(GSSContext gssContext) {
++        if (gssContext.isEstablished()) {
++            String username = null;
++            GSSName name = null;
++            try {
++                name = gssContext.getSrcName();
++            } catch (GSSException e) {
++                log.warn(sm.getString("realmBase.gssNameFail"), e);
++                return null;
++            }
++            
++            username = name.toString();
++            
++            if (isLocked(username)) {
++                // Trying to authenticate a locked user is an automatic failure
++                registerAuthFailure(username);
++                
++                log.warn(sm.getString("lockOutRealm.authLockedUser", username));
++                return null;
++            }
++
++            Principal authenticatedUser = super.authenticate(gssContext);
++            
++            if (authenticatedUser == null) {
++                registerAuthFailure(username);
++            } else {
++                registerAuthSuccess(username);
++            }
++            return authenticatedUser;
++        }
++        
++        // Fail in all other cases
++        return null;
++    }
++
++
+     /**
+      * Unlock the specified username. This will remove all records of
+      * authentication failures for this user.
+
+==================================================

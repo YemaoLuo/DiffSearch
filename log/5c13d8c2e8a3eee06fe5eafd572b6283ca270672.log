@@ -1,0 +1,170 @@
+5c13d8c2e8a3eee06fe5eafd572b6283ca270672
+==================================================
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=50642
+==================================================
+Mark Emlyn
+==================================================
+Fri Jan 28 13:03:57 2011 +0000
+==================================================
+JreMemoryLeakPreventionListener.java
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=50642
+Better fix for HttpClient keep-alive thread triggered memory leaks
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1064652 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+StandardContext.java
+index 942a69ae11..e646c8f399 100644
+--- a/java/org/apache/catalina/core/JreMemoryLeakPreventionListener.java
++++ b/java/org/apache/catalina/core/JreMemoryLeakPreventionListener.java
+@@ -80,19 +80,6 @@ public class JreMemoryLeakPreventionListener implements LifecycleListener {
+         this.gcDaemonProtection = gcDaemonProtection;
+     }
+ 
+-     /**
+-      * Protect against the memory leak caused when the first call to
+-      * <code>sun.net.www.http.HttpClient</code> is triggered by a web
+-      * application. This first call will start a KeepAlive thread with the
+-      * thread's context class loader configured to be the web application class
+-      * loader. Defaults to <code>true</code>.
+-      */
+-     private boolean keepAliveProtection = true;
+-     public boolean isKeepAliveProtection() { return keepAliveProtection; }
+-     public void setKeepAliveProtection(boolean keepAliveProtection) {
+-         this.keepAliveProtection = keepAliveProtection;
+-     }
+-    
+      /**
+       * Protect against the memory leak caused when the first call to
+       * <code>javax.security.auth.Policy</code> is triggered by a web
+@@ -251,27 +238,6 @@ public class JreMemoryLeakPreventionListener implements LifecycleListener {
+                     }
+                 }
+     
+-                /*
+-                 * When a servlet opens a connection using a URL it will use
+-                 * sun.net.www.http.HttpClient which keeps a static reference to
+-                 * a keep-alive cache which is loaded using the web application
+-                 * class loader.
+-                 */
+-                if (keepAliveProtection) {
+-                    try {
+-                        Class.forName("sun.net.www.http.HttpClient");
+-                    } catch (ClassNotFoundException e) {
+-                        if (System.getProperty("java.vendor").startsWith(
+-                                "Sun")) {
+-                            log.error(sm.getString(
+-                                    "jreLeakListener.keepAliveFail"), e);
+-                        } else {
+-                            log.debug(sm.getString(
+-                                    "jreLeakListener.keepAliveFail"), e);
+-                        }
+-                    }
+-                }
+-                
+                 /*
+                  * Calling getPolicy retains a static reference to the context 
+                  * class loader.
+
+==================================================
+WebappClassLoader.java
+index a08a05a8e7..8b23ce10fd 100644
+--- a/java/org/apache/catalina/loader/LocalStrings.properties
++++ b/java/org/apache/catalina/loader/LocalStrings.properties
+@@ -50,6 +50,7 @@ webappClassLoader.checkThreadLocalsForLeaks.unknown=Unknown
+ webappClassLoader.checkThreadLocalsForLeaks=The web application [{0}] created a ThreadLocal with key of type [{1}] (value [{2}]) and a value of type [{3}] (value [{4}]) but failed to remove it when the web application was stopped. Threads are going to be renewed over time to try and avoid a probable memory leak. 
+ webappClassLoader.checkThreadLocalsForLeaksDebug=The web application [{0}] created a ThreadLocal with key of type [{1}] (value [{2}]). The ThreadLocal has been correctly set to null and the key will be removed by GC.
+ webappClassLoader.checkThreadLocalsForLeaksFail=Failed to check for ThreadLocal references for web application [{0}]
++webappClassLoader.checkThreadsHttpClient=Found HttpClient keep-alive thread using web application class loader. Fixed by switching thread to the parent class loader.
+ webappClassLoader.stopThreadFail=Failed to terminate thread named [{0}] for web application [{1}]
+ webappClassLoader.stopTimerThreadFail=Failed to terminate TimerThread named [{0}] for web application [{1}]
+ webappClassLoader.validationErrorJarPath=Unable to validate JAR entry with name {0}
+
+==================================================
+WebappLoader.java
+index 7fbc043d77..3b7a8ec19a 100644
+--- a/java/org/apache/catalina/loader/WebappClassLoader.java
++++ b/java/org/apache/catalina/loader/WebappClassLoader.java
+@@ -132,8 +132,10 @@ public class WebappClassLoader
+     private static final List<String> JVM_THREAD_GROUP_NAMES =
+         new ArrayList<String>();
+ 
++    private static final String JVN_THREAD_GROUP_SYSTEM = "system";
++    
+     static {
+-        JVM_THREAD_GROUP_NAMES.add("system");
++        JVM_THREAD_GROUP_NAMES.add(JVN_THREAD_GROUP_SYSTEM);
+         JVM_THREAD_GROUP_NAMES.add("RMI Runtime");
+     }
+ 
+@@ -465,6 +467,15 @@ public class WebappClassLoader
+      */
+     private boolean clearReferencesLogFactoryRelease = true;
+ 
++    /**
++     * If an HttpClient keep-alive timer thread has been started by this web
++     * application and is still running, should Tomcat change the context class
++     * loader from the current {@link WebappClassLoader} to
++     * {@link WebappClassLoader#parent} to prevent a memory leak? Note that the
++     * keep-alive timer thread will stop on its own once the keep-alives all
++     * expire however, on a busy system that might not happen for some time.
++     */
++    private boolean clearReferencesHttpClientKeepAliveThread = true;
+     
+     /**
+      * Name of associated context used with logging and JMX to associate with
+@@ -745,6 +756,28 @@ public class WebappClassLoader
+      }
+ 
+ 
++     /**
++      * Return the clearReferencesHttpClientKeepAliveThread flag for this
++      * Context.
++      */
++     public boolean getClearReferencesHttpClientKeepAliveThread() {
++         return (this.clearReferencesHttpClientKeepAliveThread);
++     }
++
++
++     /**
++      * Set the clearReferencesHttpClientKeepAliveThread feature for this
++      * Context.
++      *
++      * @param clearReferencesHttpClientKeepAliveThread The new flag value
++      */
++     public void setClearReferencesHttpClientKeepAliveThread(
++             boolean clearReferencesHttpClientKeepAliveThread) {
++         this.clearReferencesHttpClientKeepAliveThread =
++             clearReferencesHttpClientKeepAliveThread;
++     }
++
++     
+     // ------------------------------------------------------- Reloader Methods
+ 
+ 
+@@ -2166,10 +2199,20 @@ public class WebappClassLoader
+                         continue;
+                     }
+ 
+-                    // Don't warn about JVM controlled threads
++                    // JVM controlled threads
+                     ThreadGroup tg = thread.getThreadGroup();
+                     if (tg != null &&
+                             JVM_THREAD_GROUP_NAMES.contains(tg.getName())) {
++
++                        // HttpClient keep-alive threads
++                        if (clearReferencesHttpClientKeepAliveThread &&
++                                thread.getName().equals("Keep-Alive-Timer")) {
++                            thread.setContextClassLoader(parent);
++                            log.debug(sm.getString(
++                                    "webappClassLoader.checkThreadsHttpClient"));
++                        }
++                    
++                        // Don't warn about remaining JVM controlled threads
+                         continue;
+                     }
+                    
+
+==================================================

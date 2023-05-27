@@ -1,0 +1,249 @@
+1af65a6357c5593f55fcfae1d622dace10f248d6
+==================================================
+Pull up sendfileData instance and breakKeepAliveLoop method
+==================================================
+Mark Thomas
+==================================================
+Fri Jan 23 19:03:16 2015 +0000
+==================================================
+AbstractHttp11Processor.java
+Pull up sendfileData instance and breakKeepAliveLoop method
+This also enabled the removal of recycleInternal()
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1654324 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Http11AprProcessor.java
+index e282da691f..b1f833ce51 100644
+--- a/java/org/apache/coyote/http11/AbstractHttp11Processor.java
++++ b/java/org/apache/coyote/http11/AbstractHttp11Processor.java
+@@ -53,6 +53,7 @@ import org.apache.tomcat.util.log.UserDataHelper;
+ import org.apache.tomcat.util.net.AbstractEndpoint;
+ import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
+ import org.apache.tomcat.util.net.DispatchType;
++import org.apache.tomcat.util.net.SendfileDataBase;
+ import org.apache.tomcat.util.net.SocketStatus;
+ import org.apache.tomcat.util.net.SocketWrapperBase;
+ import org.apache.tomcat.util.res.StringManager;
+@@ -227,6 +228,12 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+     protected HttpUpgradeHandler httpUpgradeHandler = null;
+ 
+ 
++    /**
++     * Sendfile data.
++     */
++    protected SendfileDataBase sendfileData = null;
++
++
+     public AbstractHttp11Processor(int maxHttpHeaderSize, AbstractEndpoint<S> endpoint,
+             int maxTrailerSize, int maxExtensionSize, int maxSwallowSize) {
+ 
+@@ -1769,10 +1776,32 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+      * Checks to see if the keep-alive loop should be broken, performing any
+      * processing (e.g. sendfile handling) that may have an impact on whether
+      * or not the keep-alive loop should be broken.
++     *
+      * @return true if the keep-alive loop should be broken
+      */
+-    protected abstract boolean breakKeepAliveLoop(
+-            SocketWrapperBase<S> socketWrapper);
++    protected boolean breakKeepAliveLoop(SocketWrapperBase<S> socketWrapper) {
++        openSocket = keepAlive;
++        // Do sendfile as needed: add socket to sendfile and end
++        if (sendfileData != null && !getErrorState().isError()) {
++            sendfileData.keepAlive = keepAlive;
++            switch (socketWrapper.processSendfile(sendfileData)) {
++            case DONE:
++                // If sendfile is complete, no need to break keep-alive loop
++                return false;
++            case PENDING:
++                sendfileInProgress = true;
++                return true;
++            case ERROR:
++                // Write failed
++                if (getLog().isDebugEnabled()) {
++                    getLog().debug(sm.getString("http11processor.sendfile.error"));
++                }
++                setErrorState(ErrorState.CLOSE_NOW, null);
++                return true;
++            }
++        }
++        return false;
++    }
+ 
+ 
+     @Override
+@@ -1791,11 +1820,9 @@ public abstract class AbstractHttp11Processor<S> extends AbstractProcessor<S> {
+         httpUpgradeHandler = null;
+         resetErrorState();
+         socketWrapper = null;
+-        recycleInternal();
++        sendfileData = null;
+     }
+ 
+-    protected abstract void recycleInternal();
+-
+ 
+     @Override
+     public ByteBuffer getLeftoverInput() {
+
+==================================================
+Http11Nio2Processor.java
+index 0a108483ef..0801a6557d 100644
+--- a/java/org/apache/coyote/http11/Http11AprProcessor.java
++++ b/java/org/apache/coyote/http11/Http11AprProcessor.java
+@@ -21,7 +21,6 @@ import java.security.cert.CertificateFactory;
+ import java.security.cert.X509Certificate;
+ 
+ import org.apache.coyote.ActionCode;
+-import org.apache.coyote.ErrorState;
+ import org.apache.coyote.http11.filters.BufferedInputFilter;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+@@ -33,7 +32,6 @@ import org.apache.tomcat.jni.Socket;
+ import org.apache.tomcat.util.net.AbstractEndpoint;
+ import org.apache.tomcat.util.net.AprEndpoint;
+ import org.apache.tomcat.util.net.SSLSupport;
+-import org.apache.tomcat.util.net.SocketWrapperBase;
+ 
+ 
+ /**
+@@ -62,12 +60,6 @@ public class Http11AprProcessor extends AbstractHttp11Processor<Long> {
+ 
+     // ----------------------------------------------------- Instance Variables
+ 
+-    /**
+-     * Sendfile data.
+-     */
+-    protected AprEndpoint.SendfileData sendfileData = null;
+-
+-
+     /**
+      * When client certificate information is presented in a form other than
+      * instances of {@link java.security.cert.X509Certificate} it needs to be
+@@ -90,32 +82,6 @@ public class Http11AprProcessor extends AbstractHttp11Processor<Long> {
+     }
+ 
+ 
+-    @Override
+-    protected boolean breakKeepAliveLoop(SocketWrapperBase<Long> socketWrapper) {
+-        openSocket = keepAlive;
+-        // Do sendfile as needed: add socket to sendfile and end
+-        if (sendfileData != null && !getErrorState().isError()) {
+-            sendfileData.keepAlive = keepAlive;
+-            switch (socketWrapper.processSendfile(sendfileData)) {
+-            case DONE:
+-                // If sendfile is complete, no need to break keep-alive loop
+-                return false;
+-            case PENDING:
+-                sendfileInProgress = true;
+-                return true;
+-            case ERROR:
+-                // Write failed
+-                if (log.isDebugEnabled()) {
+-                    log.debug(sm.getString("http11processor.sendfile.error"));
+-                }
+-                setErrorState(ErrorState.CLOSE_NOW, null);
+-                return true;
+-            }
+-        }
+-        return false;
+-    }
+-
+-
+     @Override
+     protected void registerForEvent(boolean read, boolean write) {
+         ((AprEndpoint) endpoint).getPoller().add(
+@@ -129,12 +95,6 @@ public class Http11AprProcessor extends AbstractHttp11Processor<Long> {
+     }
+ 
+ 
+-    @Override
+-    public void recycleInternal() {
+-        sendfileData = null;
+-    }
+-
+-
+     @Override
+     public void setSslSupport(SSLSupport sslSupport) {
+         // NOOP for APR
+
+==================================================
+Http11NioProcessor.java
+index f6aa28e10f..35a2b953ab 100644
+--- a/java/org/apache/coyote/http11/Http11Nio2Processor.java
++++ b/java/org/apache/coyote/http11/Http11Nio2Processor.java
+@@ -23,7 +23,6 @@ import java.net.InetSocketAddress;
+ import javax.net.ssl.SSLEngine;
+ 
+ import org.apache.coyote.ActionCode;
+-import org.apache.coyote.ErrorState;
+ import org.apache.coyote.http11.filters.BufferedInputFilter;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+@@ -34,7 +33,6 @@ import org.apache.tomcat.util.net.Nio2Endpoint;
+ import org.apache.tomcat.util.net.SSLSupport;
+ import org.apache.tomcat.util.net.SecureNio2Channel;
+ import org.apache.tomcat.util.net.SocketStatus;
+-import org.apache.tomcat.util.net.SocketWrapperBase;
+ 
+ 
+ /**
+@@ -64,14 +62,6 @@ public class Http11Nio2Processor extends AbstractHttp11Processor<Nio2Channel> {
+     }
+ 
+ 
+-    // ----------------------------------------------------- Instance Variables
+-
+-    /**
+-     * Sendfile data.
+-     */
+-    protected Nio2Endpoint.SendfileData sendfileData = null;
+-
+-
+     // --------------------------------------------------------- Public Methods
+ 
+     @Override
+@@ -119,38 +109,6 @@ public class Http11Nio2Processor extends AbstractHttp11Processor<Nio2Channel> {
+     }
+ 
+ 
+-    @Override
+-    protected boolean breakKeepAliveLoop(SocketWrapperBase<Nio2Channel> socketWrapper) {
+-        openSocket = keepAlive;
+-        // Do sendfile as needed: add socket to sendfile and end
+-        if (sendfileData != null && !getErrorState().isError()) {
+-            sendfileData.keepAlive = keepAlive;
+-            switch (socketWrapper.processSendfile(sendfileData)) {
+-            case DONE:
+-                // If sendfile is complete, no need to break keep-alive loop
+-                return false;
+-            case PENDING:
+-                sendfileInProgress = true;
+-                return true;
+-            case ERROR:
+-                // Write failed
+-                if (log.isDebugEnabled()) {
+-                    log.debug(sm.getString("http11processor.sendfile.error"));
+-                }
+-                setErrorState(ErrorState.CLOSE_NOW, null);
+-                return true;
+-            }
+-        }
+-        return false;
+-    }
+-
+-
+-    @Override
+-    public void recycleInternal() {
+-        sendfileData = null;
+-    }
+-
+-
+     // ----------------------------------------------------- ActionHook Methods
+ 
+     /**
+
+==================================================

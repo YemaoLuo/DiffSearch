@@ -1,0 +1,167 @@
+d3a5b1cf5c60e6acea61286eb050e54f05d193ff
+==================================================
+Refactor Servlet 3 async timeouts to become a more generic timeout
+==================================================
+Mark Thomas
+==================================================
+Wed Aug 7 18:42:44 2019 +0100
+==================================================
+AbstractProcessor.java
+Refactor Servlet 3 async timeouts to become a more generic timeout
+
+The timeout mechanism now represents any timeout that is triggered
+independently from the Socket read/write timeouts.
+
+
+==================================================
+AbstractProtocol.java
+index d94a8e4894..1affefad02 100644
+--- a/java/org/apache/coyote/AbstractProcessor.java
++++ b/java/org/apache/coyote/AbstractProcessor.java
+@@ -39,7 +39,7 @@ import org.apache.tomcat.util.res.StringManager;
+ 
+ /**
+  * Provides functionality and attributes common to all supported protocols
+- * (currently HTTP and AJP).
++ * (currently HTTP and AJP) for processing a single request/response.
+  */
+ public abstract class AbstractProcessor extends AbstractProcessorLight implements ActionHook {
+ 
+@@ -628,6 +628,13 @@ public abstract class AbstractProcessor extends AbstractProcessorLight implement
+     }
+ 
+ 
++    /**
++     * {@inheritDoc}
++     * <p>
++     * Sub-classes of this base class represent a single request/response pair.
++     * The timeout to be processed is, therefore, the Servlet asynchronous
++     * processing timeout.
++     */
+     @Override
+     public void timeoutAsync(long now) {
+         if (now < 0) {
+
+==================================================
+Processor.java
+index 174c899eb6..d95d4256bd 100644
+--- a/java/org/apache/coyote/AbstractProtocol.java
++++ b/java/org/apache/coyote/AbstractProtocol.java
+@@ -96,9 +96,9 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+             Collections.newSetFromMap(new ConcurrentHashMap<Processor, Boolean>());
+ 
+     /**
+-     * Controller for the async timeout scheduling.
++     * Controller for the timeout scheduling.
+      */
+-    private ScheduledFuture<?> asyncTimeoutFuture = null;
++    private ScheduledFuture<?> timeoutFuture = null;
+     private ScheduledFuture<?> monitorFuture;
+ 
+     public AbstractProtocol(AbstractEndpoint<S,?> endpoint) {
+@@ -595,17 +595,22 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+     }
+ 
+ 
++    /**
++     * Note: The name of this method originated with the Servlet 3.0
++     * asynchronous processing but evolved over time to represent a timeout that
++     * is triggered independently of the socket read/write timeouts.
++     */
+     protected void startAsyncTimeout() {
+-        if (asyncTimeoutFuture == null || (asyncTimeoutFuture != null && asyncTimeoutFuture.isDone())) {
+-            if (asyncTimeoutFuture != null && asyncTimeoutFuture.isDone()) {
++        if (timeoutFuture == null || (timeoutFuture != null && timeoutFuture.isDone())) {
++            if (timeoutFuture != null && timeoutFuture.isDone()) {
+                 // There was an error executing the scheduled task, get it and log it
+                 try {
+-                    asyncTimeoutFuture.get();
++                    timeoutFuture.get();
+                 } catch (InterruptedException | ExecutionException e) {
+                     getLog().error(sm.getString("abstractProtocolHandler.asyncTimeoutError"), e);
+                 }
+             }
+-            asyncTimeoutFuture = getUtilityExecutor().scheduleAtFixedRate(
++            timeoutFuture = getUtilityExecutor().scheduleAtFixedRate(
+                     new Runnable() {
+                         @Override
+                         public void run() {
+@@ -619,9 +624,9 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+     }
+ 
+     protected void stopAsyncTimeout() {
+-        if (asyncTimeoutFuture != null) {
+-            asyncTimeoutFuture.cancel(false);
+-            asyncTimeoutFuture = null;
++        if (timeoutFuture != null) {
++            timeoutFuture.cancel(false);
++            timeoutFuture = null;
+         }
+     }
+ 
+@@ -664,7 +669,7 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+             monitorFuture = null;
+         }
+         stopAsyncTimeout();
+-        // Timeout any pending async request
++        // Timeout any waiting processor
+         for (Processor processor : waitingProcessors) {
+             processor.timeoutAsync(-1);
+         }
+@@ -770,12 +775,14 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+                         processor, socket));
+             }
+ 
+-            // Async timeouts are calculated on a dedicated thread and then
++            // Timeouts are calculated on a dedicated thread and then
+             // dispatched. Because of delays in the dispatch process, the
+             // timeout may no longer be required. Check here and avoid
+             // unnecessary processing.
+-            if (SocketEvent.TIMEOUT == status && (processor == null ||
+-                    !processor.isAsync() || !processor.checkAsyncTimeoutGeneration())) {
++            if (SocketEvent.TIMEOUT == status &&
++                    (processor == null ||
++                    !processor.isAsync() && !processor.isUpgrade() ||
++                    processor.isAsync() && !processor.checkAsyncTimeoutGeneration())) {
+                 // This is effectively a NO-OP
+                 return SocketState.OPEN;
+             }
+@@ -942,6 +949,7 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+                     // to the poller if necessary.
+                     if (status != SocketEvent.OPEN_WRITE) {
+                         longPoll(wrapper, processor);
++                        getProtocol().addWaitingProcessor(processor);
+                     }
+                 } else if (state == SocketState.SUSPENDED) {
+                     // Don't add sockets back to the poller.
+
+==================================================
+UpgradeProcessorBase.java
+index 68edff505d..c58431e0a0 100644
+--- a/java/org/apache/coyote/Processor.java
++++ b/java/org/apache/coyote/Processor.java
+@@ -65,13 +65,17 @@ public interface Processor {
+     boolean isAsync();
+ 
+     /**
+-     * Check this processor to see if the async timeout has expired and process
+-     * a timeout if that is that case.
++     * Check this processor to see if the timeout has expired and process a
++     * timeout if that is that case.
++     * <p>
++     * Note: The name of this method originated with the Servlet 3.0
++     * asynchronous processing but evolved over time to represent a timeout that
++     * is triggered independently of the socket read/write timeouts.
+      *
+      * @param now The time (as returned by {@link System#currentTimeMillis()} to
+-     *            use as the current time to determine whether the async timeout
+-     *            has expired. If negative, the timeout will always be treated
+-     *            as if it has expired.
++     *            use as the current time to determine whether the timeout has
++     *            expired. If negative, the timeout will always be treated as ifq
++     *            it has expired.
+      */
+     void timeoutAsync(long now);
+ 
+
+==================================================

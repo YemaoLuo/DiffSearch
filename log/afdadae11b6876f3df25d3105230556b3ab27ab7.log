@@ -1,0 +1,158 @@
+afdadae11b6876f3df25d3105230556b3ab27ab7
+==================================================
+Fix https://bz.apache.org/bugzilla/show_bug.cgi?id=62899
+==================================================
+Mark Thomas
+==================================================
+Tue Nov 13 23:02:31 2018 +0000
+==================================================
+InputBuffer.java
+Fix https://bz.apache.org/bugzilla/show_bug.cgi?id=62899
+Prevent the incorrect timing out of connections when Servlet non-blocking I/O is used to read a request body over an HTTP/2 stream.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1846551 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AbstractProcessor.java
+index 61bacd5064..a461c20e6a 100644
+--- a/java/org/apache/catalina/connector/InputBuffer.java
++++ b/java/org/apache/catalina/connector/InputBuffer.java
+@@ -27,6 +27,7 @@ import java.security.PrivilegedActionException;
+ import java.security.PrivilegedExceptionAction;
+ import java.util.Map;
+ import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ import javax.servlet.ReadListener;
+ 
+@@ -214,17 +215,23 @@ public class InputBuffer extends Reader
+ 
+ 
+     public int available() {
++        int available = availableInThisBuffer();
++        if (available == 0) {
++            coyoteRequest.action(ActionCode.AVAILABLE,
++                    Boolean.valueOf(coyoteRequest.getReadListener() != null));
++            available = (coyoteRequest.getAvailable() > 0) ? 1 : 0;
++        }
++        return available;
++    }
++
++
++    private int availableInThisBuffer() {
+         int available = 0;
+         if (state == BYTE_STATE) {
+             available = bb.remaining();
+         } else if (state == CHAR_STATE) {
+             available = cb.remaining();
+         }
+-        if (available == 0) {
+-            coyoteRequest.action(ActionCode.AVAILABLE,
+-                    Boolean.valueOf(coyoteRequest.getReadListener() != null));
+-            available = (coyoteRequest.getAvailable() > 0) ? 1 : 0;
+-        }
+         return available;
+     }
+ 
+@@ -282,11 +289,21 @@ public class InputBuffer extends Reader
+             }
+             return false;
+         }
+-        boolean result = available() > 0;
+-        if (!result) {
+-            coyoteRequest.action(ActionCode.NB_READ_INTEREST, null);
+-        }
+-        return result;
++        // Checking for available data at the network level and registering for
++        // read can be done sequentially for HTTP/1.x and AJP as there is only
++        // ever a single thread processing the socket at any one time. However,
++        // for HTTP/2 there is one thread processing the connection and separate
++        // threads for each stream. For HTTP/2 the two operations have to be
++        // performed atomically else it is possible for the connection thread to
++        // read more data in to the buffer after the stream thread checks for
++        // available network data but before it registers for read.
++        if (availableInThisBuffer() > 0) {
++            return true;
++        }
++
++        AtomicBoolean result = new AtomicBoolean();
++        coyoteRequest.action(ActionCode.NB_READ_INTEREST, result);
++        return result.get();
+     }
+ 
+ 
+
+==================================================
+Stream.java
+index b76d7f0b14..95fbbaaf4d 100644
+--- a/java/org/apache/coyote/AbstractProcessor.java
++++ b/java/org/apache/coyote/AbstractProcessor.java
+@@ -565,9 +565,8 @@ public abstract class AbstractProcessor extends AbstractProcessorLight implement
+             break;
+         }
+         case NB_READ_INTEREST: {
+-            if (!isRequestBodyFullyRead()) {
+-                registerReadInterest();
+-            }
++            AtomicBoolean isReady = (AtomicBoolean)param;
++            isReady.set(isReadyForRead());
+             break;
+         }
+         case NB_WRITE_INTEREST: {
+@@ -781,6 +780,19 @@ public abstract class AbstractProcessor extends AbstractProcessorLight implement
+     }
+ 
+ 
++    protected boolean isReadyForRead() {
++        if (available(true) > 0) {
++            return true;
++        }
++
++        if (!isRequestBodyFullyRead()) {
++            registerReadInterest();
++        }
++
++        return false;
++    }
++
++
+     protected abstract boolean isRequestBodyFullyRead();
+ 
+ 
+
+==================================================
+StreamProcessor.java
+index 9feec5cdf7..ddba70c905 100644
+--- a/java/org/apache/coyote/http2/Stream.java
++++ b/java/org/apache/coyote/http2/Stream.java
+@@ -988,15 +988,22 @@ class Stream extends AbstractStream implements HeaderEmitter {
+         }
+ 
+ 
+-        final void registerReadInterest() {
++        final boolean isReadyForRead() {
+             ensureBuffersExist();
+ 
+-            synchronized (inBuffer) {
+-                readInterest = true;
++            synchronized (this) {
++                if (available() > 0) {
++                    return true;
++                }
++
++                if (!isRequestBodyFullyRead()) {
++                    readInterest = true;
++                }
++
++                return false;
+             }
+         }
+ 
+-
+         final synchronized boolean isRequestBodyFullyRead() {
+             return (inBuffer == null || inBuffer.position() == 0) && isInputFinished();
+         }
+
+==================================================

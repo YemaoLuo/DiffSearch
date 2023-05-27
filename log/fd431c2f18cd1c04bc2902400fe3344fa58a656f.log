@@ -1,0 +1,412 @@
+fd431c2f18cd1c04bc2902400fe3344fa58a656f
+==================================================
+Various improvements to code generation
+==================================================
+remm remm@apache.org
+==================================================
+Tue Jun 23 12:02:48 2020 +0200
+==================================================
+Catalina.java
+Various improvements to code generation
+
+Add a configuration for the location of the generated sources.
+Catalina start and stop will now use the same code. As a result, stop
+will now use the configuration source and will also generate stop code.
+If the use generated flag is enabled, ContextConfig will not look at the
+real files at all, this is just simpler (and there could be 100s of
+webapps too).
+Pass arguments from Tomcat to Catalina, since in addition to educational
+uses, the feature would be useful with AOT compilation.
+
+
+==================================================
+ConnectorCreateRule.java
+index 272d4287d4..5280d322f7 100644
+--- a/java/org/apache/catalina/startup/Catalina.java
++++ b/java/org/apache/catalina/startup/Catalina.java
+@@ -18,7 +18,6 @@ package org.apache.catalina.startup;
+ 
+ 
+ import java.io.File;
+-import java.io.FileInputStream;
+ import java.io.FileWriter;
+ import java.io.IOException;
+ import java.io.InputStream;
+@@ -147,6 +146,18 @@ public class Catalina {
+     protected boolean generateCode = false;
+ 
+ 
++    /**
++     * Location of generated sources.
++     */
++    protected File generatedCodeLocation = null;
++
++
++    /**
++     * Value of the argument.
++     */
++    protected String generatedCodeLocationParameter = null;
++
++
+     /**
+      * Use generated code as a replacement for configuration files.
+      */
+@@ -203,6 +214,16 @@ public class Catalina {
+     }
+ 
+ 
++    public File getGeneratedCodeLocation() {
++        return this.generatedCodeLocation;
++    }
++
++
++    public void setGeneratedCodeLocation(File generatedCodeLocation) {
++        this.generatedCodeLocation = generatedCodeLocation;
++    }
++
++
+     /**
+      * @return <code>true</code> if an exception should be thrown if an error
+      * occurs during server init
+@@ -284,6 +305,7 @@ public class Catalina {
+     protected boolean arguments(String args[]) {
+ 
+         boolean isConfig = false;
++        boolean isGenerateCode = false;
+ 
+         if (args.length < 1) {
+             usage();
+@@ -297,20 +319,29 @@ public class Catalina {
+             } else if (arg.equals("-config")) {
+                 isConfig = true;
+             } else if (arg.equals("-generateCode")) {
+-                generateCode = true;
++                setGenerateCode(true);
++                isGenerateCode = true;
+             } else if (arg.equals("-useGeneratedCode")) {
+-                useGeneratedCode = true;
++                setUseGeneratedCode(true);
++                isGenerateCode = false;
+             } else if (arg.equals("-nonaming")) {
+                 setUseNaming(false);
++                isGenerateCode = false;
+             } else if (arg.equals("-help")) {
+                 usage();
+                 return false;
+             } else if (arg.equals("start")) {
++                isGenerateCode = false;
+                 // NOOP
+             } else if (arg.equals("configtest")) {
++                isGenerateCode = false;
+                 // NOOP
+             } else if (arg.equals("stop")) {
++                isGenerateCode = false;
+                 // NOOP
++            } else if (isGenerateCode) {
++                generatedCodeLocationParameter = arg;
++                isGenerateCode = false;
+             } else {
+                 usage();
+                 return false;
+@@ -527,6 +558,72 @@ public class Catalina {
+     }
+ 
+ 
++    protected void parseServerXml(boolean start) {
++        // Set configuration source
++        ConfigFileLoader.setSource(new CatalinaBaseConfigurationSource(Bootstrap.getCatalinaBaseFile(), getConfigFile()));
++        File file = configFile();
++
++        // Init source location
++        File serverXmlLocation = null;
++        if (generateCode) {
++            if (generatedCodeLocationParameter != null) {
++                generatedCodeLocation = new File(generatedCodeLocationParameter);
++                if (!generatedCodeLocation.isAbsolute()) {
++                    generatedCodeLocation = new File(Bootstrap.getCatalinaHomeFile(), generatedCodeLocationParameter);
++                }
++            } else {
++                generatedCodeLocation = new File(Bootstrap.getCatalinaHomeFile(), "work");
++            }
++            serverXmlLocation = new File(generatedCodeLocation, "catalina");
++            if (!serverXmlLocation.isDirectory() && !serverXmlLocation.mkdirs()) {
++                log.warn(sm.getString("catalina.generatedCodeLocationError", generatedCodeLocation.getAbsolutePath()));
++                // Disable code generation
++                generateCode = false;
++            }
++        }
++
++        ServerXml serverXml = null;
++        if (useGeneratedCode) {
++            String xmlClassName = start ? "catalina.ServerXml" : "catalina.ServerXmlStop";
++            try {
++                serverXml = (ServerXml) Catalina.class.getClassLoader().loadClass(xmlClassName).newInstance();
++            } catch (Exception e) {
++                // Ignore, no generated code found
++            }
++        }
++
++        if (serverXml != null) {
++            serverXml.load(this);
++        } else {
++            try (ConfigurationSource.Resource resource = ConfigFileLoader.getSource().getServerXml()) {
++                // Create and execute our Digester
++                Digester digester = start ? createStartDigester() : createStopDigester();
++                InputStream inputStream = resource.getInputStream();
++                InputSource inputSource = new InputSource(resource.getURI().toURL().toString());
++                inputSource.setByteStream(inputStream);
++                digester.push(this);
++                if (generateCode) {
++                    digester.startGeneratingCode();
++                    generateClassHeader(digester, start);
++                }
++                digester.parse(inputSource);
++                if (generateCode) {
++                    generateClassFooter(digester);
++                    try (FileWriter writer = new FileWriter(new File(serverXmlLocation,
++                            start ? "ServerXml.java" : "ServerXmlStop.java"))) {
++                        writer.write(digester.getGeneratedCode().toString());
++                    }
++                    digester.endGeneratingCode();
++                }
++            } catch (Exception e) {
++                log.warn(sm.getString("catalina.configFail", file.getAbsolutePath()), e);
++                if (file.exists() && !file.canRead()) {
++                    log.warn(sm.getString("catalina.incorrectPermissions"));
++                }
++            }
++        }
++    }
++
+     public void stopServer() {
+         stopServer(null);
+     }
+@@ -539,17 +636,9 @@ public class Catalina {
+ 
+         Server s = getServer();
+         if (s == null) {
+-            // Create and execute our Digester
+-            Digester digester = createStopDigester();
+-            File file = configFile();
+-            try (FileInputStream fis = new FileInputStream(file)) {
+-                InputSource is =
+-                    new InputSource(file.toURI().toURL().toString());
+-                is.setByteStream(fis);
+-                digester.push(this);
+-                digester.parse(is);
+-            } catch (Exception e) {
+-                log.error(sm.getString("catalina.stopError"), e);
++            parseServerXml(false);
++            if (getServer() == null) {
++                log.error(sm.getString("catalina.stopError"));
+                 System.exit(1);
+             }
+         } else {
+@@ -605,53 +694,11 @@ public class Catalina {
+         // Before digester - it may be needed
+         initNaming();
+ 
+-        // Set configuration source
+-        ConfigFileLoader.setSource(new CatalinaBaseConfigurationSource(Bootstrap.getCatalinaBaseFile(), getConfigFile()));
+-        File file = configFile();
+-
+-        ServerXml serverXml = null;
+-        if (useGeneratedCode) {
+-            String xmlClassName = "catalina.ServerXml";
+-            try {
+-                serverXml = (ServerXml) Catalina.class.getClassLoader().loadClass(xmlClassName).newInstance();
+-            } catch (Exception e) {
+-                // Ignore, no generated code found
+-            }
+-        }
+-
+-        if (serverXml != null) {
+-            serverXml.load(this);
+-        } else {
+-            try (ConfigurationSource.Resource resource = ConfigFileLoader.getSource().getServerXml()) {
+-                // Create and execute our Digester
+-                Digester digester = createStartDigester();
+-                InputStream inputStream = resource.getInputStream();
+-                InputSource inputSource = new InputSource(resource.getURI().toURL().toString());
+-                inputSource.setByteStream(inputStream);
+-                digester.push(this);
+-                if (generateCode) {
+-                    digester.startGeneratingCode();
+-                    generateClassHeader(digester);
+-                }
+-                digester.parse(inputSource);
+-                if (generateCode) {
+-                    generateClassFooter(digester);
+-                    File generatedSourceFolder = new File(new File(Bootstrap.getCatalinaHomeFile(), "work"), "catalina");
+-                    if (generatedSourceFolder.isDirectory() || generatedSourceFolder.mkdirs()) {
+-                        File generatedSourceFile = new File(generatedSourceFolder, "ServerXml.java");
+-                        try (FileWriter writer = new FileWriter(generatedSourceFile)) {
+-                            writer.write(digester.getGeneratedCode().toString());
+-                        }
+-                    }
+-                    digester.endGeneratingCode();
+-                }
+-            } catch (Exception e) {
+-                log.warn(sm.getString("catalina.configFail", file.getAbsolutePath()), e);
+-                if (file.exists() && !file.canRead()) {
+-                    log.warn(sm.getString("catalina.incorrectPermissions"));
+-                }
+-                return;
+-            }
++        // Parse main server.xml
++        parseServerXml(true);
++        Server s = getServer();
++        if (s == null) {
++            return;
+         }
+ 
+         getServer().setCatalina(this);
+@@ -860,10 +907,14 @@ public class Catalina {
+     }
+ 
+ 
+-    protected void generateClassHeader(Digester digester) {
++    protected void generateClassHeader(Digester digester, boolean start) {
+         StringBuilder code = digester.getGeneratedCode();
+         code.append("package catalina;").append(System.lineSeparator());
+-        code.append("public class ServerXml implements ");
++        code.append("public class ServerXml");
++        if (!start) {
++            code.append("Stop");
++        }
++        code.append(" implements ");
+         code.append(ServerXml.class.getName().replace('$', '.')).append(" {").append(System.lineSeparator());
+         code.append("public void load(").append(Catalina.class.getName());
+         code.append(" ").append(digester.toVariableName(this)).append(") {").append(System.lineSeparator());
+
+==================================================
+ContextConfig.java
+index a1b53d9865..875fea74d9 100644
+--- a/java/org/apache/catalina/startup/ConnectorCreateRule.java
++++ b/java/org/apache/catalina/startup/ConnectorCreateRule.java
+@@ -76,6 +76,7 @@ public class ConnectorCreateRule extends Rule {
+ 
+         StringBuilder code = digester.getGeneratedCode();
+         if (code != null) {
++            code.append(System.lineSeparator());
+             code.append(Connector.class.getName()).append(" ").append(digester.toVariableName(con));
+             code.append(" = new ").append(Connector.class.getName());
+             code.append("(new ").append(con.getProtocolHandlerClassName()).append("());");
+
+==================================================
+Tomcat.java
+index 1c897e7575..2d242a0375 100644
+--- a/java/org/apache/catalina/startup/LocalStrings.properties
++++ b/java/org/apache/catalina/startup/LocalStrings.properties
+@@ -14,6 +14,7 @@
+ # limitations under the License.
+ 
+ catalina.configFail=Unable to load server configuration from [{0}]
++catalina.generatedCodeLocationError=Error using configured location for generated Tomcat embedded code [{0}]
+ catalina.incorrectPermissions=Permissions incorrect, read permission is not allowed on the file
+ catalina.init=Server initialization in [{0}] milliseconds
+ catalina.initError=Error initializing Catalina
+@@ -26,7 +27,7 @@ catalina.startup=Server startup in [{0}] milliseconds
+ catalina.stopError=Error stopping Catalina
+ catalina.stopServer=No shutdown port configured. Shut down server through OS signal. Server not shut down.
+ catalina.stopServer.connectException=Could not contact [{0}:{1}] (base port [{2}] and offset [{3}]). Tomcat may not be running.
+-catalina.usage=usage: java org.apache.catalina.startup.Catalina [ -config {pathname} ] [ -nonaming ] { -help | start | stop }
++catalina.usage=usage: java org.apache.catalina.startup.Catalina [ -config {pathname} ] [ -nonaming ] [ -generateCode [ {pathname} ] ] [ -useGeneratedCode ] { -help | start | stop }
+ 
+ catalinaConfigurationSource.cannotObtainURL=Cannot obtain URL for the relative path [{0}]. Check that catalina.base is set.
+ 
+
+==================================================
+ObjectCreateRule.java
+index be2d526984..1ec95c51b0 100644
+--- a/java/org/apache/catalina/startup/Tomcat.java
++++ b/java/org/apache/catalina/startup/Tomcat.java
+@@ -436,12 +436,30 @@ public class Tomcat {
+      * @param source The configuration source
+      */
+     public void init(ConfigurationSource source) {
++        init(source, null);
++    }
++
++    /**
++     * Initialize the server given the specified configuration source.
++     * The server will be loaded according to the Tomcat configuration
++     * files contained in the source (server.xml, web.xml, context.xml,
++     * SSL certificates, etc).
++     * If no configuration source is specified, it will use the default
++     * locations for these files.
++     * @param source The configuration source
++     * @param catalinaArguments The arguments that should be passed to Catalina
++     */
++    public void init(ConfigurationSource source, String[] catalinaArguments) {
+         ConfigFileLoader.setSource(source);
+         addDefaultWebXmlToWebapp = false;
+         Catalina catalina = new Catalina();
+         // Load the Catalina instance with the regular configuration files
+         // from specified source
+-        catalina.load();
++        if (catalinaArguments == null) {
++            catalina.load();
++        } else {
++            catalina.load(catalinaArguments);
++        }
+         // Retrieve and set the server
+         server = catalina.getServer();
+     }
+@@ -1289,9 +1307,19 @@ public class Tomcat {
+      */
+     public static void main(String[] args) throws Exception {
+         // Process some command line parameters
+-        for (String arg : args) {
+-            if (arg.equals("--no-jmx")) {
++        String[] catalinaArguments = null;
++        for (int i = 0; i < args.length; i++) {
++            if (args[i].equals("--no-jmx")) {
+                 Registry.disableRegistry();
++            } else if (args[i].equals("--catalina")) {
++                // This was already processed before
++                // Skip the rest of the arguments as they are for Catalina
++                ArrayList<String> result = new ArrayList<>();
++                for (int j = i + 1; j < args.length; j++) {
++                    result.add(args[j]);
++                }
++                catalinaArguments = result.toArray(new String[0]);
++                break;
+             }
+         }
+         SecurityClassLoad.securityClassLoad(Thread.currentThread().getContextClassLoader());
+@@ -1299,7 +1327,7 @@ public class Tomcat {
+         // Create a Catalina instance and let it parse the configuration files
+         // It will also set a shutdown hook to stop the Server when needed
+         // Use the default configuration source
+-        tomcat.init(null);
++        tomcat.init(null, catalinaArguments);
+         boolean await = false;
+         String path = "";
+         // Process command line parameters
+@@ -1319,6 +1347,9 @@ public class Tomcat {
+                 await = true;
+             } else if (args[i].equals("--no-jmx")) {
+                 // This was already processed before
++            } else if (args[i].equals("--catalina")) {
++                // This was already processed before
++                // Skip the rest of the arguments as they are for Catalina
+             } else {
+                 throw new IllegalArgumentException(sm.getString("tomcat.invalidCommandLine", args[i]));
+             }
+
+==================================================
+SetPropertiesRule.java
+index 18e1e0bb1d..ffcf4badb4 100644
+--- a/java/org/apache/tomcat/util/digester/ObjectCreateRule.java
++++ b/java/org/apache/tomcat/util/digester/ObjectCreateRule.java
+@@ -107,6 +107,7 @@ public class ObjectCreateRule extends Rule {
+ 
+         StringBuilder code = digester.getGeneratedCode();
+         if (code != null) {
++            code.append(System.lineSeparator());
+             code.append(realClassName).append(" ").append(digester.toVariableName(instance)).append(" = new ");
+             code.append(realClassName).append("();").append(System.lineSeparator());
+         }
+
+==================================================

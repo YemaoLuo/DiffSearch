@@ -1,0 +1,172 @@
+e137f989895c2ddeeb4756957d90510aa94465cc
+==================================================
+Limit concurrent read/write for HTTP upgrade to implementations that
+==================================================
+Mark Thomas
+==================================================
+Sun Feb 22 18:50:23 2015 +0000
+==================================================
+InternalHttpUpgradeHandler.java
+Limit concurrent read/write for HTTP upgrade to implementations that
+explicitly request it via a Tomcat specific interface. Note that the
+expectation is that concurrent read/writes will be replaced by these
+implementations having direct access to Tomcat's I/O layer.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1661526 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+UpgradeProcessor.java
+new file mode 100644
+index 0000000000..ee6c185b1e
+--- /dev/null
++++ b/java/org/apache/coyote/http11/upgrade/InternalHttpUpgradeHandler.java
+@@ -0,0 +1,32 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.coyote.http11.upgrade;
++
++import javax.servlet.http.HttpUpgradeHandler;
++
++
++/**
++ * Currently just a marker interface to enable Tomcat to identify
++ * implementations that expect/require concurrent read/write support.
++ *
++ * Note that concurrent read/write support is being phased out and this
++ * interface is expected to evolve into an interface internal handlers use to
++ * gain direct access to Tomcat's I/O layer rather than going through the
++ * Servlet API.
++ */
++public interface InternalHttpUpgradeHandler extends HttpUpgradeHandler {
++}
+\ No newline at end of file
+
+==================================================
+AprEndpoint.java
+index f4aeb5fd96..552781b29d 100644
+--- a/java/org/apache/coyote/http11/upgrade/UpgradeProcessor.java
++++ b/java/org/apache/coyote/http11/upgrade/UpgradeProcessor.java
+@@ -56,6 +56,10 @@ public class UpgradeProcessor implements Processor, WebConnection {
+         wrapper.unRead(leftOverInput);
+         wrapper.setReadTimeout(INFINITE_TIMEOUT);
+         wrapper.setWriteTimeout(INFINITE_TIMEOUT);
++
++        if (httpUpgradeHandler instanceof InternalHttpUpgradeHandler) {
++            wrapper.setInternalUpgrade(true);
++        }
+     }
+ 
+ 
+
+==================================================
+Nio2Endpoint.java
+index 378c2fb290..e948d96009 100644
+--- a/java/org/apache/tomcat/util/net/AprEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AprEndpoint.java
+@@ -2326,11 +2326,9 @@ public class AprEndpoint extends AbstractEndpoint<Long> {
+ 
+         @Override
+         public void run() {
+-
+-            // Upgraded connections need to allow multiple threads to access the
+-            // connection at the same time to enable blocking IO to be used when
+-            // Servlet 3.1 NIO has been configured
+-            if (socket.isUpgraded() && SocketStatus.OPEN_WRITE == status) {
++            // Upgraded connections using an internal upgrade handler are
++            // allowed concurrent read/writes
++            if (socket.isInternalUpgrade() && SocketStatus.OPEN_WRITE == status) {
+                 synchronized (socket.getWriteThreadLock()) {
+                     doRun();
+                 }
+
+==================================================
+NioEndpoint.java
+index 8d1693b7e7..a4d215b68f 100644
+--- a/java/org/apache/tomcat/util/net/Nio2Endpoint.java
++++ b/java/org/apache/tomcat/util/net/Nio2Endpoint.java
+@@ -1636,11 +1636,9 @@ public class Nio2Endpoint extends AbstractEndpoint<Nio2Channel> {
+ 
+         @Override
+         public void run() {
+-            // Upgraded connections need to allow multiple threads to access the
+-            // connection at the same time to enable blocking IO to be used when
+-            // NIO has been configured
+-            if (socket.isUpgraded() &&
+-                    SocketStatus.OPEN_WRITE == status) {
++            // Upgraded connections using an internal upgrade handler are
++            // allowed concurrent read/writes
++            if (socket.isInternalUpgrade() && SocketStatus.OPEN_WRITE == status) {
+                 synchronized (socket.getWriteThreadLock()) {
+                     doRun();
+                 }
+
+==================================================
+SocketWrapperBase.java
+index fc647ad1c5..f0b4f00fb6 100644
+--- a/java/org/apache/tomcat/util/net/NioEndpoint.java
++++ b/java/org/apache/tomcat/util/net/NioEndpoint.java
+@@ -1685,10 +1685,9 @@ public class NioEndpoint extends AbstractEndpoint<NioChannel> {
+             SelectionKey key = socket.getIOChannel().keyFor(
+                     socket.getPoller().getSelector());
+ 
+-            // Upgraded connections need to allow multiple threads to access the
+-            // connection at the same time to enable blocking IO to be used when
+-            // NIO has been configured
+-            if (ka.isUpgraded() && SocketStatus.OPEN_WRITE == status) {
++            // Upgraded connections using an internal upgrade handler are
++            // allowed concurrent read/writes
++            if (ka.isInternalUpgrade() && SocketStatus.OPEN_WRITE == status) {
+                 synchronized (ka.getWriteThreadLock()) {
+                     doRun(key, ka);
+                 }
+
+==================================================
+WsHttpUpgradeHandler.java
+index 5375cf5cd8..644b11c465 100644
+--- a/java/org/apache/tomcat/util/net/SocketWrapperBase.java
++++ b/java/org/apache/tomcat/util/net/SocketWrapperBase.java
+@@ -51,6 +51,7 @@ public abstract class SocketWrapperBase<E> {
+     private volatile boolean async = false;
+     private boolean keptAlive = false;
+     private volatile boolean upgraded = false;
++    private volatile boolean internalUpgrade = false;
+     private boolean secure = false;
+     /*
+      * Following cached for speed / reduced GC
+@@ -152,6 +153,10 @@ public abstract class SocketWrapperBase<E> {
+     }
+     public boolean isUpgraded() { return upgraded; }
+     public void setUpgraded(boolean upgraded) { this.upgraded = upgraded; }
++    public boolean isInternalUpgrade() {return internalUpgrade; }
++    public void setInternalUpgrade(boolean internalUpgrade) {
++        this.internalUpgrade = internalUpgrade;
++    }
+     public boolean isSecure() { return secure; }
+     public void setSecure(boolean secure) { this.secure = secure; }
+ 
+@@ -345,6 +350,7 @@ public abstract class SocketWrapperBase<E> {
+         this.readTimeout = soTimeout;
+         this.writeTimeout = soTimeout;
+         upgraded = false;
++        internalUpgrade = false;
+         resetSocketBufferHandler(socket);
+     }
+ 
+
+==================================================

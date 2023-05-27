@@ -1,0 +1,402 @@
+1ee6bfce5d53af47aee398a38691423608bf6b83
+==================================================
+Fix https://bz.apache.org/bugzilla/show_bug.cgi?id=57708
+==================================================
+Mark Thomas
+==================================================
+Wed Mar 18 13:31:00 2015 +0000
+==================================================
+Realm.java
+Fix https://bz.apache.org/bugzilla/show_bug.cgi?id=57708
+Implement a new feature for AJP connectors - Tomcat Authorization
+If configured (it is disabled by default) Tomcat will take an authenticated user name from the AJP protocol and use the appropriate Realm for the request to authorize (i.e. add roles) to that user.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1667546 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AuthenticatorBase.java
+index b3659321ce..4ee861c44e 100644
+--- a/java/org/apache/catalina/Realm.java
++++ b/java/org/apache/catalina/Realm.java
+@@ -75,6 +75,15 @@ public interface Realm {
+     public void addPropertyChangeListener(PropertyChangeListener listener);
+ 
+ 
++    /**
++     * Return the Principal associated with the specified username, if there
++     * is one; otherwise return <code>null</code>.
++     *
++     * @param username Username of the Principal to look up
++     */
++    public Principal authenticate(String username);
++
++
+     /**
+      * Return the Principal associated with the specified username and
+      * credentials, if there is one; otherwise return <code>null</code>.
+
+==================================================
+BasicAuthenticator.java
+index a92abee21f..1427e84079 100644
+--- a/java/org/apache/catalina/authenticator/AuthenticatorBase.java
++++ b/java/org/apache/catalina/authenticator/AuthenticatorBase.java
+@@ -40,6 +40,7 @@ import org.apache.catalina.Valve;
+ import org.apache.catalina.Wrapper;
+ import org.apache.catalina.connector.Request;
+ import org.apache.catalina.connector.Response;
++import org.apache.catalina.realm.GenericPrincipal;
+ import org.apache.catalina.util.SessionIdGeneratorBase;
+ import org.apache.catalina.util.StandardSessionIdGenerator;
+ import org.apache.catalina.valves.ValveBase;
+@@ -691,20 +692,22 @@ public abstract class AuthenticatorBase extends ValveBase implements Authenticat
+      * authenticate the user without requiring further user interaction.
+      *
+      * @param request The current request
++     * @param response The current response
+      * @param useSSO  Should information available from SSO be used to attempt
+      *                to authenticate the current user?
+      *
+      * @return <code>true</code> if the user was authenticated via the cache,
+      *         otherwise <code>false</code>
+      */
+-    protected boolean checkForCachedAuthentication(Request request, boolean useSSO) {
++    protected boolean checkForCachedAuthentication(Request request,
++            HttpServletResponse response, boolean useSSO) {
+ 
+         // Has the user already been authenticated?
+         Principal principal = request.getUserPrincipal();
+         String ssoId = (String) request.getNote(Constants.REQ_SSOID_NOTE);
+         if (principal != null) {
+             if (log.isDebugEnabled()) {
+-                log.debug("Already authenticated '" + principal.getName() + "'");
++                log.debug(sm.getString("authenticator.check.found", principal.getName()));
+             }
+             // Associate the session with any existing SSO session. Even if
+             // useSSO is false, this will ensure coordinated session
+@@ -718,8 +721,7 @@ public abstract class AuthenticatorBase extends ValveBase implements Authenticat
+         // Is there an SSO session against which we can try to reauthenticate?
+         if (useSSO && ssoId != null) {
+             if (log.isDebugEnabled()) {
+-                log.debug("SSO Id " + ssoId + " set; attempting " +
+-                          "reauthentication");
++                log.debug(sm.getString("authenticator.check.sso", ssoId));
+             }
+             /* Try to reauthenticate using data cached by SSO.  If this fails,
+                either the original SSO logon was of DIGEST or SSL (which
+@@ -732,6 +734,31 @@ public abstract class AuthenticatorBase extends ValveBase implements Authenticat
+             }
+         }
+ 
++        // Has the Connector provided a pre-authenticated Principal that now
++        // needs to be authorized?
++        if (request.getCoyoteRequest().getRemoteUserNeedsAuthorization()) {
++            String username = request.getCoyoteRequest().getRemoteUser().toString();
++            if (username != null) {
++                if (log.isDebugEnabled()) {
++                    log.debug(sm.getString("authenticator.check.authorize", username));
++                }
++                Principal authorized = context.getRealm().authenticate(username);
++                if (authorized == null) {
++                    // Realm doesn't recognise user. Create a user with no roles
++                    // from the authenticated user name
++                    if (log.isDebugEnabled()) {
++                        log.debug(sm.getString("authenticator.check.authorizeFail", username));
++                    }
++                    authorized = new GenericPrincipal(username, null,  null);
++                }
++                String authType = request.getAuthType();
++                if (authType == null || authType.length() == 0) {
++                    authType = getAuthMethod();
++                }
++                register(request, response, authorized, authType, username, null);
++                return true;
++            }
++        }
+         return false;
+     }
+ 
+
+==================================================
+DigestAuthenticator.java
+index 175d74d41a..f86ec7d645 100644
+--- a/java/org/apache/catalina/authenticator/BasicAuthenticator.java
++++ b/java/org/apache/catalina/authenticator/BasicAuthenticator.java
+@@ -63,7 +63,7 @@ public class BasicAuthenticator extends AuthenticatorBase {
+     public boolean authenticate(Request request, HttpServletResponse response)
+             throws IOException {
+ 
+-        if (checkForCachedAuthentication(request, true)) {
++        if (checkForCachedAuthentication(request, response, true)) {
+             return true;
+         }
+ 
+
+==================================================
+FormAuthenticator.java
+index 1b62024233..241f8d1018 100644
+--- a/java/org/apache/catalina/authenticator/DigestAuthenticator.java
++++ b/java/org/apache/catalina/authenticator/DigestAuthenticator.java
+@@ -205,7 +205,7 @@ public class DigestAuthenticator extends AuthenticatorBase {
+         // Change to true below to allow previous FORM or BASIC authentications
+         // to authenticate users for this webapp
+         // TODO make this a configurable attribute (in SingleSignOn??)
+-        if (checkForCachedAuthentication(request, false)) {
++        if (checkForCachedAuthentication(request, response, false)) {
+             return true;
+         }
+ 
+
+==================================================
+NonLoginAuthenticator.java
+index 49de32359b..cde0f84aa8 100644
+--- a/java/org/apache/catalina/authenticator/LocalStrings.properties
++++ b/java/org/apache/catalina/authenticator/LocalStrings.properties
+@@ -15,6 +15,10 @@
+ 
+ authenticator.certificates=No client certificate chain in this request
+ authenticator.changeSessionId=Session ID changed on authentication from [{0}] to [{1}]
++authenticator.check.authorize=Authorizing connector provided user [{0}] via Tomcat Realm
++authenticator.check.authorizeFail=Realm did not recognise user [{0}]. Creating a Principal with that name and no roles.
++authenticator.check.found=Already authenticated [{0}]
++authenticator.check.sso=Not authenticated but SSO session ID [{0}] found. Attempting re-authentication.
+ authenticator.formlogin=Invalid direct reference to form login page
+ authenticator.loginFail=Login failed
+ authenticator.manager=Exception initializing trust managers
+@@ -23,6 +27,7 @@ authenticator.notContext=Configuration error:  Must be attached to a Context
+ authenticator.requestBodyTooBig=The request body was too large to be cached during the authentication process
+ authenticator.sessionExpired=The time allowed for the login process has been exceeded. If you wish to continue you must either click back twice and re-click the link you requested or close and re-open your browser
+ authenticator.unauthorized=Cannot authenticate with the provided credentials
++
+ digestAuthenticator.cacheRemove=A valid entry has been removed from client nonce cache to make room for new entries. A replay attack is now possible. To prevent the possibility of replay attacks, reduce nonceValidity or increase cnonceCacheSize. Further warnings of this type will be suppressed for 5 minutes.
+ 
+ formAuthenticator.forwardErrorFail=Unexpected error forwarding to error page
+
+==================================================
+SSLAuthenticator.java
+index f1402556af..13f1cb25b9 100644
+--- a/java/org/apache/catalina/authenticator/NonLoginAuthenticator.java
++++ b/java/org/apache/catalina/authenticator/NonLoginAuthenticator.java
+@@ -79,7 +79,7 @@ public final class NonLoginAuthenticator extends AuthenticatorBase {
+ 
+         // Don't try and use SSO to authenticate since there is no auth
+         // configured for this web application
+-        if (checkForCachedAuthentication(request, true)) {
++        if (checkForCachedAuthentication(request, response, true)) {
+             return true;
+         }
+ 
+
+==================================================
+SpnegoAuthenticator.java
+index be9da9a050..22368706cf 100644
+--- a/java/org/apache/catalina/authenticator/SSLAuthenticator.java
++++ b/java/org/apache/catalina/authenticator/SSLAuthenticator.java
+@@ -57,7 +57,7 @@ public class SSLAuthenticator extends AuthenticatorBase {
+         // Change to true below to allow previous FORM or BASIC authentications
+         // to authenticate users for this webapp
+         // TODO make this a configurable attribute (in SingleSignOn??)
+-        if (checkForCachedAuthentication(request, false)) {
++        if (checkForCachedAuthentication(request, response, false)) {
+             return true;
+         }
+ 
+
+==================================================
+CoyoteAdapter.java
+index d74fcc80c0..377ef3f917 100644
+--- a/java/org/apache/catalina/authenticator/SpnegoAuthenticator.java
++++ b/java/org/apache/catalina/authenticator/SpnegoAuthenticator.java
+@@ -128,7 +128,7 @@ public class SpnegoAuthenticator extends AuthenticatorBase {
+     public boolean authenticate(Request request, HttpServletResponse response)
+             throws IOException {
+ 
+-        if (checkForCachedAuthentication(request, true)) {
++        if (checkForCachedAuthentication(request, response, true)) {
+             return true;
+         }
+ 
+
+==================================================
+CombinedRealm.java
+index 2ae0aae480..33fffd5600 100644
+--- a/java/org/apache/catalina/connector/LocalStrings.properties
++++ b/java/org/apache/catalina/connector/LocalStrings.properties
+@@ -14,6 +14,8 @@
+ # limitations under the License.
+ coyoteAdapter.accesslogFail=Exception while attempting to add an entry to the access log
+ coyoteAdapter.asyncDispatch=Exception while processing an asynchronous request
++coyoteAdapter.authenticate=Authenticated user [{0}] provided by connector
++coyoteAdapter.authorize=Authorizing user [{0}] using Tomcat's Realm
+ coyoteAdapter.checkRecycled.request=Encountered a non-recycled request and recycled it forcedly.
+ coyoteAdapter.checkRecycled.response=Encountered a non-recycled response and recycled it forcedly.
+ coyoteAdapter.debug=The variable [{0}] has value [{1}]
+
+==================================================
+RealmBase.java
+index f5cb879090..01f4732d17 100644
+--- a/java/org/apache/catalina/realm/CombinedRealm.java
++++ b/java/org/apache/catalina/realm/CombinedRealm.java
+@@ -136,6 +136,41 @@ public class CombinedRealm extends RealmBase {
+     }
+ 
+ 
++    /**
++     * Return the Principal associated with the specified user name otherwise
++     * return <code>null</code>.
++     *
++     * @param username User name of the Principal to look up
++     */
++    @Override
++    public Principal authenticate(String username) {
++        Principal authenticatedUser = null;
++
++        for (Realm realm : realms) {
++            if (log.isDebugEnabled()) {
++                log.debug(sm.getString("combinedRealm.authStart", username,
++                        realm.getClass().getName()));
++            }
++
++            authenticatedUser = realm.authenticate(username);
++
++            if (authenticatedUser == null) {
++                if (log.isDebugEnabled()) {
++                    log.debug(sm.getString("combinedRealm.authFail", username,
++                            realm.getClass().getName()));
++                }
++            } else {
++                if (log.isDebugEnabled()) {
++                    log.debug(sm.getString("combinedRealm.authSuccess",
++                            username, realm.getClass().getName()));
++                }
++                break;
++            }
++        }
++        return authenticatedUser;
++    }
++
++
+     /**
+      * Return the Principal associated with the specified username and
+      * credentials, if there is one; otherwise return <code>null</code>.
+
+==================================================
+Request.java
+index ac4521d212..38b733873e 100644
+--- a/java/org/apache/catalina/realm/RealmBase.java
++++ b/java/org/apache/catalina/realm/RealmBase.java
+@@ -415,6 +415,27 @@ public abstract class RealmBase extends LifecycleMBeanBase implements Realm {
+     }
+ 
+ 
++    /**
++     * Return the Principal associated with the specified username, if there
++     * is one; otherwise return <code>null</code>.
++     *
++     * @param username Username of the Principal to look up
++     */
++    @Override
++    public Principal authenticate(String username) {
++
++        if (username == null) {
++            return null;
++        }
++
++        if (containerLog.isTraceEnabled()) {
++            containerLog.trace(sm.getString("realmBase.authenticateSuccess", username));
++        }
++
++        return getPrincipal(username);
++    }
++
++
+     /**
+      * Return the Principal associated with the specified username and
+      * credentials, if there is one; otherwise return <code>null</code>.
+
+==================================================
+AbstractAjpProtocol.java
+index 3ef4124ac2..fb40c006c3 100644
+--- a/java/org/apache/coyote/Request.java
++++ b/java/org/apache/coyote/Request.java
+@@ -127,9 +127,10 @@ public final class Request {
+     private final ServerCookies serverCookies = new ServerCookies(INITIAL_COOKIE_SIZE);
+     private final Parameters parameters = new Parameters();
+ 
+-    private final MessageBytes remoteUser=MessageBytes.newInstance();
+-    private final MessageBytes authType=MessageBytes.newInstance();
+-    private final HashMap<String,Object> attributes=new HashMap<>();
++    private final MessageBytes remoteUser = MessageBytes.newInstance();
++    private boolean remoteUserNeedsAuthorization = false;
++    private final MessageBytes authType = MessageBytes.newInstance();
++    private final HashMap<String,Object> attributes = new HashMap<>();
+ 
+     private Response response;
+     private ActionHook hook;
+@@ -415,6 +416,14 @@ public final class Request {
+         return remoteUser;
+     }
+ 
++    public boolean getRemoteUserNeedsAuthorization() {
++        return remoteUserNeedsAuthorization;
++    }
++
++    public void setRemoteUserNeedsAuthorization(boolean remoteUserNeedsAuthorization) {
++        this.remoteUserNeedsAuthorization = remoteUserNeedsAuthorization;
++    }
++
+     public MessageBytes getAuthType() {
+         return authType;
+     }
+@@ -542,6 +551,7 @@ public final class Request {
+ 
+         instanceId.recycle();
+         remoteUser.recycle();
++        remoteUserNeedsAuthorization = false;
+         authType.recycle();
+         attributes.clear();
+ 
+
+==================================================
+AjpProcessor.java
+index 29bc6550a6..8b88064592 100644
+--- a/java/org/apache/coyote/ajp/AbstractAjpProtocol.java
++++ b/java/org/apache/coyote/ajp/AbstractAjpProtocol.java
+@@ -71,7 +71,7 @@ public abstract class AbstractAjpProtocol<S> extends AbstractProtocol<S> {
+     // ------------------------------------------ managed in the ProtocolHandler
+ 
+     /**
+-     * Should authentication be done in the native webserver layer,
++     * Should authentication be done in the native web server layer,
+      * or in the Servlet container ?
+      */
+     private boolean tomcatAuthentication = true;
+@@ -81,6 +81,17 @@ public abstract class AbstractAjpProtocol<S> extends AbstractProtocol<S> {
+     }
+ 
+ 
++    /**
++     * Should authentication be done in the native web server layer and
++     * authorization in the Servlet container?
++     */
++    private boolean tomcatAuthorization = false;
++    public boolean getTomcatAuthorization() { return tomcatAuthorization; }
++    public void setTomcatAuthorization(boolean tomcatAuthorization) {
++        this.tomcatAuthorization = tomcatAuthorization;
++    }
++
++
+     /**
+      * Required secret.
+      */
+@@ -106,6 +117,7 @@ public abstract class AbstractAjpProtocol<S> extends AbstractProtocol<S> {
+     protected void configureProcessor(AjpProcessor processor) {
+         processor.setAdapter(getAdapter());
+         processor.setTomcatAuthentication(getTomcatAuthentication());
++        processor.setTomcatAuthorization(getTomcatAuthorization());
+         processor.setRequiredSecret(requiredSecret);
+         processor.setKeepAliveTimeout(getKeepAliveTimeout());
+         processor.setClientCertProvider(getClientCertProvider());
+
+==================================================

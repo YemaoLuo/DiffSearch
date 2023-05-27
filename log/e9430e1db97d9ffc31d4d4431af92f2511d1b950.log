@@ -1,0 +1,477 @@
+e9430e1db97d9ffc31d4d4431af92f2511d1b950
+==================================================
+https://bz.apache.org/bugzilla/show_bug.cgi?id=63937 allowCorsPreflight
+==================================================
+Mark Thomas
+==================================================
+Mon Dec 2 14:01:13 2019 +0000
+==================================================
+AuthenticatorBase.java
+https://bz.apache.org/bugzilla/show_bug.cgi?id=63937 allowCorsPreflight
+
+Add a new attribute to the standard Authenticator implementations,
+allowCorsPreflight, that allows the Authenticators to be configured to
+allow CORS preflight requests to bypass authentication as required by
+the CORS specification.
+
+
+==================================================
+CorsFilter.java
+index 76e712bb92..308b019df5 100644
+--- a/java/org/apache/catalina/authenticator/AuthenticatorBase.java
++++ b/java/org/apache/catalina/authenticator/AuthenticatorBase.java
+@@ -33,6 +33,7 @@ import javax.security.auth.message.config.AuthConfigProvider;
+ import javax.security.auth.message.config.RegistrationListener;
+ import javax.security.auth.message.config.ServerAuthConfig;
+ import javax.security.auth.message.config.ServerAuthContext;
++import javax.servlet.DispatcherType;
+ import javax.servlet.ServletContext;
+ import javax.servlet.ServletException;
+ import javax.servlet.http.Cookie;
+@@ -53,6 +54,7 @@ import org.apache.catalina.authenticator.jaspic.CallbackHandlerImpl;
+ import org.apache.catalina.authenticator.jaspic.MessageInfoImpl;
+ import org.apache.catalina.connector.Request;
+ import org.apache.catalina.connector.Response;
++import org.apache.catalina.filters.CorsFilter;
+ import org.apache.catalina.filters.RemoteIpFilter;
+ import org.apache.catalina.realm.GenericPrincipal;
+ import org.apache.catalina.util.SessionIdGeneratorBase;
+@@ -63,9 +65,12 @@ import org.apache.coyote.ActionCode;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.ExceptionUtils;
++import org.apache.tomcat.util.descriptor.web.FilterDef;
++import org.apache.tomcat.util.descriptor.web.FilterMap;
+ import org.apache.tomcat.util.descriptor.web.LoginConfig;
+ import org.apache.tomcat.util.descriptor.web.SecurityConstraint;
+ import org.apache.tomcat.util.http.FastHttpDateFormat;
++import org.apache.tomcat.util.http.RequestUtil;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+ /**
+@@ -237,12 +242,22 @@ public abstract class AuthenticatorBase extends ValveBase
+      */
+     protected SingleSignOn sso = null;
+ 
++    private AllowCorsPreflight allowCorsPreflight = AllowCorsPreflight.NEVER;
++
+     private volatile String jaspicAppContextID = null;
+     private volatile Optional<AuthConfigProvider> jaspicProvider = null;
+ 
+ 
+     // ------------------------------------------------------------- Properties
+ 
++    public String getAllowCorsPreflight() {
++        return allowCorsPreflight.name().toLowerCase();
++    }
++
++    public void setAllowCorsPreflight(String allowCorsPreflight) {
++        this.allowCorsPreflight = AllowCorsPreflight.valueOf(allowCorsPreflight.trim().toUpperCase());
++    }
++
+     public boolean getAlwaysUseSession() {
+         return alwaysUseSession;
+     }
+@@ -593,6 +608,14 @@ public abstract class AuthenticatorBase extends ValveBase
+ 
+         JaspicState jaspicState = null;
+ 
++        if ((authRequired || constraints != null) && allowCorsPreflightBypass(request)) {
++            if (log.isDebugEnabled()) {
++                log.debug(" CORS Preflight request bypassing authentication");
++            }
++            getNext().invoke(request, response);
++            return;
++        }
++
+         if (authRequired) {
+             if (log.isDebugEnabled()) {
+                 log.debug(" Calling authenticate()");
+@@ -648,6 +671,64 @@ public abstract class AuthenticatorBase extends ValveBase
+     }
+ 
+ 
++    protected boolean allowCorsPreflightBypass(Request request) {
++        boolean allowBypass = false;
++
++        if (allowCorsPreflight != AllowCorsPreflight.NEVER) {
++            // First check to see if this is a CORS Preflight request
++            // This is a subset of the tests in CorsFilter.checkRequestType
++            if ("OPTIONS".equals(request.getMethod())) {
++                String originHeader = request.getHeader(CorsFilter.REQUEST_HEADER_ORIGIN);
++                if (originHeader != null &&
++                        !originHeader.isEmpty() &&
++                        RequestUtil.isValidOrigin(originHeader) &&
++                        !RequestUtil.isSameOrigin(request, originHeader)) {
++                    String accessControlRequestMethodHeader =
++                            request.getHeader(CorsFilter.REQUEST_HEADER_ACCESS_CONTROL_REQUEST_METHOD);
++                    if (accessControlRequestMethodHeader != null &&
++                            !accessControlRequestMethodHeader.isEmpty()) {
++                        // This appears to be a CORS Preflight request
++                        if (allowCorsPreflight == AllowCorsPreflight.ALWAYS) {
++                            allowBypass = true;
++                        } else if (allowCorsPreflight == AllowCorsPreflight.FILTER) {
++                            if (DispatcherType.REQUEST == request.getDispatcherType()) {
++                                // Look at Filter configuration for the Context
++                                // Can't cache this unless we add a listener to
++                                // the Context to clear the cache on reload
++                                for (FilterDef filterDef : request.getContext().findFilterDefs()) {
++                                    if (CorsFilter.class.getName().equals(filterDef.getFilterClass())) {
++                                        for (FilterMap filterMap : context.findFilterMaps()) {
++                                            if (filterMap.getFilterName().equals(filterDef.getFilterName())) {
++                                                if ((filterMap.getDispatcherMapping() & FilterMap.REQUEST) > 0) {
++                                                    for (String urlPattern : filterMap.getURLPatterns()) {
++                                                        if ("/*".equals(urlPattern)) {
++                                                            allowBypass = true;
++                                                            // No need to check other patterns
++                                                            break;
++                                                        }
++                                                    }
++                                                }
++                                                // Found mappings for CORS filter.
++                                                // No need to look further
++                                                break;
++                                            }
++                                        }
++                                        // Found the CORS filter. No need to look further.
++                                        break;
++                                    }
++                                }
++                            }
++                        } else {
++                            // Unexpected enum type
++                        }
++                    }
++                }
++            }
++        }
++        return allowBypass;
++    }
++
++
+     @Override
+     public boolean authenticate(Request request, HttpServletResponse httpResponse)
+             throws IOException {
+@@ -1301,4 +1382,11 @@ public abstract class AuthenticatorBase extends ValveBase
+         public MessageInfo messageInfo = null;
+         public ServerAuthContext serverAuthContext = null;
+     }
++
++
++    protected enum AllowCorsPreflight {
++        NEVER,
++        FILTER,
++        ALWAYS
++    }
+ }
+
+==================================================
+RequestUtil.java
+index 4213fb4acd..294e904a6e 100644
+--- a/java/org/apache/catalina/filters/CorsFilter.java
++++ b/java/org/apache/catalina/filters/CorsFilter.java
+@@ -19,7 +19,6 @@ package org.apache.catalina.filters;
+ import java.io.IOException;
+ import java.io.ObjectInputStream;
+ import java.net.URI;
+-import java.net.URISyntaxException;
+ import java.util.Arrays;
+ import java.util.Collection;
+ import java.util.Collections;
+@@ -590,7 +589,7 @@ public class CorsFilter extends GenericFilter {
+         if (originHeader != null) {
+             if (originHeader.isEmpty()) {
+                 requestType = CORSRequestType.INVALID_CORS;
+-            } else if (!isValidOrigin(originHeader)) {
++            } else if (!RequestUtil.isValidOrigin(originHeader)) {
+                 requestType = CORSRequestType.INVALID_CORS;
+             } else if (RequestUtil.isSameOrigin(request, originHeader)) {
+                 return CORSRequestType.NOT_CORS;
+@@ -783,34 +782,13 @@ public class CorsFilter extends GenericFilter {
+      * @param origin The origin URI
+      * @return <code>true</code> if the origin was valid
+      * @see <a href="http://tools.ietf.org/html/rfc952">RFC952</a>
++     *
++     * @deprecated This will be removed in Tomcat 10
++     *             Use {@link RequestUtil#isValidOrigin(String)}
+      */
++    @Deprecated
+     protected static boolean isValidOrigin(String origin) {
+-        // Checks for encoded characters. Helps prevent CRLF injection.
+-        if (origin.contains("%")) {
+-            return false;
+-        }
+-
+-        // "null" is a valid origin
+-        if ("null".equals(origin)) {
+-            return true;
+-        }
+-
+-        // RFC6454, section 4. "If uri-scheme is file, the implementation MAY
+-        // return an implementation-defined value.". No limits are placed on
+-        // that value so treat all file URIs as valid origins.
+-        if (origin.startsWith("file://")) {
+-            return true;
+-        }
+-
+-        URI originURI;
+-        try {
+-            originURI = new URI(origin);
+-        } catch (URISyntaxException e) {
+-            return false;
+-        }
+-        // If scheme for URI is null, return false. Return true otherwise.
+-        return originURI.getScheme() != null;
+-
++        return RequestUtil.isValidOrigin(origin);
+     }
+ 
+ 
+
+==================================================
+TestAuthenticatorBaseCorsPreflight.java
+index cfa9c57d18..2edd6954d2 100644
+--- a/java/org/apache/tomcat/util/http/RequestUtil.java
++++ b/java/org/apache/tomcat/util/http/RequestUtil.java
+@@ -16,6 +16,8 @@
+  */
+ package org.apache.tomcat.util.http;
+ 
++import java.net.URI;
++import java.net.URISyntaxException;
+ import java.util.Locale;
+ 
+ import javax.servlet.http.HttpServletRequest;
+@@ -164,4 +166,45 @@ public class RequestUtil {
+         return origin.equals(target.toString());
+     }
+ 
++
++    /**
++     * Checks if a given origin is valid or not. Criteria:
++     * <ul>
++     * <li>If an encoded character is present in origin, it's not valid.</li>
++     * <li>If origin is "null", it's valid.</li>
++     * <li>Origin should be a valid {@link URI}</li>
++     * </ul>
++     *
++     * @param origin The origin URI
++     * @return <code>true</code> if the origin was valid
++     * @see <a href="http://tools.ietf.org/html/rfc952">RFC952</a>
++     */
++    public static boolean isValidOrigin(String origin) {
++        // Checks for encoded characters. Helps prevent CRLF injection.
++        if (origin.contains("%")) {
++            return false;
++        }
++
++        // "null" is a valid origin
++        if ("null".equals(origin)) {
++            return true;
++        }
++
++        // RFC6454, section 4. "If uri-scheme is file, the implementation MAY
++        // return an implementation-defined value.". No limits are placed on
++        // that value so treat all file URIs as valid origins.
++        if (origin.startsWith("file://")) {
++            return true;
++        }
++
++        URI originURI;
++        try {
++            originURI = new URI(origin);
++        } catch (URISyntaxException e) {
++            return false;
++        }
++        // If scheme for URI is null, return false. Return true otherwise.
++        return originURI.getScheme() != null;
++
++    }
+ }
+
+==================================================
+TestCorsFilter.java
+new file mode 100644
+index 0000000000..b0a68dd645
+--- /dev/null
++++ b/test/org/apache/catalina/authenticator/TestAuthenticatorBaseCorsPreflight.java
+@@ -0,0 +1,177 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.catalina.authenticator;
++
++import java.io.File;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.junit.runners.Parameterized;
++import org.junit.runners.Parameterized.Parameter;
++
++import org.apache.catalina.Context;
++import org.apache.catalina.Realm;
++import org.apache.catalina.authenticator.AuthenticatorBase.AllowCorsPreflight;
++import org.apache.catalina.filters.AddDefaultCharsetFilter;
++import org.apache.catalina.filters.CorsFilter;
++import org.apache.catalina.realm.NullRealm;
++import org.apache.catalina.servlets.DefaultServlet;
++import org.apache.catalina.startup.Tomcat;
++import org.apache.catalina.startup.TomcatBaseTest;
++import org.apache.tomcat.util.buf.ByteChunk;
++import org.apache.tomcat.util.descriptor.web.FilterDef;
++import org.apache.tomcat.util.descriptor.web.FilterMap;
++import org.apache.tomcat.util.descriptor.web.LoginConfig;
++import org.apache.tomcat.util.descriptor.web.SecurityCollection;
++import org.apache.tomcat.util.descriptor.web.SecurityConstraint;
++
++@RunWith(Parameterized.class)
++public class TestAuthenticatorBaseCorsPreflight extends TomcatBaseTest {
++
++    private static final String ALLOWED_ORIGIN = "http://example.com";
++    private static final String EMPTY_ORIGIN = "";
++    private static final String INVALID_ORIGIN = "http://%20";
++    private static final String SAME_ORIGIN = "http://localhost";
++    private static final String ALLOWED_METHOD = "GET";
++    private static final String BLOCKED_METHOD = "POST";
++    private static final String EMPTY_METHOD = "";
++
++    @Parameterized.Parameters(name = "{index}: input[{0}]")
++    public static Collection<Object[]> parameters() {
++        List<Object[]> parameterSets = new ArrayList<>();
++
++        parameterSets.add(new Object[] { AllowCorsPreflight.NEVER,  "/*", "OPTIONS", null,           null,           Boolean.FALSE });
++        parameterSets.add(new Object[] { AllowCorsPreflight.ALWAYS, "/*", "OPTIONS", null,           null,           Boolean.FALSE });
++        parameterSets.add(new Object[] { AllowCorsPreflight.ALWAYS, "/*", "OPTIONS", ALLOWED_ORIGIN, ALLOWED_METHOD, Boolean.TRUE });
++        parameterSets.add(new Object[] { AllowCorsPreflight.ALWAYS, "/*", "OPTIONS", EMPTY_ORIGIN,   ALLOWED_METHOD, Boolean.FALSE});
++        parameterSets.add(new Object[] { AllowCorsPreflight.ALWAYS, "/*", "OPTIONS", INVALID_ORIGIN, ALLOWED_METHOD, Boolean.FALSE });
++        parameterSets.add(new Object[] { AllowCorsPreflight.ALWAYS, "/*", "OPTIONS", SAME_ORIGIN,    ALLOWED_METHOD, Boolean.FALSE });
++        parameterSets.add(new Object[] { AllowCorsPreflight.ALWAYS, "/*", "GET",     ALLOWED_ORIGIN, ALLOWED_METHOD, Boolean.FALSE });
++        parameterSets.add(new Object[] { AllowCorsPreflight.ALWAYS, "/*", "OPTIONS", ALLOWED_ORIGIN, BLOCKED_METHOD, Boolean.FALSE });
++        parameterSets.add(new Object[] { AllowCorsPreflight.ALWAYS, "/*", "OPTIONS", ALLOWED_ORIGIN, EMPTY_METHOD,   Boolean.FALSE});
++        parameterSets.add(new Object[] { AllowCorsPreflight.ALWAYS, "/*", "OPTIONS", ALLOWED_ORIGIN, null,           Boolean.FALSE});
++        parameterSets.add(new Object[] { AllowCorsPreflight.FILTER, "/*", "OPTIONS", ALLOWED_ORIGIN, ALLOWED_METHOD, Boolean.TRUE });
++        parameterSets.add(new Object[] { AllowCorsPreflight.FILTER, "/x", "OPTIONS", ALLOWED_ORIGIN, ALLOWED_METHOD, Boolean.FALSE });
++
++        return parameterSets;
++    }
++
++    @Parameter(0)
++    public AllowCorsPreflight allowCorsPreflight;
++    @Parameter(1)
++    public String filterMapping;
++    @Parameter(2)
++    public String method;
++    @Parameter(3)
++    public String origin;
++    @Parameter(4)
++    public String accessControl;
++    @Parameter(5)
++    public boolean allow;
++
++
++    @BeforeClass
++    public static void init() {
++        // So the test can set the origin header
++        System.setProperty("sun.net.http.allowRestrictedHeaders", "true");
++    }
++
++
++    @Test
++    public void test() throws Exception {
++        Tomcat tomcat = getTomcatInstance();
++
++        File appDir = new File("test/webapp");
++        Context ctx = tomcat.addContext("", appDir.getAbsolutePath());
++
++        Tomcat.addServlet(ctx, "default", new DefaultServlet());
++        ctx.addServletMappingDecoded("/", "default");
++
++        LoginConfig loginConfig  = new LoginConfig();
++        loginConfig.setAuthMethod("BASIC");
++        ctx.setLoginConfig(loginConfig);
++
++        BasicAuthenticator basicAuth = new BasicAuthenticator();
++        basicAuth.setAllowCorsPreflight(allowCorsPreflight.toString());
++        ctx.getPipeline().addValve(basicAuth);
++
++        Realm realm = new NullRealm();
++        ctx.setRealm(realm);
++
++        SecurityCollection securityCollection = new SecurityCollection();
++        securityCollection.addPattern("/*");
++        SecurityConstraint constraint = new SecurityConstraint();
++        constraint.setAuthConstraint(true);
++        constraint.addCollection(securityCollection);
++        ctx.addConstraint(constraint);
++
++        // For code coverage
++        FilterDef otherFilter = new FilterDef();
++        otherFilter.setFilterName("other");
++        otherFilter.setFilterClass(AddDefaultCharsetFilter.class.getName());
++        FilterMap otherMap = new FilterMap();
++        otherMap.setFilterName("other");
++        otherMap.addURLPatternDecoded("/other");
++        ctx.addFilterDef(otherFilter);
++        ctx.addFilterMap(otherMap);
++
++        FilterDef corsFilter = new FilterDef();
++        corsFilter.setFilterName("cors");
++        corsFilter.setFilterClass(CorsFilter.class.getName());
++        corsFilter.addInitParameter(CorsFilter.PARAM_CORS_ALLOWED_ORIGINS, ALLOWED_ORIGIN);
++        corsFilter.addInitParameter(CorsFilter.PARAM_CORS_ALLOWED_METHODS, ALLOWED_METHOD);
++        FilterMap corsFilterMap = new FilterMap();
++        corsFilterMap.setFilterName("cors");
++        corsFilterMap.addURLPatternDecoded(filterMapping);
++        ctx.addFilterDef(corsFilter);
++        ctx.addFilterMap(corsFilterMap);
++
++        tomcat.start();
++
++        Map<String,List<String>> reqHead = new HashMap<>();
++        if (origin != null) {
++            List<String> values = new ArrayList<>();
++            if (SAME_ORIGIN.equals(origin)) {
++                values.add(origin + ":" + getPort());
++            } else {
++                values.add(origin);
++            }
++            reqHead.put(CorsFilter.REQUEST_HEADER_ORIGIN, values);
++        }
++        if (accessControl != null) {
++            List<String> values = new ArrayList<>();
++            values.add(accessControl);
++            reqHead.put(CorsFilter.REQUEST_HEADER_ACCESS_CONTROL_REQUEST_METHOD, values);
++        }
++
++        ByteChunk out = new ByteChunk();
++        int rc = methodUrl("http://localhost:" + getPort() + "/target", out, 300000, reqHead, null, method, false);
++
++        if (allow) {
++            Assert.assertEquals(200, rc);
++        } else {
++            Assert.assertEquals(403, rc);
++        }
++    }
++}
+
+==================================================

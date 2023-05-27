@@ -1,0 +1,198 @@
+708acc3ad690eb5e033d7271b93678b39dcf03da
+==================================================
+Fix https://bz.apache.org/bugzilla/show_bug.cgi?id=62515
+==================================================
+Mark Thomas
+==================================================
+Mon Jul 9 11:58:18 2018 +0000
+==================================================
+StandardService.java
+Fix https://bz.apache.org/bugzilla/show_bug.cgi?id=62515
+When a connector is configured (via setting bindOnInit to false) to bind/unbind the server socket during start/stop, close the socket earlier in the stop process so new connections do not sit in the TCP backlog during the shutdown process only to be dropped as stop completes. In this scenario new connections will now be refused immediately.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1835413 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AbstractProtocol.java
+index b8852f8690..f8920f6ce8 100644
+--- a/java/org/apache/catalina/core/StandardService.java
++++ b/java/org/apache/catalina/core/StandardService.java
+@@ -458,6 +458,9 @@ public class StandardService extends LifecycleMBeanBase implements Service {
+         synchronized (connectorsLock) {
+             for (Connector connector: connectors) {
+                 connector.pause();
++                // Close server socket if bound on start
++                // Note: test is in AbstractEndpoint
++                connector.getProtocolHandler().closeServerSocketGraceful();
+             }
+         }
+ 
+
+==================================================
+ProtocolHandler.java
+index b8c9d62ace..24cf1ff6ac 100644
+--- a/java/org/apache/coyote/AbstractProtocol.java
++++ b/java/org/apache/coyote/AbstractProtocol.java
+@@ -631,6 +631,12 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler,
+     }
+ 
+ 
++    @Override
++    public void closeServerSocketGraceful() {
++        endpoint.closeServerSocketGraceful();
++    }
++
++
+     // ------------------------------------------- Connection handler base class
+ 
+     protected static class ConnectionHandler<S> implements AbstractEndpoint.Handler<S> {
+
+==================================================
+AbstractEndpoint.java
+index 33b00ce6b7..6d3842cf1b 100644
+--- a/java/org/apache/coyote/ProtocolHandler.java
++++ b/java/org/apache/coyote/ProtocolHandler.java
+@@ -100,6 +100,14 @@ public interface ProtocolHandler {
+     public void destroy() throws Exception;
+ 
+ 
++    /**
++     * Close the server socket (to prevent further connections) if the server
++     * socket was bound on {@link #start()} (rather than on {@link #init()}
++     * but do not perform any further shutdown.
++     */
++    public void closeServerSocketGraceful();
++
++
+     /**
+      * Requires APR/native library
+      *
+
+==================================================
+AprEndpoint.java
+index f06152901a..04f8ebd905 100644
+--- a/java/org/apache/tomcat/util/net/AbstractEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AbstractEndpoint.java
+@@ -128,7 +128,7 @@ public abstract class AbstractEndpoint<S,U> {
+     }
+ 
+     protected enum BindState {
+-        UNBOUND, BOUND_ON_INIT, BOUND_ON_START
++        UNBOUND, BOUND_ON_INIT, BOUND_ON_START, SOCKET_CLOSED_ON_STOP
+     }
+ 
+ 
+@@ -219,7 +219,8 @@ public abstract class AbstractEndpoint<S,U> {
+         if (key == null || key.length() == 0) {
+             throw new IllegalArgumentException(sm.getString("endpoint.noSslHostName"));
+         }
+-        if (bindState != BindState.UNBOUND && isSSLEnabled()) {
++        if (bindState != BindState.UNBOUND && bindState != BindState.SOCKET_CLOSED_ON_STOP &&
++                isSSLEnabled()) {
+             sslHostConfig.setConfigType(getSslConfigType());
+             try {
+                 createSSLContext(sslHostConfig);
+@@ -1153,7 +1154,7 @@ public abstract class AbstractEndpoint<S,U> {
+ 
+     public final void stop() throws Exception {
+         stopInternal();
+-        if (bindState == BindState.BOUND_ON_START) {
++        if (bindState == BindState.BOUND_ON_START || bindState == BindState.SOCKET_CLOSED_ON_STOP) {
+             unbind();
+             bindState = BindState.UNBOUND;
+         }
+@@ -1206,6 +1207,33 @@ public abstract class AbstractEndpoint<S,U> {
+         } else return -1;
+     }
+ 
++
++    /**
++     * Close the server socket (to prevent further connections) if the server
++     * socket was originally bound on {@link #start()} (rather than on
++     * {@link #init()}).
++     *
++     * @see #getBindOnInit()
++     */
++    public final void closeServerSocketGraceful() {
++        if (bindState == BindState.BOUND_ON_START) {
++            bindState = BindState.SOCKET_CLOSED_ON_STOP;
++            try {
++                doCloseServerSocket();
++            } catch (IOException ioe) {
++                getLog().warn(sm.getString("endpoint.serverSocket.closeFailed", getName()), ioe);
++            }
++        }
++    }
++
++
++    /**
++     * Actually close the server socket but don't perform any other clean-up.
++     *
++     * @throws IOException If an error occurs closing the socket
++     */
++    protected abstract void doCloseServerSocket() throws IOException;
++
+     protected abstract U serverSocketAccept() throws Exception;
+ 
+     protected abstract boolean setSocketOptions(U socket);
+
+==================================================
+Nio2Endpoint.java
+index 17288abcef..85a2f72ed2 100644
+--- a/java/org/apache/tomcat/util/net/LocalStrings.properties
++++ b/java/org/apache/tomcat/util/net/LocalStrings.properties
+@@ -67,6 +67,7 @@ endpoint.removeDefaultSslHostConfig=The default SSLHostConfig (named [{0}]) may
+ endpoint.sendfile.addfail=Sendfile failure: [{0}] [{1}]
+ endpoint.sendfile.error=Unexpected sendfile error
+ endpoint.sendfileThreadStop=The sendfile thread failed to stop in a timely manner
++endpoint.serverSocket.closeFailed=Failed to close server socket for [{0}]
+ endpoint.setAttribute=Set [{0}] to [{1}]
+ endpoint.timeout.err=Error processing socket timeout
+ endpoint.unknownSslHostName=The SSL host name [{0}] is not recognised for this endpoint
+
+==================================================
+NioEndpoint.java
+index 49d7f4980c..a656d1d74d 100644
+--- a/java/org/apache/tomcat/util/net/Nio2Endpoint.java
++++ b/java/org/apache/tomcat/util/net/Nio2Endpoint.java
+@@ -70,7 +70,7 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel,AsynchronousS
+     /**
+      * Server socket "pointer".
+      */
+-    private AsynchronousServerSocketChannel serverSock = null;
++    private volatile AsynchronousServerSocketChannel serverSock = null;
+ 
+     /**
+      * Allows detecting if a completion handler completes inline.
+@@ -227,9 +227,7 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel,AsynchronousS
+         if (running) {
+             stop();
+         }
+-        // Close server socket
+-        serverSock.close();
+-        serverSock = null;
++        doCloseServerSocket();
+         destroySsl();
+         super.unbind();
+         // Unlike other connectors, the thread pool is tied to the server socket
+@@ -240,6 +238,16 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel,AsynchronousS
+     }
+ 
+ 
++    @Override
++    protected void doCloseServerSocket() throws IOException {
++        // Close server socket
++        if (serverSock != null) {
++            serverSock.close();
++            serverSock = null;
++        }
++    }
++
++
+     @Override
+     public void shutdownExecutor() {
+         if (threadGroup != null && internalExecutor) {
+
+==================================================

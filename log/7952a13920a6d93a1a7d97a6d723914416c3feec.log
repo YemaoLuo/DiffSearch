@@ -1,0 +1,186 @@
+7952a13920a6d93a1a7d97a6d723914416c3feec
+==================================================
+Add an explicit configuration option for cookie version switching and update test cases and docs to include it.
+==================================================
+Mark Emlyn
+==================================================
+Sat Oct 31 12:59:51 2009 +0000
+==================================================
+ServerCookie.java
+Add an explicit configuration option for cookie version switching and update test cases and docs to include it.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@831536 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+CookiesBaseTest.java
+index e9cc851032..39a274481d 100644
+--- a/java/org/apache/tomcat/util/http/ServerCookie.java
++++ b/java/org/apache/tomcat/util/http/ServerCookie.java
+@@ -74,6 +74,14 @@ public class ServerCookie implements Serializable {
+      */
+     public static final boolean STRICT_SERVLET_COMPLIANCE;
+ 
++    /**
++     * If set to false, we don't auto switch invalid v0 cookies to v1 and add
++     * quotes to make them valid.
++     * Default is usually true. If STRICT_SERVLET_COMPLIANCE==true then default
++     * is false. Explicitly setting always takes priority.
++     */
++    public static final boolean ALLOW_VERSION_SWITCH;
++
+     /**
+      * If set to false, we don't use the IE6/7 Max-Age/Expires work around.
+      * Default is usually true. If STRICT_SERVLET_COMPLIANCE==true then default
+@@ -97,6 +105,15 @@ public class ServerCookie implements Serializable {
+                 "false")).booleanValue();
+         
+ 
++        String allowVersionSwitch = System.getProperty(
++                "org.apache.tomcat.util.http.ServerCookie.ALLOW_VERSION_SWITCH");
++        if (allowVersionSwitch == null) {
++            ALLOW_VERSION_SWITCH = !STRICT_SERVLET_COMPLIANCE;
++        } else {
++            ALLOW_VERSION_SWITCH =
++                Boolean.valueOf(allowVersionSwitch).booleanValue();
++        }
++
+         String alwaysAddExpires = System.getProperty(
+                 "org.apache.tomcat.util.http.ServerCookie.ALWAYS_ADD_EXPIRES");
+         if (alwaysAddExpires == null) {
+@@ -400,7 +417,7 @@ public class ServerCookie implements Serializable {
+             buf.append('"');
+             buf.append(escapeDoubleQuotes(value,1,value.length()-1));
+             buf.append('"');
+-        } else if (allowVersionSwitch && (!STRICT_SERVLET_COMPLIANCE) && version==0 && !isToken2(value, literals)) {
++        } else if (allowVersionSwitch && ALLOW_VERSION_SWITCH && version==0 && !isToken2(value, literals)) {
+             buf.append('"');
+             buf.append(escapeDoubleQuotes(value,0,value.length()));
+             buf.append('"');
+
+==================================================
+TestCookiesDefaultSysProps.java
+index e18fb91e57..e6ad383692 100644
+--- a/test/org/apache/tomcat/util/http/CookiesBaseTest.java
++++ b/test/org/apache/tomcat/util/http/CookiesBaseTest.java
+@@ -39,20 +39,22 @@ public abstract class CookiesBaseTest extends TomcatBaseTest {
+     /**
+      * Servlet for cookie naming test.
+      */
+-    public static class CookieName extends HttpServlet {
++    public static class CookieServlet extends HttpServlet {
+ 
+         private static final long serialVersionUID = 1L;
+         
+         private final String cookieName;
+-
+-        public CookieName(String cookieName) {
++        private final String cookieValue;
++        
++        public CookieServlet(String cookieName, String cookieValue) {
+             this.cookieName = cookieName;
++            this.cookieValue = cookieValue;
+         }
+         
+         public void doGet(HttpServletRequest req, HttpServletResponse res) 
+                 throws IOException {
+             try {
+-                Cookie cookie = new Cookie(cookieName,"Value");
++                Cookie cookie = new Cookie(cookieName, cookieValue);
+                 res.addCookie(cookie);
+                 res.getWriter().write("Cookie name ok");
+             } catch (IllegalArgumentException iae) {
+@@ -68,14 +70,18 @@ public abstract class CookiesBaseTest extends TomcatBaseTest {
+         StandardContext ctx = 
+             tomcat.addContext("/", System.getProperty("java.io.tmpdir"));
+ 
+-        Tomcat.addServlet(ctx, "invalid", new CookieName("na;me"));
++        Tomcat.addServlet(ctx, "invalid", new CookieServlet("na;me", "value"));
+         ctx.addServletMapping("/invalid", "invalid");
+-        Tomcat.addServlet(ctx, "invalidFwd", new CookieName("na/me"));
++        Tomcat.addServlet(ctx, "invalidFwd",
++                new CookieServlet("na/me", "value"));
+         ctx.addServletMapping("/invalidFwd", "invalidFwd");
+-        Tomcat.addServlet(ctx, "invalidStrict", new CookieName("na?me"));
++        Tomcat.addServlet(ctx, "invalidStrict",
++                new CookieServlet("na?me", "value"));
+         ctx.addServletMapping("/invalidStrict", "invalidStrict");
+-        Tomcat.addServlet(ctx, "valid", new CookieName("name"));
++        Tomcat.addServlet(ctx, "valid", new CookieServlet("name", "value"));
+         ctx.addServletMapping("/valid", "valid");
++        Tomcat.addServlet(ctx, "switch", new CookieServlet("name", "val?ue"));
++        ctx.addServletMapping("/switch", "switch");
+ 
+     }
+     
+
+==================================================
+TestCookiesStrictSysProps.java
+index 035bcc0960..c77ddbb3fe 100644
+--- a/test/org/apache/tomcat/util/http/TestCookiesDefaultSysProps.java
++++ b/test/org/apache/tomcat/util/http/TestCookiesDefaultSysProps.java
+@@ -17,6 +17,10 @@
+ 
+ package org.apache.tomcat.util.http;
+ 
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++
+ import org.apache.catalina.startup.Tomcat;
+ import org.apache.tomcat.util.buf.ByteChunk;
+ 
+@@ -46,6 +50,16 @@ public class TestCookiesDefaultSysProps extends CookiesBaseTest {
+         res = getUrl("http://localhost:" + getPort() + "/valid");
+         assertEquals("Cookie name ok", res.toString());
+ 
++        // Need to read response headers to test version switching
++        Map<String,List<String>> headers = new HashMap<String,List<String>>();
++        getUrl("http://localhost:" + getPort() + "/switch", res, headers);
++        List<String> cookieHeaders = headers.get("Set-Cookie");
++        for (String cookieHeader : cookieHeaders) {
++            if (cookieHeader.contains("name=")) {
++                assertTrue(cookieHeader.contains("name=\"val?ue\";"));
++            }
++        }
++
+     }
+         
+ }
+
+==================================================
+TestCookiesSwitchSysProps.java
+index 0aaf46c64e..a844195f85 100644
+--- a/test/org/apache/tomcat/util/http/TestCookiesStrictSysProps.java
++++ b/test/org/apache/tomcat/util/http/TestCookiesStrictSysProps.java
+@@ -17,6 +17,10 @@
+ 
+ package org.apache.tomcat.util.http;
+ 
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++
+ import org.apache.catalina.startup.Tomcat;
+ import org.apache.tomcat.util.buf.ByteChunk;
+ 
+@@ -49,6 +53,16 @@ public class TestCookiesStrictSysProps extends CookiesBaseTest {
+         res = getUrl("http://localhost:" + getPort() + "/valid");
+         assertEquals("Cookie name ok", res.toString());
+         
++        // Need to read response headers to test version switching
++        Map<String,List<String>> headers = new HashMap<String,List<String>>();
++        getUrl("http://localhost:" + getPort() + "/switch", res, headers);
++        List<String> cookieHeaders = headers.get("Set-Cookie");
++        for (String cookieHeader : cookieHeaders) {
++            if (cookieHeader.contains("name=")) {
++                assertTrue(cookieHeader.contains("name=val?ue"));
++            }
++        }
++        
+     }
+         
+ }
+
+==================================================

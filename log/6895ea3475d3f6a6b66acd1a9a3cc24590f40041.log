@@ -1,0 +1,159 @@
+6895ea3475d3f6a6b66acd1a9a3cc24590f40041
+==================================================
+Experiment with a static cache of C2BConverter objects rather than a per request cache that gets cleared every time the request switches to async mode.
+==================================================
+Mark Thomas
+==================================================
+Thu Sep 3 14:00:09 2015 +0000
+==================================================
+CoyoteAdapter.java
+Experiment with a static cache of C2BConverter objects rather than a per request cache that gets cleared every time the request switches to async mode.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1701027 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+OutputBuffer.java
+index 7d1a4c234c..cd3f4c1089 100644
+--- a/java/org/apache/catalina/connector/CoyoteAdapter.java
++++ b/java/org/apache/catalina/connector/CoyoteAdapter.java
+@@ -308,7 +308,6 @@ public class CoyoteAdapter implements Adapter {
+                 // Clear converters so that the minimum amount of memory
+                 // is used by this processor
+                 request.clearEncoders();
+-                response.clearEncoders();
+             }
+         }
+         return success;
+@@ -409,7 +408,6 @@ public class CoyoteAdapter implements Adapter {
+                 // Clear converters so that the minimum amount of memory
+                 // is used by this processor
+                 request.clearEncoders();
+-                response.clearEncoders();
+             }
+         }
+ 
+
+==================================================
+Response.java
+index 7457307bfb..eb804889e4 100644
+--- a/java/org/apache/catalina/connector/OutputBuffer.java
++++ b/java/org/apache/catalina/connector/OutputBuffer.java
+@@ -34,6 +34,7 @@ import org.apache.tomcat.util.buf.B2CConverter;
+ import org.apache.tomcat.util.buf.ByteChunk;
+ import org.apache.tomcat.util.buf.C2BConverter;
+ import org.apache.tomcat.util.buf.CharChunk;
++import org.apache.tomcat.util.collections.SynchronizedStack;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+ /**
+@@ -49,10 +50,14 @@ public class OutputBuffer extends Writer
+ 
+     private static final StringManager sm = StringManager.getManager(OutputBuffer.class);
+ 
+-    // -------------------------------------------------------------- Constants
+-
+     public static final int DEFAULT_BUFFER_SIZE = 8*1024;
+ 
++    /**
++     * Encoder cache.
++     */
++    private static final ConcurrentHashMap<Charset, SynchronizedStack<C2BConverter>> encoders =
++            new ConcurrentHashMap<>();
++
+ 
+     // ----------------------------------------------------- Instance Variables
+ 
+@@ -116,12 +121,6 @@ public class OutputBuffer extends Writer
+     private String enc;
+ 
+ 
+-    /**
+-     * List of encoders.
+-     */
+-    protected final ConcurrentHashMap<Charset, C2BConverter> encoders = new ConcurrentHashMap<>();
+-
+-
+     /**
+      * Current char to byte converter.
+      */
+@@ -234,6 +233,7 @@ public class OutputBuffer extends Writer
+ 
+         if (conv != null) {
+             conv.recycle();
++            encoders.get(conv.getCharset()).push(conv);
+             conv = null;
+         }
+ 
+@@ -241,14 +241,6 @@ public class OutputBuffer extends Writer
+     }
+ 
+ 
+-    /**
+-     * Clear cached encoders (to save memory for async requests).
+-     */
+-    public void clearEncoders() {
+-        encoders.clear();
+-    }
+-
+-
+     /**
+      * Close the output buffer. This tries to calculate the response size if
+      * the response has not been committed yet.
+@@ -567,11 +559,16 @@ public class OutputBuffer extends Writer
+         }
+ 
+         final Charset charset = B2CConverter.getCharset(enc);
+-        conv = encoders.get(charset);
++        SynchronizedStack<C2BConverter> stack = encoders.get(charset);
++        if (stack == null) {
++            stack = new SynchronizedStack<>();
++            encoders.putIfAbsent(charset, stack);
++            stack = encoders.get(charset);
++        }
++        conv = stack.pop();
+ 
+         if (conv == null) {
+             conv = createNewConverter(charset);
+-            encoders.put(charset, conv);
+         }
+     }
+ 
+@@ -635,6 +632,10 @@ public class OutputBuffer extends Writer
+         bytesWritten = 0;
+         charsWritten = 0;
+         if (resetWriterStreamFlags) {
++            if (conv != null) {
++                conv.recycle();
++                encoders.get(conv.getCharset()).push(conv);
++            }
+             conv = null;
+             enc = null;
+         }
+
+==================================================
+C2BConverter.java
+index b6dc265eea..ed30bb59bd 100644
+--- a/java/org/apache/catalina/connector/Response.java
++++ b/java/org/apache/catalina/connector/Response.java
+@@ -287,17 +287,8 @@ public class Response
+     }
+ 
+ 
+-    /**
+-     * Clear cached encoders (to save memory for async requests).
+-     */
+-    public void clearEncoders() {
+-        outputBuffer.clearEncoders();
+-    }
+-
+-
+     // ------------------------------------------------------- Response Methods
+ 
+-
+     /**
+      * Return the number of bytes the application has actually written to the
+      * output stream. This excludes chunking, compression, etc. as well as
+
+==================================================

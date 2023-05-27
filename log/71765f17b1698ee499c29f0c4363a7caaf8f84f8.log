@@ -1,0 +1,159 @@
+71765f17b1698ee499c29f0c4363a7caaf8f84f8
+==================================================
+Complete Servlet 3.1 non-blocking support
+==================================================
+Mark Thomas
+==================================================
+Fri Sep 25 21:47:56 2015 +0000
+==================================================
+Http2Parser.java
+Complete Servlet 3.1 non-blocking support
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1705358 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Http2UpgradeHandler.java
+index 66e4f0a3d7..86384a86fb 100644
+--- a/java/org/apache/coyote/http2/Http2Parser.java
++++ b/java/org/apache/coyote/http2/Http2Parser.java
+@@ -163,7 +163,7 @@ class Http2Parser {
+                     Integer.toString(streamId), Integer.toString(dataLength), padding));
+         }
+ 
+-        ByteBuffer dest = output.getInputByteBuffer(streamId, dataLength);
++        ByteBuffer dest = output.startRequestBodyFrame(streamId, payloadSize);
+         if (dest == null) {
+             swallow(streamId, dataLength, false);
+             // Process padding before sending any notifications in case padding
+@@ -185,7 +185,7 @@ class Http2Parser {
+                 if (endOfStream) {
+                     output.receiveEndOfStream(streamId);
+                 }
+-                dest.notifyAll();
++                output.endRequestBodyFrame(streamId);
+             }
+         }
+         if (padLength > 0) {
+@@ -586,7 +586,8 @@ class Http2Parser {
+         HpackDecoder getHpackDecoder();
+ 
+         // Data frames
+-        ByteBuffer getInputByteBuffer(int streamId, int payloadSize) throws Http2Exception;
++        ByteBuffer startRequestBodyFrame(int streamId, int payloadSize) throws Http2Exception;
++        void endRequestBodyFrame(int streamId) throws Http2Exception;
+         void receiveEndOfStream(int streamId) throws ConnectionException;
+         void swallowedPadding(int streamId, int paddingLength) throws ConnectionException, IOException;
+ 
+
+==================================================
+Stream.java
+index 50f468631b..6882a60fb4 100644
+--- a/java/org/apache/coyote/http2/Http2UpgradeHandler.java
++++ b/java/org/apache/coyote/http2/Http2UpgradeHandler.java
+@@ -953,13 +953,21 @@ public class Http2UpgradeHandler extends AbstractStream implements InternalHttpU
+ 
+ 
+     @Override
+-    public ByteBuffer getInputByteBuffer(int streamId, int payloadSize) throws Http2Exception {
++    public ByteBuffer startRequestBodyFrame(int streamId, int payloadSize) throws Http2Exception {
+         Stream stream = getStream(streamId, true);
+         stream.checkState(FrameType.DATA);
+         return stream.getInputByteBuffer();
+     }
+ 
+ 
++
++    @Override
++    public void endRequestBodyFrame(int streamId) throws Http2Exception {
++        Stream stream = getStream(streamId, true);
++        stream.getInputBuffer().onDataAvailable();
++    }
++
++
+     @Override
+     public void receiveEndOfStream(int streamId) throws ConnectionException {
+         Stream stream = getStream(streamId, connectionState.get().isNewStreamAllowed());
+
+==================================================
+StreamProcessor.java
+index 38c9cf6369..cd9031cb2a 100644
+--- a/java/org/apache/coyote/http2/Stream.java
++++ b/java/org/apache/coyote/http2/Stream.java
+@@ -21,6 +21,7 @@ import java.nio.ByteBuffer;
+ import java.util.Iterator;
+ 
+ import org.apache.coyote.ActionCode;
++import org.apache.coyote.ContainerThreadMarker;
+ import org.apache.coyote.InputBuffer;
+ import org.apache.coyote.OutputBuffer;
+ import org.apache.coyote.Request;
+@@ -537,11 +538,31 @@ public class Stream extends AbstractStream implements HeaderEmitter {
+         }
+ 
+ 
+-        synchronized boolean isRegisteredForRead() {
++        synchronized boolean isRequestBodyFullyRead() {
++            return inBuffer.position() == 0 && isInputFinished();
++        }
++
++
++        synchronized int available() {
++            return inBuffer.position();
++        }
++
++
++        /*
++         * Called after placing some data in the inBuffer.
++         */
++        synchronized boolean onDataAvailable() {
+             if (readInterest) {
+                 readInterest = false;
++                coyoteRequest.action(ActionCode.DISPATCH_READ, null);
++                if (!ContainerThreadMarker.isContainerThread()) {
++                    coyoteRequest.action(ActionCode.DISPATCH_EXECUTE, null);
++                }
+                 return true;
+             } else {
++                synchronized (inBuffer) {
++                    inBuffer.notifyAll();
++                }
+                 return false;
+             }
+         }
+
+==================================================
+Http2TestBase.java
+index 24f71e6031..022a9ebc78 100644
+--- a/java/org/apache/coyote/http2/StreamProcessor.java
++++ b/java/org/apache/coyote/http2/StreamProcessor.java
+@@ -154,6 +154,9 @@ public class StreamProcessor extends AbstractProcessor implements Runnable {
+             ((AtomicBoolean) param).set(getErrorState().isError());
+             break;
+         }
++        case AVAILABLE: {
++            request.setAvailable(stream.getInputBuffer().available());
++        }
+ 
+         // Request attribute support
+         case REQ_HOST_ADDR_ATTRIBUTE: {
+@@ -295,7 +298,7 @@ public class StreamProcessor extends AbstractProcessor implements Runnable {
+         // Servlet 3.1 non-blocking I/O
+         case REQUEST_BODY_FULLY_READ: {
+             AtomicBoolean result = (AtomicBoolean) param;
+-            result.set(stream.isInputFinished());
++            result.set(stream.getInputBuffer().isRequestBodyFullyRead());
+             break;
+         }
+         case NB_READ_INTEREST: {
+@@ -328,7 +331,6 @@ public class StreamProcessor extends AbstractProcessor implements Runnable {
+ 
+         // Unimplemented / to review
+         case ACK:
+-        case AVAILABLE:
+         case CLOSE_NOW:
+         case DISABLE_SWALLOW_INPUT:
+         case END_REQUEST:
+
+==================================================

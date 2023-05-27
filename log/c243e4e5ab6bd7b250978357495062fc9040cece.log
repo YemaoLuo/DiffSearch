@@ -1,0 +1,552 @@
+c243e4e5ab6bd7b250978357495062fc9040cece
+==================================================
+Implement session timeouts
+==================================================
+Mark Emlyn
+==================================================
+Thu Feb 14 14:50:48 2013 +0000
+==================================================
+BackgroundProcess.java
+Implement session timeouts
+Use a single background thread for session timeouts and server side async writes
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1446217 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+BackgroundProcessManager.java
+new file mode 100644
+index 0000000000..510df5748b
+--- /dev/null
++++ b/java/org/apache/tomcat/websocket/BackgroundProcess.java
+@@ -0,0 +1,26 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.tomcat.websocket;
++
++public interface BackgroundProcess {
++
++    void backgroundProcess();
++
++    void setProcessPeriod(int period);
++
++    int getProcessPeriod();
++}
+
+==================================================
+WsFrameBase.java
+index a03e5ac390..2dd0767bd3 100644
+--- a/java/org/apache/tomcat/websocket/LocalStrings.properties
++++ b/java/org/apache/tomcat/websocket/LocalStrings.properties
+@@ -36,6 +36,11 @@ wsRemoteEndpoint.changeType=When sending a fragmented message, all fragments bus
+ wsRemoteEndpoint.concurrentMessageSend=Messages may not be sent concurrently even when using the asynchronous send messages. The client must wait for the previous message to complete before sending the next.
+ wsRemoteEndpoint.inProgress=Message will not be sent because the WebSocket session is currently sending another message
+ 
++# Note the following message is used as a close reason in a WebSocket control
++# frame and therefore must be 123 bytes (not characters) or less in length.
++# Messages are encoded using UTF-8 where a single character may be encoded in
++# as many as 4 bytes.
++wsSession.timeout=The WebSocket session timeout expired
+ wsSession.duplicateHandlerBinary=A binary message handler has already been configured
+ wsSession.duplicateHandlerPong=A pong message handler has already been configured
+ wsSession.duplicateHandlerText=A text message handler has already been configured
+
+==================================================
+WsRemoteEndpointBase.java
+index 088ceb73a2..2402771bfd 100644
+--- a/java/org/apache/tomcat/websocket/WsFrameBase.java
++++ b/java/org/apache/tomcat/websocket/WsFrameBase.java
+@@ -90,6 +90,8 @@ public abstract class WsFrameBase {
+ 
+     protected void processInputBuffer() throws IOException {
+         while (true) {
++            wsSession.updateLastActive();
++
+             if (state == State.NEW_FRAME) {
+                 if (!processInitialHeader()) {
+                     break;
+
+==================================================
+WsSession.java
+index 14a453f01f..a7eff34c9e 100644
+--- a/java/org/apache/tomcat/websocket/WsRemoteEndpointBase.java
++++ b/java/org/apache/tomcat/websocket/WsRemoteEndpointBase.java
+@@ -64,6 +64,7 @@ public abstract class WsRemoteEndpointBase implements RemoteEndpoint {
+     private final ByteBuffer encoderBuffer = ByteBuffer.allocate(8192);
+     private AtomicBoolean batchingAllowed = new AtomicBoolean(false);
+     private volatile long asyncSendTimeout = -1;
++    private WsSession wsSession;
+ 
+ 
+     @Override
+@@ -226,6 +227,9 @@ public abstract class WsRemoteEndpointBase implements RemoteEndpoint {
+ 
+     void startMessage(byte opCode, ByteBuffer payload, boolean last,
+             SendHandler handler) {
++
++        wsSession.updateLastActive();
++
+         MessagePart mp = new MessagePart(opCode, payload, last, handler, this);
+ 
+         synchronized (messagePartLock) {
+@@ -272,6 +276,8 @@ public abstract class WsRemoteEndpointBase implements RemoteEndpoint {
+             }
+         }
+ 
++        wsSession.updateLastActive();
++
+         handler.setResult(result);
+     }
+ 
+@@ -459,7 +465,9 @@ public abstract class WsRemoteEndpointBase implements RemoteEndpoint {
+     }
+ 
+ 
+-
++    protected void setSession(WsSession wsSession) {
++        this.wsSession = wsSession;
++    }
+ 
+ 
+     protected abstract void doWrite(SendHandler handler, ByteBuffer... data);
+
+==================================================
+WsWebSocketContainer.java
+index 0c0a06bb14..f7301b3bf8 100644
+--- a/java/org/apache/tomcat/websocket/WsSession.java
++++ b/java/org/apache/tomcat/websocket/WsSession.java
+@@ -64,6 +64,7 @@ public class WsSession implements Session {
+     private volatile int maxTextMessageBufferSize =
+             Constants.DEFAULT_BUFFER_SIZE;
+     private volatile long sessionIdleTimeout = 0;
++    private volatile long lastActive = System.currentTimeMillis();
+ 
+ 
+     /**
+@@ -80,6 +81,7 @@ public class WsSession implements Session {
+             WsWebSocketContainer wsWebSocketContainer) {
+         this.localEndpoint = localEndpoint;
+         this.wsRemoteEndpoint = wsRemoteEndpoint;
++        this.wsRemoteEndpoint.setSession(this);
+         this.webSocketContainer = wsWebSocketContainer;
+         applicationClassLoader = Thread.currentThread().getContextClassLoader();
+         wsRemoteEndpoint.setAsyncSendTimeout(
+@@ -366,6 +368,26 @@ public class WsSession implements Session {
+     }
+ 
+ 
++    protected void updateLastActive() {
++        lastActive = System.currentTimeMillis();
++    }
++
++    protected void expire() {
++        long timeout = sessionIdleTimeout;
++        if (timeout < 1) {
++            return;
++        }
++
++        if (System.currentTimeMillis() - lastActive > timeout) {
++            try {
++                close(new CloseReason(CloseCodes.GOING_AWAY,
++                        sm.getString("wsSession.timeout")));
++            } catch (IOException e) {
++                // TODO Log this?
++            }
++        }
++    }
++
+     // Protected so unit tests can use it
+     protected static Class<?> getMessageType(MessageHandler listener) {
+         return (Class<?>) getMessageType(listener.getClass());
+
+==================================================
+ServerContainerImpl.java
+index d980d89a7d..55be0ff5b0 100644
+--- a/java/org/apache/tomcat/websocket/WsWebSocketContainer.java
++++ b/java/org/apache/tomcat/websocket/WsWebSocketContainer.java
+@@ -33,6 +33,7 @@ import java.util.Map;
+ import java.util.Map.Entry;
+ import java.util.Random;
+ import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.Future;
+ 
+@@ -47,7 +48,8 @@ import javax.xml.bind.DatatypeConverter;
+ 
+ import org.apache.tomcat.util.res.StringManager;
+ 
+-public class WsWebSocketContainer implements WebSocketContainer {
++public class WsWebSocketContainer
++        implements WebSocketContainer, BackgroundProcess {
+ 
+     private static final StringManager sm =
+             StringManager.getManager(Constants.PACKAGE_NAME);
+@@ -57,12 +59,15 @@ public class WsWebSocketContainer implements WebSocketContainer {
+ 
+     private final Map<Class<?>, Set<WsSession>> endpointSessionMap =
+             new HashMap<>();
++    private final Map<WsSession,WsSession> sessions = new ConcurrentHashMap<>();
+     private final Object endPointSessionMapLock = new Object();
+ 
+     private long defaultAsyncTimeout = -1;
+     private int maxBinaryMessageBufferSize = Constants.DEFAULT_BUFFER_SIZE;
+     private int maxTextMessageBufferSize = Constants.DEFAULT_BUFFER_SIZE;
+     private volatile long maxSessionIdleTimeout = 0;
++    private int backgroundProcessCount = 0;
++    private int processPeriod = 10;
+ 
+     @Override
+     public Session connectToServer(Class<?> annotatedEndpointClass, URI path)
+@@ -168,6 +173,9 @@ public class WsWebSocketContainer implements WebSocketContainer {
+ 
+     protected void registerSession(Class<?> endpoint, WsSession wsSession) {
+         synchronized (endPointSessionMapLock) {
++            if (endpointSessionMap.size() == 0) {
++                BackgroundProcessManager.getInstance().register(this);
++            }
+             Set<WsSession> wsSessions = endpointSessionMap.get(endpoint);
+             if (wsSessions == null) {
+                 wsSessions = new HashSet<>();
+@@ -175,6 +183,7 @@ public class WsWebSocketContainer implements WebSocketContainer {
+             }
+             wsSessions.add(wsSession);
+         }
++        sessions.put(wsSession, wsSession);
+     }
+ 
+ 
+@@ -187,13 +196,20 @@ public class WsWebSocketContainer implements WebSocketContainer {
+                     endpointSessionMap.remove(endpoint);
+                 }
+             }
++            if (endpointSessionMap.size() == 0) {
++                BackgroundProcessManager.getInstance().unregister(this);
++            }
+         }
++        sessions.remove(wsSession);
+     }
+ 
+ 
+     Set<Session> getOpenSession(Class<?> endpoint) {
+         HashSet<Session> result = new HashSet<>();
+-        result.addAll(endpointSessionMap.get(endpoint));
++        Set<WsSession> sessions = endpointSessionMap.get(endpoint);
++        if (sessions != null) {
++            result.addAll(sessions);
++        }
+         return result;
+     }
+ 
+@@ -459,4 +475,40 @@ public class WsWebSocketContainer implements WebSocketContainer {
+             return headers;
+         }
+     }
++
++
++    // ----------------------------------------------- BackgroundProcess methods
++
++    @Override
++    public void backgroundProcess() {
++        // This method gets called once a second.
++        backgroundProcessCount ++;
++
++        if (backgroundProcessCount >= processPeriod) {
++            backgroundProcessCount = 0;
++
++            for (WsSession wsSession : sessions.keySet()) {
++                wsSession.expire();
++            }
++        }
++
++    }
++
++
++    @Override
++    public void setProcessPeriod(int period) {
++        this.processPeriod = period;
++    }
++
++
++    /**
++     * {@inheritDoc}
++     *
++     * The default value is 10 which means session expirations are processed
++     * every 10 seconds.
++     */
++    @Override
++    public int getProcessPeriod() {
++        return processPeriod;
++    }
+ }
+
+==================================================
+WsListener.java
+index 723e7f0d41..c3c20111ac 100644
+--- a/java/org/apache/tomcat/websocket/server/ServerContainerImpl.java
++++ b/java/org/apache/tomcat/websocket/server/ServerContainerImpl.java
+@@ -71,8 +71,7 @@ public class ServerContainerImpl extends WsWebSocketContainer {
+         return result;
+     }
+ 
+-    private final WsTimeout wsTimeout;
+-    private final Thread timeoutThread;
++    private final WsWriteTimeout wsWriteTimeout = new WsWriteTimeout();
+ 
+     private volatile ServletContext servletContext = null;
+     private Map<String,ServerEndpointConfiguration> configMap =
+@@ -82,14 +81,6 @@ public class ServerContainerImpl extends WsWebSocketContainer {
+             new ConcurrentHashMap<>();
+ 
+ 
+-    private ServerContainerImpl() {
+-        wsTimeout = new WsTimeout();
+-        timeoutThread = new Thread(wsTimeout);
+-        timeoutThread.setName(WsTimeout.THREAD_NAME_PREFIX + this);
+-        timeoutThread.start();
+-    }
+-
+-
+     public void setServletContext(ServletContext servletContext) {
+         if (this.servletContext == servletContext) {
+             return;
+@@ -109,10 +100,6 @@ public class ServerContainerImpl extends WsWebSocketContainer {
+         if (value != null) {
+             setDefaultMaxTextMessageBufferSize(Integer.parseInt(value));
+         }
+-
+-        // Update the timeout thread name
+-        timeoutThread.setName(
+-                WsTimeout.THREAD_NAME_PREFIX + servletContext.getContextPath());
+     }
+ 
+ 
+@@ -226,22 +213,8 @@ public class ServerContainerImpl extends WsWebSocketContainer {
+     }
+ 
+ 
+-    protected WsTimeout getTimeout() {
+-        return wsTimeout;
+-    }
+-
+-
+-    protected void stop() {
+-        wsTimeout.stop();
+-        int count = 0;
+-        while (count < 50 && timeoutThread.isAlive()) {
+-            count ++;
+-            try {
+-                Thread.sleep(100);
+-            } catch (InterruptedException e) {
+-                // Ignore
+-            }
+-        }
++    protected WsWriteTimeout getTimeout() {
++        return wsWriteTimeout;
+     }
+ 
+ 
+
+==================================================
+WsRemoteEndpointServer.java
+index 0ccdf7788c..129f63ce94 100644
+--- a/java/org/apache/tomcat/websocket/server/WsListener.java
++++ b/java/org/apache/tomcat/websocket/server/WsListener.java
+@@ -35,7 +35,6 @@ public class WsListener implements ServletContextListener {
+ 
+     @Override
+     public void contextDestroyed(ServletContextEvent sce) {
+-        ServerContainerImpl sc = ServerContainerImpl.getServerContainer();
+-        sc.stop();
++        // NOOP
+     }
+ }
+
+==================================================
+WsWriteTimeout.java
+index 9218d40b88..023f2b5099 100644
+--- a/java/org/apache/tomcat/websocket/server/WsRemoteEndpointServer.java
++++ b/java/org/apache/tomcat/websocket/server/WsRemoteEndpointServer.java
+@@ -42,7 +42,7 @@ public class WsRemoteEndpointServer extends WsRemoteEndpointBase {
+             LogFactory.getLog(WsProtocolHandler.class);
+ 
+     private final ServletOutputStream sos;
+-    private final WsTimeout wsTimeout;
++    private final WsWriteTimeout wsWriteTimeout;
+     private volatile SendHandler handler = null;
+     private volatile ByteBuffer[] buffers = null;
+ 
+@@ -53,7 +53,7 @@ public class WsRemoteEndpointServer extends WsRemoteEndpointBase {
+     public WsRemoteEndpointServer(ServletOutputStream sos,
+             ServerContainerImpl serverContainer) {
+         this.sos = sos;
+-        this.wsTimeout = serverContainer.getTimeout();
++        this.wsWriteTimeout = serverContainer.getTimeout();
+     }
+ 
+ 
+@@ -87,7 +87,7 @@ public class WsRemoteEndpointServer extends WsRemoteEndpointBase {
+                     }
+                 }
+                 if (complete) {
+-                    wsTimeout.unregister(this);
++                    wsWriteTimeout.unregister(this);
+                     if (close) {
+                         close();
+                     }
+@@ -104,7 +104,7 @@ public class WsRemoteEndpointServer extends WsRemoteEndpointBase {
+             }
+ 
+         } catch (IOException ioe) {
+-            wsTimeout.unregister(this);
++            wsWriteTimeout.unregister(this);
+             close();
+             SendHandler sh = handler;
+             handler = null;
+@@ -117,7 +117,7 @@ public class WsRemoteEndpointServer extends WsRemoteEndpointBase {
+             if (timeout > 0) {
+                 // Register with timeout thread
+                 timeoutExpiry = timeout + System.currentTimeMillis();
+-                wsTimeout.register(this);
++                wsWriteTimeout.register(this);
+             }
+         }
+     }
+@@ -132,7 +132,7 @@ public class WsRemoteEndpointServer extends WsRemoteEndpointBase {
+                 log.info(sm.getString("wsRemoteEndpointServer.closeFailed"), e);
+             }
+         }
+-        wsTimeout.unregister(this);
++        wsWriteTimeout.unregister(this);
+     }
+ 
+ 
+
+==================================================
+TestWsWebSocketContainer.java
+similarity index 65%
+rename from java/org/apache/tomcat/websocket/server/WsTimeout.java
+rename to java/org/apache/tomcat/websocket/server/WsWriteTimeout.java
+index 2eb655bae9..085eedc312 100644
+--- a/java/org/apache/tomcat/websocket/server/WsTimeout.java
++++ b/java/org/apache/tomcat/websocket/server/WsWriteTimeout.java
+@@ -20,41 +20,32 @@ import java.util.Comparator;
+ import java.util.Iterator;
+ import java.util.Set;
+ import java.util.concurrent.ConcurrentSkipListSet;
++import java.util.concurrent.atomic.AtomicInteger;
++
++import org.apache.tomcat.websocket.BackgroundProcess;
++import org.apache.tomcat.websocket.BackgroundProcessManager;
+ 
+ /**
+  * Provides timeouts for asynchronous web socket writes. On the server side we
+  * only have access to {@link javax.servlet.ServletOutputStream} and
+  * {@link javax.servlet.ServletInputStream} so there is no way to set a timeout
+- * for writes to the client. Hence the separate thread.
++ * for writes to the client.
+  */
+-public class WsTimeout implements Runnable {
+-
+-    public static final String THREAD_NAME_PREFIX = "Websocket Timeout - ";
++public class WsWriteTimeout implements BackgroundProcess {
+ 
+     private final Set<WsRemoteEndpointServer> endpoints =
+             new ConcurrentSkipListSet<>(new EndpointComparator());
+-    private volatile boolean running = true;
+-
+-    public void stop() {
+-        running = false;
+-        synchronized (this) {
+-            this.notify();
+-        }
+-    }
+-
++    private final AtomicInteger count = new AtomicInteger(0);
++    private int backgroundProcessCount = 0;
++    private volatile int processPeriod = 1;
+ 
+     @Override
+-    public void run() {
+-        while (running) {
+-            // Wait for one second - no need for timeouts more frequently than
+-            // that
+-            synchronized (this) {
+-                try {
+-                    wait(1000);
+-                } catch (InterruptedException e) {
+-                    // Ignore
+-                }
+-            }
++    public void backgroundProcess() {
++        // This method gets called once a second.
++        backgroundProcessCount ++;
++
++        if (backgroundProcessCount >= processPeriod) {
++            backgroundProcessCount = 0;
+ 
+             long now = System.currentTimeMillis();
+             Iterator<WsRemoteEndpointServer> iter = endpoints.iterator();
+@@ -73,13 +64,43 @@ public class WsTimeout implements Runnable {
+     }
+ 
+ 
++    @Override
++    public void setProcessPeriod(int period) {
++        this.processPeriod = period;
++    }
++
++
++    /**
++     * {@inheritDoc}
++     *
++     * The default value is 1 which means asynchronous write timeouts are
++     * processed every 1 second.
++     */
++    @Override
++    public int getProcessPeriod() {
++        return processPeriod;
++    }
++
++
+     public void register(WsRemoteEndpointServer endpoint) {
+-        endpoints.add(endpoint);
++        boolean result = endpoints.add(endpoint);
++        if (result) {
++            int newCount = count.incrementAndGet();
++            if (newCount == 1) {
++                BackgroundProcessManager.getInstance().register(this);
++            }
++        }
+     }
+ 
+ 
+     public void unregister(WsRemoteEndpointServer endpoint) {
+-        endpoints.remove(endpoint);
++        boolean result = endpoints.remove(endpoint);
++        if (result) {
++            int newCount = count.decrementAndGet();
++            if (newCount == 0) {
++                BackgroundProcessManager.getInstance().unregister(this);
++            }
++        }
+     }
+ 
+ 
+
+==================================================

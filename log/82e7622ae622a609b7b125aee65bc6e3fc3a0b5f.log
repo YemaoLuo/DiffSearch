@@ -1,0 +1,266 @@
+82e7622ae622a609b7b125aee65bc6e3fc3a0b5f
+==================================================
+Implement per session message buffer size limits and check them on every new message.
+==================================================
+Mark Emlyn
+==================================================
+Wed Feb 13 11:24:16 2013 +0000
+==================================================
+Constants.java
+Implement per session message buffer size limits and check them on every new message.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1445556 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+WsFrameBase.java
+index 2e54509baa..2fb772f754 100644
+--- a/java/org/apache/tomcat/websocket/Constants.java
++++ b/java/org/apache/tomcat/websocket/Constants.java
+@@ -36,6 +36,9 @@ public class Constants {
+     // Always set bit 4 so these will be treated as control codes
+     static final byte INTERNAL_OPCODE_FLUSH = 0x18;
+ 
++    // Buffers
++    static final int DEFAULT_BUFFER_SIZE = 8 * 1024;
++
+     // Client connection
+     public static final String HOST_HEADER_NAME = "Host";
+     public static final String UPGRADE_HEADER_NAME = "Upgrade";
+
+==================================================
+WsFrameClient.java
+index 6773566101..088ceb73a2 100644
+--- a/java/org/apache/tomcat/websocket/WsFrameBase.java
++++ b/java/org/apache/tomcat/websocket/WsFrameBase.java
+@@ -51,9 +51,6 @@ public abstract class WsFrameBase {
+     private final CharBuffer controlBufferText = CharBuffer.allocate(125);
+ 
+     // Attributes of the current message
+-    // TODO: May need a new ByteBuffer per message
+-    private final ByteBuffer messageBufferBinary;
+-    private final CharBuffer messageBufferText;
+     private final CharsetDecoder utf8DecoderControl = new Utf8Decoder().
+             onMalformedInput(CodingErrorAction.REPORT).
+             onUnmappableCharacter(CodingErrorAction.REPORT);
+@@ -62,6 +59,9 @@ public abstract class WsFrameBase {
+             onUnmappableCharacter(CodingErrorAction.REPORT);
+     private boolean continuationExpected = false;
+     private boolean textMessage = false;
++    // TODO: May need a new ByteBuffer per message
++    private ByteBuffer messageBufferBinary;
++    private CharBuffer messageBufferText;
+ 
+     // Attributes of the current frame
+     private boolean fin = false;
+@@ -77,12 +77,13 @@ public abstract class WsFrameBase {
+     private int readPos = 0;
+     protected int writePos = 0;
+ 
+-    public WsFrameBase(int binaryMessageBufferSize, int textMessageBufferSize,
+-            WsSession wsSession) {
++    public WsFrameBase(WsSession wsSession) {
+ 
+-        inputBuffer = new byte[binaryMessageBufferSize];
+-        messageBufferBinary = ByteBuffer.allocate(binaryMessageBufferSize);
+-        messageBufferText = CharBuffer.allocate(textMessageBufferSize);
++        inputBuffer = new byte[Constants.DEFAULT_BUFFER_SIZE];
++        messageBufferBinary =
++                ByteBuffer.allocate(wsSession.getMaxBinaryMessageBufferSize());
++        messageBufferText =
++                CharBuffer.allocate(wsSession.getMaxTextMessageBufferSize());
+         this.wsSession = wsSession;
+     }
+ 
+@@ -151,9 +152,19 @@ public abstract class WsFrameBase {
+                 }
+             } else {
+                 if (opCode == Constants.OPCODE_BINARY) {
++                    // New binary message
+                     textMessage = false;
++                    int size = wsSession.getMaxBinaryMessageBufferSize();
++                    if (size != messageBufferBinary.capacity()) {
++                        messageBufferBinary = ByteBuffer.allocate(size);
++                    }
+                 } else if (opCode == Constants.OPCODE_TEXT) {
++                    // New text message
+                     textMessage = true;
++                    int size = wsSession.getMaxTextMessageBufferSize();
++                    if (size != messageBufferText.capacity()) {
++                        messageBufferText = CharBuffer.allocate(size);
++                    }
+                 } else {
+                     throw new WsIOException(new CloseReason(
+                             CloseCodes.PROTOCOL_ERROR,
+
+==================================================
+WsSession.java
+index 414e60297e..18441435be 100644
+--- a/java/org/apache/tomcat/websocket/WsFrameClient.java
++++ b/java/org/apache/tomcat/websocket/WsFrameClient.java
+@@ -31,9 +31,8 @@ public class WsFrameClient extends WsFrameBase {
+     private final CompletionHandler<Integer,Void> handler;
+ 
+     public WsFrameClient(ByteBuffer response, AsynchronousSocketChannel channel,
+-            int binaryMessageBufferSize, int textMessageBufferSize,
+             WsSession wsSession) {
+-        super(binaryMessageBufferSize, textMessageBufferSize, wsSession);
++        super(wsSession);
+         this.response = response;
+         this.channel = channel;
+         this.handler = new WsFrameClientCompletionHandler();
+
+==================================================
+WsWebSocketContainer.java
+index 92e296dce0..e86c24c96c 100644
+--- a/java/org/apache/tomcat/websocket/WsSession.java
++++ b/java/org/apache/tomcat/websocket/WsSession.java
+@@ -59,6 +59,10 @@ public class WsSession implements Session {
+     private volatile boolean open = true;
+     private final Object closeLock = new Object();
+     private Map<String,Object> userProperties = new ConcurrentHashMap<>();
++    private volatile int maxBinaryMessageBufferSize =
++            Constants.DEFAULT_BUFFER_SIZE;
++    private volatile int maxTextMessageBufferSize =
++            Constants.DEFAULT_BUFFER_SIZE;
+ 
+ 
+     /**
+@@ -79,6 +83,10 @@ public class WsSession implements Session {
+         applicationClassLoader = Thread.currentThread().getContextClassLoader();
+         wsRemoteEndpoint.setAsyncSendTimeout(
+                 webSocketContainer.getDefaultAsyncSendTimeout());
++        this.maxBinaryMessageBufferSize =
++                webSocketContainer.getDefaultMaxBinaryMessageBufferSize();
++        this.maxTextMessageBufferSize =
++                webSocketContainer.getDefaultMaxTextMessageBufferSize();
+     }
+ 
+ 
+@@ -206,33 +214,27 @@ public class WsSession implements Session {
+     }
+ 
+ 
+-
+-
+     @Override
+     public void setMaxBinaryMessageBufferSize(int max) {
+-        // TODO Auto-generated method stub
+-
++        this.maxBinaryMessageBufferSize = max;
+     }
+ 
+ 
+     @Override
+     public int getMaxBinaryMessageBufferSize() {
+-        // TODO Auto-generated method stub
+-        return 0;
++        return maxBinaryMessageBufferSize;
+     }
+ 
+ 
+     @Override
+     public void setMaxTextMessageBufferSize(int max) {
+-        // TODO Auto-generated method stub
+-
++        this.maxTextMessageBufferSize = max;
+     }
+ 
+ 
+     @Override
+     public int getMaxTextMessageBufferSize() {
+-        // TODO Auto-generated method stub
+-        return 0;
++        return maxTextMessageBufferSize;
+     }
+ 
+ 
+@@ -325,6 +327,20 @@ public class WsSession implements Session {
+     }
+ 
+ 
++    @Override
++    public String getId() {
++        // TODO Auto-generated method stub
++        return null;
++    }
++
++
++    @Override
++    public Principal getUserPrincipal() {
++        // TODO Auto-generated method stub
++        return null;
++    }
++
++
+     @Override
+     public Map<String,Object> getUserProperties() {
+         return userProperties;
+@@ -416,18 +432,4 @@ public class WsSession implements Session {
+             return null;
+         }
+     }
+-
+-
+-    @Override
+-    public String getId() {
+-        // TODO Auto-generated method stub
+-        return null;
+-    }
+-
+-
+-    @Override
+-    public Principal getUserPrincipal() {
+-        // TODO Auto-generated method stub
+-        return null;
+-    }
+ }
+
+==================================================
+WsFrameServer.java
+index f7d0b7bc73..a4a98e5860 100644
+--- a/java/org/apache/tomcat/websocket/WsWebSocketContainer.java
++++ b/java/org/apache/tomcat/websocket/WsWebSocketContainer.java
+@@ -52,11 +52,10 @@ public class WsWebSocketContainer implements WebSocketContainer {
+     private static final Random random = new Random();
+     private static final Charset iso88591 = Charset.forName("ISO-8859-1");
+     private static final byte[] crlf = new byte[] {13, 10};
+-    private static final int DEFAULT_BUFFER_SIZE = 8 * 1024;
+ 
+     private long defaultAsyncTimeout = -1;
+-    private int maxBinaryMessageBufferSize = DEFAULT_BUFFER_SIZE;
+-    private int maxTextMessageBufferSize = DEFAULT_BUFFER_SIZE;
++    private int maxBinaryMessageBufferSize = Constants.DEFAULT_BUFFER_SIZE;
++    private int maxTextMessageBufferSize = Constants.DEFAULT_BUFFER_SIZE;
+ 
+     @Override
+     public Session connectToServer(Class<?> annotatedEndpointClass, URI path)
+@@ -154,7 +153,6 @@ public class WsWebSocketContainer implements WebSocketContainer {
+         // Object creation will trigger input processing
+         @SuppressWarnings("unused")
+         WsFrameClient wsFrameClient = new WsFrameClient(response, channel,
+-                maxBinaryMessageBufferSize, maxTextMessageBufferSize,
+                 wsSession);
+ 
+         return wsSession;
+
+==================================================
+WsProtocolHandler.java
+index 95b90a75d5..ca19c1111c 100644
+--- a/java/org/apache/tomcat/websocket/server/WsFrameServer.java
++++ b/java/org/apache/tomcat/websocket/server/WsFrameServer.java
+@@ -30,9 +30,8 @@ public class WsFrameServer extends WsFrameBase {
+     private final Object connectionReadLock = new Object();
+ 
+ 
+-    public WsFrameServer(ServletInputStream sis, int binaryMessageBufferSize,
+-            int textMessageBufferSize, WsSession wsSession) {
+-        super(binaryMessageBufferSize, textMessageBufferSize, wsSession);
++    public WsFrameServer(ServletInputStream sis, WsSession wsSession) {
++        super(wsSession);
+         this.sis = sis;
+     }
+ 
+
+==================================================

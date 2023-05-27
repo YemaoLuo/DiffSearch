@@ -1,0 +1,239 @@
+47088f55790f8259fe429cdaa3ece271d0457940
+==================================================
+Add in handling of async supported for filters during regular invokation and a dispatch 
+==================================================
+Filip Hanik
+==================================================
+Thu Aug 6 22:19:08 2009 +0000
+==================================================
+Globals.java
+Add in handling of async supported for filters during regular invokation and a dispatch 
+
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@801824 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AsyncContextImpl.java
+index 2eaad85e94..99c03a4c81 100644
+--- a/java/org/apache/catalina/Globals.java
++++ b/java/org/apache/catalina/Globals.java
+@@ -329,6 +329,11 @@ public final class Globals {
+      */
+     public static final boolean IS_SECURITY_ENABLED =
+         (System.getSecurityManager() != null);
+-
++    
++    /**
++     * 
++     */
++    public static final String ASYNC_SUPPORTED_ATTR = 
++        "org.apache.catalina.ASYNC_SUPPORTED";
+ 
+ }
+
+==================================================
+CoyoteAdapter.java
+index c7f31ad622..4b3bc063e4 100644
+--- a/java/org/apache/catalina/connector/AsyncContextImpl.java
++++ b/java/org/apache/catalina/connector/AsyncContextImpl.java
+@@ -24,6 +24,7 @@ import java.util.concurrent.atomic.AtomicReference;
+ 
+ import javax.servlet.AsyncContext;
+ import javax.servlet.AsyncListener;
++import javax.servlet.DispatcherType;
+ import javax.servlet.RequestDispatcher;
+ import javax.servlet.ServletContext;
+ import javax.servlet.ServletException;
+@@ -33,6 +34,7 @@ import javax.servlet.http.HttpServletRequest;
+ import javax.servlet.http.HttpServletResponse;
+ 
+ import org.apache.catalina.Context;
++import org.apache.catalina.Globals;
+ import org.apache.coyote.ActionCode;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+@@ -110,14 +112,18 @@ public class AsyncContextImpl implements AsyncContext {
+             final HttpServletResponse servletResponse = (HttpServletResponse)getResponse();
+             Runnable run = new Runnable() {
+                 public void run() {
++                    DispatcherType type = (DispatcherType)request.getAttribute(Globals.DISPATCHER_TYPE_ATTR);
+                     try {
+                         //piggy back on the request dispatcher to ensure that filters etc get called.
+                         //TODO SERVLET3 - async should this be include/forward or a new dispatch type
+                         //javadoc suggests include with the type of DispatcherType.ASYNC
++                        request.setAttribute(Globals.DISPATCHER_TYPE_ATTR, DispatcherType.ASYNC);
+                         requestDispatcher.include(servletRequest, servletResponse);
+                     }catch (Exception x) {
+                         //log.error("Async.dispatch",x);
+                         throw new RuntimeException(x);
++                    }finally {
++                        request.setAttribute(Globals.DISPATCHER_TYPE_ATTR, type);
+                     }
+                 }
+             };
+
+==================================================
+Request.java
+index 92ec18b0d9..9571b80fa1 100644
+--- a/java/org/apache/catalina/connector/CoyoteAdapter.java
++++ b/java/org/apache/catalina/connector/CoyoteAdapter.java
+@@ -263,8 +263,6 @@ public class CoyoteAdapter
+         boolean success = true;
+         
+         try {
+-            DispatcherType prevDispatcherType = request.getDispatcherType();
+-            request.setAttribute(Globals.DISPATCHER_TYPE_ATTR, DispatcherType.ASYNC);
+             // Calling the container
+             try {
+                 if (status==SocketStatus.TIMEOUT) {
+@@ -283,7 +281,6 @@ public class CoyoteAdapter
+             }catch (RuntimeException x) {
+                 success = false;
+             } finally {
+-                request.setAttribute(Globals.DISPATCHER_TYPE_ATTR, prevDispatcherType);
+             }
+ 
+             if (request.isComet()) {
+
+==================================================
+ApplicationDispatcher.java
+index 181b2958e5..46458db5f1 100644
+--- a/java/org/apache/catalina/connector/Request.java
++++ b/java/org/apache/catalina/connector/Request.java
+@@ -385,11 +385,6 @@ public class Request
+      */
+     protected String localName = null;
+     
+-    /**
+-     * asyncSupported
+-     */
+-    protected boolean asyncSupported = true;
+-    
+     /**
+      * AsyncContext 
+      */
+@@ -400,6 +395,8 @@ public class Request
+      */
+     protected long asyncTimeout = 0;
+     
++    protected Boolean asyncSupported = null;
++    
+     
+ 
+     // --------------------------------------------------------- Public Methods
+@@ -407,7 +404,7 @@ public class Request
+     
+ 
+     public void setAsyncSupported(boolean asyncSupported) {
+-        this.asyncSupported = asyncSupported;
++        asyncSupported = asyncSupported?Boolean.TRUE:Boolean.FALSE;
+     }
+ 
+     /**
+@@ -483,7 +480,7 @@ public class Request
+             }
+         }
+         
+-        asyncSupported = true;
++        asyncSupported = null;
+         if (asyncContext!=null) asyncContext.recycle();
+ 
+     }
+@@ -850,6 +847,10 @@ public class Request
+                 ? getRequestPathMB().toString()
+                 : requestDispatcherPath.toString();
+         }
++        
++        if (name.equals(Globals.ASYNC_SUPPORTED_ATTR)) {
++            return isAsyncSupported();
++        }
+ 
+         Object attr=attributes.get(name);
+ 
+@@ -1370,6 +1371,10 @@ public class Request
+             requestDispatcherPath = value;
+             return;
+         }
++        
++        if (name.equals(Globals.ASYNC_SUPPORTED_ATTR)) {
++            this.asyncSupported = (Boolean)value;
++        }
+ 
+         Object oldValue = null;
+         boolean replaced = false;
+@@ -1487,7 +1492,11 @@ public class Request
+ 
+     public boolean isAsyncSupported() {
+         // TODO SERVLET3 - async
+-        return this.asyncSupported;
++        if (this.asyncSupported==null) { 
++            return true;
++        } else {
++            return asyncSupported.booleanValue();
++        }
+     }
+ 
+     public AsyncContext getAsyncContext() {
+
+==================================================
+ApplicationHttpRequest.java
+index fdc29e4236..6d6e4f58f4 100644
+--- a/java/org/apache/catalina/core/ApplicationDispatcher.java
++++ b/java/org/apache/catalina/core/ApplicationDispatcher.java
+@@ -47,6 +47,8 @@ import org.apache.catalina.connector.RequestFacade;
+ import org.apache.catalina.connector.Response;
+ import org.apache.catalina.connector.ResponseFacade;
+ import org.apache.catalina.util.InstanceSupport;
++import org.apache.juli.logging.Log;
++import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+ /**
+@@ -66,6 +68,7 @@ import org.apache.tomcat.util.res.StringManager;
+ final class ApplicationDispatcher
+     implements RequestDispatcher {
+ 
++    protected static Log log = LogFactory.getLog(ApplicationDispatcher.class);
+ 
+     protected class PrivilegedForward
+             implements PrivilegedExceptionAction<Void> {
+@@ -637,6 +640,16 @@ final class ApplicationDispatcher
+         ApplicationFilterFactory factory = ApplicationFilterFactory.getInstance();
+         ApplicationFilterChain filterChain = factory.createFilterChain(request,
+                                                                 wrapper,servlet);
++        
++        Object asyncSupported = request.getAttribute(Globals.ASYNC_SUPPORTED_ATTR);
++        //we have a new filter chain, setup isAsyncSupported here
++        boolean filterAsyncSupported = filterChain.isAsyncSupported();
++        if (!filterAsyncSupported && request.isAsyncSupported()) {
++            //the request says we support it, but the filters don't
++            //TODO SERVLET3 - async
++            request.setAttribute(Globals.ASYNC_SUPPORTED_ATTR, Boolean.FALSE);
++        }
++        
+         // Call the service() method for the allocated servlet instance
+         try {
+             String jspFile = wrapper.getJspFile();
+@@ -691,6 +704,8 @@ final class ApplicationDispatcher
+             wrapper.getLogger().error(sm.getString("applicationDispatcher.serviceException",
+                              wrapper.getName()), e);
+             runtimeException = e;
++        } finally {
++            request.setAttribute(Globals.ASYNC_SUPPORTED_ATTR, asyncSupported);
+         }
+ 
+         // Release the filter chain (if any) for this request
+@@ -777,8 +792,7 @@ final class ApplicationDispatcher
+         }
+ 
+     }
+-
+-
++    
+     /**
+      * Unwrap the response if we have wrapped it.
+      */
+
+==================================================

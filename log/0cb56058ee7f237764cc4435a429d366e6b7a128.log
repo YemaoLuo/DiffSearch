@@ -1,0 +1,190 @@
+0cb56058ee7f237764cc4435a429d366e6b7a128
+==================================================
+Add unit tests for HTTP/2 Ping frames
+==================================================
+Mark Thomas
+==================================================
+Fri Jun 26 09:17:57 2015 +0000
+==================================================
+Http2Parser.java
+Add unit tests for HTTP/2 Ping frames
+Expose the payload for ping ack frames as well as non-ack
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1687720 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Http2UpgradeHandler.java
+index a9676481af..826902d9c5 100644
+--- a/java/org/apache/coyote/http2/Http2Parser.java
++++ b/java/org/apache/coyote/http2/Http2Parser.java
+@@ -313,14 +313,10 @@ class Http2Parser {
+ 
+ 
+     private void readPingFrame(int flags) throws IOException {
+-        if (Flags.isAck(flags)) {
+-            output.pingAck();
+-        } else {
+-            // Read the payload
+-            byte[] payload = new byte[8];
+-            input.fill(true, payload);
+-            output.pingReceive(payload);
+-        }
++        // Read the payload
++        byte[] payload = new byte[8];
++        input.fill(true, payload);
++        output.pingReceive(payload, Flags.isAck(flags));
+     }
+ 
+ 
+@@ -600,8 +596,7 @@ class Http2Parser {
+         void settingsEnd(boolean ack) throws IOException;
+ 
+         // Ping frames
+-        void pingReceive(byte[] payload) throws IOException;
+-        void pingAck();
++        void pingReceive(byte[] payload, boolean ack) throws IOException;
+ 
+         // Goaway
+         void goaway(int lastStreamId, long errorCode, String debugData);
+
+==================================================
+Http2TestBase.java
+index 5ac7f34f09..02b6bd4ea7 100644
+--- a/java/org/apache/coyote/http2/Http2UpgradeHandler.java
++++ b/java/org/apache/coyote/http2/Http2UpgradeHandler.java
+@@ -903,22 +903,18 @@ public class Http2UpgradeHandler extends AbstractStream implements InternalHttpU
+ 
+ 
+     @Override
+-    public void pingReceive(byte[] payload) throws IOException {
+-        // Echo it back
+-        synchronized (socketWrapper) {
+-            socketWrapper.write(true, PING_ACK, 0, PING_ACK.length);
+-            socketWrapper.write(true, payload, 0, payload.length);
+-            socketWrapper.flush(true);
++    public void pingReceive(byte[] payload, boolean ack) throws IOException {
++        if (!ack) {
++            // Echo it back
++            synchronized (socketWrapper) {
++                socketWrapper.write(true, PING_ACK, 0, PING_ACK.length);
++                socketWrapper.write(true, payload, 0, payload.length);
++                socketWrapper.flush(true);
++            }
+         }
+     }
+ 
+ 
+-    @Override
+-    public void pingAck() {
+-        // TODO Auto-generated method stub
+-    }
+-
+-
+     @Override
+     public void goaway(int lastStreamId, long errorCode, String debugData) {
+         if (log.isDebugEnabled()) {
+
+==================================================
+TestHttp2Section_5_5.java
+index 635dc51b79..fdcf353200 100644
+--- a/test/org/apache/coyote/http2/Http2TestBase.java
++++ b/test/org/apache/coyote/http2/Http2TestBase.java
+@@ -57,10 +57,6 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+         { 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00 };
+     static final String EMPTY_HTTP2_SETTINGS_HEADER;
+ 
+-    private static final byte[] PING_FRAME = new byte[] {
+-        0x00, 0x00, 0x08, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00,
+-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+-
+     static {
+         byte[] empty = new byte[0];
+         EMPTY_HTTP2_SETTINGS_HEADER = "HTTP2-Settings: " + Base64.encodeBase64String(empty) + "\r\n";
+@@ -488,7 +484,24 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+ 
+ 
+     void sendPing() throws IOException {
+-        os.write(PING_FRAME);
++        sendPing(0, false, new byte[8]);
++    }
++
++
++    void sendPing(int streamId, boolean ack, byte[] payload) throws IOException {
++        byte[] pingHeader = new byte[9];
++        // length
++        ByteUtil.setThreeBytes(pingHeader, 0, payload.length);
++        // Type
++        pingHeader[3] = FrameType.PING.getIdByte();
++        // Flags
++        if (ack) {
++            ByteUtil.setOneBytes(pingHeader, 4, 0x01);
++        }
++        // Stream
++        ByteUtil.set31Bits(pingHeader, 5, streamId);
++        os.write(pingHeader);
++        os.write(payload);
+         os.flush();
+     }
+ 
+@@ -685,8 +698,12 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+ 
+ 
+         @Override
+-        public void pingReceive(byte[] payload) {
+-            trace.append("0-Ping-[");
++        public void pingReceive(byte[] payload, boolean ack) {
++            trace.append("0-Ping-");
++            if (ack) {
++                trace.append("Ack-");
++            }
++            trace.append('[');
+             boolean first = true;
+             for (byte b : payload) {
+                 if (first) {
+@@ -700,12 +717,6 @@ public abstract class Http2TestBase extends TomcatBaseTest {
+         }
+ 
+ 
+-        @Override
+-        public void pingAck() {
+-            trace.append("0-Ping-Ack\n");
+-        }
+-
+-
+         @Override
+         public void goaway(int lastStreamId, long errorCode, String debugData) {
+             trace.append("0-Goaway-[" + lastStreamId + "]-[" + errorCode + "]-[" + debugData + "]");
+
+==================================================
+TestHttp2Section_6_5.java
+index f4873ed96e..c22c59d608 100644
+--- a/test/org/apache/coyote/http2/TestHttp2Section_5_5.java
++++ b/test/org/apache/coyote/http2/TestHttp2Section_5_5.java
+@@ -73,7 +73,7 @@ public class TestHttp2Section_5_5 extends Http2TestBase {
+ 
+         parser.readFrame(true);
+ 
+-        Assert.assertEquals("0-Ping-Ack\n", output.getTrace());
++        Assert.assertEquals("0-Ping-Ack-[0,0,0,0,0,0,0,0]\n", output.getTrace());
+     }
+ 
+ 
+
+==================================================
+TestHttp2Section_6_7.java
+index fda2287134..2ee1fd05a9 100644
+--- a/test/org/apache/coyote/http2/TestHttp2Section_6_5.java
++++ b/test/org/apache/coyote/http2/TestHttp2Section_6_5.java
+@@ -20,7 +20,7 @@ import org.junit.Assert;
+ import org.junit.Test;
+ 
+ /**
+- * Unit tests for Section 6.4 of
++ * Unit tests for Section 6.5 of
+  * <a href="https://tools.ietf.org/html/rfc7540">RFC 7540</a>.
+  * <br>
+  * The order of tests in this class is aligned with the order of the
+
+==================================================

@@ -1,0 +1,478 @@
+977e3ebb204875095bc5993e94c02d3273b1096a
+==================================================
+Fix (may not be complete yet) to the memory leak in the NIO connector.
+==================================================
+Filip Hanik
+==================================================
+Tue Feb 20 23:59:05 2007 +0000
+==================================================
+NioBlockingSelector.java
+Fix (may not be complete yet) to the memory leak in the NIO connector.
+The caches where holding references they aren't supposed to hold.
+Added in the ability to use the pollers selector (share a selector) instead of each thread 
+using one from the selector pool. Selector pools can be very resource intensive.
+
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/tc6.0.x/trunk@509820 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+NioEndpoint.java
+new file mode 100644
+index 0000000000..e046caa6d1
+--- /dev/null
++++ b/java/org/apache/tomcat/util/net/NioBlockingSelector.java
+@@ -0,0 +1,149 @@
++/*
++ *  Copyright 2005-2006 The Apache Software Foundation
++ *
++ *  Licensed under the Apache License, Version 2.0 (the "License");
++ *  you may not use this file except in compliance with the License.
++ *  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.tomcat.util.net;
++
++import java.io.EOFException;
++import java.io.IOException;
++import java.net.SocketTimeoutException;
++import java.nio.ByteBuffer;
++import java.nio.channels.SelectionKey;
++import java.util.concurrent.TimeUnit;
++
++import org.apache.tomcat.util.net.NioEndpoint.KeyAttachment;
++
++public class NioBlockingSelector {
++    public NioBlockingSelector() {
++    }
++
++    /**
++     * Performs a blocking write using the bytebuffer for data to be written
++     * If the <code>selector</code> parameter is null, then it will perform a busy write that could
++     * take up a lot of CPU cycles.
++     * @param buf ByteBuffer - the buffer containing the data, we will write as long as <code>(buf.hasRemaining()==true)</code>
++     * @param socket SocketChannel - the socket to write data to
++     * @param writeTimeout long - the timeout for this write operation in milliseconds, -1 means no timeout
++     * @return int - returns the number of bytes written
++     * @throws EOFException if write returns -1
++     * @throws SocketTimeoutException if the write times out
++     * @throws IOException if an IO Exception occurs in the underlying socket logic
++     */
++    public static int write(ByteBuffer buf, NioChannel socket, long writeTimeout) throws IOException {
++        final SelectionKey key = socket.getIOChannel().keyFor(socket.getPoller().getSelector());
++        int written = 0;
++        boolean timedout = false;
++        int keycount = 1; //assume we can write
++        long time = System.currentTimeMillis(); //start the timeout timer
++        if (socket.getBufHandler().getWriteBuffer() != buf) {
++            socket.getBufHandler().getWriteBuffer().put(buf);
++            buf = socket.getBufHandler().getWriteBuffer();
++        }
++        try {
++            while ( (!timedout) && buf.hasRemaining()) {
++                if (keycount > 0) { //only write if we were registered for a write
++                    int cnt = socket.write(buf); //write the data
++                    if (cnt == -1)
++                        throw new EOFException();
++                    written += cnt;
++                    if (cnt > 0) {
++                        time = System.currentTimeMillis(); //reset our timeout timer
++                        continue; //we successfully wrote, try again without a selector
++                    }
++                }
++                
++                KeyAttachment att = (KeyAttachment) key.attachment();
++                try {
++                    att.startLatch(1);
++                    socket.getPoller().add(socket,SelectionKey.OP_WRITE);
++                    att.getLatch().await(writeTimeout,TimeUnit.MILLISECONDS);
++                }catch (InterruptedException ignore) {
++                }
++                if ( att.getLatch() == null ) keycount = 1;
++                else keycount = 0;
++                if (writeTimeout > 0 && (keycount == 0))
++                    timedout = (System.currentTimeMillis() - time) >= writeTimeout;
++            } //while
++            if (timedout) 
++                throw new SocketTimeoutException();
++        } finally {
++//            if (key != null) {
++//                socket.getPoller().addEvent(
++//                    new Runnable() {
++//                    public void run() {
++//                        key.cancel();
++//                    }
++//                });
++//            }
++        }
++        return written;
++    }
++
++    /**
++     * Performs a blocking read using the bytebuffer for data to be read
++     * If the <code>selector</code> parameter is null, then it will perform a busy read that could
++     * take up a lot of CPU cycles.
++     * @param buf ByteBuffer - the buffer containing the data, we will read as until we have read at least one byte or we timed out
++     * @param socket SocketChannel - the socket to write data to
++     * @param selector Selector - the selector to use for blocking, if null then a busy read will be initiated
++     * @param readTimeout long - the timeout for this read operation in milliseconds, -1 means no timeout
++     * @return int - returns the number of bytes read
++     * @throws EOFException if read returns -1
++     * @throws SocketTimeoutException if the read times out
++     * @throws IOException if an IO Exception occurs in the underlying socket logic
++     */
++    public static int read(ByteBuffer buf, NioChannel socket, long readTimeout) throws IOException {
++        final SelectionKey key = socket.getIOChannel().keyFor(socket.getPoller().getSelector());
++        int read = 0;
++        boolean timedout = false;
++        int keycount = 1; //assume we can write
++        long time = System.currentTimeMillis(); //start the timeout timer
++        try {
++            while ( (!timedout) && read == 0) {
++                if (keycount > 0) { //only read if we were registered for a read
++                    int cnt = socket.read(buf);
++                    if (cnt == -1)
++                        throw new EOFException();
++                    read += cnt;
++                    if (cnt > 0)
++                        break;
++                }
++                KeyAttachment att = (KeyAttachment) key.attachment();
++                try {
++                    att.startLatch(1);
++                    socket.getPoller().add(socket,SelectionKey.OP_READ);
++                    att.getLatch().await(readTimeout,TimeUnit.MILLISECONDS);
++                }catch (InterruptedException ignore) {
++                }
++                if ( att.getLatch() == null ) keycount = 1;
++                else keycount = 0;
++                if (readTimeout > 0 && (keycount == 0))
++                    timedout = (System.currentTimeMillis() - time) >= readTimeout;
++            } //while
++            if (timedout)
++                throw new SocketTimeoutException();
++        } finally {
++//            if (key != null) {
++//                socket.getPoller().addEvent(
++//                    new Runnable() {
++//                    public void run() {
++//                        key.cancel();
++//                    }
++//                });
++//            }
++        }
++        return read;
++    }
++
++}
+\ No newline at end of file
+
+==================================================
+NioSelectorPool.java
+index be95ec664c..f6f51c5a25 100644
+--- a/java/org/apache/tomcat/util/net/NioEndpoint.java
++++ b/java/org/apache/tomcat/util/net/NioEndpoint.java
+@@ -46,6 +46,7 @@ import org.apache.tomcat.util.IntrospectionUtils;
+ import org.apache.tomcat.util.net.SecureNioChannel.ApplicationBufferHandler;
+ import org.apache.tomcat.util.res.StringManager;
+ import java.util.concurrent.atomic.AtomicInteger;
++import java.util.concurrent.CountDownLatch;
+ 
+ /**
+  * NIO tailored thread pool, providing the following services:
+@@ -150,12 +151,70 @@ public class NioEndpoint {
+     /**
+      * Cache for key attachment objects
+      */
+-    protected ConcurrentLinkedQueue<KeyAttachment> keyCache = new ConcurrentLinkedQueue<KeyAttachment>();
++    protected ConcurrentLinkedQueue<KeyAttachment> keyCache = new ConcurrentLinkedQueue<KeyAttachment>() {
++        protected AtomicInteger size = new AtomicInteger(0);
++        public boolean offer(KeyAttachment ka) {
++            ka.reset();
++            boolean offer = socketProperties.getKeyCache()==-1?true:size.get()<socketProperties.getKeyCache();
++            //avoid over growing our cache or add after we have stopped
++            if ( running && (!paused) && (offer) ) {
++                boolean result = super.offer(ka);
++                if ( result ) {
++                    size.incrementAndGet();
++                }
++                return result;
++            }
++            else return false;
++        }
++
++        public KeyAttachment poll() {
++            KeyAttachment result = super.poll();
++            if ( result != null ) {
++                size.decrementAndGet();
++            }
++            return result;
++        }
++
++        public void clear() {
++            super.clear();
++            size.set(0);
++        }
++    };
++
+     
+     /**
+      * Cache for poller events
+      */
+-    protected ConcurrentLinkedQueue<PollerEvent> eventCache = new ConcurrentLinkedQueue<PollerEvent>();
++    protected ConcurrentLinkedQueue<PollerEvent> eventCache = new ConcurrentLinkedQueue<PollerEvent>() {
++        protected AtomicInteger size = new AtomicInteger(0);
++        public boolean offer(PollerEvent pe) {
++            pe.reset();
++            boolean offer = socketProperties.getEventCache()==-1?true:size.get()<socketProperties.getEventCache();
++            //avoid over growing our cache or add after we have stopped
++            if ( running && (!paused) && (offer) ) {
++                boolean result = super.offer(pe);
++                if ( result ) {
++                    size.incrementAndGet();
++                }
++                return result;
++            }
++            else return false;
++        }
++
++        public PollerEvent poll() {
++            PollerEvent result = super.poll();
++            if ( result != null ) {
++                size.decrementAndGet();
++            }
++            return result;
++        }
++
++        public void clear() {
++            super.clear();
++            size.set(0);
++        }
++    };
++
+ 
+     /**
+      * Bytebuffer cache, each channel holds a set of buffers (two, except for SSL holds four)
+@@ -163,7 +222,7 @@ public class NioEndpoint {
+     protected ConcurrentLinkedQueue<NioChannel> nioChannels = new ConcurrentLinkedQueue<NioChannel>() {
+         protected AtomicInteger size = new AtomicInteger(0);
+         protected AtomicInteger bytes = new AtomicInteger(0);
+-        public boolean offer(NioChannel socket, KeyAttachment att) {
++        public boolean offer(NioChannel socket) {
+             boolean offer = socketProperties.getBufferPool()==-1?true:size.get()<socketProperties.getBufferPool();
+             offer = offer && (socketProperties.getBufferPoolSize()==-1?true:(bytes.get()+socket.getBufferSize())<socketProperties.getBufferPoolSize());
+             //avoid over growing our cache or add after we have stopped
+@@ -190,6 +249,7 @@ public class NioEndpoint {
+         public void clear() {
+             super.clear();
+             size.set(0);
++            bytes.set(0);
+         }
+     };
+ 
+@@ -1208,6 +1268,9 @@ public class NioEndpoint {
+                                 if ( attachment.getComet() ) {
+                                     if (!processSocket(channel, SocketStatus.OPEN))
+                                         processSocket(channel, SocketStatus.DISCONNECT);
++                                } else if ( attachment.getLatch() != null ) {
++                                    attachment.getLatch().countDown();
++                                    attachment.resetLatch();
+                                 } else {
+                                     boolean close = (!processSocket(channel));
+                                     if ( close ) {
+@@ -1310,6 +1373,12 @@ public class NioEndpoint {
+         protected int interestOps = 0;
+         public int interestOps() { return interestOps;}
+         public int interestOps(int ops) { this.interestOps  = ops; return ops; }
++        public CountDownLatch getLatch() { return latch; }
++        public void resetLatch() { if ( latch.getCount() == 0 ) latch = null; else throw new IllegalStateException("Latch must be at count 0");}
++        public void startLatch(int cnt) { 
++            if ( latch == null || latch.getCount() == 0 ) this.latch = new CountDownLatch(cnt); 
++            else throw new IllegalStateException("Latch must be at count 0 or null.");
++        }
+         protected Object mutex = new Object();
+         protected long lastAccess = -1;
+         protected boolean currentAccess = false;
+@@ -1317,6 +1386,7 @@ public class NioEndpoint {
+         protected long timeout = -1;
+         protected boolean error = false;
+         protected NioChannel channel = null;
++        protected CountDownLatch latch = null;
+ 
+     }
+ 
+
+==================================================
+SocketProperties.java
+index cc8a0d740b..6e5101cb96 100644
+--- a/java/org/apache/tomcat/util/net/NioSelectorPool.java
++++ b/java/org/apache/tomcat/util/net/NioSelectorPool.java
+@@ -24,9 +24,11 @@ import java.nio.channels.SelectionKey;
+ import java.io.EOFException;
+ import java.net.SocketTimeoutException;
+ import java.util.concurrent.ConcurrentLinkedQueue;
++import org.apache.juli.logging.Log;
++import org.apache.juli.logging.LogFactory;
+ 
+ /**
+- * 
++ *
+  * Thread safe non blocking selector pool
+  * @author Filip Hanik
+  * @version 1.0
+@@ -34,15 +36,33 @@ import java.util.concurrent.ConcurrentLinkedQueue;
+  */
+ 
+ public class NioSelectorPool {
++    protected static Log log = LogFactory.getLog(NioSelectorPool.class);
++
++    protected final static boolean SHARED =
++        Boolean.valueOf(System.getProperty("org.apache.tomcat.util.net.NioSelectorShared", "true")).booleanValue();
++    protected static Selector SHARED_SELECTOR;
++    protected static Selector getSharedSelector() throws IOException {
++        if (SHARED && SHARED_SELECTOR == null) {
++            synchronized ( NioSelectorPool.class ) {
++                if ( SHARED_SELECTOR == null )  {
++					SHARED_SELECTOR = Selector.open();
++                    log.info("Using a shared selector for servlet write/read");
++			    }
++            }
++        }
++        return  SHARED_SELECTOR;
++    }
+     protected int maxSelectors = 200;
+     protected int maxSpareSelectors = -1;
+     protected boolean enabled = true;
+     protected AtomicInteger active = new AtomicInteger(0);
+     protected AtomicInteger spare = new AtomicInteger(0);
+-    //protected LinkedList<Selector> selectors = new LinkedList<Selector>();
+     protected ConcurrentLinkedQueue<Selector> selectors = new ConcurrentLinkedQueue<Selector>();
+-    
++
+     public Selector get() throws IOException{
++        if ( SHARED ) {
++            return getSharedSelector();
++        }
+         if ( (!enabled) || active.incrementAndGet() >= maxSelectors ) {
+             if ( enabled ) active.decrementAndGet();
+             return null;
+@@ -52,18 +72,19 @@ public class NioSelectorPool {
+             s = selectors.size()>0?selectors.poll():null;
+             if (s == null) s = Selector.open();
+             else spare.decrementAndGet();
+-            
++
+         }catch (NoSuchElementException x ) {
+             try {s = Selector.open();}catch (IOException iox){}
+         } finally {
+             if ( s == null ) active.decrementAndGet();//we were unable to find a selector
+         }
+-        return s;            
++        return s;
+     }
+-    
+-    
+-    
++
++
++
+     public void put(Selector s) throws IOException {
++        if ( SHARED ) return;
+         if ( enabled ) active.decrementAndGet();
+         if ( enabled && (maxSpareSelectors==-1 || spare.get() < Math.min(maxSpareSelectors,maxSelectors)) ) {
+             spare.incrementAndGet();
+@@ -71,19 +92,24 @@ public class NioSelectorPool {
+         }
+         else s.close();
+     }
+-    
++
+     public void close() throws IOException {
+         enabled = false;
+         Selector s;
+         while ( (s = selectors.poll()) != null ) s.close();
+         spare.set(0);
+         active.set(0);
++        if ( SHARED && getSharedSelector()!=null ) {
++            getSharedSelector().close();
++            SHARED_SELECTOR = null;
++        }
+     }
+-    
+-    public void open(){
++
++    public void open() throws IOException {
+         enabled = true;
++        getSharedSelector();
+     }
+-    
++
+     /**
+      * Performs a blocking write using the bytebuffer for data to be written and a selector to block.
+      * If the <code>selector</code> parameter is null, then it will perform a busy write that could
+@@ -98,6 +124,9 @@ public class NioSelectorPool {
+      * @throws IOException if an IO Exception occurs in the underlying socket logic
+      */
+     public int write(ByteBuffer buf, NioChannel socket, Selector selector, long writeTimeout) throws IOException {
++        if ( SHARED ) {
++            return NioBlockingSelector.write(buf,socket,writeTimeout);
++        }
+         SelectionKey key = null;
+         int written = 0;
+         boolean timedout = false;
+@@ -123,7 +152,7 @@ public class NioSelectorPool {
+                     if (key==null) key = socket.getIOChannel().register(selector, SelectionKey.OP_WRITE);
+                     else key.interestOps(SelectionKey.OP_WRITE);
+                     keycount = selector.select(writeTimeout);
+-                }                
++                }
+                 if (writeTimeout > 0 && (selector == null || keycount == 0) ) timedout = (System.currentTimeMillis()-time)>=writeTimeout;
+             }//while
+             if ( timedout ) throw new SocketTimeoutException();
+@@ -135,7 +164,7 @@ public class NioSelectorPool {
+         }
+         return written;
+     }
+-     
++
+     /**
+      * Performs a blocking read using the bytebuffer for data to be read and a selector to block.
+      * If the <code>selector</code> parameter is null, then it will perform a busy read that could
+@@ -150,6 +179,9 @@ public class NioSelectorPool {
+      * @throws IOException if an IO Exception occurs in the underlying socket logic
+      */
+     public int read(ByteBuffer buf, NioChannel socket, Selector selector, long readTimeout) throws IOException {
++        if ( SHARED ) {
++            return NioBlockingSelector.read(buf,socket,readTimeout);
++        }
+         SelectionKey key = null;
+         int read = 0;
+         boolean timedout = false;
+@@ -168,7 +200,7 @@ public class NioSelectorPool {
+                     if (key==null) key = socket.getIOChannel().register(selector, SelectionKey.OP_READ);
+                     else key.interestOps(SelectionKey.OP_READ);
+                     keycount = selector.select(readTimeout);
+-                }                
++                }
+                 if (readTimeout > 0 && (selector == null || keycount == 0) ) timedout = (System.currentTimeMillis()-time)>=readTimeout;
+             }//while
+             if ( timedout ) throw new SocketTimeoutException();
+@@ -180,7 +212,7 @@ public class NioSelectorPool {
+         }
+         return read;
+     }
+-    
++
+     public void setMaxSelectors(int maxSelectors) {
+         this.maxSelectors = maxSelectors;
+     }
+
+==================================================

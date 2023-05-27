@@ -1,0 +1,271 @@
+3e11e06a24b24443b4a9fd5b8a9410d3cf3f9ea4
+==================================================
+Implement JMX notification of query times and query failures
+==================================================
+Filip Hanik
+==================================================
+Fri Dec 12 01:26:39 2008 +0000
+==================================================
+ConnectionPool.java
+index 6bd3266868..e8f0178e84 100644
+--- a/modules/jdbc-pool/build.xml
++++ b/modules/jdbc-pool/build.xml
+@@ -102,6 +102,9 @@
+       <fileset dir="${tomcat.classes}">
+         <include name="org/apache/tomcat/jdbc/**" />
+       </fileset>
++      <fileset dir="${basedir}/modules/jdbc-pool/java">
++        <include name="org/apache/tomcat/jdbc/**/*.xml" />
++      </fileset>
+     </jar>
+     <!-- connection pool source file-->
+     <jar jarfile="${tomcat-jdbc-src.jar}">
+
+==================================================
+PoolProperties.java
+index 51130344c8..f4b14f7f1f 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/ConnectionPool.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/ConnectionPool.java
+@@ -350,7 +350,9 @@ public class ConnectionPool {
+             }catch (Exception x) {
+                 log.warn("Unable to inform interceptor of pool start.",x);
+                 close(true);
+-                throw new SQLException(x);
++                SQLException ex = new SQLException();
++                ex.initCause(x);
++                throw ex;
+             }
+         }        
+         //initialize the pool with its initial set of members
+@@ -477,7 +479,7 @@ public class ConnectionPool {
+         } //while
+     }
+ 
+-    protected PooledConnection createConnection(long now, PooledConnection con) {
++    protected PooledConnection createConnection(long now, PooledConnection con) throws SQLException {
+         //no connections where available we'll create one
+         boolean error = false;
+         try {
+@@ -502,7 +504,15 @@ public class ConnectionPool {
+             } //end if
+         } catch (Exception e) {
+             error = true;
+-            log.error("Unable to create a new JDBC connection.", e);
++            if (log.isDebugEnabled())
++                log.debug("Unable to create a new JDBC connection.", e);
++            if (e instanceof SQLException) {
++                throw (SQLException)e;
++            } else {
++                SQLException ex = new SQLException(e.getMessage());
++                ex.initCause(e);
++                throw ex;
++            }
+         } finally {
+             if (error ) {
+                 release(con);
+
+==================================================
+PooledConnection.java
+index d0dc7b33c0..163e14b35d 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/PoolProperties.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/PoolProperties.java
+@@ -54,7 +54,7 @@ public class PoolProperties {
+     protected int removeAbandonedTimeout = 60;
+     protected boolean logAbandoned = false;
+     protected int loginTimeout = 10000;
+-    protected String name = "Tomcat Connection Pool["+(poolCounter.addAndGet(1))+":"+System.identityHashCode(PoolProperties.class)+"]";
++    protected String name = "Tomcat Connection Pool["+(poolCounter.addAndGet(1))+"-"+System.identityHashCode(PoolProperties.class)+"]";
+     protected String password;
+     protected String username;
+     protected long validationInterval = 30000;
+
+==================================================
+SlowQueryReport.java
+index d79e7de2c5..ef05fb6603 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/PooledConnection.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/PooledConnection.java
+@@ -73,8 +73,12 @@ public class PooledConnection {
+             driver = (java.sql.Driver) Class.forName(poolProperties.getDriverClassName(),
+                                                      true, PooledConnection.class.getClassLoader()).newInstance();
+         } catch (java.lang.Exception cn) {
+-            log.error("Unable to instantiate JDBC driver.", cn);
+-            throw new SQLException(cn.getMessage());
++            if (log.isDebugEnabled()) {
++                log.debug("Unable to instantiate JDBC driver.", cn);
++            }
++            SQLException ex = new SQLException(cn.getMessage());
++            ex.initCause(cn);
++            throw ex;
+         }
+         String driverURL = poolProperties.getUrl();
+         String usr = poolProperties.getUsername();
+
+==================================================
+SlowQueryReportJmx.java
+index 0f3d15ff78..082ce53ea2 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/interceptor/SlowQueryReport.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/interceptor/SlowQueryReport.java
+@@ -27,6 +27,12 @@ import java.sql.Statement;
+ import java.util.Iterator;
+ import java.util.concurrent.ConcurrentHashMap;
+ 
++import javax.management.openmbean.CompositeDataSupport;
++import javax.management.openmbean.CompositeType;
++import javax.management.openmbean.OpenDataException;
++import javax.management.openmbean.OpenType;
++import javax.management.openmbean.SimpleType;
++
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.jdbc.pool.ConnectionPool;
+@@ -197,7 +203,7 @@ public class SlowQueryReport extends AbstractCreateStatementInterceptor  {
+         super.poolClosed(pool);
+     }
+     
+-    protected void reportFailedQuery(String query, Object[] args, final String name, long start, Throwable t) {
++    protected String reportFailedQuery(String query, Object[] args, final String name, long start, Throwable t) {
+         //extract the query string
+         String sql = (query==null && args!=null &&  args.length>0)?(String)args[0]:query;
+         //if we do batch execution, then we name the query 'batch'
+@@ -209,9 +215,10 @@ public class SlowQueryReport extends AbstractCreateStatementInterceptor  {
+             QueryStats qs = getQueryStats(sql);
+             if (qs!=null) qs.failure(System.currentTimeMillis()-start,start);
+         }
++        return sql;
+     }
+     
+-    protected void reportSlowQuery(String query, Object[] args, final String name, long start, long delta) {
++    protected String reportSlowQuery(String query, Object[] args, final String name, long start, long delta) {
+         //extract the query string
+         String sql = (query==null && args!=null &&  args.length>0)?(String)args[0]:query;
+         //if we do batch execution, then we name the query 'batch'
+@@ -223,6 +230,7 @@ public class SlowQueryReport extends AbstractCreateStatementInterceptor  {
+             QueryStats qs = getQueryStats(sql);
+             if (qs!=null) qs.add(delta,start);
+         }
++        return sql;
+     }
+     
+     protected QueryStats getQueryStats(String sql) {
+@@ -274,6 +282,48 @@ public class SlowQueryReport extends AbstractCreateStatementInterceptor  {
+      *
+      */
+     public static class QueryStats {
++        static final String[] FIELD_NAMES = new String[] {
++            "query",
++            "nrOfInvocations",
++            "maxInvocationTime",
++            "maxInvocationDate",
++            "minInvocationTime",
++            "minInvocationDate",
++            "totalInvocationTime",
++            "failures",
++            "prepareCount",
++            "prepareTime",
++            "lastInvocation"
++        };
++        
++        static final  String[] FIELD_DESCRIPTIONS = new String[] {
++            "The SQL query",
++            "The number of query invocations, a call to executeXXX",
++            "The longest time for this query in milliseconds",
++            "The time and date for when the longest query took place",
++            "The shortest time for this query in milliseconds",
++            "The time and date for when the shortest query took place",
++            "The total amount of milliseconds spent executing this query",
++            "The number of failures for this query",
++            "The number of times this query was prepared (prepareStatement/prepareCall)",
++            "The total number of milliseconds spent preparing this query",
++            "The date and time of the last invocation"
++        };
++        
++        static final OpenType[] FIELD_TYPES = new OpenType[] { 
++            SimpleType.STRING,
++            SimpleType.INTEGER,
++            SimpleType.LONG,
++            SimpleType.LONG,
++            SimpleType.LONG,
++            SimpleType.LONG,
++            SimpleType.LONG,
++            SimpleType.LONG,
++            SimpleType.INTEGER,
++            SimpleType.LONG,
++            SimpleType.LONG 
++        };
++
+         private final String query;
+         private int nrOfInvocations;
+         private long maxInvocationTime = Long.MIN_VALUE;
+@@ -286,6 +336,18 @@ public class SlowQueryReport extends AbstractCreateStatementInterceptor  {
+         private long prepareTime;
+         private volatile long lastInvocation = 0;
+         
++        public static String[] getFieldNames() {
++            return FIELD_NAMES;
++        }
++        
++        public static String[] getFieldDescriptions() {
++            return FIELD_DESCRIPTIONS;
++        }
++        
++        public static OpenType[] getFieldTypes() {
++            return FIELD_TYPES;
++        }
++        
+         public String toString() {
+             StringBuffer buf = new StringBuffer("QueryStats[query:");
+             buf.append(query);
+@@ -313,6 +375,23 @@ public class SlowQueryReport extends AbstractCreateStatementInterceptor  {
+             return buf.toString();
+         }
+         
++        public CompositeDataSupport getCompositeData(final CompositeType type) throws OpenDataException{
++            Object[] values = new Object[] {
++                    query,
++                    nrOfInvocations,
++                    maxInvocationTime,
++                    maxInvocationDate,
++                    minInvocationTime,
++                    minInvocationDate,
++                    totalInvocationTime,
++                    failures,
++                    prepareCount,
++                    prepareTime,
++                    lastInvocation
++            };
++            return new CompositeDataSupport(type,FIELD_NAMES,values);
++        }
++        
+         public QueryStats(String query) {
+             this.query = query;
+         }
+
+==================================================
+TestSlowQueryReport.java
+new file mode 100644
+index 0000000000..1252cd1092
+--- /dev/null
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/interceptor/mbeans-descriptors.xml
+@@ -0,0 +1,19 @@
++<mbeans-descriptors>
++
++  <mbean description="Reports " domain="Tomcat" group="jdbc-pool" name="SlowQueryReportJmx" 
++         type="org.apache.tomcat.jdbc.pool.interceptor.SlowQueryReportJmx">
++
++    <attribute description="The name of the connection pool this Jmx bean is representing" name="poolName" type="java.lang.String" writeable="false"/>
++    <attribute description="List of all registered connections pools" name="poolNames" type="[java.lang.String;" writeable="false"/>
++    <attribute description="All the recorded query stats. " name="slowQueriesCD" type="[javax.management.openmbean.CompositeData;" writeable="false"/>
++    <operation description="Clears all the query stats" impact="ACTION" name="resetStats" returnType="void"/>
++
++    <notification description="Notification sent out by the slow query report when a query exceeds the threshhold" name="slow-query">
++      <notification-type>Slow query</notification-type>
++    </notification>
++    
++    <notification description="Notification sent out by the slow query report when a query fails execution" name="failed-query">
++      <notification-type>Failed query execution</notification-type>
++    </notification>
++  </mbean>
++</mbeans-descriptors>
+\ No newline at end of file
+
+==================================================

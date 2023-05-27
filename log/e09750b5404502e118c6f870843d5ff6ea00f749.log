@@ -1,0 +1,189 @@
+e09750b5404502e118c6f870843d5ff6ea00f749
+==================================================
+Start by working on use cases
+==================================================
+Filip Hanik
+==================================================
+Wed Aug 5 23:20:57 2009 +0000
+==================================================
+AsyncContext.java
+Start by working on use cases
+
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@801463 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+AsyncContextImpl.java
+index a553596b7b..b944388cfd 100644
+--- a/java/javax/servlet/AsyncContext.java
++++ b/java/javax/servlet/AsyncContext.java
+@@ -16,6 +16,8 @@
+ */
+ package javax.servlet;
+ 
++import org.apache.catalina.connector.AsyncContextImpl.AsyncState;
++
+ /**
+  * @since Servlet 3.0
+  * $Id$
+@@ -63,4 +65,8 @@ public interface AsyncContext {
+     void complete();
+     
+     void start(Runnable run);
++    
++    public long getAsyncTimeout();
++    
++    public void setAsyncTimeout(long timeout);
+ }
+
+==================================================
+Async0.java
+index caaa3b1b64..8e232bdfa8 100644
+--- a/java/org/apache/catalina/connector/AsyncContextImpl.java
++++ b/java/org/apache/catalina/connector/AsyncContextImpl.java
+@@ -56,7 +56,8 @@ public class AsyncContextImpl implements AsyncContext {
+     private boolean hasOriginalRequestAndResponse = true;
+     private volatile Runnable dispatch = null;
+     private Context context = null;
+-    private AtomicReference<AsyncState> state = new AtomicReference<AsyncState>();
++    private AtomicReference<AsyncState> state = new AtomicReference<AsyncState>(AsyncState.NOT_STARTED);
++    private long timeout = -1;
+     
+     private Request request;
+     
+@@ -67,12 +68,16 @@ public class AsyncContextImpl implements AsyncContext {
+ 
+     @Override
+     public void complete() {
+-        if (state.compareAndSet(AsyncState.STARTED, AsyncState.COMPLETING)) {
++        if (state.compareAndSet(AsyncState.STARTED, AsyncState.COMPLETING) ||
++            state.compareAndSet(AsyncState.DISPATCHED, AsyncState.COMPLETING)) {
+             // TODO SERVLET3 - async
+             AtomicBoolean dispatched = new AtomicBoolean(false);
+             request.coyoteRequest.action(ActionCode.ACTION_ASYNC_COMPLETE,dispatched);
+             if (!dispatched.get()) doInternalComplete(false);
++        } else {
++            throw new IllegalStateException("Complete not allowed. Invalid state:"+state.get());
+         }
++       
+     }
+ 
+     @Override
+@@ -178,6 +183,7 @@ public class AsyncContextImpl implements AsyncContext {
+         hasOriginalRequestAndResponse = true;
+         state.set(AsyncState.NOT_STARTED);
+         context = null;
++        timeout = -1;
+     }
+ 
+     public boolean isStarted() {
+@@ -227,6 +233,7 @@ public class AsyncContextImpl implements AsyncContext {
+     
+     public void doInternalDispatch() throws ServletException, IOException {
+         if (this.state.compareAndSet(AsyncState.TIMING_OUT, AsyncState.DISPATCHED)) {
++            log.info("TIMING OUT!");
+             boolean listenerInvoked = false;
+             for (AsyncListenerWrapper listener : listeners) {
+                 listener.fireOnTimeout();
+@@ -260,7 +267,8 @@ public class AsyncContextImpl implements AsyncContext {
+             //this is the same as
+             //request.startAsync().complete();
+             recycle();
+-        } else if (state.compareAndSet(AsyncState.DISPATCHED, AsyncState.NOT_STARTED)) {
++        } else if (state.compareAndSet(AsyncState.DISPATCHED, AsyncState.NOT_STARTED) ||
++                   state.compareAndSet(AsyncState.COMPLETING, AsyncState.NOT_STARTED)) {
+             for (AsyncListenerWrapper wrapper : listeners) {
+                 try {
+                     wrapper.fireOnComplete();
+@@ -290,5 +298,14 @@ public class AsyncContextImpl implements AsyncContext {
+     protected void setState(AsyncState st) {
+         state.set(st);
+     }
++    
++    public long getAsyncTimeout() {
++        return timeout;
++    }
++    
++    public void setAsyncTimeout(long timeout) {
++        this.timeout = timeout;
++        request.coyoteRequest.action(ActionCode.ACTION_ASYNC_SETTIMEOUT,new Long(timeout));
++    }
+ 
+ }
+
+==================================================
+Async1.java
+new file mode 100644
+index 0000000000..40797bfb23
+--- /dev/null
++++ b/webapps/examples/WEB-INF/classes/async/Async0.java
+@@ -0,0 +1,65 @@
++/*
++* Licensed to the Apache Software Foundation (ASF) under one or more
++* contributor license agreements.  See the NOTICE file distributed with
++* this work for additional information regarding copyright ownership.
++* The ASF licenses this file to You under the Apache License, Version 2.0
++* (the "License"); you may not use this file except in compliance with
++* the License.  You may obtain a copy of the License at
++*
++*     http://www.apache.org/licenses/LICENSE-2.0
++*
++* Unless required by applicable law or agreed to in writing, software
++* distributed under the License is distributed on an "AS IS" BASIS,
++* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++* See the License for the specific language governing permissions and
++* limitations under the License.
++*/
++package async;
++
++import java.io.IOException;
++
++import javax.servlet.AsyncContext;
++import javax.servlet.ServletException;
++import javax.servlet.http.HttpServlet;
++import javax.servlet.http.HttpServletRequest;
++import javax.servlet.http.HttpServletResponse;
++
++import org.apache.juli.logging.Log;
++import org.apache.juli.logging.LogFactory;
++
++public class Async0 extends HttpServlet {
++    protected static Log log = LogFactory.getLog(Async0.class);
++    public Async0() {
++    }
++
++    @Override
++    protected void service(HttpServletRequest req, HttpServletResponse resp) throws ServletException, IOException {
++        if (req.isAsyncStarted()) {
++            log.info("Received dispatch, completing on the worker thread.");
++            req.getAsyncContext().complete();
++            log.info("After complete called started:"+req.isAsyncStarted());
++            resp.getWriter().write("Async dispatch worked\n");
++        } else {
++            resp.setContentType("text/plain");
++            final AsyncContext actx = req.startAsync();
++            actx.setAsyncTimeout(30*1000);
++            Runnable run = new Runnable() {
++                public void run() {
++                    try {
++                        Thread.currentThread().setName("Async0-Thread");
++                        log.info("Putting AsyncThread to sleep");
++                        Thread.sleep(10*1000);
++                        log.info("Dispatching");
++                        actx.dispatch();
++                    }catch (InterruptedException x) {
++                        log.error("Async1",x);
++                    }catch (IllegalStateException x) {
++                        log.error("Async1",x);
++                    }
++                }
++            };
++            Thread t = new Thread(run);
++            t.start();
++        }
++    }
++}
+
+==================================================

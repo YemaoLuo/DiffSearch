@@ -1,0 +1,197 @@
+7c2100f3aa2c23fb900168651d58c4169ebf96dc
+==================================================
+It appears that pausing requests for a Context during reload was relying on the mapper not being cleaned up correctly. The Lifecycle refactoring cleaned up the mapper registrations and broke the handling of paused requests. This commit restores that functionality and extends it. The key changes are:
+==================================================
+Mark Emlyn
+==================================================
+Tue May 8 18:54:44 2012 +0000
+==================================================
+CoyoteAdapter.java
+It appears that pausing requests for a Context during reload was relying on the mapper not being cleaned up correctly. The Lifecycle refactoring cleaned up the mapper registrations and broke the handling of paused requests. This commit restores that functionality and extends it. The key changes are:
+- Contexts are no longer from the mapper if they are stopped while they are paused
+- The CoyoteAdapter pauses for 1s if a request is mapped to a paused Context and then tries to re-map it. This replaces the reloading handling in the StandardContextValve
+- The reload handling has been removed from the StandardContextValve
+- Editing a watched resource now triggers a reload (that pauses requests received during the reload) rather than a stop/start which will return 404s for requests received while the context is stopping and starting
+
+As with previous iterations of this feature it is impossible to completely eliminate the chances of a 404 without a fair amount of locking that would slow things down unnecessarily in production.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1335692 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+MapperListener.java
+index 1403b92b2f..b01f74c8e2 100644
+--- a/java/org/apache/catalina/connector/CoyoteAdapter.java
++++ b/java/org/apache/catalina/connector/CoyoteAdapter.java
+@@ -719,7 +719,19 @@ public class CoyoteAdapter implements Adapter {
+                     }
+                 }
+             }
+-
++            if (!mapRequired && request.getContext().getPaused()) {
++                // Found a matching context but it is paused. Mapping data will
++                // be wrong since some Wrappers may not be registered at this
++                // point.
++                try {
++                    Thread.sleep(1000);
++                } catch (InterruptedException e) {
++                    // Should never happen
++                }
++                // Reset mapping
++                request.getMappingData().recycle();
++                mapRequired = true;
++            }
+         }
+ 
+         // Possible redirect
+
+==================================================
+StandardContext.java
+index 84086204a0..52b437821f 100644
+--- a/java/org/apache/catalina/connector/MapperListener.java
++++ b/java/org/apache/catalina/connector/MapperListener.java
+@@ -437,7 +437,12 @@ public class MapperListener extends LifecycleMBeanBase
+             if (obj instanceof Wrapper) {
+                 unregisterWrapper((Wrapper) obj);
+             } else if (obj instanceof Context) {
+-                unregisterContext((Context) obj);
++                Context c = (Context) obj;
++                // Only unregister if not paused. If paused, need to keep
++                // registration in place to prevent 404's during reload
++                if (!c.getPaused()) {
++                    unregisterContext(c);
++                }
+             } else if (obj instanceof Host) {
+                 unregisterHost((Host) obj);
+             }
+
+==================================================
+StandardContextValve.java
+index 73560cc6af..1ad3ee5f10 100644
+--- a/java/org/apache/catalina/core/StandardContext.java
++++ b/java/org/apache/catalina/core/StandardContext.java
+@@ -3767,9 +3767,12 @@ public class StandardContext extends ContainerBase
+      * <p>
+      * <b>IMPLEMENTATION NOTE</b>:  This method is designed to deal with
+      * reloads required by changes to classes in the underlying repositories
+-     * of our class loader.  It does not handle changes to the web application
+-     * deployment descriptor.  If that has occurred, you should stop this
+-     * Context and create (and start) a new Context instance instead.
++     * of our class loader and changes to the web.xml file. It does not handle
++     * changes to any context.xml file. If the context.xml has changed, you
++     * should stop this Context and create (and start) a new Context instance
++     * instead. Note that there is additional code in
++     * <code>CoyoteAdapter#postParseRequest()</code> to handle mapping requests
++     * to paused Contexts.
+      *
+      * @exception IllegalStateException if the <code>reloadable</code>
+      *  property is set to <code>false</code>.
+@@ -3786,7 +3789,7 @@ public class StandardContext extends ContainerBase
+             log.info(sm.getString("standardContext.reloadingStarted",
+                     getName()));
+ 
+-        // Stop accepting requests temporarily
++        // Stop accepting requests temporarily.
+         setPaused(true);
+ 
+         try {
+
+==================================================
+HostConfig.java
+index 3ed2d25d74..13aad37ef4 100644
+--- a/java/org/apache/catalina/core/StandardContextValve.java
++++ b/java/org/apache/catalina/core/StandardContextValve.java
+@@ -14,11 +14,8 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+-
+-
+ package org.apache.catalina.core;
+ 
+-
+ import java.io.IOException;
+ 
+ import javax.servlet.RequestDispatcher;
+@@ -26,7 +23,6 @@ import javax.servlet.ServletException;
+ import javax.servlet.http.HttpServletResponse;
+ 
+ import org.apache.catalina.Container;
+-import org.apache.catalina.Context;
+ import org.apache.catalina.Wrapper;
+ import org.apache.catalina.comet.CometEvent;
+ import org.apache.catalina.connector.Request;
+@@ -44,22 +40,13 @@ import org.apache.tomcat.util.buf.MessageBytes;
+  * @author Craig R. McClanahan
+  * @version $Id$
+  */
+-
+ final class StandardContextValve extends ValveBase {
+ 
+-    //------------------------------------------------------ Constructor
+     public StandardContextValve() {
+         super(true);
+     }
+ 
+ 
+-    // ----------------------------------------------------- Instance Variables
+-
+-    private Context context = null;
+-
+-
+-    // --------------------------------------------------------- Public Methods
+-
+     /**
+      * Cast to a StandardContext right away, as it will be needed later.
+      *
+@@ -68,7 +55,6 @@ final class StandardContextValve extends ValveBase {
+     @Override
+     public void setContainer(Container container) {
+         super.setContainer(container);
+-        context = (Context) container;
+     }
+ 
+ 
+@@ -97,38 +83,11 @@ final class StandardContextValve extends ValveBase {
+             return;
+         }
+ 
+-        // Wait if we are reloading
+-        boolean reloaded = false;
+-        while (context.getPaused()) {
+-            reloaded = true;
+-            try {
+-                Thread.sleep(1000);
+-            } catch (InterruptedException e) {
+-                // Ignore
+-            }
+-        }
+-
+-        // Reloading will have stopped the old webappclassloader and
+-        // created a new one
+-        if (reloaded &&
+-                context.getLoader() != null &&
+-                context.getLoader().getClassLoader() != null) {
+-            Thread.currentThread().setContextClassLoader(
+-                    context.getLoader().getClassLoader());
+-        }
+-
+         // Select the Wrapper to be used for this Request
+         Wrapper wrapper = request.getWrapper();
+-        if (wrapper == null) {
++        if (wrapper == null || wrapper.isUnavailable()) {
+             response.sendError(HttpServletResponse.SC_NOT_FOUND);
+             return;
+-        } else if (wrapper.isUnavailable()) {
+-            // May be as a result of a reload, try and find the new wrapper
+-            wrapper = (Wrapper) container.findChild(wrapper.getName());
+-            if (wrapper == null) {
+-                response.sendError(HttpServletResponse.SC_NOT_FOUND);
+-                return;
+-            }
+         }
+ 
+         // Acknowledge the request
+
+==================================================

@@ -1,0 +1,1010 @@
+1687b13e908e807b71074ad1857a6a31ca4dc862
+==================================================
+Simplify with new API cleanups from Java 19 preview
+==================================================
+remm remm@apache.org
+==================================================
+Wed Jun 22 09:52:11 2022 +0200
+==================================================
+OpenSSLContext.java
+Simplify with new API cleanups from Java 19 preview
+
+The new API is less verbose so encourages allocating from the most
+appropriate memory session. As a result the main memory sessions are now
+only used for the upcalls, and of course cleanup of the OpenSSL
+resources for contexts and engines. Trivial local allocations are from
+confined sessions with single allocations.
+Review by Maurizio Cimadamore.
+
+
+==================================================
+OpenSSLEngine.java
+index 020b90009c..ebf5bc6086 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/net/openssl/panama/OpenSSLContext.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/net/openssl/panama/OpenSSLContext.java
+@@ -217,7 +217,6 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
+             // Create OpenSSLConfCmd context if used
+             OpenSSLConf openSslConf = sslHostConfig.getOpenSslConf();
+             if (openSslConf != null) {
+-                var allocator = SegmentAllocator.newNativeArena(contextMemorySession);
+                 try {
+                     if (log.isDebugEnabled()) {
+                         log.debug(sm.getString("openssl.makeConf"));
+@@ -225,9 +224,11 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
+                     confCtx = SSL_CONF_CTX_new();
+                     long errCode = ERR_get_error();
+                     if (errCode != 0) {
+-                        var buf = allocator.allocateArray(ValueLayout.JAVA_BYTE, new byte[128]);
+-                        ERR_error_string(errCode, buf);
+-                        log.error(sm.getString("openssl.errorLoadingCertificate", buf.getUtf8String(0)));
++                        try (var memorySession = MemorySession.openConfined()) {
++                            var buf = memorySession.allocateArray(ValueLayout.JAVA_BYTE, new byte[128]);
++                            ERR_error_string(errCode, buf);
++                            log.error(sm.getString("openssl.errorLoadingCertificate", buf.getUtf8String(0)));
++                        }
+                     }
+                     SSL_CONF_CTX_set_flags(confCtx, SSL_CONF_FLAG_FILE() |
+                             SSL_CONF_FLAG_SERVER() |
+@@ -355,7 +356,7 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
+              * OpenSSLSessionContext) to ensure that the OpenSSLContext remains
+              * ineligible for GC while those connections are alive. Once those
+              * connections complete, the OpenSSLContext will become eligible for GC
+-             * and the implicit scope will ensure that the associated native
++             * and the memory session will ensure that the associated native
+              * resources are cleaned up.
+              */
+             cleanable = cleaner.register(this, state);
+@@ -406,12 +407,11 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
+                 if (name.equals("NO_OCSP_CHECK")) {
+                     rc = 1;
+                 } else {
+-                    var allocator = SegmentAllocator.newNativeArena(memorySession);
+-                    int code = SSL_CONF_cmd_value_type(state.confCtx, allocator.allocateUtf8String(name));
++                    int code = SSL_CONF_cmd_value_type(state.confCtx, memorySession.allocateUtf8String(name));
+                     rc = 1;
+                     long errCode = ERR_get_error();
+                     if (errCode != 0) {
+-                        var buf = allocator.allocateArray(ValueLayout.JAVA_BYTE, new byte[128]);
++                        var buf = memorySession.allocateArray(ValueLayout.JAVA_BYTE, new byte[128]);
+                         ERR_error_string(errCode, buf);
+                         log.error(sm.getString("opensslconf.checkFailed", buf.getUtf8String(0)));
+                         rc = 0;
+@@ -483,12 +483,11 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
+                     noOcspCheck = Boolean.valueOf(value);
+                     rc = 1;
+                 } else {
+-                    var allocator = SegmentAllocator.newNativeArena(memorySession);
+-                    rc = SSL_CONF_cmd(state.confCtx, allocator.allocateUtf8String(name),
+-                            allocator.allocateUtf8String(value));
++                    rc = SSL_CONF_cmd(state.confCtx, memorySession.allocateUtf8String(name),
++                            memorySession.allocateUtf8String(value));
+                     long errCode = ERR_get_error();
+                     if (rc <= 0 || errCode != 0) {
+-                        var buf = allocator.allocateArray(ValueLayout.JAVA_BYTE, new byte[128]);
++                        var buf = memorySession.allocateArray(ValueLayout.JAVA_BYTE, new byte[128]);
+                         ERR_error_string(errCode, buf);
+                         log.error(sm.getString("opensslconf.commandError", name, value, buf.getUtf8String(0)));
+                         rc = 0;
+@@ -536,7 +535,7 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
+             log.warn(sm.getString("openssl.doubleInit"));
+             return;
+         }
+-        try {
++        try (var memorySession = MemorySession.openConfined()) {
+             if (sslHostConfig.getInsecureRenegotiation()) {
+                 SSL_CTX_set_options(state.sslCtx, SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION());
+             } else {
+@@ -568,13 +567,13 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
+             // List the ciphers that the client is permitted to negotiate
+             if (minTlsVersion <= TLS1_2_VERSION()) {
+                 if (SSL_CTX_set_cipher_list(state.sslCtx,
+-                        SegmentAllocator.implicitAllocator().allocateUtf8String(sslHostConfig.getCiphers())) <= 0) {
++                        memorySession.allocateUtf8String(sslHostConfig.getCiphers())) <= 0) {
+                     log.warn(sm.getString("engine.failedCipherList", sslHostConfig.getCiphers()));
+                 }
+             }
+             if (maxTlsVersion >= TLS1_3_VERSION() && (sslHostConfig.getCiphers() != SSLHostConfig.DEFAULT_TLS_CIPHERS)) {
+                 if (SSL_CTX_set_ciphersuites(state.sslCtx,
+-                        SegmentAllocator.implicitAllocator().allocateUtf8String(sslHostConfig.getCiphers())) <= 0) {
++                        memorySession.allocateUtf8String(sslHostConfig.getCiphers())) <= 0) {
+                     log.warn(sm.getString("engine.failedCipherSuite", sslHostConfig.getCiphers()));
+                 }
+             }
+@@ -583,7 +582,7 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
+                 certificate.setCertificateKeyManager(OpenSSLUtil.chooseKeyManager(kms));
+             }
+ 
+-            addCertificate(certificate);
++            addCertificate(certificate, memorySession);
+ 
+             // Client certificate verification
+             int value = 0;
+@@ -616,64 +615,61 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
+             SSL_CTX_set_verify(state.sslCtx, value, openSSLCallbackVerify);
+ 
+             // Trust and certificate verification
+-            try (var scope = MemorySession.openConfined()) {
+-                var allocator = SegmentAllocator.newNativeArena(scope);
+-                if (tms != null) {
+-                    // Client certificate verification based on custom trust managers
+-                    state.x509TrustManager = chooseTrustManager(tms);
+-                    var openSSLCallbackCertVerify =
+-                            Linker.nativeLinker().upcallStub(openSSLCallbackCertVerifyHandle,
+-                            openSSLCallbackCertVerifyFunctionDescriptor, state.contextMemorySession);
+-                    SSL_CTX_set_cert_verify_callback(state.sslCtx, openSSLCallbackCertVerify, state.sslCtx);
+-
+-                    // Pass along the DER encoded certificates of the accepted client
+-                    // certificate issuers, so that their subjects can be presented
+-                    // by the server during the handshake to allow the client choosing
+-                    // an acceptable certificate
+-                    for (X509Certificate caCert : state.x509TrustManager.getAcceptedIssuers()) {
+-                        //SSLContext.addClientCACertificateRaw(state.ctx, caCert.getEncoded());
+-                        var rawCACertificate = allocator.allocateArray(ValueLayout.JAVA_BYTE, caCert.getEncoded());
+-                        var rawCACertificatePointer = allocator.allocate(ValueLayout.ADDRESS, rawCACertificate);
+-                        var x509CACert = d2i_X509(MemoryAddress.NULL, rawCACertificatePointer, rawCACertificate.byteSize());
+-                        if (MemoryAddress.NULL.equals(x509CACert)) {
+-                            logLastError(allocator, "openssl.errorLoadingCertificate");
+-                        } else if (SSL_CTX_add_client_CA(state.sslCtx, x509CACert) <= 0) {
+-                            logLastError(allocator, "openssl.errorAddingCertificate");
+-                        } else if (log.isDebugEnabled()) {
+-                            log.debug(sm.getString("openssl.addedClientCaCert", caCert.toString()));
+-                        }
++            if (tms != null) {
++                // Client certificate verification based on custom trust managers
++                state.x509TrustManager = chooseTrustManager(tms);
++                var openSSLCallbackCertVerify =
++                        Linker.nativeLinker().upcallStub(openSSLCallbackCertVerifyHandle,
++                                openSSLCallbackCertVerifyFunctionDescriptor, state.contextMemorySession);
++                SSL_CTX_set_cert_verify_callback(state.sslCtx, openSSLCallbackCertVerify, state.sslCtx);
++
++                // Pass along the DER encoded certificates of the accepted client
++                // certificate issuers, so that their subjects can be presented
++                // by the server during the handshake to allow the client choosing
++                // an acceptable certificate
++                for (X509Certificate caCert : state.x509TrustManager.getAcceptedIssuers()) {
++                    //SSLContext.addClientCACertificateRaw(state.ctx, caCert.getEncoded());
++                    var rawCACertificate = memorySession.allocateArray(ValueLayout.JAVA_BYTE, caCert.getEncoded());
++                    var rawCACertificatePointer = memorySession.allocate(ValueLayout.ADDRESS, rawCACertificate);
++                    var x509CACert = d2i_X509(MemoryAddress.NULL, rawCACertificatePointer, rawCACertificate.byteSize());
++                    if (MemoryAddress.NULL.equals(x509CACert)) {
++                        logLastError(memorySession, "openssl.errorLoadingCertificate");
++                    } else if (SSL_CTX_add_client_CA(state.sslCtx, x509CACert) <= 0) {
++                        logLastError(memorySession, "openssl.errorAddingCertificate");
++                    } else if (log.isDebugEnabled()) {
++                        log.debug(sm.getString("openssl.addedClientCaCert", caCert.toString()));
+                     }
++                }
++            } else {
++                // Client certificate verification based on trusted CA files and dirs
++                //SSLContext.setCACertificate(state.ctx,
++                //        SSLHostConfig.adjustRelativePath(sslHostConfig.getCaCertificateFile()),
++                //        SSLHostConfig.adjustRelativePath(sslHostConfig.getCaCertificatePath()));
++                MemorySegment caCertificateFileNative = sslHostConfig.getCaCertificateFile() != null
++                        ? memorySession.allocateUtf8String(SSLHostConfig.adjustRelativePath(sslHostConfig.getCaCertificateFile())) : null;
++                MemorySegment caCertificatePathNative = sslHostConfig.getCaCertificatePath() != null
++                        ? memorySession.allocateUtf8String(SSLHostConfig.adjustRelativePath(sslHostConfig.getCaCertificatePath())) : null;
++                if ((sslHostConfig.getCaCertificateFile() != null || sslHostConfig.getCaCertificatePath() != null) 
++                        && SSL_CTX_load_verify_locations(state.sslCtx,
++                                caCertificateFileNative == null ? MemoryAddress.NULL : caCertificateFileNative,
++                                        caCertificatePathNative == null ? MemoryAddress.NULL : caCertificatePathNative) <= 0) {
++                    logLastError(memorySession, "openssl.errorConfiguringLocations");
+                 } else {
+-                    // Client certificate verification based on trusted CA files and dirs
+-                    //SSLContext.setCACertificate(state.ctx,
+-                    //        SSLHostConfig.adjustRelativePath(sslHostConfig.getCaCertificateFile()),
+-                    //        SSLHostConfig.adjustRelativePath(sslHostConfig.getCaCertificatePath()));
+-                    MemorySegment caCertificateFileNative = sslHostConfig.getCaCertificateFile() != null
+-                            ? allocator.allocateUtf8String(SSLHostConfig.adjustRelativePath(sslHostConfig.getCaCertificateFile())) : null;
+-                    MemorySegment caCertificatePathNative = sslHostConfig.getCaCertificatePath() != null
+-                            ? allocator.allocateUtf8String(SSLHostConfig.adjustRelativePath(sslHostConfig.getCaCertificatePath())) : null;
+-                    if ((sslHostConfig.getCaCertificateFile() != null || sslHostConfig.getCaCertificatePath() != null) 
+-                            && SSL_CTX_load_verify_locations(state.sslCtx,
+-                                    caCertificateFileNative == null ? MemoryAddress.NULL : caCertificateFileNative,
+-                                    caCertificatePathNative == null ? MemoryAddress.NULL : caCertificatePathNative) <= 0) {
+-                        logLastError(allocator, "openssl.errorConfiguringLocations");
+-                    } else {
+-                        var caCerts = SSL_CTX_get_client_CA_list(state.sslCtx);
+-                        if (MemoryAddress.NULL.equals(caCerts)) {
+-                            caCerts = SSL_load_client_CA_file(caCertificateFileNative == null ? MemoryAddress.NULL : caCertificateFileNative);
+-                            if (!MemoryAddress.NULL.equals(caCerts)) {
+-                                SSL_CTX_set_client_CA_list(state.sslCtx, caCerts);
+-                            }
+-                        } else {
+-                            if (SSL_add_file_cert_subjects_to_stack(caCerts,
+-                                    caCertificateFileNative == null ? MemoryAddress.NULL : caCertificateFileNative) <= 0) {
+-                                caCerts = MemoryAddress.NULL;
+-                            }
++                    var caCerts = SSL_CTX_get_client_CA_list(state.sslCtx);
++                    if (MemoryAddress.NULL.equals(caCerts)) {
++                        caCerts = SSL_load_client_CA_file(caCertificateFileNative == null ? MemoryAddress.NULL : caCertificateFileNative);
++                        if (!MemoryAddress.NULL.equals(caCerts)) {
++                            SSL_CTX_set_client_CA_list(state.sslCtx, caCerts);
+                         }
+-                        if (MemoryAddress.NULL.equals(caCerts)) {
+-                            log.warn(sm.getString("openssl.noCACerts"));
++                    } else {
++                        if (SSL_add_file_cert_subjects_to_stack(caCerts,
++                                caCertificateFileNative == null ? MemoryAddress.NULL : caCertificateFileNative) <= 0) {
++                            caCerts = MemoryAddress.NULL;
+                         }
+                     }
++                    if (MemoryAddress.NULL.equals(caCerts)) {
++                        log.warn(sm.getString("openssl.noCACerts"));
++                    }
+                 }
+             }
+ 
+@@ -798,7 +794,7 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
+             log.warn(sm.getString("context.noSSL", Long.valueOf(arg.toRawLongValue())));
+             return SSL_TLSEXT_ERR_NOACK();
+         }
+-        // No scope, so byte by byte read, the ALPN data is small
++        // Byte by byte read, the ALPN data is small
+         byte[] advertisedBytes = new byte[inlen];
+         for (int i = 0; i < inlen; i++) {
+             advertisedBytes[i] = in.get(ValueLayout.JAVA_BYTE, i);
+@@ -846,10 +842,9 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
+         int len = OPENSSL_sk_num(sk);
+         byte[][] certificateChain = new byte[len][];
+         try (var memorySession = MemorySession.openConfined()) {
+-            var allocator = SegmentAllocator.newNativeArena(memorySession);
+             for (int i = 0; i < len; i++) {
+                 MemoryAddress/*(X509*)*/ x509 = OPENSSL_sk_value(sk, i);
+-                MemorySegment bufPointer = allocator.allocate(ValueLayout.ADDRESS, MemoryAddress.NULL);
++                MemorySegment bufPointer = memorySession.allocate(ValueLayout.ADDRESS, MemoryAddress.NULL);
+                 int length = i2d_X509(x509, bufPointer);
+                 if (length < 0) {
+                     certificateChain[i] = new byte[0];
+@@ -965,8 +960,7 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
+         String callbackPassword = callbackPasswordTheadLocal.get();
+         if (callbackPassword != null && callbackPassword.length() > 0) {
+             try (var memorySession = MemorySession.openConfined()) {
+-                var allocator = SegmentAllocator.newNativeArena(memorySession);
+-                MemorySegment callbackPasswordNative = allocator.allocateUtf8String(callbackPassword);
++                MemorySegment callbackPasswordNative = memorySession.allocateUtf8String(callbackPassword);
+                 if (callbackPasswordNative.byteSize() > bufsiz) {
+                     // The password is too long
+                     log.error(sm.getString("openssl.passwordTooLong"));
+@@ -981,8 +975,7 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
+     }
+ 
+ 
+-    private void addCertificate(SSLHostConfigCertificate certificate) throws Exception {
+-        var allocator = SegmentAllocator.newNativeArena(state.contextMemorySession);
++    private void addCertificate(SSLHostConfigCertificate certificate, MemorySession memorySession) throws Exception {
+         int index = getCertificateIndex(certificate);
+         // Load Server key and certificate
+         if (certificate.getCertificateFile() != null) {
+@@ -991,9 +984,9 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
+             //        SSLHostConfig.adjustRelativePath(certificate.getCertificateFile()),
+             //        SSLHostConfig.adjustRelativePath(certificate.getCertificateKeyFile()),
+             //        certificate.getCertificateKeyPassword(), getCertificateIndex(certificate));
+-            var certificateFileNative = allocator.allocateUtf8String(SSLHostConfig.adjustRelativePath(certificate.getCertificateFile()));
++            var certificateFileNative = memorySession.allocateUtf8String(SSLHostConfig.adjustRelativePath(certificate.getCertificateFile()));
+             var certificateKeyFileNative = (certificate.getCertificateKeyFile() == null) ? certificateFileNative
+-                    : allocator.allocateUtf8String(SSLHostConfig.adjustRelativePath(certificate.getCertificateKeyFile()));
++                    : memorySession.allocateUtf8String(SSLHostConfig.adjustRelativePath(certificate.getCertificateKeyFile()));
+             MemoryAddress bio;
+             MemoryAddress cert = MemoryAddress.NULL;
+             MemoryAddress key = MemoryAddress.NULL;
+@@ -1017,7 +1010,7 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
+                 int passwordLength = 0;
+                 String callbackPassword = certificate.getCertificateKeyPassword();
+                 if (callbackPassword != null && callbackPassword.length() > 0) {
+-                    MemorySegment password = allocator.allocateUtf8String(callbackPassword);
++                    MemorySegment password = memorySession.allocateUtf8String(callbackPassword);
+                     passwordAddress = password.address();
+                     passwordLength = (int) (password.byteSize() - 1);
+                 }
+@@ -1027,8 +1020,8 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
+                     PKCS12_free(p12);
+                     return;
+                 }
+-                MemorySegment certPointer = allocator.allocate(ValueLayout.ADDRESS);
+-                MemorySegment keyPointer = allocator.allocate(ValueLayout.ADDRESS);
++                MemorySegment certPointer = memorySession.allocate(ValueLayout.ADDRESS);
++                MemorySegment keyPointer = memorySession.allocate(ValueLayout.ADDRESS);
+                 if (PKCS12_parse(p12, passwordAddress, keyPointer, certPointer, MemoryAddress.NULL) <= 0) {
+                     log.error(sm.getString("openssl.errorLoadingCertificate", "[3]:" + certificate.getCertificateFile()));
+                     PKCS12_free(p12);
+@@ -1108,20 +1101,20 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
+                 }
+             }
+             if (SSL_CTX_use_certificate(state.sslCtx, cert) <= 0) {
+-                logLastError(allocator, "openssl.errorLoadingCertificate");
++                logLastError(memorySession, "openssl.errorLoadingCertificate");
+                 return;
+             }
+             if (SSL_CTX_use_PrivateKey(state.sslCtx, key) <= 0) {
+-                logLastError(allocator, "openssl.errorLoadingPrivateKey");
++                logLastError(memorySession, "openssl.errorLoadingPrivateKey");
+                 return;
+             }
+             if (SSL_CTX_check_private_key(state.sslCtx) <= 0) {
+-                logLastError(allocator, "openssl.errorPrivateKeyCheck");
++                logLastError(memorySession, "openssl.errorPrivateKeyCheck");
+                 return;
+             }
+             // Try to read DH parameters from the (first) SSLCertificateFile
+             if (index == SSL_AIDX_RSA) {
+-                bio = BIO_new_file(certificateFileNative, allocator.allocateUtf8String("r"));
++                bio = BIO_new_file(certificateFileNative, memorySession.allocateUtf8String("r"));
+                 var dh = PEM_read_bio_DHparams(bio, MemoryAddress.NULL, MemoryAddress.NULL, MemoryAddress.NULL);
+                 BIO_free(bio);
+                 // #  define SSL_CTX_set_tmp_dh(sslCtx,dh) \
+@@ -1132,7 +1125,7 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
+                 }
+             }
+             // Similarly, try to read the ECDH curve name from SSLCertificateFile...
+-            bio = BIO_new_file(certificateFileNative, allocator.allocateUtf8String("r"));
++            bio = BIO_new_file(certificateFileNative, memorySession.allocateUtf8String("r"));
+             var ecparams = PEM_read_bio_ECPKParameters(bio, MemoryAddress.NULL, MemoryAddress.NULL, MemoryAddress.NULL);
+             BIO_free(bio);
+             if (!MemoryAddress.NULL.equals(ecparams)) {
+@@ -1151,7 +1144,7 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
+             // Set certificate chain file
+             if (certificate.getCertificateChainFile() != null) {
+                 var certificateChainFileNative =
+-                        allocator.allocateUtf8String(SSLHostConfig.adjustRelativePath(certificate.getCertificateChainFile()));
++                        memorySession.allocateUtf8String(SSLHostConfig.adjustRelativePath(certificate.getCertificateChainFile()));
+                 // SSLContext.setCertificateChainFile(state.ctx,
+                 //        SSLHostConfig.adjustRelativePath(certificate.getCertificateChainFile()), false);
+                 if (SSL_CTX_use_certificate_chain_file(state.sslCtx, certificateChainFileNative) <= 0) {
+@@ -1168,7 +1161,7 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
+             if (sslHostConfig.getCertificateRevocationListFile() != null) {
+                 MemoryAddress x509Lookup = X509_STORE_add_lookup(certificateStore, X509_LOOKUP_file());
+                 var certificateRevocationListFileNative =
+-                        allocator.allocateUtf8String(SSLHostConfig.adjustRelativePath(sslHostConfig.getCertificateRevocationListFile()));
++                        memorySession.allocateUtf8String(SSLHostConfig.adjustRelativePath(sslHostConfig.getCertificateRevocationListFile()));
+                 //X509_LOOKUP_ctrl(lookup,X509_L_FILE_LOAD,file,type,NULL)
+                 if (X509_LOOKUP_ctrl(x509Lookup, X509_L_FILE_LOAD(), certificateRevocationListFileNative,
+                         X509_FILETYPE_PEM(), MemoryAddress.NULL) <= 0) {
+@@ -1178,7 +1171,7 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
+             if (sslHostConfig.getCertificateRevocationListPath() != null) {
+                 MemoryAddress x509Lookup = X509_STORE_add_lookup(certificateStore, X509_LOOKUP_hash_dir());
+                 var certificateRevocationListPathNative =
+-                        allocator.allocateUtf8String(SSLHostConfig.adjustRelativePath(sslHostConfig.getCertificateRevocationListPath()));
++                        memorySession.allocateUtf8String(SSLHostConfig.adjustRelativePath(sslHostConfig.getCertificateRevocationListPath()));
+                 //X509_LOOKUP_ctrl(lookup,X509_L_ADD_DIR,path,type,NULL)
+                 if (X509_LOOKUP_ctrl(x509Lookup, X509_L_ADD_DIR(), certificateRevocationListPathNative,
+                         X509_FILETYPE_PEM(), MemoryAddress.NULL) <= 0) {
+@@ -1204,12 +1197,12 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
+             //SSLContext.setCertificateRaw(state.ctx, chain[0].getEncoded(),
+             //        sb.toString().getBytes(StandardCharsets.US_ASCII),
+             //        getCertificateIndex(certificate));
+-            var rawCertificate = allocator.allocateArray(ValueLayout.JAVA_BYTE, chain[0].getEncoded());
+-            var rawCertificatePointer = allocator.allocate(ValueLayout.ADDRESS, rawCertificate);
+-            var rawKey = allocator.allocateArray(ValueLayout.JAVA_BYTE, sb.toString().getBytes(StandardCharsets.US_ASCII));
++            var rawCertificate = memorySession.allocateArray(ValueLayout.JAVA_BYTE, chain[0].getEncoded());
++            var rawCertificatePointer = memorySession.allocate(ValueLayout.ADDRESS, rawCertificate);
++            var rawKey = memorySession.allocateArray(ValueLayout.JAVA_BYTE, sb.toString().getBytes(StandardCharsets.US_ASCII));
+             var x509cert = d2i_X509(MemoryAddress.NULL, rawCertificatePointer, rawCertificate.byteSize());
+             if (MemoryAddress.NULL.equals(x509cert)) {
+-                logLastError(allocator, "openssl.errorLoadingCertificate");
++                logLastError(memorySession, "openssl.errorLoadingCertificate");
+                 return;
+             }
+             var bio = BIO_new(BIO_s_mem());
+@@ -1217,19 +1210,19 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
+             MemoryAddress privateKeyAddress = PEM_read_bio_PrivateKey(bio, MemoryAddress.NULL, MemoryAddress.NULL, MemoryAddress.NULL);
+             BIO_free(bio);
+             if (MemoryAddress.NULL.equals(privateKeyAddress)) {
+-                logLastError(allocator, "openssl.errorLoadingPrivateKey");
++                logLastError(memorySession, "openssl.errorLoadingPrivateKey");
+                 return;
+             }
+             if (SSL_CTX_use_certificate(state.sslCtx, x509cert) <= 0) {
+-                logLastError(allocator, "openssl.errorLoadingCertificate");
++                logLastError(memorySession, "openssl.errorLoadingCertificate");
+                 return;
+             }
+             if (SSL_CTX_use_PrivateKey(state.sslCtx, privateKeyAddress) <= 0) {
+-                logLastError(allocator, "openssl.errorLoadingPrivateKey");
++                logLastError(memorySession, "openssl.errorLoadingPrivateKey");
+                 return;
+             }
+             if (SSL_CTX_check_private_key(state.sslCtx) <= 0) {
+-                logLastError(allocator, "openssl.errorPrivateKeyCheck");
++                logLastError(memorySession, "openssl.errorPrivateKeyCheck");
+                 return;
+             }
+             // Set callback for DH parameters
+@@ -1238,16 +1231,16 @@ public class OpenSSLContext implements org.apache.tomcat.util.net.SSLContext {
+             SSL_CTX_set_tmp_dh_callback(state.sslCtx, openSSLCallbackTmpDH);
+             for (int i = 1; i < chain.length; i++) {
+                 //SSLContext.addChainCertificateRaw(state.ctx, chain[i].getEncoded());
+-                var rawCertificateChain = allocator.allocateArray(ValueLayout.JAVA_BYTE, chain[i].getEncoded());
+-                var rawCertificateChainPointer = allocator.allocate(ValueLayout.ADDRESS, rawCertificateChain);
++                var rawCertificateChain = memorySession.allocateArray(ValueLayout.JAVA_BYTE, chain[i].getEncoded());
++                var rawCertificateChainPointer = memorySession.allocate(ValueLayout.ADDRESS, rawCertificateChain);
+                 var x509certChain = d2i_X509(MemoryAddress.NULL, rawCertificateChainPointer, rawCertificateChain.byteSize());
+                 if (MemoryAddress.NULL.equals(x509certChain)) {
+-                    logLastError(allocator, "openssl.errorLoadingCertificate");
++                    logLastError(memorySession, "openssl.errorLoadingCertificate");
+                     return;
+                 }
+                 // # define SSL_CTX_add0_chain_cert(sslCtx,x509) SSL_CTX_ctrl(sslCtx,SSL_CTRL_CHAIN_CERT,0,(char *)(x509))
+                 if (SSL_CTX_ctrl(state.sslCtx, SSL_CTRL_CHAIN_CERT(), 0, x509certChain) <= 0) {
+-                    logLastError(allocator, "openssl.errorAddingCertificate");
++                    logLastError(memorySession, "openssl.errorAddingCertificate");
+                     return;
+                 }
+             }
+
+==================================================
+OpenSSLLifecycleListener.java
+index c486226ae2..2af7b0947e 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/net/openssl/panama/OpenSSLEngine.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/net/openssl/panama/OpenSSLEngine.java
+@@ -23,7 +23,6 @@ import java.lang.foreign.Linker;
+ import java.lang.foreign.MemoryAddress;
+ import java.lang.foreign.MemorySegment;
+ import java.lang.foreign.MemorySession;
+-import java.lang.foreign.SegmentAllocator;
+ import java.lang.foreign.ValueLayout;
+ import java.lang.invoke.MethodHandle;
+ import java.lang.invoke.MethodHandles;
+@@ -106,11 +105,10 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
+ 
+         final Set<String> availableCipherSuites = new LinkedHashSet<>(128);
+         try (var memorySession = MemorySession.openConfined()) {
+-            var allocator = SegmentAllocator.newNativeArena(memorySession);
+             var sslCtx = SSL_CTX_new(TLS_server_method());
+             try {
+                 SSL_CTX_set_options(sslCtx, SSL_OP_ALL());
+-                SSL_CTX_set_cipher_list(sslCtx, allocator.allocateUtf8String("ALL"));
++                SSL_CTX_set_cipher_list(sslCtx, memorySession.allocateUtf8String("ALL"));
+                 var ssl = SSL_new(sslCtx);
+                 SSL_set_accept_state(ssl);
+                 try {
+@@ -247,7 +245,6 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
+             throw new IllegalArgumentException(sm.getString("engine.noSSLContext"));
+         }
+         engineMemorySession = MemorySession.openImplicit();
+-        var allocator = SegmentAllocator.newNativeArena(engineMemorySession);
+         session = new OpenSSLSession();
+         var ssl = SSL_new(sslCtx);
+         // Set ssl_info_callback
+@@ -260,13 +257,15 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
+             SSL_set_accept_state(ssl);
+         }
+         SSL_set_verify_result(ssl, X509_V_OK());
+-        var internalBIOPointer = allocator.allocate(ValueLayout.ADDRESS);
+-        var networkBIOPointer = allocator.allocate(ValueLayout.ADDRESS);
+-        BIO_new_bio_pair(internalBIOPointer, 0, networkBIOPointer, 0);
+-        var internalBIO = internalBIOPointer.get(ValueLayout.ADDRESS, 0);
+-        var networkBIO = networkBIOPointer.get(ValueLayout.ADDRESS, 0);
+-        SSL_set_bio(ssl, internalBIO, internalBIO);
+-        state = new EngineState(ssl, networkBIO, certificateVerificationDepth, noOcspCheck);
++        try (var memorySession = MemorySession.openConfined()) {
++            var internalBIOPointer = memorySession.allocate(ValueLayout.ADDRESS);
++            var networkBIOPointer = memorySession.allocate(ValueLayout.ADDRESS);
++            BIO_new_bio_pair(internalBIOPointer, 0, networkBIOPointer, 0);
++            var internalBIO = internalBIOPointer.get(ValueLayout.ADDRESS, 0);
++            var networkBIO = networkBIOPointer.get(ValueLayout.ADDRESS, 0);
++            SSL_set_bio(ssl, internalBIO, internalBIO);
++            state = new EngineState(ssl, networkBIO, certificateVerificationDepth, noOcspCheck);
++        }
+         engineMemorySession.addCloseAction(state);
+         this.fallbackApplicationProtocol = fallbackApplicationProtocol;
+         this.clientMode = clientMode;
+@@ -315,8 +314,7 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
+             }
+         } else {
+             try (var memorySession = MemorySession.openConfined()) {
+-                var allocator = SegmentAllocator.newNativeArena(memorySession);
+-                MemorySegment bufSegment = allocator.allocateArray(ValueLayout.JAVA_BYTE, len);
++                MemorySegment bufSegment = memorySession.allocateArray(ValueLayout.JAVA_BYTE, len);
+                 MemorySegment.copy(src.array(), pos, bufSegment, ValueLayout.JAVA_BYTE, 0, len);
+                 sslWrote = SSL_write(ssl, bufSegment, len);
+                 if (sslWrote > 0) {
+@@ -391,8 +389,7 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
+             final int limit = dst.limit();
+             final int len = Math.min(MAX_ENCRYPTED_PACKET_LENGTH, limit - pos);
+             try (var memorySession = MemorySession.openConfined()) {
+-                var allocator = SegmentAllocator.newNativeArena(memorySession);
+-                MemorySegment bufSegment = allocator.allocateArray(ValueLayout.JAVA_BYTE, len);
++                MemorySegment bufSegment = memorySession.allocateArray(ValueLayout.JAVA_BYTE, len);
+                 final int sslRead = SSL_read(ssl, bufSegment, len);
+                 if (sslRead > 0) {
+                     MemorySegment.copy(bufSegment, ValueLayout.JAVA_BYTE, 0, dst.array(), pos, sslRead);
+@@ -828,9 +825,8 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
+         buf.setLength(buf.length() - 1);
+ 
+         final String cipherSuiteSpec = buf.toString();
+-        try {
+-            SSL_set_cipher_list(state.ssl, SegmentAllocator.newNativeArena(engineMemorySession)
+-                    .allocateUtf8String(cipherSuiteSpec));
++        try (var memorySession = MemorySession.openConfined()) {
++            SSL_set_cipher_list(state.ssl, memorySession.allocateUtf8String(cipherSuiteSpec));
+         } catch (Exception e) {
+             throw new IllegalStateException(sm.getString("engine.failedCipherSuite", cipherSuiteSpec), e);
+         }
+@@ -966,18 +962,19 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
+     }
+ 
+     private byte[] getPeerCertificate() {
+-        var allocator = SegmentAllocator.newNativeArena(engineMemorySession);
+-        MemoryAddress/*(X509*)*/ x509 = (OpenSSLContext.OPENSSL_3 ? SSL_get1_peer_certificate(state.ssl) : SSL_get_peer_certificate(state.ssl));
+-        MemorySegment bufPointer = allocator.allocate(ValueLayout.ADDRESS, MemoryAddress.NULL);
+-        int length = i2d_X509(x509, bufPointer);
+-        if (length <= 0) {
+-            return null;
++        try (var memorySession = MemorySession.openConfined()) {
++            MemoryAddress/*(X509*)*/ x509 = (OpenSSLContext.OPENSSL_3 ? SSL_get1_peer_certificate(state.ssl) : SSL_get_peer_certificate(state.ssl));
++            MemorySegment bufPointer = memorySession.allocate(ValueLayout.ADDRESS, MemoryAddress.NULL);
++            int length = i2d_X509(x509, bufPointer);
++            if (length <= 0) {
++                return null;
++            }
++            MemoryAddress buf = bufPointer.get(ValueLayout.ADDRESS, 0);
++            byte[] certificate = MemorySegment.ofAddress(buf, length, memorySession).toArray(ValueLayout.JAVA_BYTE);
++            X509_free(x509);
++            CRYPTO_free(buf, MemoryAddress.NULL, 0); // OPENSSL_free macro
++            return certificate;
+         }
+-        MemoryAddress buf = bufPointer.get(ValueLayout.ADDRESS, 0);
+-        byte[] certificate = MemorySegment.ofAddress(buf, length, engineMemorySession).toArray(ValueLayout.JAVA_BYTE);
+-        X509_free(x509);
+-        CRYPTO_free(buf, MemoryAddress.NULL, 0); // OPENSSL_free macro
+-        return certificate;
+     }
+ 
+     private byte[][] getPeerCertChain() {
+@@ -987,41 +984,43 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
+             return null;
+         }
+         byte[][] certificateChain = new byte[len][];
+-        var allocator = SegmentAllocator.newNativeArena(engineMemorySession);
+-        for (int i = 0; i < len; i++) {
+-            MemoryAddress/*(X509*)*/ x509 = OPENSSL_sk_value(sk, i);
+-            MemorySegment bufPointer = allocator.allocate(ValueLayout.ADDRESS, MemoryAddress.NULL);
+-            int length = i2d_X509(x509, bufPointer);
+-            if (length < 0) {
+-                certificateChain[i] = new byte[0];
+-                continue;
++        try (var memorySession = MemorySession.openConfined()) {
++            for (int i = 0; i < len; i++) {
++                MemoryAddress/*(X509*)*/ x509 = OPENSSL_sk_value(sk, i);
++                MemorySegment bufPointer = memorySession.allocate(ValueLayout.ADDRESS, MemoryAddress.NULL);
++                int length = i2d_X509(x509, bufPointer);
++                if (length < 0) {
++                    certificateChain[i] = new byte[0];
++                    continue;
++                }
++                MemoryAddress buf = bufPointer.get(ValueLayout.ADDRESS, 0);
++                byte[] certificate = MemorySegment.ofAddress(buf, length, memorySession).toArray(ValueLayout.JAVA_BYTE);
++                certificateChain[i] = certificate;
++                CRYPTO_free(buf, MemoryAddress.NULL, 0); // OPENSSL_free macro
+             }
+-            MemoryAddress buf = bufPointer.get(ValueLayout.ADDRESS, 0);
+-            byte[] certificate = MemorySegment.ofAddress(buf, length, engineMemorySession).toArray(ValueLayout.JAVA_BYTE);
+-            certificateChain[i] = certificate;
+-            CRYPTO_free(buf, MemoryAddress.NULL, 0); // OPENSSL_free macro
++            return certificateChain;
+         }
+-        return certificateChain;
+     }
+ 
+     private String getProtocolNegotiated() {
+-        var allocator = SegmentAllocator.newNativeArena(engineMemorySession);
+-        MemorySegment lenAddress = allocator.allocate(ValueLayout.JAVA_INT, 0);
+-        MemorySegment protocolPointer = allocator.allocate(ValueLayout.ADDRESS, MemoryAddress.NULL);
+-        SSL_get0_alpn_selected(state.ssl, protocolPointer, lenAddress);
+-        if (MemoryAddress.NULL.equals(protocolPointer.address())) {
+-            return null;
+-        }
+-        int length = lenAddress.get(ValueLayout.JAVA_INT, 0);
+-        if (length == 0) {
+-            return null;
+-        }
+-        MemoryAddress protocolAddress = protocolPointer.get(ValueLayout.ADDRESS, 0);
+-        byte[] name = MemorySegment.ofAddress(protocolAddress, length, engineMemorySession).toArray(ValueLayout.JAVA_BYTE);
+-        if (log.isDebugEnabled()) {
+-            log.debug("Protocol negotiated [" + new String(name) + "]");
++        try (var memorySession = MemorySession.openConfined()) {
++            MemorySegment lenAddress = memorySession.allocate(ValueLayout.JAVA_INT, 0);
++            MemorySegment protocolPointer = memorySession.allocate(ValueLayout.ADDRESS, MemoryAddress.NULL);
++            SSL_get0_alpn_selected(state.ssl, protocolPointer, lenAddress);
++            if (MemoryAddress.NULL.equals(protocolPointer.address())) {
++                return null;
++            }
++            int length = lenAddress.get(ValueLayout.JAVA_INT, 0);
++            if (length == 0) {
++                return null;
++            }
++            MemoryAddress protocolAddress = protocolPointer.get(ValueLayout.ADDRESS, 0);
++            byte[] name = MemorySegment.ofAddress(protocolAddress, length, memorySession).toArray(ValueLayout.JAVA_BYTE);
++            if (log.isDebugEnabled()) {
++                log.debug("Protocol negotiated [" + new String(name) + "]");
++            }
++            return new String(name);
+         }
+-        return new String(name);
+     }
+ 
+     private void beginHandshakeImplicitly() throws SSLException {
+@@ -1104,19 +1103,20 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
+         String sslError = null;
+         long error = ERR_get_error();
+         if (error != SSL_ERROR_NONE()) {
+-            var allocator = SegmentAllocator.newNativeArena(engineMemorySession);
+-            do {
+-                // Loop until getLastErrorNumber() returns SSL_ERROR_NONE
+-                var buf = allocator.allocateArray(ValueLayout.JAVA_BYTE, new byte[128]);
+-                ERR_error_string(error, buf);
+-                String err = buf.getUtf8String(0);
+-                if (sslError == null) {
+-                    sslError = err;
+-                }
+-                if (log.isDebugEnabled()) {
+-                    log.debug(sm.getString("engine.openSSLError", Long.toString(error), err));
+-                }
+-            } while ((error = ERR_get_error()) != SSL_ERROR_NONE());
++            try (var memorySession = MemorySession.openConfined()) {
++                do {
++                    // Loop until getLastErrorNumber() returns SSL_ERROR_NONE
++                    var buf = memorySession.allocateArray(ValueLayout.JAVA_BYTE, new byte[128]);
++                    ERR_error_string(error, buf);
++                    String err = buf.getUtf8String(0);
++                    if (sslError == null) {
++                        sslError = err;
++                    }
++                    if (log.isDebugEnabled()) {
++                        log.debug(sm.getString("engine.openSSLError", Long.toString(error), err));
++                    }
++                } while ((error = ERR_get_error()) != SSL_ERROR_NONE());
++            }
+         }
+         return sslError;
+     }
+@@ -1458,7 +1458,6 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
+         MemoryAddress basicResponse = MemoryAddress.NULL;
+         MemoryAddress certId = MemoryAddress.NULL;
+         try (ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
+-            var allocator = SegmentAllocator.newNativeArena(memorySession);
+             ocspRequest = OCSP_REQUEST_new();
+             if (MemoryAddress.NULL.equals(ocspRequest)) {
+                 return V_OCSP_CERTSTATUS_UNKNOWN();
+@@ -1471,7 +1470,7 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
+             if (MemoryAddress.NULL.equals(ocspOneReq)) {
+                 return V_OCSP_CERTSTATUS_UNKNOWN();
+             }
+-            MemorySegment bufPointer = allocator.allocate(ValueLayout.ADDRESS, MemoryAddress.NULL);
++            MemorySegment bufPointer = memorySession.allocate(ValueLayout.ADDRESS, MemoryAddress.NULL);
+             int requestLength = i2d_OCSP_REQUEST(ocspRequest, bufPointer);
+             if (requestLength <= 0) {
+                 return V_OCSP_CERTSTATUS_UNKNOWN();
+@@ -1502,8 +1501,8 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
+                 baos.write(responseBuf, 0, read);
+             }
+             byte[] responseData = baos.toByteArray();
+-            var nativeResponseData = allocator.allocateArray(ValueLayout.JAVA_BYTE, responseData);
+-            var nativeResponseDataPointer = allocator.allocate(ValueLayout.ADDRESS, nativeResponseData);
++            var nativeResponseData = memorySession.allocateArray(ValueLayout.JAVA_BYTE, responseData);
++            var nativeResponseDataPointer = memorySession.allocate(ValueLayout.ADDRESS, nativeResponseData);
+             ocspResponse = d2i_OCSP_RESPONSE(MemoryAddress.NULL, nativeResponseDataPointer, responseData.length);
+             if (!MemoryAddress.NULL.equals(ocspResponse)) {
+                 if (OCSP_response_status(ocspResponse) == OCSP_RESPONSE_STATUS_SUCCESSFUL()) {
+@@ -1563,16 +1562,17 @@ public final class OpenSSLEngine extends SSLEngine implements SSLUtil.ProtocolIn
+             byte[] id = null;
+             synchronized (OpenSSLEngine.this) {
+                 if (!destroyed) {
+-                    var allocator = SegmentAllocator.newNativeArena(engineMemorySession);
+-                    MemorySegment lenPointer = allocator.allocate(ValueLayout.ADDRESS);
+-                    var session = SSL_get_session(state.ssl);
+-                    if (MemoryAddress.NULL.equals(session)) {
+-                        return new byte[0];
++                    try (var memorySession = MemorySession.openConfined()) {
++                        MemorySegment lenPointer = memorySession.allocate(ValueLayout.ADDRESS);
++                        var session = SSL_get_session(state.ssl);
++                        if (MemoryAddress.NULL.equals(session)) {
++                            return new byte[0];
++                        }
++                        MemoryAddress sessionId = SSL_SESSION_get_id(session, lenPointer);
++                        int len = lenPointer.get(ValueLayout.JAVA_INT, 0);
++                        id = (len == 0) ? new byte[0]
++                                : MemorySegment.ofAddress(sessionId, len, memorySession).toArray(ValueLayout.JAVA_BYTE);
+                     }
+-                    MemoryAddress sessionId = SSL_SESSION_get_id(session, lenPointer);
+-                    int len = lenPointer.get(ValueLayout.JAVA_INT, 0);
+-                    id = (len == 0) ? new byte[0]
+-                            : MemorySegment.ofAddress(sessionId, len, engineMemorySession).toArray(ValueLayout.JAVA_BYTE);
+                 }
+             }
+ 
+
+==================================================
+OpenSSLSessionContext.java
+index 50882bc3b8..f65c459d71 100644
+--- a/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/net/openssl/panama/OpenSSLLifecycleListener.java
++++ b/modules/openssl-foreign/src/main/java/org/apache/tomcat/util/net/openssl/panama/OpenSSLLifecycleListener.java
+@@ -23,7 +23,6 @@ import static org.apache.tomcat.util.openssl.openssl_h.*;
+ 
+ import java.lang.foreign.MemoryAddress;
+ import java.lang.foreign.MemorySession;
+-import java.lang.foreign.SegmentAllocator;
+ import java.lang.foreign.ValueLayout;
+ import java.security.SecureRandom;
+ 
+@@ -230,157 +229,157 @@ public class OpenSSLLifecycleListener implements LifecycleListener {
+                 return;
+             }
+ 
+-            var memorySession = MemorySession.global();
+-            var allocator = SegmentAllocator.newNativeArena(memorySession);
+-
+-            // Main library init
+-            initLibrary();
+-
+-            // Setup engine
+-            String engineName = "on".equalsIgnoreCase(SSLEngine) ? null : SSLEngine;
+-            if (engineName != null) {
+-                if ("auto".equals(engineName)) {
+-                    ENGINE_register_all_complete();
+-                } else {
+-                    var engine = allocator.allocateUtf8String(engineName);
+-                    enginePointer = ENGINE_by_id(engine);
+-                    if (MemoryAddress.NULL.equals(enginePointer)) {
+-                        enginePointer = ENGINE_by_id(allocator.allocateUtf8String("dynamic"));
+-                        if (enginePointer != null) {
+-                            if (ENGINE_ctrl_cmd_string(enginePointer, allocator.allocateUtf8String("SO_PATH"), engine, 0) == 0
+-                                    || ENGINE_ctrl_cmd_string(enginePointer, allocator.allocateUtf8String("LOAD"),
+-                                            MemoryAddress.NULL, 0) == 0) {
++            try (var memorySession = MemorySession.openConfined()) {
++
++                // Main library init
++                initLibrary();
++
++                // Setup engine
++                String engineName = "on".equalsIgnoreCase(SSLEngine) ? null : SSLEngine;
++                if (engineName != null) {
++                    if ("auto".equals(engineName)) {
++                        ENGINE_register_all_complete();
++                    } else {
++                        var engine = memorySession.allocateUtf8String(engineName);
++                        enginePointer = ENGINE_by_id(engine);
++                        if (MemoryAddress.NULL.equals(enginePointer)) {
++                            enginePointer = ENGINE_by_id(memorySession.allocateUtf8String("dynamic"));
++                            if (enginePointer != null) {
++                                if (ENGINE_ctrl_cmd_string(enginePointer, memorySession.allocateUtf8String("SO_PATH"), engine, 0) == 0
++                                        || ENGINE_ctrl_cmd_string(enginePointer, memorySession.allocateUtf8String("LOAD"),
++                                                MemoryAddress.NULL, 0) == 0) {
++                                    // Engine load error
++                                    ENGINE_free(enginePointer);
++                                    enginePointer = MemoryAddress.NULL;
++                                }
++                            }
++                        }
++                        if (!MemoryAddress.NULL.equals(enginePointer)) {
++                            if (ENGINE_set_default(enginePointer, ENGINE_METHOD_ALL()) == 0) {
+                                 // Engine load error
+                                 ENGINE_free(enginePointer);
+                                 enginePointer = MemoryAddress.NULL;
+                             }
+                         }
+-                    }
+-                    if (!MemoryAddress.NULL.equals(enginePointer)) {
+-                        if (ENGINE_set_default(enginePointer, ENGINE_METHOD_ALL()) == 0) {
+-                            // Engine load error
+-                            ENGINE_free(enginePointer);
+-                            enginePointer = MemoryAddress.NULL;
++                        if (MemoryAddress.NULL.equals(enginePointer)) {
++                            throw new IllegalStateException(sm.getString("listener.engineError"));
+                         }
+                     }
+-                    if (MemoryAddress.NULL.equals(enginePointer)) {
+-                        throw new IllegalStateException(sm.getString("listener.engineError"));
+-                    }
+                 }
+-            }
+-
+-            // Set the random seed, translated to the Java way
+-            boolean seedDone = false;
+-            if (SSLRandomSeed != null || SSLRandomSeed.length() != 0 || !"builtin".equals(SSLRandomSeed)) {
+-                var randomSeed = allocator.allocateUtf8String(SSLRandomSeed);
+-                seedDone = RAND_load_file(randomSeed, 128) > 0;
+-            }
+-            if (!seedDone) {
+-                // Use a regular random to get some bytes
+-                SecureRandom random = new SecureRandom();
+-                byte[] randomBytes = random.generateSeed(128);
+-                RAND_seed(allocator.allocateArray(ValueLayout.JAVA_BYTE, randomBytes), 128);
+-            }
+-
+-            initDHParameters();
+-
+-            // OpenSSL 3 onwards uses providers
+-            boolean usingProviders = (OpenSSL_version_num() >= 0x3000000fL);
+ 
+-            if (usingProviders || !(null == FIPSMode || "off".equalsIgnoreCase(FIPSMode))) {
+-                fipsModeActive = false;
+-                final boolean enterFipsMode;
+-                int fipsModeState = FIPS_OFF;
+-                if (usingProviders) {
+-                    var md = EVP_MD_fetch(MemoryAddress.NULL, allocator.allocateUtf8String("SHA-512"), MemoryAddress.NULL);
+-                    var provider = EVP_MD_get0_provider(md);
+-                    String name = OSSL_PROVIDER_get0_name(provider).getUtf8String(0);
+-                    EVP_MD_free(md);
+-                    if ("fips".equals(name)) {
+-                        fipsModeState = FIPS_ON;
+-                    }
+-                } else {
+-                    fipsModeState = FIPS_mode();
++                // Set the random seed, translated to the Java way
++                boolean seedDone = false;
++                if (SSLRandomSeed != null || SSLRandomSeed.length() != 0 || !"builtin".equals(SSLRandomSeed)) {
++                    var randomSeed = memorySession.allocateUtf8String(SSLRandomSeed);
++                    seedDone = RAND_load_file(randomSeed, 128) > 0;
+                 }
+-
+-                if(log.isDebugEnabled()) {
+-                    log.debug(sm.getString("listener.currentFIPSMode", Integer.valueOf(fipsModeState)));
++                if (!seedDone) {
++                    // Use a regular random to get some bytes
++                    SecureRandom random = new SecureRandom();
++                    byte[] randomBytes = random.generateSeed(128);
++                    RAND_seed(memorySession.allocateArray(ValueLayout.JAVA_BYTE, randomBytes), 128);
+                 }
+ 
+-                if (null == FIPSMode || "off".equalsIgnoreCase(FIPSMode)) {
+-                    if (fipsModeState == FIPS_ON) {
+-                        fipsModeActive = true;
+-                    }
+-                    enterFipsMode = false;
+-                } else if ("on".equalsIgnoreCase(FIPSMode)) {
+-                    if (fipsModeState == FIPS_ON) {
+-                        if (!usingProviders) {
+-                            log.info(sm.getString("listener.skipFIPSInitialization"));
++                initDHParameters();
++
++                // OpenSSL 3 onwards uses providers
++                boolean usingProviders = (OpenSSL_version_num() >= 0x3000000fL);
++
++                if (usingProviders || !(null == FIPSMode || "off".equalsIgnoreCase(FIPSMode))) {
++                    fipsModeActive = false;
++                    final boolean enterFipsMode;
++                    int fipsModeState = FIPS_OFF;
++                    if (usingProviders) {
++                        var md = EVP_MD_fetch(MemoryAddress.NULL, memorySession.allocateUtf8String("SHA-512"), MemoryAddress.NULL);
++                        var provider = EVP_MD_get0_provider(md);
++                        String name = OSSL_PROVIDER_get0_name(provider).getUtf8String(0);
++                        EVP_MD_free(md);
++                        if ("fips".equals(name)) {
++                            fipsModeState = FIPS_ON;
+                         }
+-                        fipsModeActive = true;
+-                        enterFipsMode = false;
+                     } else {
+-                        if (usingProviders) {
+-                            throw new IllegalStateException(sm.getString("listener.FIPSProviderNotDefault", FIPSMode));
+-                        } else {
+-                            enterFipsMode = true;
+-                        }
++                        fipsModeState = FIPS_mode();
+                     }
+-                } else if ("require".equalsIgnoreCase(FIPSMode)) {
+-                    if (fipsModeState == FIPS_ON) {
+-                        fipsModeActive = true;
+-                        enterFipsMode = false;
+-                    } else {
+-                        if (usingProviders) {
+-                            throw new IllegalStateException(sm.getString("listener.FIPSProviderNotDefault", FIPSMode));
+-                        } else {
+-                            throw new IllegalStateException(sm.getString("listener.requireNotInFIPSMode"));
+-                        }
++
++                    if(log.isDebugEnabled()) {
++                        log.debug(sm.getString("listener.currentFIPSMode", Integer.valueOf(fipsModeState)));
+                     }
+-                } else if ("enter".equalsIgnoreCase(FIPSMode)) {
+-                    if (fipsModeState == FIPS_OFF) {
+-                        if (usingProviders) {
+-                            throw new IllegalStateException(sm.getString("listener.FIPSProviderNotDefault", FIPSMode));
++
++                    if (null == FIPSMode || "off".equalsIgnoreCase(FIPSMode)) {
++                        if (fipsModeState == FIPS_ON) {
++                            fipsModeActive = true;
++                        }
++                        enterFipsMode = false;
++                    } else if ("on".equalsIgnoreCase(FIPSMode)) {
++                        if (fipsModeState == FIPS_ON) {
++                            if (!usingProviders) {
++                                log.info(sm.getString("listener.skipFIPSInitialization"));
++                            }
++                            fipsModeActive = true;
++                            enterFipsMode = false;
+                         } else {
+-                            enterFipsMode = true;
++                            if (usingProviders) {
++                                throw new IllegalStateException(sm.getString("listener.FIPSProviderNotDefault", FIPSMode));
++                            } else {
++                                enterFipsMode = true;
++                            }
+                         }
+-                    } else {
+-                        if (usingProviders) {
++                    } else if ("require".equalsIgnoreCase(FIPSMode)) {
++                        if (fipsModeState == FIPS_ON) {
+                             fipsModeActive = true;
+                             enterFipsMode = false;
+                         } else {
+-                            throw new IllegalStateException(sm.getString(
+-                                    "listener.enterAlreadyInFIPSMode", Integer.valueOf(fipsModeState)));
++                            if (usingProviders) {
++                                throw new IllegalStateException(sm.getString("listener.FIPSProviderNotDefault", FIPSMode));
++                            } else {
++                                throw new IllegalStateException(sm.getString("listener.requireNotInFIPSMode"));
++                            }
+                         }
++                    } else if ("enter".equalsIgnoreCase(FIPSMode)) {
++                        if (fipsModeState == FIPS_OFF) {
++                            if (usingProviders) {
++                                throw new IllegalStateException(sm.getString("listener.FIPSProviderNotDefault", FIPSMode));
++                            } else {
++                                enterFipsMode = true;
++                            }
++                        } else {
++                            if (usingProviders) {
++                                fipsModeActive = true;
++                                enterFipsMode = false;
++                            } else {
++                                throw new IllegalStateException(sm.getString(
++                                        "listener.enterAlreadyInFIPSMode", Integer.valueOf(fipsModeState)));
++                            }
++                        }
++                    } else {
++                        throw new IllegalArgumentException(sm.getString(
++                                "listener.wrongFIPSMode", FIPSMode));
+                     }
+-                } else {
+-                    throw new IllegalArgumentException(sm.getString(
+-                            "listener.wrongFIPSMode", FIPSMode));
+-                }
+ 
+-                if (enterFipsMode) {
+-                    log.info(sm.getString("listener.initializingFIPS"));
++                    if (enterFipsMode) {
++                        log.info(sm.getString("listener.initializingFIPS"));
+ 
+-                    fipsModeState = FIPS_mode_set(FIPS_ON);
+-                    if (fipsModeState != FIPS_ON) {
+-                        // This case should be handled by the native method,
+-                        // but we'll make absolutely sure, here.
+-                        String message = sm.getString("listener.initializeFIPSFailed");
+-                        log.error(message);
+-                        throw new IllegalStateException(message);
++                        fipsModeState = FIPS_mode_set(FIPS_ON);
++                        if (fipsModeState != FIPS_ON) {
++                            // This case should be handled by the native method,
++                            // but we'll make absolutely sure, here.
++                            String message = sm.getString("listener.initializeFIPSFailed");
++                            log.error(message);
++                            throw new IllegalStateException(message);
++                        }
++
++                        fipsModeActive = true;
++                        log.info(sm.getString("listener.initializeFIPSSuccess"));
+                     }
+ 
+-                    fipsModeActive = true;
+-                    log.info(sm.getString("listener.initializeFIPSSuccess"));
++                    if (usingProviders && fipsModeActive) {
++                        log.info(sm.getString("aprListener.usingFIPSProvider"));
++                    }
+                 }
+ 
+-                if (usingProviders && fipsModeActive) {
+-                    log.info(sm.getString("aprListener.usingFIPSProvider"));
+-                }
++                log.info(sm.getString("listener.initializedOpenSSL", OpenSSL_version(0).getUtf8String(0)));
++                OpenSSLStatus.setAvailable(true);
+             }
+-
+-            log.info(sm.getString("listener.initializedOpenSSL", OpenSSL_version(0).getUtf8String(0)));
+-            OpenSSLStatus.setAvailable(true);
+         }
+     }
+ 
+
+==================================================

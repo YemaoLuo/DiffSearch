@@ -1,0 +1,160 @@
+c89926bccf055c9e02bf08869c42d46821726abe
+==================================================
+Extend the parameter limits to multi-part processing
+==================================================
+Mark Emlyn
+==================================================
+Tue Nov 1 12:49:53 2011 +0000
+==================================================
+Request.java
+index 3f22b0eedc..10a1dc137f 100644
+--- a/java/org/apache/catalina/connector/LocalStrings.properties
++++ b/java/org/apache/catalina/connector/LocalStrings.properties
+@@ -62,6 +62,7 @@ coyoteRequest.authenticate.ise=Cannot call authenticate() after the reponse has
+ coyoteRequest.uploadLocationInvalid=The temporary upload location [{0}] is not valid
+ coyoteRequest.sessionEndAccessFail=Exception triggered ending access to session while recycling request
+ coyoteRequest.sendfileNotCanonical=Unable to determine canonical name of file [{0}] specified for use with sendfile
++coyoteRequest.maxPostSizeExceeded=The multi-part request contained parameter data (excluding uploaded files) that exceeded the limit for maxPostSize set on the associated connector
+ 
+ requestFacade.nullRequest=The request object has been recycled and is no longer associated with this facade
+ 
+
+==================================================
+Parameters.java
+index df1459f6bd..0e89a0aa50 100644
+--- a/java/org/apache/catalina/connector/Request.java
++++ b/java/org/apache/catalina/connector/Request.java
+@@ -22,6 +22,7 @@ import java.io.File;
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.io.UnsupportedEncodingException;
++import java.nio.charset.Charset;
+ import java.security.Principal;
+ import java.text.SimpleDateFormat;
+ import java.util.ArrayList;
+@@ -2520,26 +2521,59 @@ public class Request
+         parts = new ArrayList<Part>();
+         try {
+             List<FileItem> items = upload.parseRequest(this);
++            int maxPostSize = getConnector().getMaxPostSize();
++            int postSize = 0;
++            String enc = getCharacterEncoding();
++            Charset charset = null;
++            if (enc != null) {
++                try {
++                    charset = B2CConverter.getCharset(enc);
++                } catch (UnsupportedEncodingException e) {
++                    // Ignore
++                }
++            }
+             for (FileItem item : items) {
+                 ApplicationPart part = new ApplicationPart(item, mce);
+                 parts.add(part);
+                 if (part.getFilename() == null) {
++                    String name = part.getName();
++                    String value = null;
+                     try {
+                         String encoding = parameters.getEncoding();
+                         if (encoding == null) {
+                             encoding = Parameters.DEFAULT_ENCODING;
+                         }
+-                        parameters.addParameter(part.getName(),
+-                                part.getString(encoding));
++                        value = part.getString(encoding);
+                     } catch (UnsupportedEncodingException uee) {
+                         try {
+-                            parameters.addParameter(part.getName(),
+-                                    part.getString(
+-                                            Parameters.DEFAULT_ENCODING));
++                            value = part.getString(Parameters.DEFAULT_ENCODING);
+                         } catch (UnsupportedEncodingException e) {
+                             // Should not be possible
+                         }
+                     }
++                    if (maxPostSize > 0) {
++                        // Have to calculate equivalent size. Not completely
++                        // accurate but close enough.
++                        if (charset == null) {
++                            // Name length
++                            postSize += name.getBytes().length;
++                        } else {
++                            postSize += name.getBytes(charset).length;
++                        }
++                        if (value != null) {
++                            // Equals sign
++                            postSize++;
++                            // Value length
++                            postSize += part.getSize();
++                        }
++                        // Value separator
++                        postSize++;
++                        if (postSize > maxPostSize) {
++                            throw new IllegalStateException(sm.getString(
++                                    "coyoteRequest.maxPostSizeExceeded"));
++                        }
++                    }
++                    parameters.addParameter(name, value);
+                 }
+             }
+ 
+
+==================================================
+TestParameters.java
+index 0536cb5739..e9d86b5b81 100644
+--- a/java/org/apache/tomcat/util/http/Parameters.java
++++ b/java/org/apache/tomcat/util/http/Parameters.java
+@@ -157,10 +157,21 @@ public final class Parameters {
+     }
+ 
+ 
+-    public void addParameter( String key, String value ) {
++    public void addParameter( String key, String value )
++            throws IllegalStateException {
++
+         if( key==null ) {
+             return;
+         }
++
++        parameterCount ++;
++        if (limit > -1 && parameterCount > limit) {
++            // Processing this parameter will push us over the limit. ISE is
++            // what Request.parseParts() uses for requests that are too big
++            throw new IllegalStateException(sm.getString(
++                    "parameters.maxCountFail", Integer.valueOf(limit)));
++        }
++
+         ArrayList<String> values = paramHashValues.get(key);
+         if (values == null) {
+             values = new ArrayList<String>(1);
+@@ -204,13 +215,6 @@ public final class Parameters {
+         int end = start + len;
+ 
+         while(pos < end) {
+-            parameterCount ++;
+-
+-            if (limit > -1 && parameterCount >= limit) {
+-                log.warn(sm.getString("parameters.maxCountFail",
+-                        Integer.valueOf(limit)));
+-                break;
+-            }
+             int nameStart = pos;
+             int nameEnd = -1;
+             int valueStart = -1;
+@@ -328,7 +332,14 @@ public final class Parameters {
+                 tmpValue.setCharset(charset);
+                 value = tmpValue.toString();
+ 
+-                addParameter(name, value);
++                try {
++                    addParameter(name, value);
++                } catch (IllegalStateException ise) {
++                    // Hitting limit stops processing further params but does
++                    // not cause request to fail.
++                    log.warn(ise.getMessage());
++                    break;
++                }
+             } catch (IOException e) {
+                 decodeFailCount++;
+                 if (decodeFailCount == 1 || log.isDebugEnabled()) {
+
+==================================================

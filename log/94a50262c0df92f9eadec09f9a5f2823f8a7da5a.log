@@ -1,0 +1,343 @@
+94a50262c0df92f9eadec09f9a5f2823f8a7da5a
+==================================================
+Fix BZ 66196 - Log and drop invalid HTTP/1.1 response headers
+==================================================
+Mark Thomas
+==================================================
+Fri Sep 2 11:24:06 2022 +0100
+==================================================
+Http11Processor.java
+Fix BZ 66196 - Log and drop invalid HTTP/1.1 response headers
+
+https://bz.apache.org/bugzilla/show_bug.cgi?id=66196
+This also optimizes the common case of String -> Byte conversion in
+MessageByte when ISO-8859-1 is used.
+
+
+
+==================================================
+MessageBytes.java
+index 2dd62b93e9..da283cb3f4 100644
+--- a/java/org/apache/tomcat/util/buf/LocalStrings.properties
++++ b/java/org/apache/tomcat/util/buf/LocalStrings.properties
+@@ -27,6 +27,8 @@ encodedSolidusHandling.invalid=The value [{0}] is not recognised
+ hexUtils.fromHex.nonHex=The input must consist only of hex digits
+ hexUtils.fromHex.oddDigits=The input must consist of an even number of hex digits
+ 
++messageBytes.illegalCharacter=The Unicode character [{0}] at code point [{1}] cannot be encoded as it is outside the permitted range of 0 to 255
++
+ uDecoder.eof=End of file (EOF)
+ uDecoder.noSlash=The encoded slash character is not allowed
+ uDecoder.urlDecode.conversionError=Failed to decode [{0}] using character set [{1}]
+
+==================================================
+TestHttp11OutputBuffer.java
+index d1d675fd02..50ae3596dc 100644
+--- a/java/org/apache/tomcat/util/buf/MessageBytes.java
++++ b/java/org/apache/tomcat/util/buf/MessageBytes.java
+@@ -19,9 +19,12 @@ package org.apache.tomcat.util.buf;
+ import java.io.IOException;
+ import java.io.Serializable;
+ import java.nio.ByteBuffer;
++import java.nio.CharBuffer;
+ import java.nio.charset.Charset;
+ import java.util.Locale;
+ 
++import org.apache.tomcat.util.res.StringManager;
++
+ /**
+  * This class is used to represent a subarray of bytes in an HTTP message.
+  * It represents all request/response elements. The byte/char conversions are
+@@ -35,8 +38,11 @@ import java.util.Locale;
+  * @author Costin Manolache
+  */
+ public final class MessageBytes implements Cloneable, Serializable {
++
+     private static final long serialVersionUID = 1L;
+ 
++    private static final StringManager sm = StringManager.getManager(MessageBytes.class);
++
+     // primary type ( whatever is set as original value )
+     private int type = T_NULL;
+ 
+@@ -230,29 +236,71 @@ public final class MessageBytes implements Cloneable, Serializable {
+      * Convert to bytes and fill the ByteChunk with the converted value.
+      */
+     public void toBytes() {
+-        switch (type) {
+-            case T_NULL:
+-                byteC.recycle();
+-                //$FALL-THROUGH$
+-            case T_BYTES:
+-                // No conversion required
+-                return;
+-            case T_CHARS:
+-                toString();
+-                //$FALL-THROUGH$
+-            case T_STR: {
+-                type = T_BYTES;
+-                Charset charset = byteC.getCharset();
+-                ByteBuffer result = charset.encode(strValue);
+-                byteC.setBytes(result.array(), result.arrayOffset(), result.limit());
++        if (type == T_NULL) {
++            byteC.recycle();
++            return;
++        }
++
++        if (type == T_BYTES) {
++            // No conversion required
++            return;
++        }
++
++        if (getCharset() == ByteChunk.DEFAULT_CHARSET) {
++            if (type == T_CHARS) {
++                toBytesSimple(charC.getChars(), charC.getStart(), charC.getLength());
++            } else {
++                // Must be T_STR
++                char[] chars = strValue.toCharArray();
++                toBytesSimple(chars, 0, chars.length);
++            }
++            return;
++        }
++
++        ByteBuffer bb;
++        if (type == T_CHARS) {
++            bb = getCharset().encode(CharBuffer.wrap(charC));
++        } else {
++            // Must be T_STR
++            bb = getCharset().encode(strValue);
++        }
++
++        byteC.setBytes(bb.array(), bb.arrayOffset(), bb.limit());
++        type = T_BYTES;
++    }
++
++
++    /**
++     * Simple conversion of chars to bytes.
++     *
++     * @throws IllegalArgumentException if any of the characters to convert are
++     *                                  above code point 0xFF.
++     */
++    private void toBytesSimple(char[] chars, int start, int len) {
++        byteC.recycle();
++        byteC.allocate(len, byteC.getLimit());
++        byte[] bytes = byteC.getBuffer();
++
++        for (int i = 0; i < len; i++) {
++            if (chars[i + start] > 255) {
++                throw new IllegalArgumentException(sm.getString("messageBytes.illegalCharacter",
++                        Character.toString(chars[i + start]), Integer.valueOf(chars[i + start])));
++            } else {
++                bytes[i] = (byte) chars[i + start];
+             }
+         }
++
++        byteC.setEnd(len);
++        type = T_BYTES;
+     }
+ 
+ 
+     /**
+      * Convert to char[] and fill the CharChunk.
+-     * XXX Not optimized - it converts to String first.
++     *
++     * Note: The conversion from bytes is not optimised - it converts to String
++     *       first. However, Tomcat doesn't call this method to convert from
++     *       bytes so there is no benefit from optimising that path.
+      */
+     public void toChars() {
+         switch (type) {
+
+==================================================
+TestMessageBytes.java
+index affb5d37a9..f8ab52112b 100644
+--- a/test/org/apache/coyote/http11/TestHttp11OutputBuffer.java
++++ b/test/org/apache/coyote/http11/TestHttp11OutputBuffer.java
+@@ -16,6 +16,16 @@
+  */
+ package org.apache.coyote.http11;
+ 
++import java.io.IOException;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++
++import jakarta.servlet.ServletException;
++import jakarta.servlet.http.HttpServlet;
++import jakarta.servlet.http.HttpServletRequest;
++import jakarta.servlet.http.HttpServletResponse;
++
+ import org.junit.Assert;
+ import org.junit.Test;
+ 
+@@ -23,6 +33,7 @@ import org.apache.catalina.Context;
+ import org.apache.catalina.startup.ExpectationClient;
+ import org.apache.catalina.startup.Tomcat;
+ import org.apache.catalina.startup.TomcatBaseTest;
++import org.apache.tomcat.util.buf.ByteChunk;
+ 
+ public class TestHttp11OutputBuffer extends TomcatBaseTest {
+ 
+@@ -55,4 +66,74 @@ public class TestHttp11OutputBuffer extends TomcatBaseTest {
+         Assert.assertTrue(client.isResponse200());
+         Assert.assertTrue(client.isResponseBodyOK());
+     }
++
++
++    @Test
++    public void testHTTPHeaderBelow128() throws Exception {
++        doTestHTTPHeaderValue("This should be OK", true);
++    }
++
++
++    @Test
++    public void testHTTPHeader128To255() throws Exception {
++        doTestHTTPHeaderValue("\u00A0 should be OK", true);
++    }
++
++
++    @Test
++    public void testHTTPHeaderAbove255() throws Exception {
++        doTestHTTPHeaderValue("\u0100 should fail", false);
++    }
++
++
++    private void doTestHTTPHeaderValue(String customHeaderValue, boolean valid) throws Exception {
++        Tomcat tomcat = getTomcatInstance();
++
++        // No file system docBase required
++        Context ctx = tomcat.addContext("", null);
++
++        Tomcat.addServlet(ctx, "header", new HeaderServlet(customHeaderValue));
++        ctx.addServletMappingDecoded("/header", "header");
++
++        tomcat.start();
++
++        Map<String,List<String>> resHeaders = new HashMap<>();
++        int rc = getUrl("http://localhost:" + getPort() + "/header", new ByteChunk(), resHeaders);
++
++        if (valid) {
++            Assert.assertEquals(HttpServletResponse.SC_OK, rc);
++            List<String> values = resHeaders.get(HeaderServlet.CUSTOM_HEADER_NAME);
++            Assert.assertNotNull(values);
++            Assert.assertEquals(1, values.size());
++            Assert.assertEquals(customHeaderValue, values.get(0));
++        } else {
++            Assert.assertEquals(HttpServletResponse.SC_OK, rc);
++            List<String> values = resHeaders.get(HeaderServlet.CUSTOM_HEADER_NAME);
++            Assert.assertNull(values);
++        }
++    }
++
++
++    private static class HeaderServlet extends HttpServlet {
++
++        private static final long serialVersionUID = 1L;
++
++        private static final String CUSTOM_HEADER_NAME = "X-Test";
++
++        private final String customHeaderValue;
++
++        public HeaderServlet(String customHeaderValue) {
++            this.customHeaderValue = customHeaderValue;
++        }
++
++        @Override
++        protected void doGet(HttpServletRequest req, HttpServletResponse resp) throws ServletException, IOException {
++            resp.setContentType("text/plain");
++            resp.setCharacterEncoding("UTF-8");
++
++            resp.setHeader(CUSTOM_HEADER_NAME, customHeaderValue);
++
++            resp.flushBuffer();
++        }
++    }
+ }
+
+==================================================
+TestMessageBytesConversion.java
+index f9af7fd19d..f2016f478d 100644
+--- a/test/org/apache/tomcat/util/buf/TestMessageBytes.java
++++ b/test/org/apache/tomcat/util/buf/TestMessageBytes.java
+@@ -16,6 +16,10 @@
+  */
+ package org.apache.tomcat.util.buf;
+ 
++import java.nio.charset.Charset;
++import java.nio.charset.StandardCharsets;
++
++import org.junit.Assert;
+ import org.junit.Test;
+ 
+ public class TestMessageBytes {
+@@ -66,4 +70,67 @@ public class TestMessageBytes {
+         mb.recycle();
+         mb.toChars();
+     }
++
++
++    /*
++     * Checks the the optimized code is at least twice as fast as the
++     * non-optimized code.
++     */
++    @Test
++    public void testConversionPerformance() {
++        long optimized = -1;
++        long nonOptimized = -1;
++
++        /*
++         * One loop is likely to be enough as the optimised code is
++         * significantly (3x to 4x on markt's desktop) faster than the
++         * non-optimised code. Loop three times allows once to warn up the JVM
++         * once to run the test and once more in case of unexpected CI /GC
++         * slowness. The test will exit early if possible.
++         */
++        for (int i = 0; i < 3; i++) {
++            optimized = doTestConversionPerformance(StandardCharsets.ISO_8859_1);
++            // US_ASCII chosen as the conversion is the same and it is another
++            // Charset available on all platforms.
++            nonOptimized = doTestConversionPerformance(StandardCharsets.US_ASCII);
++
++            System.out.println(optimized + " " + nonOptimized);
++            if (optimized * 2 < nonOptimized) {
++                break;
++            }
++        }
++
++        Assert.assertTrue("Non-optimised code was faster (" + nonOptimized + "ns) compared to optimized (" + optimized + "ns)", optimized < nonOptimized);
++    }
++
++
++    private long doTestConversionPerformance(Charset charset) {
++        MessageBytes mb = MessageBytes.newInstance();
++
++        int loops = 1000000;
++
++        long start = System.nanoTime();
++        for (int i = 0; i < loops; i++) {
++            mb.recycle();
++            mb.setCharset(charset);
++            mb.setString("0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF" +
++                    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF" +
++                    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF" +
++                    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF" +
++                    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF" +
++                    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF" +
++                    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF" +
++                    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF" +
++                    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF" +
++                    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF" +
++                    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF" +
++                    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF" +
++                    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF" +
++                    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF" +
++                    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF" +
++                    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF");
++            mb.toBytes();
++        }
++        return System.nanoTime() - start;
++    }
+ }
+
+==================================================

@@ -1,0 +1,395 @@
+2ab4a1b54f6301f038a309e8ea7f4692b7dd5a8b
+==================================================
+Refactoring
+==================================================
+Mark Thomas
+==================================================
+Fri Jan 15 17:40:18 2016 +0000
+==================================================
+Manager.java
+Refactoring
+Make the session attribute distribution / filtering more consistent across the various Manager and Session implementation.
+Differentiate between
+- whether or not it is possible for an attribute to be distributed - Session.isAttributeDistributable()
+- whether or not the Manager wants and attribute to be distributed - Manager.willAttributeDistribute
+
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1724863 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Session.java
+index 2ca24be767..05cb02060c 100644
+--- a/java/org/apache/catalina/Manager.java
++++ b/java/org/apache/catalina/Manager.java
+@@ -370,4 +370,18 @@ public interface Manager {
+      * a method that executes periodic tasks, such as expiring sessions etc.
+      */
+     public void backgroundProcess();
++
++
++    /**
++     * Would the Manager distribute the given session attribute? Manager
++     * implementations may provide additional configuration options to control
++     * which attributes are distributable.
++     *
++     * @param name  The attribute name
++     * @param value The attribute value
++     *
++     * @return {@code true} if the Manager would distribute the given attribute
++     *         otherwise {@code false}
++     */
++    public boolean willAttributeDistribute(String name, Object value);
+ }
+
+==================================================
+ClusterManagerBase.java
+index cb576f6a73..f551ada52d 100644
+--- a/java/org/apache/catalina/Session.java
++++ b/java/org/apache/catalina/Session.java
+@@ -356,4 +356,23 @@ public interface Session {
+             boolean notifySessionListeners, boolean notifyContainerListeners);
+ 
+ 
++    /**
++     * Does the session implementation support the distributing of the given
++     * attribute? If the Manager is marked as distributable, then this method
++     * must be used to check attributes before adding them to a session and
++     * an {@link IllegalArgumentException} thrown if the proposed attribute is
++     * not distributable.
++     * <p>
++     * Note that the {@link Manager} implementation may further restrict which
++     * attributes are distributed but a {@link Manager} level restriction should
++     * not trigger an {@link IllegalArgumentException} in
++     * {@link HttpSession#setAttribute(String, Object)}
++     *
++     * @param name  The attribute name
++     * @param value The attribute value
++     *
++     * @return {@code true} if distribution is supported, otherwise {@code
++     *         false}
++     */
++    public boolean isAttributeDistributable(String name, Object value);
+ }
+
+==================================================
+DeltaSession.java
+index aa889e66a4..13f248e6f8 100644
+--- a/java/org/apache/catalina/ha/session/ClusterManagerBase.java
++++ b/java/org/apache/catalina/ha/session/ClusterManagerBase.java
+@@ -138,14 +138,25 @@ public abstract class ClusterManagerBase extends ManagerBase implements ClusterM
+      *
+      * @param name The attribute name
+      * @return <code>true</code> if the attribute should be distributed
++     *
++     * @deprecated Use {@link #willAttributeDistribute(String, Object)}. Will be
++     *             removed in Tomcat 9.0.x
+      */
++    @Deprecated
+     public boolean willAttributeDistribute(String name) {
++        return willAttributeDistribute(name, null);
++    }
++
++
++    @Override
++    public boolean willAttributeDistribute(String name, Object value) {
+         if (sessionAttributePattern == null) {
+             return true;
+         }
+         return sessionAttributePattern.matcher(name).matches();
+     }
+ 
++
+     public static ClassLoader[] getClassLoaders(Context context) {
+         ClassLoader tccl = Thread.currentThread().getContextClassLoader();
+         Loader loader = context.getLoader();
+
+==================================================
+DummyProxySession.java
+index ff94915efb..209c855786 100644
+--- a/java/org/apache/catalina/ha/session/DeltaSession.java
++++ b/java/org/apache/catalina/ha/session/DeltaSession.java
+@@ -610,42 +610,11 @@ public class DeltaSession extends StandardSession implements Externalizable,Clus
+         return deltaRequest;
+     }
+ 
++
+     // ------------------------------------------------- HttpSession Properties
+ 
+     // ----------------------------------------------HttpSession Public Methods
+ 
+-
+-    /**
+-     * Check whether the Object can be distributed.
+-     * The object is always distributable, if the cluster manager
+-     * decides to never distribute it.
+-     * @param name The name of the attribute to check
+-     * @param value The value of the attribute to check
+-     * @return true if the attribute is distributable, false otherwise
+-     */
+-    @Override
+-    protected boolean isAttributeDistributable(String name, Object value) {
+-        if (manager instanceof ClusterManagerBase &&
+-            !((ClusterManagerBase)manager).willAttributeDistribute(name))
+-            return true;
+-        return super.isAttributeDistributable(name, value);
+-    }
+-
+-    /**
+-     * Exclude attributes from replication.
+-     * @param name the attribute's name
+-     * @return true if attribute should not be replicated
+-     */
+-    @Override
+-    protected boolean exclude(String name) {
+-
+-        if (super.exclude(name))
+-            return true;
+-        if (manager instanceof ClusterManagerBase)
+-            return !((ClusterManagerBase)manager).willAttributeDistribute(name);
+-        return false;
+-    }
+-
+     /**
+      * Remove the object bound with the specified name from this session. If the
+      * session does not have an object bound with this name, this method does
+@@ -713,7 +682,7 @@ public class DeltaSession extends StandardSession implements Externalizable,Clus
+         lock();
+         try {
+             super.setAttribute(name,value, notify);
+-            if (addDeltaRequest && deltaRequest != null && !exclude(name)) {
++            if (addDeltaRequest && deltaRequest != null && !exclude(name, value)) {
+                 deltaRequest.setAttribute(name, value);
+             }
+         } finally {
+@@ -863,9 +832,8 @@ public class DeltaSession extends StandardSession implements Externalizable,Clus
+         for (int i = 0; i < keys.length; i++) {
+             Object value = null;
+             value = attributes.get(keys[i]);
+-            if (value == null || exclude(keys[i]))
+-                continue;
+-            else if (value instanceof Serializable) {
++            if (value != null && !exclude(keys[i], value) &&
++                    isAttributeDistributable(keys[i], value)) {
+                 saveNames.add(keys[i]);
+                 saveValues.add(value);
+             }
+@@ -908,7 +876,7 @@ public class DeltaSession extends StandardSession implements Externalizable,Clus
+             if (value == null) return;
+ 
+             super.removeAttributeInternal(name,notify);
+-            if (addDeltaRequest && deltaRequest != null && !exclude(name)) {
++            if (addDeltaRequest && deltaRequest != null && !exclude(name, null)) {
+                 deltaRequest.removeAttribute(name);
+             }
+ 
+
+==================================================
+Constants.java
+index 63d930e720..cdc282ff62 100644
+--- a/java/org/apache/catalina/manager/DummyProxySession.java
++++ b/java/org/apache/catalina/manager/DummyProxySession.java
+@@ -214,4 +214,9 @@ public class DummyProxySession implements Session {
+             boolean notifySessionListeners, boolean notifyContainerListeners) {
+         // NOOP
+     }
++
++    @Override
++    public boolean isAttributeDistributable(String name, Object value) {
++        return false;
++    }
+ }
+
+==================================================
+ManagerBase.java
+index 3350345702..37fd52e9f7 100644
+--- a/java/org/apache/catalina/session/Constants.java
++++ b/java/org/apache/catalina/session/Constants.java
+@@ -14,9 +14,13 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
++package org.apache.catalina.session;
+ 
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.Set;
+ 
+-package org.apache.catalina.session;
++import org.apache.catalina.Globals;
+ 
+ /**
+  * Manifest constants for the <code>org.apache.catalina.session</code>
+@@ -27,6 +31,17 @@ package org.apache.catalina.session;
+ 
+ public class Constants {
+ 
+-    public static final String Package = "org.apache.catalina.session";
++    /**
++     * Set of session attribute names used internally by Tomcat that should
++     * always be removed from the session before it is persisted, replicated or
++     * equivalent.
++     */
++    public static final Set<String> excludedAttributeNames;
+ 
++    static {
++        Set<String> names = new HashSet<>();
++        names.add(Globals.SUBJECT_ATTR);
++        names.add(Globals.GSS_CREDENTIAL_ATTR);
++        excludedAttributeNames = Collections.unmodifiableSet(names);
++    }
+ }
+
+==================================================
+StandardSession.java
+index 1e128fcda6..19e571908f 100644
+--- a/java/org/apache/catalina/session/ManagerBase.java
++++ b/java/org/apache/catalina/session/ManagerBase.java
+@@ -191,8 +191,7 @@ public abstract class ManagerBase extends LifecycleMBeanBase
+     /**
+      * The string manager for this package.
+      */
+-    protected static final StringManager sm =
+-        StringManager.getManager(Constants.Package);
++    protected static final StringManager sm = StringManager.getManager(ManagerBase.class);
+ 
+     /**
+      * The property change support for this component.
+@@ -773,6 +772,17 @@ public abstract class ManagerBase extends LifecycleMBeanBase
+     }
+ 
+ 
++    /**
++     * {@inheritDoc}
++     * <p>
++     * This implementation always returns {@code true}
++     */
++    @Override
++    public boolean willAttributeDistribute(String name, Object value) {
++        return true;
++    }
++
++
+     // ------------------------------------------------------ Protected Methods
+ 
+ 
+
+==================================================
+StoreBase.java
+index 2b19fb895a..6ffba7af2b 100644
+--- a/java/org/apache/catalina/session/StandardSession.java
++++ b/java/org/apache/catalina/session/StandardSession.java
+@@ -162,7 +162,11 @@ public class StandardSession implements HttpSession, Session, Serializable {
+ 
+     /**
+      * Set of attribute names which are not allowed to be persisted.
++     *
++     * @deprecated Use {@link Constants#excludedAttributeNames} instead. Will be
++     *             removed in Tomcat 9.
+      */
++    @Deprecated
+     protected static final String[] excludedAttributes = {
+         Globals.SUBJECT_ATTR,
+         Globals.GSS_CREDENTIAL_ATTR
+@@ -247,8 +251,7 @@ public class StandardSession implements HttpSession, Session, Serializable {
+     /**
+      * The string manager for this package.
+      */
+-    protected static final StringManager sm =
+-        StringManager.getManager(Constants.Package);
++    protected static final StringManager sm = StringManager.getManager(StandardSession.class);
+ 
+ 
+     /**
+@@ -1463,13 +1466,15 @@ public class StandardSession implements HttpSession, Session, Serializable {
+         }
+ 
+         // Validate our current state
+-        if (!isValidInternal())
++        if (!isValidInternal()) {
+             throw new IllegalStateException(sm.getString(
+                     "standardSession.setAttribute.ise", getIdInternal()));
++        }
+         if ((manager != null) && manager.getDistributable() &&
+-          !isAttributeDistributable(name, value))
+-            throw new IllegalArgumentException
+-                (sm.getString("standardSession.setAttribute.iae", name));
++                !isAttributeDistributable(name, value) && !exclude(name, value)) {
++            throw new IllegalArgumentException(sm.getString(
++                    "standardSession.setAttribute.iae", name));
++        }
+         // Construct an event with the new value
+         HttpSessionBindingEvent event = null;
+ 
+@@ -1571,15 +1576,14 @@ public class StandardSession implements HttpSession, Session, Serializable {
+     }
+ 
+     /**
+-     * Check whether the Object can be distributed. This implementation
+-     * simply checks for serializability. Derived classes might use other
+-     * distribution technology not based on serialization and can extend
+-     * this check.
+-     * @param name The name of the attribute to check
+-     * @param value The value of the attribute to check
+-     * @return true if the attribute is distributable, false otherwise
++     * {@inheritDoc}
++     * <p>
++     * This implementation simply checks the value for serializability.
++     * Sub-classes might use other distribution technology not based on
++     * serialization and can override this check.
+      */
+-    protected boolean isAttributeDistributable(String name, Object value) {
++    @Override
++    public boolean isAttributeDistributable(String name, Object value) {
+         return value instanceof Serializable;
+     }
+ 
+@@ -1723,15 +1727,40 @@ public class StandardSession implements HttpSession, Session, Serializable {
+      * @param name the attribute's name
+      * @return <code>true</code> if the specified attribute should be
+      *    excluded from serialization
++     *
++     * @deprecated Use {@link #exclude(String, Object)}. Will be removed in
++     *             Tomcat 9.0.x.
+      */
++    @Deprecated
+     protected boolean exclude(String name){
++        return exclude(name, null);
++    }
+ 
+-        for (int i = 0; i < excludedAttributes.length; i++) {
+-            if (name.equalsIgnoreCase(excludedAttributes[i]))
+-                return true;
+-        }
+ 
+-        return false;
++    /**
++     * Should the given session attribute be excluded? This implementation
++     * checks:</p>
++     * <ul>
++     * <li>{@link Constants#excludedAttributeNames}</li>
++     * <li>{@link Manager#willAttributeDistribute(String, Object)}</li>
++     * </ul>
++     * Note: This method deliberately does not check
++     *       {@link #isAttributeDistributable(String, Object)} which is
++     *       deliberately separate to support the checks required in
++     *       {@link #setAttribute(String, Object, boolean)}
++     *
++     * @param name  The attribute name
++     * @param value The attribute value
++     *
++     * @return {@code true} if the attribute should be excluded from
++     *         distribution, otherwise {@false}
++     */
++    protected boolean exclude(String name, Object value) {
++        if (Constants.excludedAttributeNames.contains(name)) {
++            return true;
++        }
++        // Last check so use a short-cut
++        return !getManager().willAttributeDistribute(name, value);
+     }
+ 
+ 
+
+==================================================

@@ -1,0 +1,160 @@
+aa73fa021267bfee65b0aa79c22057941ef5b210
+==================================================
+Minor Graal workarounds and robustness
+==================================================
+remm remm@apache.org
+==================================================
+Fri May 10 13:59:13 2019 +0200
+==================================================
+ParallelWebappClassLoader.java
+Minor Graal workarounds and robustness
+
+It goes up to the webapp start now. Still having problems with CL
+resources though, among many other items.
+
+
+==================================================
+WebappClassLoaderBase.java
+index 2235229d13..a71d26d447 100644
+--- a/java/org/apache/catalina/loader/ParallelWebappClassLoader.java
++++ b/java/org/apache/catalina/loader/ParallelWebappClassLoader.java
+@@ -19,13 +19,14 @@ package org.apache.catalina.loader;
+ import org.apache.catalina.LifecycleException;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
++import org.apache.tomcat.util.compat.JreCompat;
+ 
+ public class ParallelWebappClassLoader extends WebappClassLoaderBase {
+ 
+     private static final Log log = LogFactory.getLog(ParallelWebappClassLoader.class);
+ 
+     static {
+-        boolean result = ClassLoader.registerAsParallelCapable();
++        boolean result = !JreCompat.isGraalAvailable() && ClassLoader.registerAsParallelCapable();
+         if (!result) {
+             log.warn(sm.getString("webappClassLoaderParallel.registrationFailed"));
+         }
+
+==================================================
+CharsetMapper.java
+index a8a079e101..1ee573bf4c 100644
+--- a/java/org/apache/catalina/loader/WebappClassLoaderBase.java
++++ b/java/org/apache/catalina/loader/WebappClassLoaderBase.java
+@@ -137,7 +137,9 @@ public abstract class WebappClassLoaderBase extends URLClassLoader
+     private static final String CLASS_FILE_SUFFIX = ".class";
+ 
+     static {
+-        ClassLoader.registerAsParallelCapable();
++        if (!JreCompat.isGraalAvailable()) {
++            ClassLoader.registerAsParallelCapable();
++        }
+         JVM_THREAD_GROUP_NAMES.add(JVM_THREAD_GROUP_SYSTEM);
+         JVM_THREAD_GROUP_NAMES.add("RMI Runtime");
+     }
+@@ -1215,7 +1217,7 @@ public abstract class WebappClassLoaderBase extends URLClassLoader
+     @Override
+     public Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
+ 
+-        synchronized (getClassLoadingLock(name)) {
++        synchronized (JreCompat.isGraalAvailable() ? this : getClassLoadingLock(name)) {
+             if (log.isDebugEnabled())
+                 log.debug("loadClass(" + name + ", " + resolve + ")");
+             Class<?> clazz = null;
+@@ -1234,7 +1236,7 @@ public abstract class WebappClassLoaderBase extends URLClassLoader
+             }
+ 
+             // (0.1) Check our previously loaded class cache
+-            clazz = findLoadedClass(name);
++            clazz = JreCompat.isGraalAvailable() ? null : findLoadedClass(name);
+             if (clazz != null) {
+                 if (log.isDebugEnabled())
+                     log.debug("  Returning class from cache");
+@@ -2323,7 +2325,7 @@ public abstract class WebappClassLoaderBase extends URLClassLoader
+         if (clazz != null)
+             return clazz;
+ 
+-        synchronized (getClassLoadingLock(name)) {
++        synchronized (JreCompat.isGraalAvailable() ? this : getClassLoadingLock(name)) {
+             clazz = entry.loadedClass;
+             if (clazz != null)
+                 return clazz;
+
+==================================================
+Localizer.java
+index 1d6df62f88..f0efd5a702 100644
+--- a/java/org/apache/catalina/util/CharsetMapper.java
++++ b/java/org/apache/catalina/util/CharsetMapper.java
+@@ -23,6 +23,7 @@ import java.util.Locale;
+ import java.util.Properties;
+ 
+ import org.apache.tomcat.util.ExceptionUtils;
++import org.apache.tomcat.util.compat.JreCompat;
+ 
+ 
+ 
+@@ -69,11 +70,15 @@ public class CharsetMapper {
+      *  resource could not be loaded for any reason.
+      */
+     public CharsetMapper(String name) {
+-        try (InputStream stream = this.getClass().getResourceAsStream(name)) {
+-            map.load(stream);
+-        } catch (Throwable t) {
+-            ExceptionUtils.handleThrowable(t);
+-            throw new IllegalArgumentException(t.toString());
++        if (JreCompat.isGraalAvailable()) {
++            map.put("en", "ISO-8859-1");
++        } else {
++            try (InputStream stream = this.getClass().getResourceAsStream(name)) {
++                map.load(stream);
++            } catch (Throwable t) {
++                ExceptionUtils.handleThrowable(t);
++                throw new IllegalArgumentException(t);
++            }
+         }
+     }
+ 
+
+==================================================
+StringManager.java
+index 24a6de268a..e22803a64d 100644
+--- a/java/org/apache/jasper/compiler/Localizer.java
++++ b/java/org/apache/jasper/compiler/Localizer.java
+@@ -37,7 +37,6 @@ public class Localizer {
+             bundle = ResourceBundle.getBundle("org.apache.jasper.resources.LocalStrings");
+         } catch (Throwable t) {
+             ExceptionUtils.handleThrowable(t);
+-            t.printStackTrace();
+         }
+     }
+ 
+@@ -55,7 +54,9 @@ public class Localizer {
+     public static String getMessage(String errCode) {
+         String errMsg = errCode;
+         try {
+-            errMsg = bundle.getString(errCode);
++            if (bundle != null) {
++                errMsg = bundle.getString(errCode);
++            }
+         } catch (MissingResourceException e) {
+         }
+         return errMsg;
+
+==================================================
+JreCompat.java
+index 5e36c1af27..8e9922d2dc 100644
+--- a/java/org/apache/naming/StringManager.java
++++ b/java/org/apache/naming/StringManager.java
+@@ -110,7 +110,10 @@ public class StringManager {
+         String str = null;
+ 
+         try {
+-            str = bundle.getString(key);
++            // Avoid NPE if bundle is null and treat it like an MRE
++            if (bundle != null) {
++                str = bundle.getString(key);
++            }
+         } catch(MissingResourceException mre) {
+             //bad: shouldn't mask an exception the following way:
+             //   str = "[cannot find message associated with key '" + key + "' due to " + mre + "]";
+
+==================================================

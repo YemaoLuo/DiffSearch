@@ -1,0 +1,239 @@
+1d35952456418c80cdca6e8e117699cc2a88a7e0
+==================================================
+First pass at an implementation that supports multiple certificate types for all connectors.
+==================================================
+Mark Thomas
+==================================================
+Fri Jun 19 21:20:02 2015 +0000
+==================================================
+AbstractJsseEndpoint.java
+First pass at an implementation that supports multiple certificate types for all connectors.
+Smoke test (SNI with 2 hosts with NIO) passes.
+Further testing required.
+Configuration via server.xml is still TODO
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1686501 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+SSLHostConfig.java
+index 4315d84498..8b699d45b8 100644
+--- a/java/org/apache/tomcat/util/net/AbstractJsseEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AbstractJsseEndpoint.java
+@@ -16,6 +16,9 @@
+  */
+ package org.apache.tomcat.util.net;
+ 
++import java.util.ArrayList;
++import java.util.Iterator;
++import java.util.LinkedHashSet;
+ import java.util.List;
+ import java.util.Set;
+ 
+@@ -132,19 +135,36 @@ public abstract class AbstractJsseEndpoint<S> extends AbstractEndpoint<S> {
+ 
+ 
+     private SSLHostConfigCertificate selectCertificate(
+-            SSLHostConfig sslHostConfig, List<Cipher> clientRequestedCiphers) {
++            SSLHostConfig sslHostConfig, List<Cipher> clientCiphers) {
+ 
+         Set<SSLHostConfigCertificate> certificates = sslHostConfig.getCertificates(true);
+         if (certificates.size() == 1) {
+             return certificates.iterator().next();
+         }
+ 
+-        // TODO:
+-        // Need to select correct certificate based on the ciphers requested by
+-        // the client, the ciphers configured for the server and which is
+-        // configured to define the preference order
++        LinkedHashSet<Cipher> serverCiphers = sslHostConfig.getCipherList();
+ 
+-        // For now, just return the first certificate
++        List<Cipher> candidateCiphers = new ArrayList<>();
++        if (sslHostConfig.getHonorCipherOrder()) {
++            candidateCiphers.addAll(serverCiphers);
++            candidateCiphers.retainAll(clientCiphers);
++        } else {
++            candidateCiphers.addAll(clientCiphers);
++            candidateCiphers.retainAll(serverCiphers);
++        }
++
++        Iterator<Cipher> candidateIter = candidateCiphers.iterator();
++        while (candidateIter.hasNext()) {
++            Cipher candidate = candidateIter.next();
++            for (SSLHostConfigCertificate certificate : certificates) {
++                if (certificate.getType().isCompatibleWith(candidate.getAu())) {
++                    return certificate;
++                }
++            }
++        }
++
++        // No matches. Just return the first certificate. The handshake will
++        // then fail due to no matching ciphers.
+         return certificates.iterator().next();
+     }
+ 
+
+==================================================
+SSLHostConfigCertificate.java
+index 4448c5ba09..0b0aa8f2fc 100644
+--- a/java/org/apache/tomcat/util/net/SSLHostConfig.java
++++ b/java/org/apache/tomcat/util/net/SSLHostConfig.java
+@@ -19,6 +19,8 @@ package org.apache.tomcat.util.net;
+ import java.io.File;
+ import java.util.HashMap;
+ import java.util.HashSet;
++import java.util.LinkedHashSet;
++import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+ 
+@@ -27,6 +29,7 @@ import javax.net.ssl.TrustManagerFactory;
+ 
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
++import org.apache.tomcat.util.net.jsse.openssl.Cipher;
+ import org.apache.tomcat.util.net.jsse.openssl.OpenSSLCipherConfigurationParser;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+@@ -75,6 +78,8 @@ public class SSLHostConfig {
+     private CertificateVerification certificateVerification = CertificateVerification.NONE;
+     private int certificateVerificationDepth = 10;
+     private String ciphers = "HIGH:!aNULL:!eNULL:!EXPORT:!DES:!RC4:!MD5:!kRSA";
++    private LinkedHashSet<Cipher> cipherList = null;
++    private List<String> jsseCipherNames = null;
+     private boolean honorCipherOrder = true;
+     private Set<String> protocols = new HashSet<>();
+     // JSSE
+@@ -250,6 +255,9 @@ public class SSLHostConfig {
+         } else {
+             this.ciphers = ciphersList;
+         }
++        this.cipherList = null;
++        this.jsseCipherNames = null;
++
+     }
+ 
+ 
+@@ -258,6 +266,22 @@ public class SSLHostConfig {
+     }
+ 
+ 
++    public LinkedHashSet<Cipher> getCipherList() {
++        if (cipherList == null) {
++            cipherList = OpenSSLCipherConfigurationParser.parse(ciphers);
++        }
++        return cipherList;
++    }
++
++
++    public List<String> getJsseCipherNames() {
++        if (jsseCipherNames == null) {
++            jsseCipherNames = OpenSSLCipherConfigurationParser.convertForJSSE(getCipherList());
++        }
++        return jsseCipherNames;
++    }
++
++
+     public void setHonorCipherOrder(boolean honorCipherOrder) {
+         this.honorCipherOrder = honorCipherOrder;
+     }
+
+==================================================
+JSSESocketFactory.java
+index 8fb40f939f..5e145a22f4 100644
+--- a/java/org/apache/tomcat/util/net/SSLHostConfigCertificate.java
++++ b/java/org/apache/tomcat/util/net/SSLHostConfigCertificate.java
+@@ -16,7 +16,11 @@
+  */
+ package org.apache.tomcat.util.net;
+ 
++import java.util.HashSet;
++import java.util.Set;
++
+ import org.apache.tomcat.util.net.AbstractJsseEndpoint.SSLContextWrapper;
++import org.apache.tomcat.util.net.jsse.openssl.Authentication;
+ 
+ 
+ public class SSLHostConfigCertificate {
+@@ -174,9 +178,25 @@ public class SSLHostConfigCertificate {
+     // Nested types
+ 
+     public static enum Type {
++
+         UNDEFINED,
+-        RSA,
+-        DSA,
+-        ECC
++        RSA(Authentication.RSA),
++        DSA(Authentication.DSS),
++        ECC(Authentication.ECDH, Authentication.ECDSA);
++
++        private final Set<Authentication> compatibleAuthentications;
++
++        private Type(Authentication... authentications) {
++            compatibleAuthentications = new HashSet<>();
++            if (authentications != null) {
++                for (Authentication authentication : authentications) {
++                    compatibleAuthentications.add(authentication);
++                }
++            }
++        }
++
++        public boolean isCompatibleWith(Authentication au) {
++            return compatibleAuthentications.contains(au);
++        }
+     }
+ }
+
+==================================================
+Authentication.java
+index a8562eb93b..bca2339536 100644
+--- a/java/org/apache/tomcat/util/net/jsse/JSSESocketFactory.java
++++ b/java/org/apache/tomcat/util/net/jsse/JSSESocketFactory.java
+@@ -58,7 +58,6 @@ import org.apache.tomcat.util.net.SSLContext;
+ import org.apache.tomcat.util.net.SSLHostConfig;
+ import org.apache.tomcat.util.net.SSLHostConfigCertificate;
+ import org.apache.tomcat.util.net.SSLUtil;
+-import org.apache.tomcat.util.net.jsse.openssl.OpenSSLCipherConfigurationParser;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+ /**
+@@ -142,17 +141,14 @@ public class JSSESocketFactory implements SSLUtil {
+ 
+     @Override
+     public String[] getEnableableCiphers(SSLContext context) {
+-        String requestedCiphersStr = sslHostConfig.getCiphers();
+-
+-        List<String> requestedCiphers =
+-                OpenSSLCipherConfigurationParser.parseExpression(requestedCiphersStr);
++        List<String> requestedCiphers = sslHostConfig.getJsseCipherNames();
+ 
+         List<String> ciphers = new ArrayList<>(requestedCiphers);
+         ciphers.retainAll(Arrays.asList(context.getSupportedSSLParameters().getCipherSuites()));
+ 
+         if (ciphers.isEmpty()) {
+             log.warn(sm.getString("jsse.requested_ciphers_not_supported",
+-                    requestedCiphersStr));
++                    sslHostConfig.getCiphers()));
+         }
+         if (log.isDebugEnabled()) {
+             log.debug(sm.getString("jsse.enableable_ciphers", ciphers));
+
+==================================================
+OpenSSLCipherConfigurationParser.java
+index 21ad4d4fb8..c1859d82b1 100644
+--- a/java/org/apache/tomcat/util/net/jsse/openssl/Authentication.java
++++ b/java/org/apache/tomcat/util/net/jsse/openssl/Authentication.java
+@@ -17,7 +17,7 @@
+ 
+ package org.apache.tomcat.util.net.jsse.openssl;
+ 
+-enum Authentication {
++public enum Authentication {
+     RSA /* RSA auth */,
+     DSS /* DSS auth */,
+     aNULL /* no auth (i.e. use ADH or AECDH) */,
+
+==================================================

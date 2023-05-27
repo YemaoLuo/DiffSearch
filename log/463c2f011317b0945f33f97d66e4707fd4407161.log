@@ -1,0 +1,234 @@
+463c2f011317b0945f33f97d66e4707fd4407161
+==================================================
+Fix https://bz.apache.org/bugzilla/show_bug.cgi?id=57974
+==================================================
+Mark Thomas
+==================================================
+Thu Jan 24 22:54:41 2019 +0000
+==================================================
+WsSession.java
+Fix https://bz.apache.org/bugzilla/show_bug.cgi?id=57974
+Re-work code that supports Session.getOpenSessions() to ensure that both client-side and server-side calls behave as the EG intended
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1852079 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+WsWebSocketContainer.java
+index 6b040c4e97..40b38b7401 100644
+--- a/java/org/apache/tomcat/websocket/WsSession.java
++++ b/java/org/apache/tomcat/websocket/WsSession.java
+@@ -45,6 +45,7 @@ import javax.websocket.RemoteEndpoint;
+ import javax.websocket.SendResult;
+ import javax.websocket.Session;
+ import javax.websocket.WebSocketContainer;
++import javax.websocket.server.ServerEndpointConfig;
+ 
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+@@ -416,7 +417,7 @@ public class WsSession implements Session {
+     @Override
+     public Set<Session> getOpenSessions() {
+         checkState();
+-        return webSocketContainer.getOpenSessions(localEndpoint);
++        return webSocketContainer.getOpenSessions(getSessionMapKey());
+     }
+ 
+ 
+@@ -605,11 +606,21 @@ public class WsSession implements Session {
+                 localEndpoint.onError(this, e);
+             }
+         } finally {
+-            webSocketContainer.unregisterSession(localEndpoint, this);
++            webSocketContainer.unregisterSession(getSessionMapKey(), this);
+         }
+     }
+ 
+ 
++    private Object getSessionMapKey() {
++        if (endpointConfig instanceof ServerEndpointConfig) {
++            // Server
++            return ((ServerEndpointConfig) endpointConfig).getPath();
++        } else {
++            // Client
++            return localEndpoint;
++        }
++    }
++
+     /**
+      * Use protected so unit tests can access this method directly.
+      * @param msg The message
+
+==================================================
+WsHttpUpgradeHandler.java
+index 29d92525fa..abebdec018 100644
+--- a/java/org/apache/tomcat/websocket/WsWebSocketContainer.java
++++ b/java/org/apache/tomcat/websocket/WsWebSocketContainer.java
+@@ -89,8 +89,9 @@ public class WsWebSocketContainer implements WebSocketContainer, BackgroundProce
+     private final Object asynchronousChannelGroupLock = new Object();
+ 
+     private final Log log = LogFactory.getLog(WsWebSocketContainer.class); // must not be static
+-    private final Map<Endpoint, Set<WsSession>> endpointSessionMap =
+-            new HashMap<>();
++    // Server side uses the endpoint path as the key
++    // Client side uses the client endpoint instance
++    private final Map<Object, Set<WsSession>> endpointSessionMap = new HashMap<>();
+     private final Map<WsSession,WsSession> sessions = new ConcurrentHashMap<>();
+     private final Object endPointSessionMapLock = new Object();
+ 
+@@ -578,7 +579,7 @@ public class WsWebSocketContainer implements WebSocketContainer, BackgroundProce
+         return ByteBuffer.wrap(bytes);
+     }
+ 
+-    protected void registerSession(Endpoint endpoint, WsSession wsSession) {
++    protected void registerSession(Object key, WsSession wsSession) {
+ 
+         if (!wsSession.isOpen()) {
+             // The session was closed during onOpen. No need to register it.
+@@ -588,10 +589,10 @@ public class WsWebSocketContainer implements WebSocketContainer, BackgroundProce
+             if (endpointSessionMap.size() == 0) {
+                 BackgroundProcessManager.getInstance().register(this);
+             }
+-            Set<WsSession> wsSessions = endpointSessionMap.get(endpoint);
++            Set<WsSession> wsSessions = endpointSessionMap.get(key);
+             if (wsSessions == null) {
+                 wsSessions = new HashSet<>();
+-                endpointSessionMap.put(endpoint, wsSessions);
++                endpointSessionMap.put(key, wsSessions);
+             }
+             wsSessions.add(wsSession);
+         }
+@@ -599,14 +600,14 @@ public class WsWebSocketContainer implements WebSocketContainer, BackgroundProce
+     }
+ 
+ 
+-    protected void unregisterSession(Endpoint endpoint, WsSession wsSession) {
++    protected void unregisterSession(Object key, WsSession wsSession) {
+ 
+         synchronized (endPointSessionMapLock) {
+-            Set<WsSession> wsSessions = endpointSessionMap.get(endpoint);
++            Set<WsSession> wsSessions = endpointSessionMap.get(key);
+             if (wsSessions != null) {
+                 wsSessions.remove(wsSession);
+                 if (wsSessions.size() == 0) {
+-                    endpointSessionMap.remove(endpoint);
++                    endpointSessionMap.remove(key);
+                 }
+             }
+             if (endpointSessionMap.size() == 0) {
+@@ -617,10 +618,10 @@ public class WsWebSocketContainer implements WebSocketContainer, BackgroundProce
+     }
+ 
+ 
+-    Set<Session> getOpenSessions(Endpoint endpoint) {
++    Set<Session> getOpenSessions(Object key) {
+         HashSet<Session> result = new HashSet<>();
+         synchronized (endPointSessionMapLock) {
+-            Set<WsSession> sessions = endpointSessionMap.get(endpoint);
++            Set<WsSession> sessions = endpointSessionMap.get(key);
+             if (sessions != null) {
+                 result.addAll(sessions);
+             }
+
+==================================================
+WsServerContainer.java
+index 0cde0e3672..437a33ca8e 100644
+--- a/java/org/apache/tomcat/websocket/server/WsHttpUpgradeHandler.java
++++ b/java/org/apache/tomcat/websocket/server/WsHttpUpgradeHandler.java
+@@ -26,8 +26,8 @@ import javax.websocket.CloseReason;
+ import javax.websocket.CloseReason.CloseCodes;
+ import javax.websocket.DeploymentException;
+ import javax.websocket.Endpoint;
+-import javax.websocket.EndpointConfig;
+ import javax.websocket.Extension;
++import javax.websocket.server.ServerEndpointConfig;
+ 
+ import org.apache.coyote.http11.upgrade.InternalHttpUpgradeHandler;
+ import org.apache.juli.logging.Log;
+@@ -54,7 +54,7 @@ public class WsHttpUpgradeHandler implements InternalHttpUpgradeHandler {
+     private SocketWrapperBase<?> socketWrapper;
+ 
+     private Endpoint ep;
+-    private EndpointConfig endpointConfig;
++    private ServerEndpointConfig serverEndpointConfig;
+     private WsServerContainer webSocketContainer;
+     private WsHandshakeRequest handshakeRequest;
+     private List<Extension> negotiatedExtensions;
+@@ -80,13 +80,13 @@ public class WsHttpUpgradeHandler implements InternalHttpUpgradeHandler {
+     }
+ 
+ 
+-    public void preInit(Endpoint ep, EndpointConfig endpointConfig,
++    public void preInit(Endpoint ep, ServerEndpointConfig serverEndpointConfig,
+             WsServerContainer wsc, WsHandshakeRequest handshakeRequest,
+             List<Extension> negotiatedExtensionsPhase2, String subProtocol,
+             Transformation transformation, Map<String,String> pathParameters,
+             boolean secure) {
+         this.ep = ep;
+-        this.endpointConfig = endpointConfig;
++        this.serverEndpointConfig = serverEndpointConfig;
+         this.webSocketContainer = wsc;
+         this.handshakeRequest = handshakeRequest;
+         this.negotiatedExtensions = negotiatedExtensionsPhase2;
+@@ -124,14 +124,14 @@ public class WsHttpUpgradeHandler implements InternalHttpUpgradeHandler {
+                     handshakeRequest.getQueryString(),
+                     handshakeRequest.getUserPrincipal(), httpSessionId,
+                     negotiatedExtensions, subProtocol, pathParameters, secure,
+-                    endpointConfig);
++                    serverEndpointConfig);
+             wsFrame = new WsFrameServer(socketWrapper, wsSession, transformation,
+                     applicationClassLoader);
+             // WsFrame adds the necessary final transformations. Copy the
+             // completed transformation chain to the remote end point.
+             wsRemoteEndpointServer.setTransformation(wsFrame.getTransformation());
+-            ep.onOpen(wsSession, endpointConfig);
+-            webSocketContainer.registerSession(ep, wsSession);
++            ep.onOpen(wsSession, serverEndpointConfig);
++            webSocketContainer.registerSession(serverEndpointConfig.getPath(), wsSession);
+         } catch (DeploymentException e) {
+             throw new IllegalArgumentException(e);
+         } finally {
+
+==================================================
+TestWsWebSocketContainerGetOpenSessions.java
+index ae178cba1a..e1661a4201 100644
+--- a/java/org/apache/tomcat/websocket/server/WsServerContainer.java
++++ b/java/org/apache/tomcat/websocket/server/WsServerContainer.java
+@@ -37,7 +37,6 @@ import javax.websocket.CloseReason;
+ import javax.websocket.CloseReason.CloseCodes;
+ import javax.websocket.DeploymentException;
+ import javax.websocket.Encoder;
+-import javax.websocket.Endpoint;
+ import javax.websocket.server.ServerContainer;
+ import javax.websocket.server.ServerEndpoint;
+ import javax.websocket.server.ServerEndpointConfig;
+@@ -341,8 +340,8 @@ public class WsServerContainer extends WsWebSocketContainer
+      * Overridden to make it visible to other classes in this package.
+      */
+     @Override
+-    protected void registerSession(Endpoint endpoint, WsSession wsSession) {
+-        super.registerSession(endpoint, wsSession);
++    protected void registerSession(Object key, WsSession wsSession) {
++        super.registerSession(key, wsSession);
+         if (wsSession.isOpen() &&
+                 wsSession.getUserPrincipal() != null &&
+                 wsSession.getHttpSessionId() != null) {
+@@ -358,13 +357,13 @@ public class WsServerContainer extends WsWebSocketContainer
+      * Overridden to make it visible to other classes in this package.
+      */
+     @Override
+-    protected void unregisterSession(Endpoint endpoint, WsSession wsSession) {
++    protected void unregisterSession(Object key, WsSession wsSession) {
+         if (wsSession.getUserPrincipal() != null &&
+                 wsSession.getHttpSessionId() != null) {
+             unregisterAuthenticatedSession(wsSession,
+                     wsSession.getHttpSessionId());
+         }
+-        super.unregisterSession(endpoint, wsSession);
++        super.unregisterSession(key, wsSession);
+     }
+ 
+ 
+
+==================================================

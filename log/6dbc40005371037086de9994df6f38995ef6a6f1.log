@@ -1,0 +1,182 @@
+6dbc40005371037086de9994df6f38995ef6a6f1
+==================================================
+Implement asynchronous callbacks for CometEvent.close and CometEvent.setTimeout to avoid connections with very long timeouts getting stuck
+==================================================
+Filip Hanik
+==================================================
+Sat Apr 5 20:44:42 2008 +0000
+==================================================
+CometProcessor.java
+Implement asynchronous callbacks for CometEvent.close and CometEvent.setTimeout to avoid connections with very long timeouts getting stuck
+CometProcessor implements servlet interface, or the code will fail deployment
+if no keepalive, close the connection after comet transaction is complete
+
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@645175 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+CometEventImpl.java
+index 8645f0041f..4536a82099 100644
+--- a/java/org/apache/catalina/CometProcessor.java
++++ b/java/org/apache/catalina/CometProcessor.java
+@@ -21,6 +21,7 @@ package org.apache.catalina;
+ import java.io.IOException;
+ 
+ import javax.servlet.ServletException;
++import javax.servlet.Servlet;
+ 
+ /**
+  * This interface should be implemented by servlets which would like to handle
+@@ -29,7 +30,7 @@ import javax.servlet.ServletException;
+  * Note: When this interface is implemented, the service method of the servlet will
+  * never be called, and will be replaced with a begin event.
+  */
+-public interface CometProcessor {
++public interface CometProcessor extends Servlet{
+ 
+     /**
+      * Process the given Comet event.
+
+==================================================
+Request.java
+index 5a2670e535..3c3489a02d 100644
+--- a/java/org/apache/catalina/connector/CometEventImpl.java
++++ b/java/org/apache/catalina/connector/CometEventImpl.java
+@@ -26,6 +26,7 @@ import javax.servlet.http.HttpServletResponse;
+ 
+ import org.apache.catalina.CometEvent;
+ import org.apache.catalina.util.StringManager;
++import org.apache.coyote.ActionCode;
+ 
+ public class CometEventImpl implements CometEvent {
+ 
+@@ -92,8 +93,10 @@ public class CometEventImpl implements CometEvent {
+         if (request == null) {
+             throw new IllegalStateException(sm.getString("cometEvent.nullRequest"));
+         }
++        boolean iscomet = request.isComet();
+         request.setComet(false);
+         response.finishResponse();
++        if (iscomet) request.cometClose();
+     }
+ 
+     public EventSubType getEventSubType() {
+@@ -116,6 +119,7 @@ public class CometEventImpl implements CometEvent {
+             UnsupportedOperationException {
+         if (request.getAttribute("org.apache.tomcat.comet.timeout.support") == Boolean.TRUE) {
+             request.setAttribute("org.apache.tomcat.comet.timeout", new Integer(timeout));
++            if (request.isComet()) request.setCometTimeout((long)timeout);
+         } else {
+             throw new UnsupportedOperationException();
+         }
+
+==================================================
+ActionCode.java
+index 7a2f21f22b..2b3ed3f1b0 100644
+--- a/java/org/apache/catalina/connector/Request.java
++++ b/java/org/apache/catalina/connector/Request.java
+@@ -2256,6 +2256,13 @@ public class Request
+         return (inputBuffer.available() > 0);
+     }
+ 
++    public void cometClose() {
++        coyoteRequest.action(ActionCode.ACTION_COMET_CLOSE,getEvent());
++    }
++    
++    public void setCometTimeout(long timeout) {
++        coyoteRequest.action(ActionCode.ACTION_COMET_SETTIMEOUT,new Long(timeout));
++    }
+     
+     // ------------------------------------------------------ Protected Methods
+ 
+
+==================================================
+Http11AprProcessor.java
+index 1bc8622800..ac2e0fcab3 100644
+--- a/java/org/apache/coyote/ActionCode.java
++++ b/java/org/apache/coyote/ActionCode.java
+@@ -141,7 +141,7 @@ public final class ActionCode {
+ 
+ 
+     /**
+-     * Callback for begin Comet processing
++     * Callback for end Comet processing
+      */
+     public static final ActionCode ACTION_COMET_END = new ActionCode(22);
+ 
+@@ -151,7 +151,16 @@ public final class ActionCode {
+      */
+     public static final ActionCode ACTION_AVAILABLE = new ActionCode(23);
+ 
++    /**
++     * Callback for an asynchronous close of the Comet event
++     */
++    public static final ActionCode ACTION_COMET_CLOSE = new ActionCode(24);
+ 
++    /**
++     * Callback for setting the timeout asynchronously
++     */
++    public static final ActionCode ACTION_COMET_SETTIMEOUT = new ActionCode(25);
++    
+     // ----------------------------------------------------------- Constructors
+     int code;
+ 
+
+==================================================
+Http11NioProcessor.java
+index 884b71cfd8..d1a8ead199 100644
+--- a/java/org/apache/coyote/http11/Http11AprProcessor.java
++++ b/java/org/apache/coyote/http11/Http11AprProcessor.java
+@@ -1205,6 +1205,10 @@ public class Http11AprProcessor implements ActionHook {
+             comet = true;
+         } else if (actionCode == ActionCode.ACTION_COMET_END) {
+             comet = false;
++        } else if (actionCode == ActionCode.ACTION_COMET_CLOSE) {
++            //no op
++        } else if (actionCode == ActionCode.ACTION_COMET_SETTIMEOUT) {
++            //no op
+         }
+ 
+     }
+
+==================================================
+NioEndpoint.java
+index 0c57c7bcfe..86df02a641 100644
+--- a/java/org/apache/coyote/http11/Http11NioProcessor.java
++++ b/java/org/apache/coyote/http11/Http11NioProcessor.java
+@@ -777,7 +777,8 @@ public class Http11NioProcessor implements ActionHook {
+             return SocketState.CLOSED;
+         } else if (!comet) {
+             recycle();
+-            return SocketState.OPEN;
++            //pay attention to the keep alive flag set in process()
++            return (keepAlive)?SocketState.OPEN:SocketState.CLOSED;
+         } else {
+             return SocketState.LONG;
+         }
+@@ -1219,6 +1220,21 @@ public class Http11NioProcessor implements ActionHook {
+             comet = true;
+         } else if (actionCode == ActionCode.ACTION_COMET_END) {
+             comet = false;
++        }  else if (actionCode == ActionCode.ACTION_COMET_CLOSE) {
++            NioEndpoint.KeyAttachment attach = (NioEndpoint.KeyAttachment)socket.getAttachment(false);
++            attach.setCometOps(NioEndpoint.OP_CALLBACK);
++            //notify poller if not on a tomcat thread
++            RequestInfo rp = request.getRequestProcessor();
++            if ( rp.getStage() != org.apache.coyote.Constants.STAGE_SERVICE ) //async handling
++                socket.getPoller().cometInterest(socket);
++        } else if (actionCode == ActionCode.ACTION_COMET_SETTIMEOUT) {
++            if (param==null) return;
++            NioEndpoint.KeyAttachment attach = (NioEndpoint.KeyAttachment)socket.getAttachment(false);
++            long timeout = ((Long)param).longValue();
++            //if we are not piggy backing on a worker thread, set the timeout
++            RequestInfo rp = request.getRequestProcessor();
++            if ( rp.getStage() != org.apache.coyote.Constants.STAGE_SERVICE ) //async handling
++                attach.setTimeout(timeout);
+         }
+ 
+     }
+
+==================================================

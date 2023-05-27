@@ -1,0 +1,5170 @@
+27ac1263bf25a6af9175afe772416e39b1f51f6a
+==================================================
+Add experimental NIO2 connector. Based on code developed by Nabil Benothman.
+==================================================
+Remy Maucherat
+==================================================
+Mon Mar 10 11:27:11 2014 +0000
+==================================================
+AjpNio2Processor.java
+index 8dccf57048..95b907d05f 100644
+--- a/build.xml
++++ b/build.xml
+@@ -1317,7 +1317,7 @@
+   <property name="junit.formatter.extension" value=".txt" />
+ 
+   <target name="test" description="Runs the JUnit test cases"
+-          depends="test-bio,test-nio,test-apr,cobertura-report" >
++          depends="test-bio,test-nio,test-nio2,test-apr,cobertura-report" >
+     <fail if="test.result.error" message='Some tests completed with an Error. See ${tomcat.build}/logs for details, search for "FAILED".' />
+     <fail if="test.result.failure" message='Some tests completed with a Failure. See ${tomcat.build}/logs for details, search for "FAILED".' />
+   </target>
+@@ -1334,6 +1334,12 @@
+               extension=".NIO" />
+   </target>
+ 
++  <target name="test-nio2" description="Runs the JUnit test cases for NIO2. Does not stop on errors."
++	     depends="test-compile,deploy,cobertura-instrument" if="${execute.test.nio2}">
++    <runtests protocol="org.apache.coyote.http11.Http11Nio2Protocol"
++	          extension=".NIO2" />
++  </target>
++
+   <target name="test-apr" description="Runs the JUnit test cases for APR. Does not stop on errors."
+           depends="test-compile,deploy,test-apr-exists,cobertura-instrument"
+           if="${apr.exists}">
+@@ -1451,7 +1457,7 @@
+   </target>
+ 
+   <target name="cobertura-report" if="${test.cobertura}"
+-          depends="test-bio,test-nio,test-apr"
++          depends="test-bio,test-nio,test-nio2,test-apr"
+           description="Creates report from gathered Cobertura results">
+ 
+     <cobertura-report srcdir="${basedir}/java" destdir="${cobertura.out}"
+
+==================================================
+AjpNio2Protocol.java
+new file mode 100644
+index 0000000000..06ae4a81cd
+--- /dev/null
++++ b/java/org/apache/coyote/ajp/AjpNio2Processor.java
+@@ -0,0 +1,269 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.coyote.ajp;
++
++import java.io.IOException;
++import java.nio.ByteBuffer;
++import java.nio.channels.CompletionHandler;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.TimeoutException;
++
++import org.apache.juli.logging.Log;
++import org.apache.juli.logging.LogFactory;
++import org.apache.tomcat.util.net.Nio2Channel;
++import org.apache.tomcat.util.net.Nio2Endpoint;
++import org.apache.tomcat.util.net.SocketStatus;
++import org.apache.tomcat.util.net.SocketWrapper;
++
++/**
++ * Processes AJP requests using NIO2.
++ */
++public class AjpNio2Processor extends AbstractAjpProcessor<Nio2Channel> {
++
++    private static final Log log = LogFactory.getLog(AjpNio2Processor.class);
++    @Override
++    protected Log getLog() {
++        return log;
++    }
++
++    /**
++     * The completion handler used for asynchronous write operations
++     */
++    protected CompletionHandler<Integer, SocketWrapper<Nio2Channel>> writeCompletionHandler;
++
++    /**
++     * Flipped flag for read buffer.
++     */
++    protected boolean flipped = false;
++
++    /**
++     * Write pending flag.
++     */
++    protected volatile boolean writePending = false;
++
++    public AjpNio2Processor(int packetSize, Nio2Endpoint endpoint0) {
++        super(packetSize, endpoint0);
++        response.setOutputBuffer(new SocketOutputBuffer());
++        this.writeCompletionHandler = new CompletionHandler<Integer, SocketWrapper<Nio2Channel>>() {
++            @Override
++            public void completed(Integer nBytes, SocketWrapper<Nio2Channel> attachment) {
++                boolean notify = false;
++                synchronized (writeCompletionHandler) {
++                    if (nBytes < 0) {
++                        failed(new IOException(sm.getString("ajpprocessor.failedsend")), attachment);
++                        return;
++                    }
++                    writePending = false;
++                    if (!Nio2Endpoint.isInline()) {
++                        notify = true;
++                    }
++                }
++                if (notify) {
++                    endpoint.processSocket(attachment, SocketStatus.OPEN_WRITE, false);
++                }
++            }
++            @Override
++            public void failed(Throwable exc, SocketWrapper<Nio2Channel> attachment) {
++                attachment.setError(true);
++                writePending = false;
++                endpoint.processSocket(attachment, SocketStatus.DISCONNECT, true);
++            }
++        };
++    }
++
++    @Override
++    public void recycle(boolean socketClosing) {
++        super.recycle(socketClosing);
++        writePending = false;
++        flipped = false;
++    }
++
++    @Override
++    protected void registerForEvent(boolean read, boolean write) {
++        final Nio2Endpoint.Nio2SocketWrapper attach =
++                (Nio2Endpoint.Nio2SocketWrapper) socketWrapper;
++        if (attach == null) {
++            return;
++        }
++        if (read) {
++            attach.interestOps(attach.interestOps() | Nio2Endpoint.OP_READ);
++        }
++        if (write) {
++            attach.interestOps(attach.interestOps() | Nio2Endpoint.OP_WRITE);
++        }
++    }
++
++    @Override
++    protected void resetTimeouts() {
++        // The NIO connector uses the timeout configured on the wrapper in the
++        // poller. Therefore, it needs to be reset once asycn processing has
++        // finished.
++        if (!error && socketWrapper != null &&
++                asyncStateMachine.isAsyncDispatching()) {
++            long soTimeout = endpoint.getSoTimeout();
++
++            //reset the timeout
++            if (keepAliveTimeout > 0) {
++                socketWrapper.setTimeout(keepAliveTimeout);
++            } else {
++                socketWrapper.setTimeout(soTimeout);
++            }
++        }
++
++    }
++
++
++    @Override
++    protected void setupSocket(SocketWrapper<Nio2Channel> socketWrapper)
++            throws IOException {
++        // NO-OP
++    }
++
++
++    @Override
++    protected void setTimeout(SocketWrapper<Nio2Channel> socketWrapper,
++            int timeout) throws IOException {
++        socketWrapper.setTimeout(timeout);
++    }
++
++
++    @Override
++    protected int output(byte[] src, int offset, int length, boolean block)
++            throws IOException {
++
++        if (socketWrapper == null || socketWrapper.getSocket() == null)
++            return -1;
++
++        ByteBuffer writeBuffer =
++                socketWrapper.getSocket().getBufHandler().getWriteBuffer();
++
++        int result = 0;
++        if (block) {
++            writeBuffer.clear();
++            writeBuffer.put(src, offset, length);
++            writeBuffer.flip();
++            try {
++                result = socketWrapper.getSocket().write(writeBuffer).get(socketWrapper.getTimeout(), TimeUnit.MILLISECONDS);
++            } catch (InterruptedException | ExecutionException
++                    | TimeoutException e) {
++                throw new IOException(sm.getString("ajpprocessor.failedsend"), e);
++            }
++        } else {
++            synchronized (writeCompletionHandler) {
++                if (!writePending) {
++                    writeBuffer.clear();
++                    writeBuffer.put(src, offset, length);
++                    writeBuffer.flip();
++                    writePending = true;
++                    Nio2Endpoint.startInline();
++                    socketWrapper.getSocket().write(writeBuffer, socketWrapper.getTimeout(),
++                            TimeUnit.MILLISECONDS, socketWrapper, writeCompletionHandler);
++                    Nio2Endpoint.endInline();
++                    result = length;
++                }
++            }
++        }
++        return result;
++    }
++
++
++    @Override
++    protected boolean read(byte[] buf, int pos, int n, boolean blockFirstRead)
++        throws IOException {
++
++        int read = 0;
++        int res = 0;
++        boolean block = blockFirstRead;
++
++        while (read < n) {
++            res = readSocket(buf, read + pos, n - read, block);
++            if (res > 0) {
++                read += res;
++            } else if (res == 0 && !block) {
++                return false;
++            } else {
++                throw new IOException(sm.getString("ajpprocessor.failedread"));
++            }
++            block = true;
++        }
++        return true;
++    }
++
++
++    private int readSocket(byte[] buf, int pos, int n, boolean block)
++            throws IOException {
++        int nRead = 0;
++        ByteBuffer readBuffer =
++                socketWrapper.getSocket().getBufHandler().getReadBuffer();
++
++        if (block) {
++            if (!flipped) {
++                readBuffer.flip();
++                flipped = true;
++            }
++            if (readBuffer.remaining() > 0) {
++                nRead = Math.min(n, readBuffer.remaining());
++                readBuffer.get(buf, pos, nRead);
++                if (readBuffer.remaining() == 0) {
++                    readBuffer.clear();
++                    flipped = false;
++                }
++            } else {
++                readBuffer.clear();
++                flipped = false;
++                readBuffer.limit(n);
++                try {
++                    nRead = socketWrapper.getSocket().read(readBuffer).get(socketWrapper.getTimeout(), TimeUnit.MILLISECONDS);
++                } catch (InterruptedException | ExecutionException
++                        | TimeoutException e) {
++                    throw new IOException(sm.getString("ajpprocessor.failedread"), e);
++                }
++                if (nRead > 0) {
++                    if (!flipped) {
++                        readBuffer.flip();
++                        flipped = true;
++                    }
++                    nRead = Math.min(n, readBuffer.remaining());
++                    readBuffer.get(buf, pos, nRead);
++                    if (readBuffer.remaining() == 0) {
++                        readBuffer.clear();
++                        flipped = false;
++                    }
++                }
++            }
++        } else {
++            if (!flipped) {
++                readBuffer.flip();
++                flipped = true;
++            }
++            if (readBuffer.remaining() > 0) {
++                nRead = Math.min(n, readBuffer.remaining());
++                readBuffer.get(buf, pos, nRead);
++                if (readBuffer.remaining() == 0) {
++                    readBuffer.clear();
++                    flipped = false;
++                }
++            } else {
++                readBuffer.clear();
++                flipped = false;
++                readBuffer.limit(n);
++            }
++        }
++        return nRead;
++    }
++}
+
+==================================================
+Http11Nio2Processor.java
+new file mode 100644
+index 0000000000..c61a559c88
+--- /dev/null
++++ b/java/org/apache/coyote/ajp/AjpNio2Protocol.java
+@@ -0,0 +1,158 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.coyote.ajp;
++
++import javax.net.ssl.SSLEngine;
++
++import org.apache.coyote.AbstractProtocol;
++import org.apache.coyote.Processor;
++import org.apache.juli.logging.Log;
++import org.apache.juli.logging.LogFactory;
++import org.apache.tomcat.util.net.AbstractEndpoint;
++import org.apache.tomcat.util.net.Nio2Channel;
++import org.apache.tomcat.util.net.Nio2Endpoint;
++import org.apache.tomcat.util.net.Nio2Endpoint.Handler;
++import org.apache.tomcat.util.net.SSLImplementation;
++import org.apache.tomcat.util.net.SocketWrapper;
++
++
++/**
++ * Abstract the protocol implementation, including threading, etc.
++ * Processor is single threaded and specific to stream-based protocols,
++ * will not fit Jk protocols like JNI.
++ */
++public class AjpNio2Protocol extends AbstractAjpProtocol<Nio2Channel> {
++
++
++    private static final Log log = LogFactory.getLog(AjpNio2Protocol.class);
++
++    @Override
++    protected Log getLog() { return log; }
++
++
++    @Override
++    protected AbstractEndpoint.Handler getHandler() {
++        return cHandler;
++    }
++
++
++    // ------------------------------------------------------------ Constructor
++
++
++    public AjpNio2Protocol() {
++        endpoint = new Nio2Endpoint();
++        cHandler = new AjpConnectionHandler(this);
++        ((Nio2Endpoint) endpoint).setHandler(cHandler);
++        setSoLinger(Constants.DEFAULT_CONNECTION_LINGER);
++        setSoTimeout(Constants.DEFAULT_CONNECTION_TIMEOUT);
++        setTcpNoDelay(Constants.DEFAULT_TCP_NO_DELAY);
++        // AJP does not use Send File
++        ((Nio2Endpoint) endpoint).setUseSendfile(false);
++    }
++
++
++    // ----------------------------------------------------- Instance Variables
++
++
++    /**
++     * Connection handler for AJP.
++     */
++    private final AjpConnectionHandler cHandler;
++
++
++    // ----------------------------------------------------- JMX related methods
++
++    @Override
++    protected String getNamePrefix() {
++        return ("ajp-nio2");
++    }
++
++
++    // --------------------------------------  AjpConnectionHandler Inner Class
++
++
++    protected static class AjpConnectionHandler
++            extends AbstractAjpConnectionHandler<Nio2Channel, AjpNio2Processor>
++            implements Handler {
++
++        protected final AjpNio2Protocol proto;
++
++        public AjpConnectionHandler(AjpNio2Protocol proto) {
++            this.proto = proto;
++        }
++
++        @Override
++        protected AbstractProtocol<Nio2Channel> getProtocol() {
++            return proto;
++        }
++
++        @Override
++        protected Log getLog() {
++            return log;
++        }
++
++        @Override
++        public SSLImplementation getSslImplementation() {
++            // AJP does not support SSL
++            return null;
++        }
++
++        /**
++         * Expected to be used by the Poller to release resources on socket
++         * close, errors etc.
++         */
++        @Override
++        public void release(SocketWrapper<Nio2Channel> socket) {
++            Processor<Nio2Channel> processor =
++                    connections.remove(socket.getSocket());
++            if (processor != null) {
++                processor.recycle(true);
++                recycledProcessors.push(processor);
++            }
++        }
++
++        /**
++         * Expected to be used by the handler once the processor is no longer
++         * required.
++         */
++        @Override
++        public void release(SocketWrapper<Nio2Channel> socket,
++                Processor<Nio2Channel> processor, boolean isSocketClosing,
++                boolean addToPoller) {
++            processor.recycle(isSocketClosing);
++            recycledProcessors.push(processor);
++            if (addToPoller) {
++                ((Nio2Endpoint) proto.endpoint).awaitBytes(socket);
++            }
++        }
++
++        @Override
++        protected AjpNio2Processor createProcessor() {
++            AjpNio2Processor processor = new AjpNio2Processor(proto.packetSize, (Nio2Endpoint) proto.endpoint);
++            processor.setAdapter(proto.getAdapter());
++            processor.setTomcatAuthentication(proto.tomcatAuthentication);
++            processor.setRequiredSecret(proto.requiredSecret);
++            processor.setClientCertProvider(proto.getClientCertProvider());
++            register(processor);
++            return processor;
++        }
++
++        @Override
++        public void onCreateSSLEngine(SSLEngine engine) {
++        }
++    }
++}
+
+==================================================
+Http11Nio2Protocol.java
+new file mode 100644
+index 0000000000..6ee340424a
+--- /dev/null
++++ b/java/org/apache/coyote/http11/Http11Nio2Processor.java
+@@ -0,0 +1,578 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.coyote.http11;
++
++import java.io.IOException;
++import java.io.InterruptedIOException;
++import java.net.InetAddress;
++import java.net.InetSocketAddress;
++
++import javax.net.ssl.SSLEngine;
++
++import org.apache.coyote.ActionCode;
++import org.apache.coyote.RequestInfo;
++import org.apache.coyote.http11.filters.BufferedInputFilter;
++import org.apache.juli.logging.Log;
++import org.apache.juli.logging.LogFactory;
++import org.apache.tomcat.util.ExceptionUtils;
++import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
++import org.apache.tomcat.util.net.Nio2Channel;
++import org.apache.tomcat.util.net.Nio2Endpoint;
++import org.apache.tomcat.util.net.SSLSupport;
++import org.apache.tomcat.util.net.SecureNio2Channel;
++import org.apache.tomcat.util.net.SocketStatus;
++import org.apache.tomcat.util.net.SocketWrapper;
++
++
++/**
++ * Processes HTTP requests.
++ */
++public class Http11Nio2Processor extends AbstractHttp11Processor<Nio2Channel> {
++
++    private static final Log log = LogFactory.getLog(Http11Nio2Processor.class);
++    @Override
++    protected Log getLog() {
++        return log;
++    }
++
++
++    /**
++     * SSL information.
++     */
++    protected SSLSupport sslSupport;
++
++    // ----------------------------------------------------------- Constructors
++
++
++    public Http11Nio2Processor(int maxHttpHeaderSize, Nio2Endpoint endpoint,
++            int maxTrailerSize, int maxExtensionSize) {
++
++        super(endpoint);
++
++        inputBuffer = new InternalNio2InputBuffer(request, maxHttpHeaderSize);
++        request.setInputBuffer(inputBuffer);
++
++        outputBuffer = new InternalNio2OutputBuffer(response, maxHttpHeaderSize);
++        response.setOutputBuffer(outputBuffer);
++
++        initializeFilters(maxTrailerSize, maxExtensionSize);
++    }
++
++
++    // ----------------------------------------------------- Instance Variables
++
++    /**
++     * Sendfile data.
++     */
++    protected Nio2Endpoint.SendfileData sendfileData = null;
++
++
++    // --------------------------------------------------------- Public Methods
++
++    @Override
++    public SocketState event(SocketStatus status)
++        throws IOException {
++
++        long soTimeout = endpoint.getSoTimeout();
++
++        RequestInfo rp = request.getRequestProcessor();
++        final SocketWrapper<Nio2Channel> attach = socketWrapper;
++        try {
++            rp.setStage(org.apache.coyote.Constants.STAGE_SERVICE);
++            error = !getAdapter().event(request, response, status);
++            if ( !error ) {
++                if (attach != null) {
++                    attach.setComet(comet);
++                    if (comet) {
++                        Integer comettimeout = (Integer) request.getAttribute(
++                                org.apache.coyote.Constants.COMET_TIMEOUT_ATTR);
++                        if (comettimeout != null) {
++                            attach.setTimeout(comettimeout.longValue());
++                        }
++                    } else {
++                        //reset the timeout
++                        if (keepAlive) {
++                            attach.setTimeout(keepAliveTimeout);
++                        } else {
++                            attach.setTimeout(soTimeout);
++                        }
++                    }
++
++                }
++            }
++        } catch (InterruptedIOException e) {
++            error = true;
++        } catch (Throwable t) {
++            ExceptionUtils.handleThrowable(t);
++            log.error(sm.getString("http11processor.request.process"), t);
++            // 500 - Internal Server Error
++            response.setStatus(500);
++            getAdapter().log(request, response, 0);
++            error = true;
++        }
++
++        rp.setStage(org.apache.coyote.Constants.STAGE_ENDED);
++
++        if (error || status==SocketStatus.STOP) {
++            return SocketState.CLOSED;
++        } else if (!comet) {
++            if (keepAlive) {
++                inputBuffer.nextRequest();
++                outputBuffer.nextRequest();
++                return SocketState.OPEN;
++            } else {
++                return SocketState.CLOSED;
++            }
++        } else {
++            return SocketState.LONG;
++        }
++    }
++
++    @Override
++    protected void registerForEvent(boolean read, boolean write) {
++        final Nio2Endpoint.Nio2SocketWrapper attach =
++                (Nio2Endpoint.Nio2SocketWrapper) socketWrapper;
++        if (attach == null) {
++            return;
++        }
++        if (read) {
++            attach.interestOps(attach.interestOps() | Nio2Endpoint.OP_READ);
++        }
++        if (write) {
++            attach.interestOps(attach.interestOps() | Nio2Endpoint.OP_WRITE);
++        }
++    }
++
++
++    @Override
++    protected void resetTimeouts() {
++        if (!error && socketWrapper != null &&
++                asyncStateMachine.isAsyncDispatching()) {
++            long soTimeout = endpoint.getSoTimeout();
++
++            //reset the timeout
++            if (keepAlive) {
++                socketWrapper.setTimeout(keepAliveTimeout);
++            } else {
++                socketWrapper.setTimeout(soTimeout);
++            }
++        }
++    }
++
++
++    @Override
++    protected boolean disableKeepAlive() {
++        return false;
++    }
++
++
++    @Override
++    protected void setRequestLineReadTimeout() throws IOException {
++        // socket.setTimeout()
++        //     - timeout used by poller
++        // socket.getSocket().getIOChannel().socket().setSoTimeout()
++        //     - timeout used for blocking reads
++
++        // When entering the processing loop there will always be data to read
++        // so no point changing timeouts at this point
++
++        // For the second and subsequent executions of the processing loop, a
++        // non-blocking read is used so again no need to set the timeouts
++
++        // Because NIO supports non-blocking reading of the request line and
++        // headers the timeouts need to be set when returning the socket to
++        // the poller rather than here.
++
++        // NO-OP
++    }
++
++
++    @Override
++    protected boolean handleIncompleteRequestLineRead() {
++        // Haven't finished reading the request so keep the socket
++        // open
++        openSocket = true;
++        // Check to see if we have read any of the request line yet
++        if (((InternalNio2InputBuffer)
++                inputBuffer).getParsingRequestLinePhase() < 1) {
++            if (socketWrapper.getLastAccess() > -1 || keptAlive) {
++                // Haven't read the request line and have previously processed a
++                // request. Must be keep-alive. Make sure poller uses keepAlive.
++                socketWrapper.setTimeout(endpoint.getKeepAliveTimeout());
++            }
++        } else {
++            // Started to read request line. Need to keep processor
++            // associated with socket
++            readComplete = false;
++            // Make sure poller uses soTimeout from here onwards
++            socketWrapper.setTimeout(endpoint.getSoTimeout());
++        }
++        if (endpoint.isPaused()) {
++            // 503 - Service unavailable
++            response.setStatus(503);
++            getAdapter().log(request, response, 0);
++            error = true;
++        } else {
++            return true;
++        }
++        return false;
++    }
++
++
++    @Override
++    protected void setSocketTimeout(int timeout) throws IOException {
++        // Not relevant for NIO2
++    }
++
++
++    @Override
++    protected void setCometTimeouts(SocketWrapper<Nio2Channel> socketWrapper) {
++        final Nio2Endpoint.Nio2SocketWrapper attach =
++                (Nio2Endpoint.Nio2SocketWrapper)socketWrapper;
++        if (attach != null)  {
++            attach.setComet(comet);
++            if (comet) {
++                Integer comettimeout = (Integer) request.getAttribute(
++                        org.apache.coyote.Constants.COMET_TIMEOUT_ATTR);
++                if (comettimeout != null) {
++                    attach.setTimeout(comettimeout.longValue());
++                }
++            }
++        }
++    }
++
++
++    @Override
++    protected boolean breakKeepAliveLoop(
++            SocketWrapper<Nio2Channel> socketWrapper) {
++        openSocket = keepAlive;
++        // Do sendfile as needed: add socket to sendfile and end
++        if (sendfileData != null && !error) {
++            ((Nio2Endpoint.Nio2SocketWrapper) socketWrapper).setSendfileData(sendfileData);
++            sendfileData.keepAlive = keepAlive;
++            if (((Nio2Endpoint) endpoint).processSendfile(
++                    (Nio2Endpoint.Nio2SocketWrapper) socketWrapper)) {
++                sendfileInProgress = true;
++            } else {
++                // Write failed
++                if (log.isDebugEnabled()) {
++                    log.debug(sm.getString("http11processor.sendfile.error"));
++                }
++                error = true;
++            }
++            return true;
++        }
++        return false;
++    }
++
++
++    @Override
++    public void recycleInternal() {
++        socketWrapper = null;
++        sendfileData = null;
++    }
++
++
++    // ----------------------------------------------------- ActionHook Methods
++
++
++    /**
++     * Send an action to the connector.
++     *
++     * @param actionCode Type of the action
++     * @param param Action parameter
++     */
++    @Override
++    public void actionInternal(ActionCode actionCode, Object param) {
++
++        if (actionCode == ActionCode.REQ_HOST_ADDR_ATTRIBUTE) {
++
++            if (socketWrapper == null || socketWrapper.getSocket() == null) {
++                request.remoteAddr().recycle();
++            } else {
++                if (socketWrapper.getRemoteAddr() == null) {
++                    InetAddress inetAddr = null;
++                    try {
++                        inetAddr = ((InetSocketAddress) socketWrapper.getSocket().getIOChannel().getRemoteAddress()).getAddress();
++                    } catch (IOException e) {
++                        // Ignore
++                    }
++                    if (inetAddr != null) {
++                        socketWrapper.setRemoteAddr(inetAddr.getHostAddress());
++                    }
++                }
++                request.remoteAddr().setString(socketWrapper.getRemoteAddr());
++            }
++
++        } else if (actionCode == ActionCode.REQ_LOCAL_NAME_ATTRIBUTE) {
++
++            if (socketWrapper == null || socketWrapper.getSocket() == null) {
++                request.localName().recycle();
++            } else {
++                if (socketWrapper.getLocalName() == null) {
++                    InetAddress inetAddr = null;
++                    try {
++                        inetAddr = ((InetSocketAddress) socketWrapper.getSocket().getIOChannel().getLocalAddress()).getAddress();
++                    } catch (IOException e) {
++                        // Ignore
++                    }
++                    if (inetAddr != null) {
++                        socketWrapper.setLocalName(inetAddr.getHostName());
++                    }
++                }
++                request.localName().setString(socketWrapper.getLocalName());
++            }
++
++        } else if (actionCode == ActionCode.REQ_HOST_ATTRIBUTE) {
++
++            if (socketWrapper == null || socketWrapper.getSocket() == null) {
++                request.remoteHost().recycle();
++            } else {
++                if (socketWrapper.getRemoteHost() == null) {
++                    InetAddress inetAddr = null;
++                    try {
++                        inetAddr = ((InetSocketAddress) socketWrapper.getSocket().getIOChannel().getRemoteAddress()).getAddress();
++                    } catch (IOException e) {
++                        // Ignore
++                    }
++                    if (inetAddr != null) {
++                        socketWrapper.setRemoteHost(inetAddr.getHostName());
++                    }
++                    if (socketWrapper.getRemoteHost() == null) {
++                        if (socketWrapper.getRemoteAddr() == null &&
++                                inetAddr != null) {
++                            socketWrapper.setRemoteAddr(inetAddr.getHostAddress());
++                        }
++                        if (socketWrapper.getRemoteAddr() != null) {
++                            socketWrapper.setRemoteHost(socketWrapper.getRemoteAddr());
++                        }
++                    }
++                }
++                request.remoteHost().setString(socketWrapper.getRemoteHost());
++            }
++
++        } else if (actionCode == ActionCode.REQ_LOCAL_ADDR_ATTRIBUTE) {
++
++            if (socketWrapper == null || socketWrapper.getSocket() == null) {
++                request.localAddr().recycle();
++            } else {
++                if (socketWrapper.getLocalAddr() == null) {
++                    try {
++                        socketWrapper.setLocalAddr(
++                                ((InetSocketAddress) socketWrapper.getSocket().getIOChannel().getLocalAddress()).getAddress().getHostAddress());
++                    } catch (IOException e) {
++                        // Ignore
++                    }
++                }
++                request.localAddr().setString(socketWrapper.getLocalAddr());
++            }
++
++        } else if (actionCode == ActionCode.REQ_REMOTEPORT_ATTRIBUTE) {
++
++            if (socketWrapper == null || socketWrapper.getSocket() == null) {
++                request.setRemotePort(0);
++            } else {
++                if (socketWrapper.getRemotePort() == -1) {
++                    try {
++                        socketWrapper.setRemotePort(((InetSocketAddress) socketWrapper.getSocket().getIOChannel().getRemoteAddress()).getPort());
++                    } catch (IOException e) {
++                        // Ignore
++                    }
++                }
++                request.setRemotePort(socketWrapper.getRemotePort());
++            }
++
++        } else if (actionCode == ActionCode.REQ_LOCALPORT_ATTRIBUTE) {
++
++            if (socketWrapper == null || socketWrapper.getSocket() == null) {
++                request.setLocalPort(0);
++            } else {
++                if (socketWrapper.getLocalPort() == -1) {
++                    try {
++                        socketWrapper.setLocalPort(((InetSocketAddress) socketWrapper.getSocket().getIOChannel().getLocalAddress()).getPort());
++                    } catch (IOException e) {
++                        // Ignore
++                    }
++                }
++                request.setLocalPort(socketWrapper.getLocalPort());
++            }
++
++        } else if (actionCode == ActionCode.REQ_SSL_ATTRIBUTE ) {
++
++            try {
++                if (sslSupport != null) {
++                    Object sslO = sslSupport.getCipherSuite();
++                    if (sslO != null) {
++                        request.setAttribute
++                            (SSLSupport.CIPHER_SUITE_KEY, sslO);
++                    }
++                    sslO = sslSupport.getPeerCertificateChain(false);
++                    if (sslO != null) {
++                        request.setAttribute
++                            (SSLSupport.CERTIFICATE_KEY, sslO);
++                    }
++                    sslO = sslSupport.getKeySize();
++                    if (sslO != null) {
++                        request.setAttribute
++                            (SSLSupport.KEY_SIZE_KEY, sslO);
++                    }
++                    sslO = sslSupport.getSessionId();
++                    if (sslO != null) {
++                        request.setAttribute
++                            (SSLSupport.SESSION_ID_KEY, sslO);
++                    }
++                    request.setAttribute(SSLSupport.SESSION_MGR, sslSupport);
++                }
++            } catch (Exception e) {
++                log.warn(sm.getString("http11processor.socket.ssl"), e);
++            }
++
++        } else if (actionCode == ActionCode.REQ_SSL_CERTIFICATE) {
++
++            if (sslSupport != null && socketWrapper.getSocket() != null) {
++                /*
++                 * Consume and buffer the request body, so that it does not
++                 * interfere with the client's handshake messages
++                 */
++                InputFilter[] inputFilters = inputBuffer.getFilters();
++                ((BufferedInputFilter) inputFilters[Constants.BUFFERED_FILTER])
++                    .setLimit(maxSavePostSize);
++                inputBuffer.addActiveFilter
++                    (inputFilters[Constants.BUFFERED_FILTER]);
++                SecureNio2Channel sslChannel = (SecureNio2Channel) socketWrapper.getSocket();
++                SSLEngine engine = sslChannel.getSslEngine();
++                if (!engine.getNeedClientAuth()) {
++                    // Need to re-negotiate SSL connection
++                    engine.setNeedClientAuth(true);
++                    try {
++                        sslChannel.rehandshake();
++                        sslSupport = ((Nio2Endpoint)endpoint).getHandler()
++                                .getSslImplementation().getSSLSupport(
++                                        engine.getSession());
++                    } catch (IOException ioe) {
++                        log.warn(sm.getString("http11processor.socket.sslreneg",ioe));
++                    }
++                }
++
++                try {
++                    // use force=false since re-negotiation is handled above
++                    // (and it is a NO-OP for NIO anyway)
++                    Object sslO = sslSupport.getPeerCertificateChain(false);
++                    if( sslO != null) {
++                        request.setAttribute
++                            (SSLSupport.CERTIFICATE_KEY, sslO);
++                    }
++                } catch (Exception e) {
++                    log.warn(sm.getString("http11processor.socket.ssl"), e);
++                }
++            }
++        } else if (actionCode == ActionCode.COMET_BEGIN) {
++            comet = true;
++        } else if (actionCode == ActionCode.COMET_END) {
++            comet = false;
++        } else if (actionCode == ActionCode.COMET_CLOSE) {
++            if (socketWrapper == null || socketWrapper.getSocket() == null) {
++                return;
++            }
++            RequestInfo rp = request.getRequestProcessor();
++            if (rp.getStage() != org.apache.coyote.Constants.STAGE_SERVICE) {
++                // Close event for this processor triggered by request
++                // processing in another processor, a non-Tomcat thread (i.e.
++                // an application controlled thread) or similar.
++                endpoint.processSocket(this.socketWrapper, SocketStatus.OPEN_READ, true);
++            }
++        } else if (actionCode == ActionCode.COMET_SETTIMEOUT) {
++            if (param == null) {
++                return;
++            }
++            if (socketWrapper == null) {
++                return;
++            }
++            long timeout = ((Long)param).longValue();
++            //if we are not piggy backing on a worker thread, set the timeout
++            RequestInfo rp = request.getRequestProcessor();
++            if ( rp.getStage() != org.apache.coyote.Constants.STAGE_SERVICE ) {
++                socketWrapper.setTimeout(timeout);
++            }
++        } else if (actionCode == ActionCode.ASYNC_COMPLETE) {
++            socketWrapper.clearDispatches();
++            if (asyncStateMachine.asyncComplete()) {
++                endpoint.processSocket(this.socketWrapper, SocketStatus.OPEN_READ, true);
++            }
++        } else if (actionCode == ActionCode.ASYNC_SETTIMEOUT) {
++            if (param == null) {
++                return;
++            }
++            if (socketWrapper == null) {
++                return;
++            }
++            long timeout = ((Long)param).longValue();
++            //if we are not piggy backing on a worker thread, set the timeout
++            socketWrapper.setTimeout(timeout);
++        } else if (actionCode == ActionCode.ASYNC_DISPATCH) {
++            if (asyncStateMachine.asyncDispatch()) {
++                endpoint.processSocket(this.socketWrapper, SocketStatus.OPEN_READ, true);
++            }
++        }
++    }
++
++
++    // ------------------------------------------------------ Protected Methods
++
++
++    @Override
++    protected void prepareRequestInternal() {
++        sendfileData = null;
++    }
++
++    @Override
++    protected boolean prepareSendfile(OutputFilter[] outputFilters) {
++        String fileName = (String) request.getAttribute(
++                org.apache.coyote.Constants.SENDFILE_FILENAME_ATTR);
++        if (fileName != null) {
++            // No entity body sent here
++            outputBuffer.addActiveFilter(outputFilters[Constants.VOID_FILTER]);
++            contentDelimitation = true;
++            sendfileData = new Nio2Endpoint.SendfileData();
++            sendfileData.fileName = fileName;
++            sendfileData.pos = ((Long) request.getAttribute(
++                    org.apache.coyote.Constants.SENDFILE_FILE_START_ATTR)).longValue();
++            sendfileData.length = ((Long) request.getAttribute(
++                    org.apache.coyote.Constants.SENDFILE_FILE_END_ATTR)).longValue() - sendfileData.pos;
++            return true;
++        }
++        return false;
++    }
++
++    @Override
++    protected AbstractInputBuffer<Nio2Channel> getInputBuffer() {
++        return inputBuffer;
++    }
++
++    @Override
++    protected AbstractOutputBuffer<Nio2Channel> getOutputBuffer() {
++        return outputBuffer;
++    }
++
++    /**
++     * Set the SSL information for this HTTP connection.
++     */
++    @Override
++    public void setSslSupport(SSLSupport sslSupport) {
++        this.sslSupport = sslSupport;
++    }
++}
+
+==================================================
+InternalNio2InputBuffer.java
+new file mode 100644
+index 0000000000..2e327ac981
+--- /dev/null
++++ b/java/org/apache/coyote/http11/Http11Nio2Protocol.java
+@@ -0,0 +1,278 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.coyote.http11;
++
++import java.io.IOException;
++
++import javax.net.ssl.SSLEngine;
++import javax.servlet.http.HttpUpgradeHandler;
++
++import org.apache.coyote.AbstractProtocol;
++import org.apache.coyote.Processor;
++import org.apache.coyote.http11.upgrade.Nio2Processor;
++import org.apache.juli.logging.Log;
++import org.apache.juli.logging.LogFactory;
++import org.apache.tomcat.util.net.AbstractEndpoint;
++import org.apache.tomcat.util.net.Nio2Channel;
++import org.apache.tomcat.util.net.Nio2Endpoint;
++import org.apache.tomcat.util.net.Nio2Endpoint.Handler;
++import org.apache.tomcat.util.net.Nio2Endpoint.Nio2SocketWrapper;
++import org.apache.tomcat.util.net.SSLImplementation;
++import org.apache.tomcat.util.net.SecureNio2Channel;
++import org.apache.tomcat.util.net.SocketStatus;
++import org.apache.tomcat.util.net.SocketWrapper;
++
++
++/**
++ * HTTP/1.1 protocol implementation using NIO2.
++ */
++public class Http11Nio2Protocol extends AbstractHttp11JsseProtocol<Nio2Channel> {
++
++    private static final Log log = LogFactory.getLog(Http11Nio2Protocol.class);
++
++
++    @Override
++    protected Log getLog() { return log; }
++
++
++    @Override
++    protected AbstractEndpoint.Handler getHandler() {
++        return cHandler;
++    }
++
++
++    public Http11Nio2Protocol() {
++        endpoint=new Nio2Endpoint();
++        cHandler = new Http11ConnectionHandler(this);
++        ((Nio2Endpoint) endpoint).setHandler(cHandler);
++        setSoLinger(Constants.DEFAULT_CONNECTION_LINGER);
++        setSoTimeout(Constants.DEFAULT_CONNECTION_TIMEOUT);
++        setTcpNoDelay(Constants.DEFAULT_TCP_NO_DELAY);
++    }
++
++
++    public Nio2Endpoint getEndpoint() {
++        return ((Nio2Endpoint)endpoint);
++    }
++
++    @Override
++    public void start() throws Exception {
++        super.start();
++        if (npnHandler != null) {
++            npnHandler.init(getEndpoint(), 0, getAdapter());
++        }
++    }
++
++    // -------------------- Properties--------------------
++
++    private final Http11ConnectionHandler cHandler;
++
++    // -------------------- Pool setup --------------------
++
++    public void setAcceptorThreadPriority(int threadPriority) {
++        ((Nio2Endpoint)endpoint).setAcceptorThreadPriority(threadPriority);
++    }
++
++    public void setPollerThreadPriority(int threadPriority) {
++        ((Nio2Endpoint)endpoint).setPollerThreadPriority(threadPriority);
++    }
++
++    public int getAcceptorThreadPriority() {
++      return ((Nio2Endpoint)endpoint).getAcceptorThreadPriority();
++    }
++
++    public int getPollerThreadPriority() {
++      return ((Nio2Endpoint)endpoint).getThreadPriority();
++    }
++
++    public boolean getUseSendfile() {
++        return endpoint.getUseSendfile();
++    }
++
++    public void setUseSendfile(boolean useSendfile) {
++        ((Nio2Endpoint)endpoint).setUseSendfile(useSendfile);
++    }
++
++    // -------------------- Tcp setup --------------------
++
++    public void setOomParachute(int oomParachute) {
++        ((Nio2Endpoint)endpoint).setOomParachute(oomParachute);
++    }
++
++    // ----------------------------------------------------- JMX related methods
++
++    @Override
++    protected String getNamePrefix() {
++        return ("http-nio2");
++    }
++
++
++    // --------------------  Connection handler --------------------
++
++    protected static class Http11ConnectionHandler
++            extends AbstractConnectionHandler<Nio2Channel,Http11Nio2Processor>
++            implements Handler {
++
++        protected Http11Nio2Protocol proto;
++
++        Http11ConnectionHandler(Http11Nio2Protocol proto) {
++            this.proto = proto;
++        }
++
++        @Override
++        protected AbstractProtocol<Nio2Channel> getProtocol() {
++            return proto;
++        }
++
++        @Override
++        protected Log getLog() {
++            return log;
++        }
++
++
++        @Override
++        public SSLImplementation getSslImplementation() {
++            return proto.sslImplementation;
++        }
++
++        /**
++         * Expected to be used by the Poller to release resources on socket
++         * close, errors etc.
++         */
++        @Override
++        public void release(SocketWrapper<Nio2Channel> socket) {
++            Processor<Nio2Channel> processor =
++                connections.remove(socket.getSocket());
++            if (processor != null) {
++                processor.recycle(true);
++                recycledProcessors.push(processor);
++            }
++        }
++
++        @Override
++        public SocketState process(SocketWrapper<Nio2Channel> socket,
++                SocketStatus status) {
++            if (proto.npnHandler != null) {
++                SocketState ss = proto.npnHandler.process(socket, status);
++                if (ss != SocketState.OPEN) {
++                    return ss;
++                }
++            }
++            return super.process(socket, status);
++        }
++
++
++        /**
++         * Expected to be used by the handler once the processor is no longer
++         * required.
++         *
++         * @param socket
++         * @param processor
++         * @param isSocketClosing   Not used in HTTP
++         * @param addToPoller
++         */
++        @Override
++        public void release(SocketWrapper<Nio2Channel> socket,
++                Processor<Nio2Channel> processor, boolean isSocketClosing,
++                boolean addToPoller) {
++            processor.recycle(isSocketClosing);
++            recycledProcessors.push(processor);
++            if (socket.isAsync()) {
++                ((Nio2Endpoint) proto.endpoint).removeTimeout(socket);
++            }
++            if (addToPoller) {
++                ((Nio2Endpoint) proto.endpoint).awaitBytes(socket);
++            }
++        }
++
++
++        @Override
++        protected void initSsl(SocketWrapper<Nio2Channel> socket,
++                Processor<Nio2Channel> processor) {
++            if (proto.isSSLEnabled() &&
++                    (proto.sslImplementation != null)
++                    && (socket.getSocket() instanceof SecureNio2Channel)) {
++                SecureNio2Channel ch = (SecureNio2Channel)socket.getSocket();
++                processor.setSslSupport(
++                        proto.sslImplementation.getSSLSupport(
++                                ch.getSslEngine().getSession()));
++            } else {
++                processor.setSslSupport(null);
++            }
++
++        }
++
++        @Override
++        protected void longPoll(SocketWrapper<Nio2Channel> socket,
++                Processor<Nio2Channel> processor) {
++            if (processor.isAsync()) {
++                socket.setAsync(true);
++                ((Nio2Endpoint) proto.endpoint).addTimeout(socket);
++            } else if (processor.isUpgrade()) {
++                if (((Nio2SocketWrapper) socket).isUpgradeInit()) {
++                    ((Nio2Endpoint) proto.endpoint).awaitBytes(socket);
++                }
++            } else {
++                // Either:
++                //  - this is comet request
++                //  - this is an upgraded connection
++                //  - the request line/headers have not been completely
++                //    read
++                // The completion handlers should be in place,
++                // so nothing to do here
++            }
++        }
++
++        @Override
++        public Http11Nio2Processor createProcessor() {
++            Http11Nio2Processor processor = new Http11Nio2Processor(
++                    proto.getMaxHttpHeaderSize(), (Nio2Endpoint)proto.endpoint,
++                    proto.getMaxTrailerSize(), proto.getMaxExtensionSize());
++            processor.setAdapter(proto.getAdapter());
++            processor.setMaxKeepAliveRequests(proto.getMaxKeepAliveRequests());
++            processor.setKeepAliveTimeout(proto.getKeepAliveTimeout());
++            processor.setConnectionUploadTimeout(
++                    proto.getConnectionUploadTimeout());
++            processor.setDisableUploadTimeout(proto.getDisableUploadTimeout());
++            processor.setCompressionMinSize(proto.getCompressionMinSize());
++            processor.setCompression(proto.getCompression());
++            processor.setNoCompressionUserAgents(proto.getNoCompressionUserAgents());
++            processor.setCompressableMimeTypes(proto.getCompressableMimeTypes());
++            processor.setRestrictedUserAgents(proto.getRestrictedUserAgents());
++            processor.setSocketBuffer(proto.getSocketBuffer());
++            processor.setMaxSavePostSize(proto.getMaxSavePostSize());
++            processor.setServer(proto.getServer());
++            register(processor);
++            return processor;
++        }
++
++        @Override
++        protected Processor<Nio2Channel> createUpgradeProcessor(
++                SocketWrapper<Nio2Channel> socket,
++                HttpUpgradeHandler httpUpgradeProcessor)
++                throws IOException {
++            return new Nio2Processor(socket, httpUpgradeProcessor);
++        }
++
++        @Override
++        public void onCreateSSLEngine(SSLEngine engine) {
++            if (proto.npnHandler != null) {
++                proto.npnHandler.onCreateEngine(engine);
++            }
++        }
++    }
++}
+
+==================================================
+InternalNio2OutputBuffer.java
+new file mode 100644
+index 0000000000..42c16c8d83
+--- /dev/null
++++ b/java/org/apache/coyote/http11/InternalNio2InputBuffer.java
+@@ -0,0 +1,930 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.coyote.http11;
++
++import java.io.EOFException;
++import java.io.IOException;
++import java.nio.ByteBuffer;
++import java.nio.channels.ClosedChannelException;
++import java.nio.channels.CompletionHandler;
++import java.nio.channels.ReadPendingException;
++import java.nio.charset.StandardCharsets;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.TimeoutException;
++
++import javax.servlet.RequestDispatcher;
++
++import org.apache.coyote.InputBuffer;
++import org.apache.coyote.Request;
++import org.apache.juli.logging.Log;
++import org.apache.juli.logging.LogFactory;
++import org.apache.tomcat.util.buf.ByteChunk;
++import org.apache.tomcat.util.buf.MessageBytes;
++import org.apache.tomcat.util.net.AbstractEndpoint;
++import org.apache.tomcat.util.net.Nio2Channel;
++import org.apache.tomcat.util.net.Nio2Endpoint;
++import org.apache.tomcat.util.net.SocketStatus;
++import org.apache.tomcat.util.net.SocketWrapper;
++
++/**
++ * Output buffer implementation for NIO2.
++ */
++public class InternalNio2InputBuffer extends AbstractInputBuffer<Nio2Channel> {
++
++    private static final Log log =
++            LogFactory.getLog(InternalNio2InputBuffer.class);
++
++    // -------------------------------------------------------------- Constants
++
++    enum HeaderParseStatus {
++        DONE, HAVE_MORE_HEADERS, NEED_MORE_DATA
++    }
++
++    enum HeaderParsePosition {
++        /**
++         * Start of a new header. A CRLF here means that there are no more
++         * headers. Any other character starts a header name.
++         */
++        HEADER_START,
++        /**
++         * Reading a header name. All characters of header are HTTP_TOKEN_CHAR.
++         * Header name is followed by ':'. No whitespace is allowed.<br />
++         * Any non-HTTP_TOKEN_CHAR (this includes any whitespace) encountered
++         * before ':' will result in the whole line being ignored.
++         */
++        HEADER_NAME,
++        /**
++         * Skipping whitespace before text of header value starts, either on the
++         * first line of header value (just after ':') or on subsequent lines
++         * when it is known that subsequent line starts with SP or HT.
++         */
++        HEADER_VALUE_START,
++        /**
++         * Reading the header value. We are inside the value. Either on the
++         * first line or on any subsequent line. We come into this state from
++         * HEADER_VALUE_START after the first non-SP/non-HT byte is encountered
++         * on the line.
++         */
++        HEADER_VALUE,
++        /**
++         * Before reading a new line of a header. Once the next byte is peeked,
++         * the state changes without advancing our position. The state becomes
++         * either HEADER_VALUE_START (if that first byte is SP or HT), or
++         * HEADER_START (otherwise).
++         */
++        HEADER_MULTI_LINE,
++        /**
++         * Reading all bytes until the next CRLF. The line is being ignored.
++         */
++        HEADER_SKIPLINE
++    }
++
++    // ----------------------------------------------------------- Constructors
++
++
++    /**
++     * Alternate constructor.
++     */
++    public InternalNio2InputBuffer(Request request, int headerBufferSize) {
++
++        this.request = request;
++        headers = request.getMimeHeaders();
++
++        this.headerBufferSize = headerBufferSize;
++
++        inputStreamInputBuffer = new SocketInputBuffer();
++
++        filterLibrary = new InputFilter[0];
++        activeFilters = new InputFilter[0];
++        lastActiveFilter = -1;
++
++        parsingHeader = true;
++        parsingRequestLine = true;
++        parsingRequestLinePhase = 0;
++        parsingRequestLineEol = false;
++        parsingRequestLineStart = 0;
++        parsingRequestLineQPos = -1;
++        headerParsePos = HeaderParsePosition.HEADER_START;
++        headerData.recycle();
++        swallowInput = true;
++
++    }
++
++    /**
++     * Parsing state - used for non blocking parsing so that
++     * when more data arrives, we can pick up where we left off.
++     */
++    private boolean parsingRequestLine;
++    private int parsingRequestLinePhase = 0;
++    private boolean parsingRequestLineEol = false;
++    private int parsingRequestLineStart = 0;
++    private int parsingRequestLineQPos = -1;
++    private HeaderParsePosition headerParsePos;
++
++    /**
++     * Underlying socket.
++     */
++    private SocketWrapper<Nio2Channel> socket;
++
++    /**
++     * Maximum allowed size of the HTTP request line plus headers plus any
++     * leading blank lines.
++     */
++    private final int headerBufferSize;
++
++    /**
++     * Known size of the NioChannel read buffer.
++     */
++    private int socketReadBufferSize;
++
++    /**
++     * The completion handler used for asynchronous read operations
++     */
++    private CompletionHandler<Integer, SocketWrapper<Nio2Channel>> completionHandler;
++
++    /**
++     * The associated endpoint.
++     */
++    protected AbstractEndpoint<Nio2Channel> endpoint = null;
++
++    /**
++     * Read pending flag.
++     */
++    protected volatile boolean readPending = false;
++
++    /**
++     * Exception that occurred during writing.
++     */
++    protected IOException e = null;
++
++    /**
++     * Track if the byte buffer is flipped
++     */
++    protected volatile boolean flipped = false;
++
++    // --------------------------------------------------------- Public Methods
++
++    @Override
++    protected final Log getLog() {
++        return log;
++    }
++
++
++    /**
++     * Recycle the input buffer. This should be called when closing the
++     * connection.
++     */
++    @Override
++    public void recycle() {
++        super.recycle();
++        socket = null;
++        headerParsePos = HeaderParsePosition.HEADER_START;
++        parsingRequestLine = true;
++        parsingRequestLinePhase = 0;
++        parsingRequestLineEol = false;
++        parsingRequestLineStart = 0;
++        parsingRequestLineQPos = -1;
++        headerData.recycle();
++        readPending = false;
++        flipped = false;
++        e = null;
++    }
++
++
++    /**
++     * End processing of current HTTP request.
++     * Note: All bytes of the current request should have been already
++     * consumed. This method only resets all the pointers so that we are ready
++     * to parse the next HTTP request.
++     */
++    @Override
++    public void nextRequest() {
++        super.nextRequest();
++        headerParsePos = HeaderParsePosition.HEADER_START;
++        parsingRequestLine = true;
++        parsingRequestLinePhase = 0;
++        parsingRequestLineEol = false;
++        parsingRequestLineStart = 0;
++        parsingRequestLineQPos = -1;
++        headerData.recycle();
++    }
++
++    /**
++     * Read the request line. This function is meant to be used during the
++     * HTTP request header parsing. Do NOT attempt to read the request body
++     * using it.
++     *
++     * @throws IOException If an exception occurs during the underlying socket
++     * read operations, or if the given buffer is not big enough to accommodate
++     * the whole line.
++     * @return true if data is properly fed; false if no data is available
++     * immediately and thread should be freed
++     */
++    @Override
++    public boolean parseRequestLine(boolean useAvailableDataOnly)
++        throws IOException {
++
++        //check state
++        if ( !parsingRequestLine ) return true;
++        //
++        // Skipping blank lines
++        //
++        if ( parsingRequestLinePhase < 2 ) {
++            byte chr = 0;
++            do {
++
++                // Read new bytes if needed
++                if (pos >= lastValid) {
++                    if (useAvailableDataOnly) {
++                        return false;
++                    }
++                    // Do a simple read with a short timeout
++                    if (!fill(false)) {
++                        // A read is pending, so no longer in initial state
++                        parsingRequestLinePhase = 1;
++                        return false;
++                    }
++                }
++                chr = buf[pos++];
++            } while ((chr == Constants.CR) || (chr == Constants.LF));
++            pos--;
++
++            parsingRequestLineStart = pos;
++            parsingRequestLinePhase = 2;
++            if (log.isDebugEnabled()) {
++                log.debug("Received ["
++                        + new String(buf, pos, lastValid - pos,
++                                StandardCharsets.ISO_8859_1)
++                        + "]");
++            }
++        }
++        if ( parsingRequestLinePhase == 2 ) {
++            //
++            // Reading the method name
++            // Method name is always US-ASCII
++            //
++            boolean space = false;
++            while (!space) {
++                // Read new bytes if needed
++                if (pos >= lastValid) {
++                    if (!fill(false)) //request line parsing
++                        return false;
++                }
++                // Spec says no CR or LF in method name
++                if (buf[pos] == Constants.CR || buf[pos] == Constants.LF) {
++                    throw new IllegalArgumentException(
++                            sm.getString("iib.invalidmethod"));
++                }
++                if (buf[pos] == Constants.SP || buf[pos] == Constants.HT) {
++                    space = true;
++                    request.method().setBytes(buf, parsingRequestLineStart, pos - parsingRequestLineStart);
++                }
++                pos++;
++            }
++            parsingRequestLinePhase = 3;
++        }
++        if ( parsingRequestLinePhase == 3 ) {
++            // Spec says single SP but also be tolerant of multiple and/or HT
++            boolean space = true;
++            while (space) {
++                // Read new bytes if needed
++                if (pos >= lastValid) {
++                    if (!fill(false)) //request line parsing
++                        return false;
++                }
++                if (buf[pos] == Constants.SP || buf[pos] == Constants.HT) {
++                    pos++;
++                } else {
++                    space = false;
++                }
++            }
++            parsingRequestLineStart = pos;
++            parsingRequestLinePhase = 4;
++        }
++        if (parsingRequestLinePhase == 4) {
++            // Mark the current buffer position
++
++            int end = 0;
++            //
++            // Reading the URI
++            //
++            boolean space = false;
++            while (!space) {
++                // Read new bytes if needed
++                if (pos >= lastValid) {
++                    if (!fill(false)) //request line parsing
++                        return false;
++                }
++                if (buf[pos] == Constants.SP || buf[pos] == Constants.HT) {
++                    space = true;
++                    end = pos;
++                } else if ((buf[pos] == Constants.CR)
++                           || (buf[pos] == Constants.LF)) {
++                    // HTTP/0.9 style request
++                    parsingRequestLineEol = true;
++                    space = true;
++                    end = pos;
++                } else if ((buf[pos] == Constants.QUESTION)
++                           && (parsingRequestLineQPos == -1)) {
++                    parsingRequestLineQPos = pos;
++                }
++                pos++;
++            }
++            request.unparsedURI().setBytes(buf, parsingRequestLineStart, end - parsingRequestLineStart);
++            if (parsingRequestLineQPos >= 0) {
++                request.queryString().setBytes(buf, parsingRequestLineQPos + 1,
++                                               end - parsingRequestLineQPos - 1);
++                request.requestURI().setBytes(buf, parsingRequestLineStart, parsingRequestLineQPos - parsingRequestLineStart);
++            } else {
++                request.requestURI().setBytes(buf, parsingRequestLineStart, end - parsingRequestLineStart);
++            }
++            parsingRequestLinePhase = 5;
++        }
++        if ( parsingRequestLinePhase == 5 ) {
++            // Spec says single SP but also be tolerant of multiple and/or HT
++            boolean space = true;
++            while (space) {
++                // Read new bytes if needed
++                if (pos >= lastValid) {
++                    if (!fill(false)) //request line parsing
++                        return false;
++                }
++                if (buf[pos] == Constants.SP || buf[pos] == Constants.HT) {
++                    pos++;
++                } else {
++                    space = false;
++                }
++            }
++            parsingRequestLineStart = pos;
++            parsingRequestLinePhase = 6;
++
++            // Mark the current buffer position
++            end = 0;
++        }
++        if (parsingRequestLinePhase == 6) {
++            //
++            // Reading the protocol
++            // Protocol is always US-ASCII
++            //
++            while (!parsingRequestLineEol) {
++                // Read new bytes if needed
++                if (pos >= lastValid) {
++                    if (!fill(false)) //request line parsing
++                        return false;
++                }
++
++                if (buf[pos] == Constants.CR) {
++                    end = pos;
++                } else if (buf[pos] == Constants.LF) {
++                    if (end == 0)
++                        end = pos;
++                    parsingRequestLineEol = true;
++                }
++                pos++;
++            }
++
++            if ( (end - parsingRequestLineStart) > 0) {
++                request.protocol().setBytes(buf, parsingRequestLineStart, end - parsingRequestLineStart);
++            } else {
++                request.protocol().setString("");
++            }
++            parsingRequestLine = false;
++            parsingRequestLinePhase = 0;
++            parsingRequestLineEol = false;
++            parsingRequestLineStart = 0;
++            return true;
++        }
++        throw new IllegalStateException("Invalid request line parse phase:"+parsingRequestLinePhase);
++    }
++
++    private void expand(int newsize) {
++        if ( newsize > buf.length ) {
++            if (parsingHeader) {
++                throw new IllegalArgumentException(
++                        sm.getString("iib.requestheadertoolarge.error"));
++            }
++            // Should not happen
++            log.warn("Expanding buffer size. Old size: " + buf.length
++                    + ", new size: " + newsize, new Exception());
++            byte[] tmp = new byte[newsize];
++            System.arraycopy(buf,0,tmp,0,buf.length);
++            buf = tmp;
++        }
++    }
++
++    /**
++     * Parse the HTTP headers.
++     */
++    @Override
++    public boolean parseHeaders()
++        throws IOException {
++        if (!parsingHeader) {
++            throw new IllegalStateException(
++                    sm.getString("iib.parseheaders.ise.error"));
++        }
++
++        HeaderParseStatus status = HeaderParseStatus.HAVE_MORE_HEADERS;
++
++        do {
++            status = parseHeader();
++            // Checking that
++            // (1) Headers plus request line size does not exceed its limit
++            // (2) There are enough bytes to avoid expanding the buffer when
++            // reading body
++            // Technically, (2) is technical limitation, (1) is logical
++            // limitation to enforce the meaning of headerBufferSize
++            // From the way how buf is allocated and how blank lines are being
++            // read, it should be enough to check (1) only.
++            if (pos > headerBufferSize
++                    || buf.length - pos < socketReadBufferSize) {
++                throw new IllegalArgumentException(
++                        sm.getString("iib.requestheadertoolarge.error"));
++            }
++        } while ( status == HeaderParseStatus.HAVE_MORE_HEADERS );
++        if (status == HeaderParseStatus.DONE) {
++            parsingHeader = false;
++            end = pos;
++            return true;
++        } else {
++            return false;
++        }
++    }
++
++
++    /**
++     * Parse an HTTP header.
++     *
++     * @return false after reading a blank line (which indicates that the
++     * HTTP header parsing is done
++     */
++    private HeaderParseStatus parseHeader()
++        throws IOException {
++
++        //
++        // Check for blank line
++        //
++
++        byte chr = 0;
++        while (headerParsePos == HeaderParsePosition.HEADER_START) {
++
++            // Read new bytes if needed
++            if (pos >= lastValid) {
++                if (!fill(false)) {//parse header
++                    headerParsePos = HeaderParsePosition.HEADER_START;
++                    return HeaderParseStatus.NEED_MORE_DATA;
++                }
++            }
++
++            chr = buf[pos];
++
++            if (chr == Constants.CR) {
++                // Skip
++            } else if (chr == Constants.LF) {
++                pos++;
++                return HeaderParseStatus.DONE;
++            } else {
++                break;
++            }
++
++            pos++;
++
++        }
++
++        if ( headerParsePos == HeaderParsePosition.HEADER_START ) {
++            // Mark the current buffer position
++            headerData.start = pos;
++            headerParsePos = HeaderParsePosition.HEADER_NAME;
++        }
++
++        //
++        // Reading the header name
++        // Header name is always US-ASCII
++        //
++
++        while (headerParsePos == HeaderParsePosition.HEADER_NAME) {
++
++            // Read new bytes if needed
++            if (pos >= lastValid) {
++                if (!fill(false)) { //parse header
++                    return HeaderParseStatus.NEED_MORE_DATA;
++                }
++            }
++
++            chr = buf[pos];
++            if (chr == Constants.COLON) {
++                headerParsePos = HeaderParsePosition.HEADER_VALUE_START;
++                headerData.headerValue = headers.addValue(buf, headerData.start, pos - headerData.start);
++                pos++;
++                // Mark the current buffer position
++                headerData.start = pos;
++                headerData.realPos = pos;
++                headerData.lastSignificantChar = pos;
++                break;
++            } else if (!HTTP_TOKEN_CHAR[chr]) {
++                // If a non-token header is detected, skip the line and
++                // ignore the header
++                headerData.lastSignificantChar = pos;
++                return skipLine();
++            }
++
++            // chr is next byte of header name. Convert to lowercase.
++            if ((chr >= Constants.A) && (chr <= Constants.Z)) {
++                buf[pos] = (byte) (chr - Constants.LC_OFFSET);
++            }
++            pos++;
++        }
++
++        // Skip the line and ignore the header
++        if (headerParsePos == HeaderParsePosition.HEADER_SKIPLINE) {
++            return skipLine();
++        }
++
++        //
++        // Reading the header value (which can be spanned over multiple lines)
++        //
++
++        while (headerParsePos == HeaderParsePosition.HEADER_VALUE_START ||
++               headerParsePos == HeaderParsePosition.HEADER_VALUE ||
++               headerParsePos == HeaderParsePosition.HEADER_MULTI_LINE) {
++
++            if ( headerParsePos == HeaderParsePosition.HEADER_VALUE_START ) {
++                // Skipping spaces
++                while (true) {
++                    // Read new bytes if needed
++                    if (pos >= lastValid) {
++                        if (!fill(false)) {//parse header
++                            //HEADER_VALUE_START
++                            return HeaderParseStatus.NEED_MORE_DATA;
++                        }
++                    }
++
++                    chr = buf[pos];
++                    if (chr == Constants.SP || chr == Constants.HT) {
++                        pos++;
++                    } else {
++                        headerParsePos = HeaderParsePosition.HEADER_VALUE;
++                        break;
++                    }
++                }
++            }
++            if ( headerParsePos == HeaderParsePosition.HEADER_VALUE ) {
++
++                // Reading bytes until the end of the line
++                boolean eol = false;
++                while (!eol) {
++
++                    // Read new bytes if needed
++                    if (pos >= lastValid) {
++                        if (!fill(false)) {//parse header
++                            //HEADER_VALUE
++                            return HeaderParseStatus.NEED_MORE_DATA;
++                        }
++                    }
++
++                    chr = buf[pos];
++                    if (chr == Constants.CR) {
++                        // Skip
++                    } else if (chr == Constants.LF) {
++                        eol = true;
++                    } else if (chr == Constants.SP || chr == Constants.HT) {
++                        buf[headerData.realPos] = chr;
++                        headerData.realPos++;
++                    } else {
++                        buf[headerData.realPos] = chr;
++                        headerData.realPos++;
++                        headerData.lastSignificantChar = headerData.realPos;
++                    }
++
++                    pos++;
++                }
++
++                // Ignore whitespaces at the end of the line
++                headerData.realPos = headerData.lastSignificantChar;
++
++                // Checking the first character of the new line. If the character
++                // is a LWS, then it's a multiline header
++                headerParsePos = HeaderParsePosition.HEADER_MULTI_LINE;
++            }
++            // Read new bytes if needed
++            if (pos >= lastValid) {
++                if (!fill(false)) {//parse header
++                    //HEADER_MULTI_LINE
++                    return HeaderParseStatus.NEED_MORE_DATA;
++                }
++            }
++
++            chr = buf[pos];
++            if ( headerParsePos == HeaderParsePosition.HEADER_MULTI_LINE ) {
++                if ( (chr != Constants.SP) && (chr != Constants.HT)) {
++                    headerParsePos = HeaderParsePosition.HEADER_START;
++                    break;
++                } else {
++                    // Copying one extra space in the buffer (since there must
++                    // be at least one space inserted between the lines)
++                    buf[headerData.realPos] = chr;
++                    headerData.realPos++;
++                    headerParsePos = HeaderParsePosition.HEADER_VALUE_START;
++                }
++            }
++        }
++        // Set the header value
++        headerData.headerValue.setBytes(buf, headerData.start,
++                headerData.lastSignificantChar - headerData.start);
++        headerData.recycle();
++        return HeaderParseStatus.HAVE_MORE_HEADERS;
++    }
++
++    public int getParsingRequestLinePhase() {
++        return parsingRequestLinePhase;
++    }
++
++    private HeaderParseStatus skipLine() throws IOException {
++        headerParsePos = HeaderParsePosition.HEADER_SKIPLINE;
++        boolean eol = false;
++
++        // Reading bytes until the end of the line
++        while (!eol) {
++
++            // Read new bytes if needed
++            if (pos >= lastValid) {
++                if (!fill(false)) {
++                    return HeaderParseStatus.NEED_MORE_DATA;
++                }
++            }
++
++            if (buf[pos] == Constants.CR) {
++                // Skip
++            } else if (buf[pos] == Constants.LF) {
++                eol = true;
++            } else {
++                headerData.lastSignificantChar = pos;
++            }
++
++            pos++;
++        }
++        if (log.isDebugEnabled()) {
++            log.debug(sm.getString("iib.invalidheader", new String(buf,
++                    headerData.start,
++                    headerData.lastSignificantChar - headerData.start + 1,
++                    StandardCharsets.ISO_8859_1)));
++        }
++
++        headerParsePos = HeaderParsePosition.HEADER_START;
++        return HeaderParseStatus.HAVE_MORE_HEADERS;
++    }
++
++    private final HeaderParseData headerData = new HeaderParseData();
++    public static class HeaderParseData {
++        /**
++         * When parsing header name: first character of the header.<br />
++         * When skipping broken header line: first character of the header.<br />
++         * When parsing header value: first character after ':'.
++         */
++        int start = 0;
++        /**
++         * When parsing header name: not used (stays as 0).<br />
++         * When skipping broken header line: not used (stays as 0).<br />
++         * When parsing header value: starts as the first character after ':'.
++         * Then is increased as far as more bytes of the header are harvested.
++         * Bytes from buf[pos] are copied to buf[realPos]. Thus the string from
++         * [start] to [realPos-1] is the prepared value of the header, with
++         * whitespaces removed as needed.<br />
++         */
++        int realPos = 0;
++        /**
++         * When parsing header name: not used (stays as 0).<br />
++         * When skipping broken header line: last non-CR/non-LF character.<br />
++         * When parsing header value: position after the last not-LWS character.<br />
++         */
++        int lastSignificantChar = 0;
++        /**
++         * MB that will store the value of the header. It is null while parsing
++         * header name and is created after the name has been parsed.
++         */
++        MessageBytes headerValue = null;
++        public void recycle() {
++            start = 0;
++            realPos = 0;
++            lastSignificantChar = 0;
++            headerValue = null;
++        }
++    }
++
++
++    // ------------------------------------------------------ Protected Methods
++
++    @Override
++    protected void init(SocketWrapper<Nio2Channel> socketWrapper,
++            AbstractEndpoint<Nio2Channel> associatedEndpoint) throws IOException {
++
++        endpoint = associatedEndpoint;
++        socket = socketWrapper;
++        if (socket == null) {
++            // Socket has been closed in another thread
++            throw new IOException(sm.getString("iib.socketClosed"));
++        }
++        socketReadBufferSize =
++            socket.getSocket().getBufHandler().getReadBuffer().capacity();
++
++        int bufLength = headerBufferSize + socketReadBufferSize;
++        if (buf == null || buf.length < bufLength) {
++            buf = new byte[bufLength];
++        }
++
++        // Initialize the completion handler
++        this.completionHandler = new CompletionHandler<Integer, SocketWrapper<Nio2Channel>>() {
++
++            @Override
++            public void completed(Integer nBytes, SocketWrapper<Nio2Channel> attachment) {
++                boolean notify = false;
++                synchronized (completionHandler) {
++                    if (nBytes < 0) {
++                        failed(new ClosedChannelException(), attachment);
++                        return;
++                    }
++                    readPending = false;
++                    if (!Nio2Endpoint.isInline()) {
++                        notify = true;
++                    }
++                }
++                if (notify) {
++                    endpoint.processSocket(attachment, SocketStatus.OPEN_READ, false);
++                }
++            }
++
++            @Override
++            public void failed(Throwable exc, SocketWrapper<Nio2Channel> attachment) {
++                attachment.setError(true);
++                if (exc instanceof IOException) {
++                    e = (IOException) exc;
++                } else {
++                    e = new IOException(exc);
++                }
++                request.setAttribute(RequestDispatcher.ERROR_EXCEPTION, e);
++                readPending = false;
++                endpoint.processSocket(attachment, SocketStatus.OPEN_READ, true);
++            }
++        };
++    }
++
++    @Override
++    protected boolean fill(boolean block) throws IOException, EOFException {
++        if (e != null) {
++            throw e;
++        }
++        if (parsingHeader) {
++            if (lastValid > headerBufferSize) {
++                throw new IllegalArgumentException
++                    (sm.getString("iib.requestheadertoolarge.error"));
++            }
++        } else {
++            lastValid = pos = end;
++        }
++        // Now fill the internal buffer
++        int nRead = 0;
++        ByteBuffer byteBuffer = socket.getSocket().getBufHandler().getReadBuffer();
++        if (block) {
++            if (!flipped) {
++                byteBuffer.flip();
++                flipped = true;
++            }
++            int nBytes = byteBuffer.remaining();
++            // This case can happen when a blocking read follows a non blocking
++            // fill that completed asynchronously
++            if (nBytes > 0) {
++                expand(nBytes + pos);
++                byteBuffer.get(buf, pos, nBytes);
++                lastValid = pos + nBytes;
++                byteBuffer.clear();
++                flipped = false;
++                return true;
++            } else {
++                byteBuffer.clear();
++                flipped = false;
++                try {
++                    nRead = socket.getSocket().read(byteBuffer).get(socket.getTimeout(), TimeUnit.MILLISECONDS);
++                } catch (InterruptedException | ExecutionException
++                        | TimeoutException e) {
++                    throw new EOFException(sm.getString("iib.eof.error"));
++                }
++                if (nRead > 0) {
++                    if (!flipped) {
++                        byteBuffer.flip();
++                        flipped = true;
++                    }
++                    expand(nRead + pos);
++                    byteBuffer.get(buf, pos, nRead);
++                    lastValid = pos + nRead;
++                    return true;
++                } else if (nRead == -1) {
++                    //return false;
++                    throw new EOFException(sm.getString("iib.eof.error"));
++                } else {
++                    return false;
++                }
++            }
++        } else {
++            synchronized (completionHandler) {
++                if (!readPending) {
++                    if (!flipped) {
++                        byteBuffer.flip();
++                        flipped = true;
++                    }
++                    int nBytes = byteBuffer.remaining();
++                    if (nBytes > 0) {
++                        expand(nBytes + pos);
++                        byteBuffer.get(buf, pos, nBytes);
++                        lastValid = pos + nBytes;
++                        byteBuffer.clear();
++                        flipped = false;
++                    } else {
++                        byteBuffer.clear();
++                        flipped = false;
++                        readPending = true;
++                        Nio2Endpoint.startInline();
++                        try {
++                            socket.getSocket().read(byteBuffer, socket.getTimeout(),
++                                    TimeUnit.MILLISECONDS, socket, completionHandler);
++                        } catch (ReadPendingException e) {
++                            // Ignore ?
++                        }
++                        Nio2Endpoint.endInline();
++                        // Return the number of bytes that have been placed into the buffer
++                        if (!readPending) {
++                            // If the completion handler completed immediately
++                            if (!flipped) {
++                                byteBuffer.flip();
++                                flipped = true;
++                            }
++                            nBytes = byteBuffer.remaining();
++                            if (nBytes > 0) {
++                                expand(nBytes + pos);
++                                byteBuffer.get(buf, pos, nBytes);
++                                lastValid = pos + nBytes;
++                            }
++                            byteBuffer.clear();
++                            flipped = false;
++                        }
++                    }
++                    return (lastValid - pos) > 0;
++                } else {
++                    return false;
++                }
++            }
++        }
++    }
++
++
++    // ------------------------------------- InputStreamInputBuffer Inner Class
++
++
++    /**
++     * This class is an input buffer which will read its data from an input
++     * stream.
++     */
++    protected class SocketInputBuffer
++        implements InputBuffer {
++
++
++        /**
++         * Read bytes into the specified chunk.
++         */
++        @Override
++        public int doRead(ByteChunk chunk, Request req )
++            throws IOException {
++
++            if (pos >= lastValid) {
++                if (!fill(true)) //read body, must be blocking, as the thread is inside the app
++                    return -1;
++            }
++            if (isBlocking()) {
++                int length = lastValid - pos;
++                chunk.setBytes(buf, pos, length);
++                pos = lastValid;
++                return (length);
++            } else {
++                synchronized (completionHandler) {
++                    int length = lastValid - pos;
++                    chunk.setBytes(buf, pos, length);
++                    pos = lastValid;
++                    return (length);
++                }
++            }
++        }
++    }
++}
+
+==================================================
+Nio2Processor.java
+index 8ad8141f60..e55ce1a199 100644
+--- a/java/org/apache/coyote/http11/LocalStrings.properties
++++ b/java/org/apache/coyote/http11/LocalStrings.properties
+@@ -38,6 +38,7 @@ iib.readtimeout=Timeout attempting to read data from the socket
+ iib.requestheadertoolarge.error=Request header is too large
+ iib.socketClosed=The socket has been closed in another thread
+ 
++iob.failedwrite=Failed write
+ iob.failedwrite.ack=Failed to send HTTP 100 continue response
+ iob.illegalreset=The response may not be reset once it has been committed
+ iob.responseheadertoolarge.error=An attempt was made to write more data to the response headers than there was room available in the buffer. Increase maxHttpHeaderSize on the connector or write less data into the response headers.
+
+==================================================
+Nio2ServletInputStream.java
+new file mode 100644
+index 0000000000..21e797919f
+--- /dev/null
++++ b/java/org/apache/coyote/http11/upgrade/Nio2Processor.java
+@@ -0,0 +1,42 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.coyote.http11.upgrade;
++
++import javax.servlet.http.HttpUpgradeHandler;
++
++import org.apache.juli.logging.Log;
++import org.apache.juli.logging.LogFactory;
++import org.apache.tomcat.util.net.Nio2Channel;
++import org.apache.tomcat.util.net.SocketWrapper;
++
++public class Nio2Processor extends AbstractProcessor<Nio2Channel> {
++
++    private static final Log log = LogFactory.getLog(Nio2Processor.class);
++    @Override
++    protected Log getLog() {return log;}
++
++    private static final int INFINITE_TIMEOUT = -1;
++
++    public Nio2Processor(SocketWrapper<Nio2Channel> wrapper,
++            HttpUpgradeHandler httpUpgradeProcessor) {
++        super(httpUpgradeProcessor,
++                new Nio2ServletInputStream(wrapper),
++                new Nio2ServletOutputStream(wrapper));
++
++        wrapper.setTimeout(INFINITE_TIMEOUT);
++    }
++}
+
+==================================================
+Nio2ServletOutputStream.java
+new file mode 100644
+index 0000000000..5dcb59c77c
+--- /dev/null
++++ b/java/org/apache/coyote/http11/upgrade/Nio2ServletInputStream.java
+@@ -0,0 +1,229 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.coyote.http11.upgrade;
++
++import java.io.EOFException;
++import java.io.IOException;
++import java.nio.ByteBuffer;
++import java.nio.channels.AsynchronousCloseException;
++import java.nio.channels.ClosedChannelException;
++import java.nio.channels.CompletionHandler;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.TimeoutException;
++
++import org.apache.tomcat.util.net.Nio2Channel;
++import org.apache.tomcat.util.net.Nio2Endpoint;
++import org.apache.tomcat.util.net.SocketWrapper;
++
++public class Nio2ServletInputStream extends AbstractServletInputStream {
++
++    private final SocketWrapper<Nio2Channel> wrapper;
++    private final Nio2Channel channel;
++    private final CompletionHandler<Integer, SocketWrapper<Nio2Channel>> completionHandler;
++    private boolean flipped = false;
++    private volatile boolean readPending = false;
++
++    public Nio2ServletInputStream(SocketWrapper<Nio2Channel> wrapper) {
++        this.wrapper = wrapper;
++        this.channel = wrapper.getSocket();
++        this.completionHandler = new CompletionHandler<Integer, SocketWrapper<Nio2Channel>>() {
++            @Override
++            public void completed(Integer nBytes, SocketWrapper<Nio2Channel> attachment) {
++                synchronized (completionHandler) {
++                    if (nBytes < 0) {
++                        failed(new ClosedChannelException(), attachment);
++                        return;
++                    }
++                    readPending = false;
++                }
++                if (nBytes > 0) {
++                    if (!Nio2Endpoint.isInline()) {
++                        try {
++                            onDataAvailable();
++                        } catch (IOException e) {
++                            failed(e, attachment);
++                        }
++                    }
++                } else {
++                    try {
++                        onAllDataRead();
++                    } catch (IOException e) {
++                        failed(e, attachment);
++                    }
++                }
++            }
++            @Override
++            public void failed(Throwable exc, SocketWrapper<Nio2Channel> attachment) {
++                attachment.setError(true);
++                readPending = false;
++                onError(exc);
++                try {
++                    close();
++                } catch (IOException e) {
++                    // Ignore
++                }
++            }
++        };
++    }
++
++    @Override
++    protected boolean doIsReady() throws IOException {
++        synchronized (completionHandler) {
++            if (readPending) {
++                return false;
++            }
++            ByteBuffer readBuffer = channel.getBufHandler().getReadBuffer();
++            if (!flipped) {
++                readBuffer.flip();
++                flipped = true;
++            }
++            if (readBuffer.remaining() > 0) {
++                return true;
++            }
++
++            readBuffer.clear();
++            flipped = false;
++            int nRead = fillReadBuffer(false);
++
++            boolean isReady = nRead > 0;
++            if (isReady) {
++                if (!flipped) {
++                    readBuffer.flip();
++                    flipped = true;
++                }
++                try {
++                    onDataAvailable();
++                } catch (IOException e) {
++                    onError(e);
++                    try {
++                        close();
++                    } catch (IOException ioe) {
++                        // Ignore
++                    }
++                }
++            }
++            return isReady;
++        }
++    }
++
++    @Override
++    protected int doRead(boolean block, byte[] b, int off, int len)
++            throws IOException {
++
++        synchronized (completionHandler) {
++            if (readPending) {
++                return 0;
++            }
++
++            ByteBuffer readBuffer = channel.getBufHandler().getReadBuffer();
++
++            if (!flipped) {
++                readBuffer.flip();
++                flipped = true;
++            }
++            int remaining = readBuffer.remaining();
++            // Is there enough data in the read buffer to satisfy this request?
++            if (remaining >= len) {
++                readBuffer.get(b, off, len);
++                return len;
++            }
++
++            // Copy what data there is in the read buffer to the byte array
++            int leftToWrite = len;
++            int newOffset = off;
++            if (remaining > 0) {
++                readBuffer.get(b, off, remaining);
++                leftToWrite -= remaining;
++                newOffset += remaining;
++            }
++
++            // Fill the read buffer as best we can
++            readBuffer.clear();
++            flipped = false;
++            int nRead = fillReadBuffer(block);
++
++            // Full as much of the remaining byte array as possible with the data
++            // that was just read
++            if (nRead > 0) {
++                if (!flipped) {
++                    readBuffer.flip();
++                    flipped = true;
++                }
++                if (nRead > leftToWrite) {
++                    readBuffer.get(b, newOffset, leftToWrite);
++                    leftToWrite = 0;
++                } else {
++                    readBuffer.get(b, newOffset, nRead);
++                    leftToWrite -= nRead;
++                }
++            } else if (nRead == 0) {
++                if (block) {
++                    if (!flipped) {
++                        readBuffer.flip();
++                        flipped = true;
++                    }
++                }
++            } else if (nRead == -1) {
++                // TODO i18n
++                throw new EOFException();
++            }
++
++            return len - leftToWrite;
++        }
++    }
++
++    @Override
++    protected void doClose() throws IOException {
++        try {
++            channel.close();
++        } catch (AsynchronousCloseException e) {
++            // Ignore
++        }
++    }
++
++    private int fillReadBuffer(boolean block) throws IOException {
++        ByteBuffer readBuffer = channel.getBufHandler().getReadBuffer();
++        int nRead = 0;
++        if (block) {
++            readPending = true;
++            readBuffer.clear();
++            flipped = false;
++            try {
++                nRead = channel.read(readBuffer)
++                        .get(wrapper.getTimeout(), TimeUnit.MILLISECONDS);
++                readPending = false;
++            } catch (InterruptedException | ExecutionException
++                    | TimeoutException e) {
++                onError(e);
++                throw new IOException(e);
++            }
++        } else {
++            readPending = true;
++            readBuffer.clear();
++            flipped = false;
++            Nio2Endpoint.startInline();
++            channel.read(readBuffer,
++                    wrapper.getTimeout(), TimeUnit.MILLISECONDS, wrapper, completionHandler);
++            Nio2Endpoint.endInline();
++            if (!readPending) {
++                nRead = readBuffer.position();
++            }
++        }
++        return nRead;
++    }
++}
+
+==================================================
+Nio2Channel.java
+new file mode 100644
+index 0000000000..2ecd9d2d7f
+--- /dev/null
++++ b/java/org/apache/coyote/http11/upgrade/Nio2ServletOutputStream.java
+@@ -0,0 +1,169 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.coyote.http11.upgrade;
++
++import java.io.EOFException;
++import java.io.IOException;
++import java.nio.ByteBuffer;
++import java.nio.channels.AsynchronousCloseException;
++import java.nio.channels.ClosedChannelException;
++import java.nio.channels.CompletionHandler;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.TimeoutException;
++
++import org.apache.tomcat.util.net.Nio2Channel;
++import org.apache.tomcat.util.net.Nio2Endpoint;
++import org.apache.tomcat.util.net.Nio2Endpoint.Nio2SocketWrapper;
++import org.apache.tomcat.util.net.SocketWrapper;
++
++public class Nio2ServletOutputStream extends AbstractServletOutputStream<Nio2Channel> {
++
++    private final Nio2Channel channel;
++    private final int maxWrite;
++    private final CompletionHandler<Integer, SocketWrapper<Nio2Channel>> completionHandler;
++    private volatile boolean writePending = false;
++
++    public Nio2ServletOutputStream(SocketWrapper<Nio2Channel> socketWrapper) {
++        super(socketWrapper);
++        channel = socketWrapper.getSocket();
++        maxWrite = channel.getBufHandler().getWriteBuffer().capacity();
++        this.completionHandler = new CompletionHandler<Integer, SocketWrapper<Nio2Channel>>() {
++            @Override
++            public void completed(Integer nBytes, SocketWrapper<Nio2Channel> attachment) {
++                synchronized (completionHandler) {
++                    if (nBytes < 0) {
++                        failed(new ClosedChannelException(), attachment);
++                        return;
++                    }
++                    writePending = false;
++                }
++                if (!Nio2Endpoint.isInline()) {
++                    try {
++                        onWritePossible();
++                    } catch (IOException e) {
++                        failed(e, attachment);
++                    }
++                }
++            }
++            @Override
++            public void failed(Throwable exc, SocketWrapper<Nio2Channel> attachment) {
++                attachment.setError(true);
++                writePending = false;
++                onError(exc);
++                try {
++                    close();
++                } catch (IOException e) {
++                    // Ignore
++                }
++            }
++        };
++    }
++
++    @Override
++    protected int doWrite(boolean block, byte[] b, int off, int len)
++            throws IOException {
++        int leftToWrite = len;
++        int count = 0;
++        int offset = off;
++
++        while (leftToWrite > 0) {
++            int writeThisLoop;
++            int writtenThisLoop;
++
++            if (leftToWrite > maxWrite) {
++                writeThisLoop = maxWrite;
++            } else {
++                writeThisLoop = leftToWrite;
++            }
++
++            writtenThisLoop = doWriteInternal(block, b, offset, writeThisLoop);
++            if (writtenThisLoop < 0) {
++                throw new EOFException();
++            }
++            count += writtenThisLoop;
++            if (!block && writePending) {
++                // Prevent concurrent writes in non blocking mode,
++                // leftover data has to be buffered
++                return count;
++            }
++            offset += writtenThisLoop;
++            leftToWrite -= writtenThisLoop;
++
++            if (writtenThisLoop < writeThisLoop) {
++                break;
++            }
++        }
++
++        return count;
++    }
++
++    private int doWriteInternal(boolean block, byte[] b, int off, int len)
++            throws IOException {
++        ByteBuffer buffer = channel.getBufHandler().getWriteBuffer();
++        int written = 0;
++        long writeTimeout = ((Nio2SocketWrapper) socketWrapper).getWriteTimeout();
++        if (block) {
++            buffer.clear();
++            buffer.put(b, off, len);
++            buffer.flip();
++            try {
++                written = channel.write(buffer).get(writeTimeout, TimeUnit.MILLISECONDS);
++            } catch (InterruptedException | ExecutionException
++                    | TimeoutException e) {
++                onError(e);
++                throw new IOException(e);
++            }
++        } else {
++            synchronized (completionHandler) {
++                if (!writePending) {
++                    buffer.clear();
++                    buffer.put(b, off, len);
++                    buffer.flip();
++                    writePending = true;
++                    Nio2Endpoint.startInline();
++                    channel.write(buffer, writeTimeout, TimeUnit.MILLISECONDS, socketWrapper, completionHandler);
++                    Nio2Endpoint.endInline();
++                    written = len;
++                }
++            }
++        }
++        return written;
++    }
++
++    @Override
++    protected void doFlush() throws IOException {
++        long writeTimeout = ((Nio2SocketWrapper) socketWrapper).getWriteTimeout();
++        try {
++            if (!writePending) {
++                channel.flush().get(writeTimeout, TimeUnit.MILLISECONDS);
++            }
++        } catch (InterruptedException | ExecutionException | TimeoutException e) {
++            onError(e);
++            throw new IOException(e);
++        }
++    }
++
++    @Override
++    protected void doClose() throws IOException {
++        try {
++            channel.close();
++        } catch (AsynchronousCloseException e) {
++            // Ignore
++        }
++    }
++}
+
+==================================================
+Nio2Endpoint.java
+new file mode 100644
+index 0000000000..fe027fa973
+--- /dev/null
++++ b/java/org/apache/tomcat/util/net/Nio2Channel.java
+@@ -0,0 +1,207 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.tomcat.util.net;
++
++import java.io.IOException;
++import java.nio.ByteBuffer;
++import java.nio.channels.AsynchronousByteChannel;
++import java.nio.channels.AsynchronousSocketChannel;
++import java.nio.channels.CompletionHandler;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.Future;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.TimeoutException;
++
++import org.apache.tomcat.util.net.SecureNio2Channel.ApplicationBufferHandler;
++
++/**
++ * Base class for a SocketChannel wrapper used by the endpoint.
++ * This way, logic for a SSL socket channel remains the same as for
++ * a non SSL, making sure we don't need to code for any exception cases.
++ */
++public class Nio2Channel implements AsynchronousByteChannel {
++
++    protected static ByteBuffer emptyBuf = ByteBuffer.allocate(0);
++
++    protected AsynchronousSocketChannel sc = null;
++
++    protected ApplicationBufferHandler bufHandler;
++
++    protected boolean sendFile = false;
++
++    public Nio2Channel(AsynchronousSocketChannel channel, ApplicationBufferHandler bufHandler) {
++        this.sc = channel;
++        this.bufHandler = bufHandler;
++    }
++
++    /**
++     * Reset the channel
++     *
++     * @throws IOException If a problem was encountered resetting the channel
++     */
++    public void reset() throws IOException {
++        bufHandler.getReadBuffer().clear();
++        bufHandler.getWriteBuffer().clear();
++        this.sendFile = false;
++    }
++
++    public int getBufferSize() {
++        if ( bufHandler == null ) return 0;
++        int size = 0;
++        size += bufHandler.getReadBuffer()!=null?bufHandler.getReadBuffer().capacity():0;
++        size += bufHandler.getWriteBuffer()!=null?bufHandler.getWriteBuffer().capacity():0;
++        return size;
++    }
++
++    /**
++     * Closes this channel.
++     *
++     * @throws IOException If an I/O error occurs
++     */
++    @Override
++    public void close() throws IOException {
++        getIOChannel().close();
++    }
++
++    public void close(boolean force) throws IOException {
++        if (isOpen() || force ) close();
++    }
++    /**
++     * Tells whether or not this channel is open.
++     *
++     * @return <tt>true</tt> if, and only if, this channel is open
++     */
++    @Override
++    public boolean isOpen() {
++        return sc.isOpen();
++    }
++
++    public ApplicationBufferHandler getBufHandler() {
++        return bufHandler;
++    }
++
++    public AsynchronousSocketChannel getIOChannel() {
++        return sc;
++    }
++
++    public boolean isClosing() {
++        return false;
++    }
++
++    public boolean isHandshakeComplete() {
++        return true;
++    }
++
++    /**
++     * Performs SSL handshake hence is a no-op for the non-secure
++     * implementation.
++     *
++     * @return Always returns zero
++     * @throws IOException
++     */
++    public int handshake() throws IOException {
++        return 0;
++    }
++
++    public void setIOChannel(AsynchronousSocketChannel IOChannel) {
++        this.sc = IOChannel;
++    }
++
++    @Override
++    public String toString() {
++        return super.toString()+":"+this.sc.toString();
++    }
++
++    public boolean isSendFile() {
++        return sendFile;
++    }
++
++    public void setSendFile(boolean s) {
++        this.sendFile = s;
++    }
++
++    @Override
++    public Future<Integer> read(ByteBuffer dst) {
++        return sc.read(dst);
++    }
++
++    @Override
++    public <A> void read(ByteBuffer dst, A attachment,
++            CompletionHandler<Integer, ? super A> handler) {
++        read(dst, Integer.MAX_VALUE, TimeUnit.MILLISECONDS, attachment, handler);
++    }
++
++    public <A> void read(ByteBuffer dst,
++            long timeout, TimeUnit unit, A attachment,
++            CompletionHandler<Integer, ? super A> handler) {
++        sc.read(dst, timeout, unit, attachment, handler);
++    }
++
++    @Override
++    public Future<Integer> write(ByteBuffer src) {
++        return sc.write(src);
++    }
++
++    @Override
++    public <A> void write(ByteBuffer src, A attachment,
++            CompletionHandler<Integer, ? super A> handler) {
++        write(src, Integer.MAX_VALUE, TimeUnit.MILLISECONDS, attachment, handler);
++    }
++
++    public <A> void write(ByteBuffer src, long timeout, TimeUnit unit, A attachment,
++            CompletionHandler<Integer, ? super A> handler) {
++        sc.write(src, timeout, unit, attachment, handler);
++    }
++
++    public <A> void write(ByteBuffer[] srcs, int offset, int length,
++            long timeout, TimeUnit unit, A attachment,
++            CompletionHandler<Long,? super A> handler) {
++        sc.write(srcs, offset, length, timeout, unit, attachment, handler);
++    }
++
++    private static final Future<Boolean> DONE = new Future<Boolean>() {
++        @Override
++        public boolean cancel(boolean mayInterruptIfRunning) {
++            return false;
++        }
++        @Override
++        public boolean isCancelled() {
++            return false;
++        }
++        @Override
++        public boolean isDone() {
++            return true;
++        }
++        @Override
++        public Boolean get() throws InterruptedException,
++                ExecutionException {
++            return Boolean.TRUE;
++        }
++        @Override
++        public Boolean get(long timeout, TimeUnit unit)
++                throws InterruptedException, ExecutionException,
++                TimeoutException {
++            return Boolean.TRUE;
++        }
++    };
++
++    public Future<Boolean> flush()
++            throws IOException {
++        return DONE;
++    }
++
++}
+
+==================================================
+SecureNio2Channel.java
+new file mode 100644
+index 0000000000..5665ec5880
+--- /dev/null
++++ b/java/org/apache/tomcat/util/net/Nio2Endpoint.java
+@@ -0,0 +1,1251 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++
++package org.apache.tomcat.util.net;
++
++import java.io.File;
++import java.io.IOException;
++import java.net.InetSocketAddress;
++import java.net.SocketAddress;
++import java.net.StandardSocketOptions;
++import java.nio.ByteBuffer;
++import java.nio.channels.AsynchronousChannelGroup;
++import java.nio.channels.AsynchronousServerSocketChannel;
++import java.nio.channels.AsynchronousSocketChannel;
++import java.nio.channels.ClosedChannelException;
++import java.nio.channels.CompletionHandler;
++import java.nio.channels.FileChannel;
++import java.nio.channels.ReadPendingException;
++import java.nio.file.StandardOpenOption;
++import java.util.Iterator;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.Executor;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.RejectedExecutionException;
++import java.util.concurrent.TimeUnit;
++
++import javax.net.ssl.KeyManager;
++import javax.net.ssl.SSLContext;
++import javax.net.ssl.SSLEngine;
++import javax.net.ssl.SSLSessionContext;
++import javax.net.ssl.X509KeyManager;
++
++import org.apache.juli.logging.Log;
++import org.apache.juli.logging.LogFactory;
++import org.apache.tomcat.util.ExceptionUtils;
++import org.apache.tomcat.util.collections.SynchronizedStack;
++import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
++import org.apache.tomcat.util.net.SecureNio2Channel.ApplicationBufferHandler;
++import org.apache.tomcat.util.net.jsse.NioX509KeyManager;
++
++/**
++ * NIO2 endpoint.
++ */
++public class Nio2Endpoint extends AbstractEndpoint<Nio2Channel> {
++
++
++    // -------------------------------------------------------------- Constants
++
++
++    private static final Log log = LogFactory.getLog(Nio2Endpoint.class);
++
++
++    public static final int OP_REGISTER = 0x100; //register interest op
++    public static final int OP_CALLBACK = 0x200; //callback interest op
++    public static final int OP_READ = 0x400; //read interest op
++    public static final int OP_WRITE = 0x800; //write interest op
++
++    // ----------------------------------------------------------------- Fields
++
++    /**
++     * Server socket "pointer".
++     */
++    private AsynchronousServerSocketChannel serverSock = null;
++
++    /**
++     * use send file
++     */
++    private boolean useSendfile = true;
++
++    /**
++     * The size of the OOM parachute.
++     */
++    private int oomParachute = 1024*1024;
++
++    /**
++     * Allows detecting if a completion handler completes inline.
++     */
++    private static ThreadLocal<Boolean> inlineCompletion = new ThreadLocal<>();
++
++    /**
++     * The oom parachute, when an OOM error happens,
++     * will release the data, giving the JVM instantly
++     * a chunk of data to be able to recover with.
++     */
++    private byte[] oomParachuteData = null;
++
++    /**
++     * Make sure this string has already been allocated
++     */
++    private static final String oomParachuteMsg =
++        "SEVERE:Memory usage is low, parachute is non existent, your system may start failing.";
++
++    /**
++     * Keep track of OOM warning messages.
++     */
++    private long lastParachuteCheck = System.currentTimeMillis();
++    
++    /**
++     * Cache for SocketProcessor objects
++     */
++    private final SynchronizedStack<SocketProcessor> processorCache =
++            new SynchronizedStack<>(SynchronizedStack.DEFAULT_SIZE,
++                    socketProperties.getProcessorCache());
++
++    /**
++     * Cache for key attachment objects
++     */
++    private final SynchronizedStack<Nio2SocketWrapper> socketWrapperCache =
++            new SynchronizedStack<>(SynchronizedStack.DEFAULT_SIZE,
++                    socketProperties.getSocketWrapperCache());
++
++    /**
++     * Bytebuffer cache, each channel holds a set of buffers (two, except for SSL holds four)
++     */
++    private final SynchronizedStack<Nio2Channel> nioChannels =
++            new SynchronizedStack<>(SynchronizedStack.DEFAULT_SIZE,
++                    socketProperties.getBufferPoolSize());
++
++
++    // ------------------------------------------------------------- Properties
++
++
++    /**
++     * Use the object caches to reduce GC at the expense of additional memory use.
++     */
++    private boolean useCaches = false;
++    public void setUseCaches(boolean useCaches) { this.useCaches = useCaches; }
++    public boolean getUseCaches() { return useCaches; }
++
++
++    /**
++     * Priority of the poller threads.
++     */
++    private int pollerThreadPriority = Thread.NORM_PRIORITY;
++    public void setPollerThreadPriority(int pollerThreadPriority) { this.pollerThreadPriority = pollerThreadPriority; }
++    public int getPollerThreadPriority() { return pollerThreadPriority; }
++
++
++    /**
++     * Handling of accepted sockets.
++     */
++    private Handler handler = null;
++    public void setHandler(Handler handler ) { this.handler = handler; }
++    public Handler getHandler() { return handler; }
++
++
++    /**
++     * Allow comet request handling.
++     */
++    private boolean useComet = true;
++    public void setUseComet(boolean useComet) { this.useComet = useComet; }
++    @Override
++    public boolean getUseComet() { return useComet; }
++    @Override
++    public boolean getUseCometTimeout() { return getUseComet(); }
++    @Override
++    public boolean getUsePolling() { return true; } // Always supported
++
++    public void setSocketProperties(SocketProperties socketProperties) {
++        this.socketProperties = socketProperties;
++    }
++
++    public void setUseSendfile(boolean useSendfile) {
++        this.useSendfile = useSendfile;
++    }
++
++    /**
++     * Is deferAccept supported?
++     */
++    @Override
++    public boolean getDeferAccept() {
++        // Not supported
++        return false;
++    }
++
++    public void setOomParachute(int oomParachute) {
++        this.oomParachute = oomParachute;
++    }
++
++    public void setOomParachuteData(byte[] oomParachuteData) {
++        this.oomParachuteData = oomParachuteData;
++    }
++
++
++    private SSLContext sslContext = null;
++    public SSLContext getSSLContext() { return sslContext;}
++    public void setSSLContext(SSLContext c) { sslContext = c;}
++    private String[] enabledCiphers;
++    private String[] enabledProtocols;
++
++    /**
++     * Port in use.
++     */
++    @Override
++    public int getLocalPort() {
++        AsynchronousServerSocketChannel ssc = serverSock;
++        if (ssc == null) {
++            return -1;
++        } else {
++            try {
++                SocketAddress sa = ssc.getLocalAddress();
++                if (sa != null && sa instanceof InetSocketAddress) {
++                    return ((InetSocketAddress) sa).getPort();
++                } else {
++                    return -1;
++                }
++            } catch (IOException e) {
++                return -1;
++            }
++        }
++    }
++
++
++    @Override
++    public String[] getCiphersUsed() {
++        return enabledCiphers;
++    }
++
++
++    // --------------------------------------------------------- OOM Parachute Methods
++
++    protected void checkParachute() {
++        boolean para = reclaimParachute(false);
++        if (!para && (System.currentTimeMillis()-lastParachuteCheck)>10000) {
++            try {
++                log.fatal(oomParachuteMsg);
++            }catch (Throwable t) {
++                ExceptionUtils.handleThrowable(t);
++                System.err.println(oomParachuteMsg);
++            }
++            lastParachuteCheck = System.currentTimeMillis();
++        }
++    }
++
++    protected boolean reclaimParachute(boolean force) {
++        if ( oomParachuteData != null ) return true;
++        if ( oomParachute > 0 && ( force || (Runtime.getRuntime().freeMemory() > (oomParachute*2))) )
++            oomParachuteData = new byte[oomParachute];
++        return oomParachuteData != null;
++    }
++
++    protected void releaseCaches() {
++        if (useCaches) {
++            this.socketWrapperCache.clear();
++            this.nioChannels.clear();
++            this.processorCache.clear();
++        }
++        if ( handler != null ) handler.recycle();
++
++    }
++
++    // --------------------------------------------------------- Public Methods
++    
++    /**
++     * Number of keepalive sockets.
++     */
++    public int getKeepAliveCount() {
++        return 0;
++        // FIXME: would need some specific statistics gathering
++    }
++
++
++    // ----------------------------------------------- Public Lifecycle Methods
++
++
++    /**
++     * Initialize the endpoint.
++     */
++    @Override
++    public void bind() throws Exception {
++
++        // Create worker collection
++        if ( getExecutor() == null ) {
++            createExecutor();
++        }
++        AsynchronousChannelGroup threadGroup = null;
++        if (getExecutor() instanceof ExecutorService) {
++            threadGroup = AsynchronousChannelGroup.withThreadPool((ExecutorService) getExecutor());
++        }
++
++        serverSock = AsynchronousServerSocketChannel.open(threadGroup);
++        socketProperties.setProperties(serverSock);
++        InetSocketAddress addr = (getAddress()!=null?new InetSocketAddress(getAddress(),getPort()):new InetSocketAddress(getPort()));
++        serverSock.bind(addr,getBacklog());
++
++        // Initialize thread count defaults for acceptor, poller
++        if (acceptorThreadCount == 0) {
++            // NIO2 does not allow any form of IO concurrency
++            acceptorThreadCount = 1;
++        }
++
++        // Initialize SSL if needed
++        if (isSSLEnabled()) {
++            SSLUtil sslUtil = handler.getSslImplementation().getSSLUtil(this);
++
++            sslContext = sslUtil.createSSLContext();
++            sslContext.init(wrap(sslUtil.getKeyManagers()),
++                    sslUtil.getTrustManagers(), null);
++
++            SSLSessionContext sessionContext =
++                sslContext.getServerSessionContext();
++            if (sessionContext != null) {
++                sslUtil.configureSessionContext(sessionContext);
++            }
++            // Determine which cipher suites and protocols to enable
++            enabledCiphers = sslUtil.getEnableableCiphers(sslContext);
++            enabledProtocols = sslUtil.getEnableableProtocols(sslContext);
++        }
++
++        if (oomParachute>0) reclaimParachute(true);
++    }
++
++    public KeyManager[] wrap(KeyManager[] managers) {
++        if (managers==null) return null;
++        KeyManager[] result = new KeyManager[managers.length];
++        for (int i=0; i<result.length; i++) {
++            if (managers[i] instanceof X509KeyManager && getKeyAlias()!=null) {
++                result[i] = new NioX509KeyManager((X509KeyManager)managers[i],getKeyAlias());
++            } else {
++                result[i] = managers[i];
++            }
++        }
++        return result;
++    }
++
++
++    /**
++     * Start the NIO endpoint, creating acceptor, poller threads.
++     */
++    @Override
++    public void startInternal() throws Exception {
++
++        if (!running) {
++            running = true;
++            paused = false;
++
++            // FIXME: remove when more stable
++            log.warn("The NIO2 connector is currently EXPERIMENTAL and should not be used in production");
++
++            // Create worker collection
++            if ( getExecutor() == null ) {
++                createExecutor();
++            }
++
++            initializeConnectionLatch();
++            startAcceptorThreads();
++
++            // Start async timeout thread
++            Thread timeoutThread = new Thread(new AsyncTimeout(),
++                    getName() + "-AsyncTimeout");
++            timeoutThread.setPriority(threadPriority);
++            timeoutThread.setDaemon(true);
++            timeoutThread.start();
++        }
++    }
++
++
++    /**
++     * Stop the endpoint. This will cause all processing threads to stop.
++     */
++    @Override
++    public void stopInternal() {
++        releaseConnectionLatch();
++        if (!paused) {
++            pause();
++        }
++        if (running) {
++            running = false;
++            unlockAccept();
++        }
++        if (useCaches) {
++            socketWrapperCache.clear();
++            nioChannels.clear();
++            processorCache.clear();
++        }
++    }
++
++
++    /**
++     * Deallocate NIO memory pools, and close server socket.
++     */
++    @Override
++    public void unbind() throws Exception {
++        if (log.isDebugEnabled()) {
++            log.debug("Destroy initiated for "+new InetSocketAddress(getAddress(),getPort()));
++        }
++        if (running) {
++            stop();
++        }
++        // Close server socket
++        serverSock.close();
++        serverSock = null;
++        sslContext = null;
++        // Unlike other connectors, the thread pool is tied to the server socket
++        shutdownExecutor();
++        releaseCaches();
++        if (log.isDebugEnabled()) {
++            log.debug("Destroy completed for "+new InetSocketAddress(getAddress(),getPort()));
++        }
++    }
++
++
++    // ------------------------------------------------------ Protected Methods
++
++
++    public int getWriteBufSize() {
++        return socketProperties.getTxBufSize();
++    }
++
++    public int getReadBufSize() {
++        return socketProperties.getRxBufSize();
++    }
++
++    @Override
++    public boolean getUseSendfile() {
++        return useSendfile;
++    }
++
++    public int getOomParachute() {
++        return oomParachute;
++    }
++
++    public byte[] getOomParachuteData() {
++        return oomParachuteData;
++    }
++
++
++    @Override
++    protected AbstractEndpoint.Acceptor createAcceptor() {
++        return new Acceptor();
++    }
++
++
++    /**
++     * Process the specified connection.
++     */
++    protected boolean setSocketOptions(AsynchronousSocketChannel socket) {
++        // Process the connection
++        try {
++            socketProperties.setProperties(socket);
++
++            Nio2Channel channel = (useCaches) ? nioChannels.pop() : null;
++            if (channel == null) {
++                // SSL setup
++                if (sslContext != null) {
++                    SSLEngine engine = createSSLEngine();
++                    int appbufsize = engine.getSession().getApplicationBufferSize();
++                    NioBufferHandler bufhandler = new NioBufferHandler(Math.max(appbufsize,socketProperties.getAppReadBufSize()),
++                            socketProperties.getAppWriteBufSize(),
++                            socketProperties.getDirectBuffer());
++                    channel = new SecureNio2Channel(socket, engine, bufhandler, this);
++                } else {
++                    // normal tcp setup
++                    NioBufferHandler bufhandler = new NioBufferHandler(socketProperties.getAppReadBufSize(),
++                                                                       socketProperties.getAppWriteBufSize(),
++                                                                       socketProperties.getDirectBuffer());
++
++                    channel = new Nio2Channel(socket, bufhandler);
++                }
++            } else {
++                channel.setIOChannel(socket);
++                if ( channel instanceof SecureNio2Channel ) {
++                    SSLEngine engine = createSSLEngine();
++                    ((SecureNio2Channel)channel).reset(engine);
++                } else {
++                    channel.reset();
++                }
++            }
++            Nio2SocketWrapper socketWrapper = (useCaches) ? socketWrapperCache.pop() : null;
++            if (socketWrapper == null) {
++                socketWrapper = new Nio2SocketWrapper(channel);
++            }
++            socketWrapper.reset(channel, getSocketProperties().getSoTimeout());
++            socketWrapper.setKeepAliveLeft(Nio2Endpoint.this.getMaxKeepAliveRequests());
++            socketWrapper.setSecure(isSSLEnabled());
++            if (sslContext != null) {
++                ((SecureNio2Channel) channel).setSocket(socketWrapper);
++            }
++            processSocket(socketWrapper, SocketStatus.OPEN_READ, true);
++            // FIXME: In theory, awaitBytes is better, but the SSL handshake is done by processSocket
++            //awaitBytes(socketWrapper);
++        } catch (Throwable t) {
++            ExceptionUtils.handleThrowable(t);
++            try {
++                log.error("",t);
++            } catch (Throwable tt) {
++                ExceptionUtils.handleThrowable(t);
++            }
++            // Tell to close the socket
++            return false;
++        }
++        return true;
++    }
++
++    protected SSLEngine createSSLEngine() {
++        SSLEngine engine = sslContext.createSSLEngine();
++        if ("false".equals(getClientAuth())) {
++            engine.setNeedClientAuth(false);
++            engine.setWantClientAuth(false);
++        } else if ("true".equals(getClientAuth()) || "yes".equals(getClientAuth())){
++            engine.setNeedClientAuth(true);
++        } else if ("want".equals(getClientAuth())) {
++            engine.setWantClientAuth(true);
++        }
++        engine.setUseClientMode(false);
++        engine.setEnabledCipherSuites(enabledCiphers);
++        engine.setEnabledProtocols(enabledProtocols);
++
++        handler.onCreateSSLEngine(engine);
++        return engine;
++    }
++
++
++    /**
++     * Returns true if a worker thread is available for processing.
++     * @return boolean
++     */
++    protected boolean isWorkerAvailable() {
++        return true;
++    }
++
++
++    @Override
++    public void processSocket(SocketWrapper<Nio2Channel> socketWrapper,
++            SocketStatus socketStatus, boolean dispatch) {
++        processSocket0(socketWrapper, socketStatus, dispatch);
++    }
++
++    protected boolean processSocket0(SocketWrapper<Nio2Channel> socket, SocketStatus status, boolean dispatch) {
++        try {
++            ((Nio2SocketWrapper) socket).setCometNotify(false); //will get reset upon next reg
++            SocketProcessor sc = (useCaches) ? processorCache.pop() : null;
++            if (sc == null) {
++                sc = new SocketProcessor(socket, status);
++            } else {
++                sc.reset(socket, status);
++            }
++            Executor executor = getExecutor();
++            if (dispatch && executor != null) {
++                executor.execute(sc);
++            } else {
++                sc.run();
++            }
++        } catch (RejectedExecutionException ree) {
++            log.warn(sm.getString("endpoint.executor.fail", socket), ree);
++            return false;
++        } catch (Throwable t) {
++            ExceptionUtils.handleThrowable(t);
++            // This means we got an OOM or similar creating a thread, or that
++            // the pool and its queue are full
++            log.error(sm.getString("endpoint.process.fail"), t);
++            return false;
++        }
++        return true;
++    }
++
++    public void closeSocket(SocketWrapper<Nio2Channel> socket, SocketStatus status) {
++        try {
++            Nio2SocketWrapper ka = (Nio2SocketWrapper) socket;
++            if (socket != null && socket.isComet() && status != null) {
++                socket.setComet(false);//to avoid a loop
++                if (status == SocketStatus.TIMEOUT ) {
++                    if (processSocket0(socket, status, true)) {
++                        return; // don't close on comet timeout
++                    }
++                } else {
++                    // Don't dispatch if the lines below are canceling the key
++                    processSocket0(socket, status, false);
++                }
++            }
++            if (socket!=null) handler.release(socket);
++            try {
++                if (socket!=null) {
++                    socket.getSocket().close(true);
++                }
++            } catch (Exception e){
++                if (log.isDebugEnabled()) {
++                    log.debug(sm.getString(
++                            "endpoint.debug.socketCloseFail"), e);
++                }
++            }
++            try {
++                if (ka != null && ka.getSendfileData() != null
++                        && ka.getSendfileData().fchannel != null
++                        && ka.getSendfileData().fchannel.isOpen()) {
++                    ka.getSendfileData().fchannel.close();
++                }
++            } catch (Exception ignore) {
++            }
++            if (ka!=null) {
++                ka.reset();
++                countDownConnection();
++            }
++        } catch (Throwable e) {
++            ExceptionUtils.handleThrowable(e);
++            if (log.isDebugEnabled()) log.error("",e);
++        }
++    }
++
++    @Override
++    protected Log getLog() {
++        return log;
++    }
++
++
++    // --------------------------------------------------- Acceptor Inner Class
++
++    /**
++     * With NIO2, the main acceptor thread only initiates the initial accept
++     * but periodically checks that the connector is still accepting (if not
++     * it will attempt to start again). It is also responsible for periodic
++     * checks of async timeouts, rather than use a dedicated thread for that.
++     */
++    protected class Acceptor extends AbstractEndpoint.Acceptor {
++
++        @Override
++        public void run() {
++
++            int errorDelay = 0;
++
++            // Loop until we receive a shutdown command
++            while (running) {
++
++                // Loop if endpoint is paused
++                while (paused && running) {
++                    state = AcceptorState.PAUSED;
++                    try {
++                        Thread.sleep(50);
++                    } catch (InterruptedException e) {
++                        // Ignore
++                    }
++                }
++
++                if (!running) {
++                    break;
++                }
++                state = AcceptorState.RUNNING;
++
++                try {
++                    //if we have reached max connections, wait
++                    countUpOrAwaitConnection();
++
++                    AsynchronousSocketChannel socket = null;
++                    try {
++                        // Accept the next incoming connection from the server
++                        // socket
++                        socket = serverSock.accept().get();
++                    } catch (Exception e) {
++                        countDownConnection();
++                        // Introduce delay if necessary
++                        errorDelay = handleExceptionWithDelay(errorDelay);
++                        // re-throw
++                        throw e;
++                    }
++                    // Successful accept, reset the error delay
++                    errorDelay = 0;
++
++                    // Configure the socket
++                    if (running && !paused) {
++                        // Hand this socket off to an appropriate processor
++                        if (!setSocketOptions(socket)) {
++                            countDownConnection();
++                            closeSocket(socket);
++                        }
++                    } else {
++                        countDownConnection();
++                        // Close socket right away
++                        closeSocket(socket);
++                    }
++                } catch (NullPointerException npe) {
++                    if (running) {
++                        log.error(sm.getString("endpoint.accept.fail"), npe);
++                    }
++                } catch (Throwable t) {
++                    ExceptionUtils.handleThrowable(t);
++                    log.error(sm.getString("endpoint.accept.fail"), t);
++                }
++            }
++            state = AcceptorState.ENDED;
++        }
++
++    }
++
++    /**
++     * Async timeout thread
++     */
++    protected class AsyncTimeout implements Runnable {
++        /**
++         * The background thread that checks async requests and fires the
++         * timeout if there has been no activity.
++         */
++        @Override
++        public void run() {
++
++            // Loop until we receive a shutdown command
++            while (running) {
++                try {
++                    Thread.sleep(1000);
++                } catch (InterruptedException e) {
++                    // Ignore
++                }
++                long now = System.currentTimeMillis();
++                Iterator<SocketWrapper<Nio2Channel>> sockets =
++                    waitingRequests.keySet().iterator();
++                while (sockets.hasNext()) {
++                    SocketWrapper<Nio2Channel> socket = sockets.next();
++                    long access = socket.getLastAccess();
++                    if (socket.getTimeout() > 0 &&
++                            (now-access)>socket.getTimeout()) {
++                        processSocket(socket, SocketStatus.TIMEOUT, true);
++                    }
++                }
++
++                // Loop if endpoint is paused
++                while (paused && running) {
++                    try {
++                        Thread.sleep(1000);
++                    } catch (InterruptedException e) {
++                        // Ignore
++                    }
++                }
++
++            }
++        }
++    }
++
++
++    private void closeSocket(AsynchronousSocketChannel socket) {
++        try {
++            socket.close();
++        } catch (IOException ioe) {
++            if (log.isDebugEnabled()) {
++                log.debug("", ioe);
++            }
++        }
++    }
++
++
++    public static class Nio2SocketWrapper extends SocketWrapper<Nio2Channel> {
++
++        public Nio2SocketWrapper(Nio2Channel channel) {
++            super(channel);
++        }
++
++        public void reset(Nio2Channel channel, long soTimeout) {
++            super.reset(channel, soTimeout);
++            upgradeInit = false;
++            cometNotify = false;
++            interestOps = 0;
++            sendfileData = null;
++            if (readLatch != null) {
++                try {
++                    for (int i = 0; i < (int) readLatch.getCount(); i++) {
++                        readLatch.countDown();
++                    }
++                } catch (Exception ignore) {
++                }
++            }
++            readLatch = null;
++            sendfileData = null;
++            if (writeLatch != null) {
++                try {
++                    for (int i = 0; i < (int) writeLatch.getCount(); i++) {
++                        writeLatch.countDown();
++                    }
++                } catch (Exception ignore) {
++                }
++            }
++            writeLatch = null;
++            setWriteTimeout(soTimeout);
++        }
++
++        public void reset() {
++            reset(null, -1);
++        }
++
++        @Override
++        public long getTimeout() {
++            long timeout = super.getTimeout();
++            return (timeout > 0) ? timeout : Long.MAX_VALUE;
++        }
++        public void setUpgraded(boolean upgraded) {
++            if (upgraded && !isUpgraded()) {
++                upgradeInit = true;
++            }
++            super.setUpgraded(upgraded);
++        }
++        public boolean isUpgradeInit() {
++            boolean value = upgradeInit;
++            upgradeInit = false;
++            return value;
++        }
++        public void setCometNotify(boolean notify) { this.cometNotify = notify; }
++        public boolean getCometNotify() { return cometNotify; }
++        public Nio2Channel getChannel() { return getSocket();}
++        public int interestOps() { return interestOps;}
++        public int interestOps(int ops) { this.interestOps  = ops; return ops; }
++        public CountDownLatch getReadLatch() { return readLatch; }
++        public CountDownLatch getWriteLatch() { return writeLatch; }
++        protected CountDownLatch resetLatch(CountDownLatch latch) {
++            if ( latch==null || latch.getCount() == 0 ) return null;
++            else throw new IllegalStateException("Latch must be at count 0");
++        }
++        public void resetReadLatch() { readLatch = resetLatch(readLatch); }
++        public void resetWriteLatch() { writeLatch = resetLatch(writeLatch); }
++
++        protected CountDownLatch startLatch(CountDownLatch latch, int cnt) {
++            if ( latch == null || latch.getCount() == 0 ) {
++                return new CountDownLatch(cnt);
++            }
++            else throw new IllegalStateException("Latch must be at count 0 or null.");
++        }
++        public void startReadLatch(int cnt) { readLatch = startLatch(readLatch,cnt);}
++        public void startWriteLatch(int cnt) { writeLatch = startLatch(writeLatch,cnt);}
++
++        protected void awaitLatch(CountDownLatch latch, long timeout, TimeUnit unit) throws InterruptedException {
++            if ( latch == null ) throw new IllegalStateException("Latch cannot be null");
++            // Note: While the return value is ignored if the latch does time
++            //       out, logic further up the call stack will trigger a
++            //       SocketTimeoutException
++            latch.await(timeout,unit);
++        }
++        public void awaitReadLatch(long timeout, TimeUnit unit) throws InterruptedException { awaitLatch(readLatch,timeout,unit);}
++        public void awaitWriteLatch(long timeout, TimeUnit unit) throws InterruptedException { awaitLatch(writeLatch,timeout,unit);}
++
++        public void setSendfileData(SendfileData sf) { this.sendfileData = sf;}
++        public SendfileData getSendfileData() { return this.sendfileData;}
++
++        public void setWriteTimeout(long writeTimeout) {
++            if (writeTimeout <= 0) {
++                this.writeTimeout = Long.MAX_VALUE;
++            } else {
++                this.writeTimeout = writeTimeout;
++            }
++        }
++        public long getWriteTimeout() {return this.writeTimeout;}
++
++        private int interestOps = 0;
++        private boolean cometNotify = false;
++        private CountDownLatch readLatch = null;
++        private CountDownLatch writeLatch = null;
++        private SendfileData sendfileData = null;
++        private long writeTimeout = -1;
++        private boolean upgradeInit = false;
++
++    }
++
++    // ------------------------------------------------ Application Buffer Handler
++    public static class NioBufferHandler implements ApplicationBufferHandler {
++        private ByteBuffer readbuf = null;
++        private ByteBuffer writebuf = null;
++
++        public NioBufferHandler(int readsize, int writesize, boolean direct) {
++            if ( direct ) {
++                readbuf = ByteBuffer.allocateDirect(readsize);
++                writebuf = ByteBuffer.allocateDirect(writesize);
++            }else {
++                readbuf = ByteBuffer.allocate(readsize);
++                writebuf = ByteBuffer.allocate(writesize);
++            }
++        }
++
++        @Override
++        public ByteBuffer expand(ByteBuffer buffer, int remaining) {return buffer;}
++        @Override
++        public ByteBuffer getReadBuffer() {return readbuf;}
++        @Override
++        public ByteBuffer getWriteBuffer() {return writebuf;}
++
++    }
++
++    // ------------------------------------------------ Handler Inner Interface
++
++
++    /**
++     * Bare bones interface used for socket processing. Per thread data is to be
++     * stored in the ThreadWithAttributes extra folders, or alternately in
++     * thread local fields.
++     */
++    public interface Handler extends AbstractEndpoint.Handler {
++        public SocketState process(SocketWrapper<Nio2Channel> socket,
++                SocketStatus status);
++        public void release(SocketWrapper<Nio2Channel> socket);
++        public SSLImplementation getSslImplementation();
++        public void onCreateSSLEngine(SSLEngine engine);
++    }
++
++    protected ConcurrentHashMap<SocketWrapper<Nio2Channel>, SocketWrapper<Nio2Channel>> waitingRequests =
++            new ConcurrentHashMap<>();
++
++    /**
++     * The completion handler used for asynchronous read operations
++     */
++    private CompletionHandler<Integer, SocketWrapper<Nio2Channel>> awaitBytes
++            = new CompletionHandler<Integer, SocketWrapper<Nio2Channel>>() {
++
++        @Override
++        public synchronized void completed(Integer nBytes, SocketWrapper<Nio2Channel> attachment) {
++            if (nBytes < 0) {
++                failed(new ClosedChannelException(), attachment);
++                return;
++            }
++            processSocket0(attachment, SocketStatus.OPEN_READ, true);
++        }
++
++        @Override
++        public void failed(Throwable exc, SocketWrapper<Nio2Channel> attachment) {
++            processSocket0(attachment, SocketStatus.DISCONNECT, true);
++        }
++    };
++
++    public void addTimeout(SocketWrapper<Nio2Channel> socket) {
++        waitingRequests.put(socket, socket);
++    }
++
++    public boolean removeTimeout(SocketWrapper<Nio2Channel> socket) {
++        return waitingRequests.remove(socket) != null;
++    }
++
++    public static void startInline() {
++        inlineCompletion.set(Boolean.TRUE);
++    }
++
++    public static void endInline() {
++        inlineCompletion.set(Boolean.FALSE);
++    }
++
++    public static boolean isInline() {
++        Boolean flag = inlineCompletion.get();
++        if (flag == null) {
++            return false;
++        } else {
++            return flag.booleanValue();
++        }
++    }
++
++    public void awaitBytes(SocketWrapper<Nio2Channel> socket) {
++        if (socket == null || socket.getSocket() == null) {
++            return;
++        }
++        ByteBuffer byteBuffer = socket.getSocket().getBufHandler().getReadBuffer();
++        byteBuffer.clear();
++        try {
++            socket.getSocket().read(byteBuffer, socket.getTimeout(),
++                    TimeUnit.MILLISECONDS, socket, awaitBytes);
++        } catch (ReadPendingException e) {
++            // Ignore
++        }
++    }
++
++    public boolean processSendfile(final Nio2SocketWrapper socket) {
++
++        // Configure the send file data
++        SendfileData data = socket.getSendfileData();
++        if (data.fchannel == null || !data.fchannel.isOpen()) {
++            java.nio.file.Path path = new File(data.fileName).toPath();
++            try {
++                data.fchannel = java.nio.channels.FileChannel
++                        .open(path, StandardOpenOption.READ).position(data.pos);
++            } catch (IOException e) {
++                closeSocket(socket, SocketStatus.ERROR);
++                return false;
++            }
++        }
++
++        final ByteBuffer buffer;
++        if (!socketProperties.getDirectBuffer() && sslContext == null) {
++            // If not using SSL and direct buffers are not used, the
++            // idea of sendfile is to avoid memory copies, so allocate a
++            // direct buffer
++            int BUFFER_SIZE;
++            try {
++                BUFFER_SIZE = socket.getSocket().getIOChannel().getOption(StandardSocketOptions.SO_SNDBUF);
++            } catch (IOException e) {
++                BUFFER_SIZE = 8192;
++            }
++            buffer = ByteBuffer.allocateDirect(BUFFER_SIZE);
++        } else {
++            buffer = socket.getSocket().getBufHandler().getWriteBuffer();
++        }
++        int nr = -1;
++        try {
++            nr = data.fchannel.read(buffer);
++        } catch (IOException e1) {
++            closeSocket(socket, SocketStatus.ERROR);
++            return false;
++        }
++
++        if (nr >= 0) {
++            socket.getSocket().setSendFile(true);
++            buffer.flip();
++            socket.getSocket().write(buffer, data, new CompletionHandler<Integer, SendfileData>() {
++
++                @Override
++                public void completed(Integer nw, SendfileData attachment) {
++                    if (nw < 0) { // Reach the end of stream
++                        closeSocket(socket, SocketStatus.DISCONNECT);
++                        try {
++                            attachment.fchannel.close();
++                        } catch (IOException e) {
++                            // Ignore
++                        }
++                        return;
++                    }
++
++                    attachment.pos += nw;
++                    attachment.length -= nw;
++
++                    if (attachment.length <= 0) {
++                        socket.setSendfileData(null);
++                        try {
++                            attachment.fchannel.close();
++                        } catch (IOException e) {
++                            // Ignore
++                        }
++                        if (attachment.keepAlive) {
++                            socket.getSocket().setSendFile(false);
++                            awaitBytes(socket);
++                        } else {
++                            closeSocket(socket, SocketStatus.DISCONNECT);
++                        }
++                        return;
++                    }
++
++                    boolean ok = true;
++
++                    if (!buffer.hasRemaining()) {
++                        // This means that all data in the buffer has
++                        // been
++                        // written => Empty the buffer and read again
++                        buffer.clear();
++                        try {
++                            if (attachment.fchannel.read(buffer) >= 0) {
++                                buffer.flip();
++                                if (attachment.length < buffer.remaining()) {
++                                    buffer.limit(buffer.limit() - buffer.remaining() + (int) attachment.length);
++                                }
++                            } else {
++                                // Reach the EOF
++                                ok = false;
++                            }
++                        } catch (Throwable th) {
++                            if ( log.isDebugEnabled() ) log.debug("Unable to complete sendfile request:", th);
++                            ok = false;
++                        }
++                    }
++
++                    if (ok) {
++                        socket.getSocket().write(buffer, attachment, this);
++                    } else {
++                        try {
++                            attachment.fchannel.close();
++                        } catch (IOException e) {
++                            // Ignore
++                        }
++                        closeSocket(socket, SocketStatus.ERROR);
++                    }
++                }
++
++                @Override
++                public void failed(Throwable exc, SendfileData attachment) {
++                    // Closing channels
++                    closeSocket(socket, SocketStatus.ERROR);
++                    try {
++                        attachment.fchannel.close();
++                    } catch (IOException e) {
++                        // Ignore
++                    }
++                }
++            });
++            return true;
++        } else {
++            return false;
++        }
++    }
++
++    // ---------------------------------------------- SocketProcessor Inner Class
++    /**
++     * This class is the equivalent of the Worker, but will simply use in an
++     * external Executor thread pool.
++     */
++    protected class SocketProcessor implements Runnable {
++
++        private SocketWrapper<Nio2Channel> socket = null;
++        private SocketStatus status = null;
++
++        public SocketProcessor(SocketWrapper<Nio2Channel> socket, SocketStatus status) {
++            reset(socket,status);
++        }
++
++        public void reset(SocketWrapper<Nio2Channel> socket, SocketStatus status) {
++            this.socket = socket;
++            this.status = status;
++        }
++
++        @Override
++        public void run() {
++            // Upgraded connections need to allow multiple threads to access the
++            // connection at the same time to enable blocking IO to be used when
++            // NIO has been configured
++            if (socket != null && socket.isUpgraded() &&
++                    SocketStatus.OPEN_WRITE == status) {
++                synchronized (socket.getWriteThreadLock()) {
++                    doRun();
++                }
++            } else {
++                synchronized (socket) {
++                    doRun();
++                }
++            }
++        }
++
++        private void doRun() {
++            boolean launch = false;
++            try {
++                int handshake = -1;
++
++                try {
++                    if (socket != null && socket.getSocket() != null) {
++                        // For STOP there is no point trying to handshake as the
++                        // Poller has been stopped.
++                        if (socket.getSocket().isHandshakeComplete() ||
++                                status == SocketStatus.STOP) {
++                            handshake = 0;
++                        } else {
++                            handshake = socket.getSocket().handshake();
++                            // The handshake process reads/writes from/to the
++                            // socket. status may therefore be OPEN_WRITE once
++                            // the handshake completes. However, the handshake
++                            // happens when the socket is opened so the status
++                            // must always be OPEN_READ after it completes. It
++                            // is OK to always set this as it is only used if
++                            // the handshake completes.
++                            status = SocketStatus.OPEN_READ;
++                        }
++                    }
++                } catch (IOException x) {
++                    handshake = -1;
++                    if (log.isDebugEnabled()) log.debug("Error during SSL handshake",x);
++                }
++                if (handshake == 0) {
++                    SocketState state = SocketState.OPEN;
++                    // Process the request from this socket
++                    if (status == null) {
++                        state = handler.process(socket, SocketStatus.OPEN_READ);
++                    } else {
++                        state = handler.process(socket, status);
++                    }
++                    if (state == SocketState.CLOSED) {
++                        // Close socket and pool
++                        try {
++                            socket.setComet(false);
++                            closeSocket(socket, SocketStatus.ERROR);
++                            if (useCaches && running && !paused) {
++                                nioChannels.push(socket.getSocket());
++                            }
++                            if (useCaches && running && !paused && socket != null) {
++                                socketWrapperCache.push((Nio2SocketWrapper) socket);
++                            }
++                        } catch (Exception x) {
++                            log.error("",x);
++                        }
++                    } else if (state == SocketState.UPGRADING) {
++                        socket.setKeptAlive(true);
++                        socket.access();
++                        launch = true;
++                    }
++                } else if (handshake == -1 ) {
++                    if (socket != null) {
++                        closeSocket(socket, SocketStatus.DISCONNECT);
++                    }
++                    if (useCaches && running && !paused) {
++                        nioChannels.push(socket.getSocket());
++                    }
++                    if (useCaches && running && !paused && socket != null) {
++                        socketWrapperCache.push(((Nio2SocketWrapper) socket));
++                    }
++                }
++            } catch (OutOfMemoryError oom) {
++                try {
++                    oomParachuteData = null;
++                    log.error("", oom);
++                    if (socket != null) {
++                        closeSocket(socket, SocketStatus.ERROR);
++                    }
++                    releaseCaches();
++                } catch (Throwable oomt) {
++                    try {
++                        System.err.println(oomParachuteMsg);
++                        oomt.printStackTrace();
++                    } catch (Throwable letsHopeWeDontGetHere){
++                        ExceptionUtils.handleThrowable(letsHopeWeDontGetHere);
++                    }
++                }
++            } catch (VirtualMachineError vme) {
++                ExceptionUtils.handleThrowable(vme);
++            } catch (Throwable t) {
++                log.error("", t);
++                if (socket != null) {
++                    closeSocket(socket, SocketStatus.ERROR);
++                }
++            } finally {
++                if (launch) {
++                    try {
++                        getExecutor().execute(new SocketProcessor(socket, SocketStatus.OPEN_READ));
++                    } catch (NullPointerException npe) {
++                        if (running) {
++                            log.error(sm.getString("endpoint.launch.fail"),
++                                    npe);
++                        }
++                    }
++                }
++                socket = null;
++                status = null;
++                //return to cache
++                if (useCaches && running && !paused) {
++                    processorCache.push(this);
++                }
++            }
++        }
++    }
++
++    // ----------------------------------------------- SendfileData Inner Class
++    /**
++     * SendfileData class.
++     */
++    public static class SendfileData {
++        // File
++        public String fileName;
++        public FileChannel fchannel;
++        public long pos;
++        public long length;
++        // KeepAlive flag
++        public boolean keepAlive;
++    }
++}
+
+==================================================
+SocketProperties.java
+new file mode 100644
+index 0000000000..98046a2b87
+--- /dev/null
++++ b/java/org/apache/tomcat/util/net/SecureNio2Channel.java
+@@ -0,0 +1,911 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.tomcat.util.net;
++
++import java.io.EOFException;
++import java.io.IOException;
++import java.net.SocketTimeoutException;
++import java.nio.ByteBuffer;
++import java.nio.channels.AsynchronousSocketChannel;
++import java.nio.channels.ClosedChannelException;
++import java.nio.channels.CompletionHandler;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.Future;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.TimeoutException;
++
++import javax.net.ssl.SSLEngine;
++import javax.net.ssl.SSLEngineResult;
++import javax.net.ssl.SSLEngineResult.HandshakeStatus;
++import javax.net.ssl.SSLEngineResult.Status;
++import javax.net.ssl.SSLException;
++
++/**
++ * Implementation of a secure socket channel for NIO2.
++ */
++public class SecureNio2Channel extends Nio2Channel  {
++
++    protected ByteBuffer netInBuffer;
++    protected ByteBuffer netOutBuffer;
++
++    protected SSLEngine sslEngine;
++    protected final Nio2Endpoint endpoint;
++    protected SocketWrapper<Nio2Channel> socket;
++
++    protected boolean handshakeComplete = false;
++    protected HandshakeStatus handshakeStatus; //gets set by handshake
++
++    protected boolean closed = false;
++    protected boolean closing = false;
++    protected boolean readPending = false;
++    protected boolean writePending = false;
++
++    private CompletionHandler<Integer, SocketWrapper<Nio2Channel>> handshakeReadCompletionHandler;
++    private CompletionHandler<Integer, SocketWrapper<Nio2Channel>> handshakeWriteCompletionHandler;
++
++    public SecureNio2Channel(AsynchronousSocketChannel channel, SSLEngine engine,
++            ApplicationBufferHandler bufHandler, Nio2Endpoint endpoint0) throws IOException {
++        super(channel, bufHandler);
++        this.sslEngine = engine;
++        this.endpoint = endpoint0;
++        int appBufSize = sslEngine.getSession().getApplicationBufferSize();
++        int netBufSize = sslEngine.getSession().getPacketBufferSize();
++        //allocate network buffers - TODO, add in optional direct non-direct buffers
++        netInBuffer = ByteBuffer.allocateDirect(netBufSize);
++        netOutBuffer = ByteBuffer.allocateDirect(netBufSize);
++
++        handshakeReadCompletionHandler = new CompletionHandler<Integer, SocketWrapper<Nio2Channel>>() {
++            @Override
++            public void completed(Integer result, SocketWrapper<Nio2Channel> attachment) {
++                if (result < 0) {
++                    failed(new IOException("Error"), attachment);
++                    return;
++                }
++                endpoint.processSocket(attachment, SocketStatus.OPEN_READ, false);
++            }
++            @Override
++            public void failed(Throwable exc, SocketWrapper<Nio2Channel> attachment) {
++                endpoint.closeSocket(attachment, SocketStatus.ERROR);
++            }
++        };
++        handshakeWriteCompletionHandler = new CompletionHandler<Integer, SocketWrapper<Nio2Channel>>() {
++            @Override
++            public void completed(Integer result, SocketWrapper<Nio2Channel> attachment) {
++                if (result < 0) {
++                    failed(new IOException("Error"), attachment);
++                    return;
++                }
++                endpoint.processSocket(attachment, SocketStatus.OPEN_WRITE, false);
++            }
++            @Override
++            public void failed(Throwable exc, SocketWrapper<Nio2Channel> attachment) {
++                endpoint.closeSocket(attachment, SocketStatus.ERROR);
++            }
++        };
++
++        //ensure that the application has a large enough read/write buffers
++        //by doing this, we should not encounter any buffer overflow errors
++        // FIXME: this does nothing, so it is in the NIO2 endpoint
++        bufHandler.expand(bufHandler.getReadBuffer(), appBufSize);
++        reset();
++    }
++
++    void setSocket(SocketWrapper<Nio2Channel> socket) {
++        this.socket = socket;
++    }
++
++    public void reset(SSLEngine engine) throws IOException {
++        this.sslEngine = engine;
++        reset();
++    }
++
++    @Override
++    public void reset() throws IOException {
++        super.reset();
++        netOutBuffer.position(0);
++        netOutBuffer.limit(0);
++        netInBuffer.position(0);
++        netInBuffer.limit(0);
++        handshakeComplete = false;
++        closed = false;
++        closing = false;
++        readPending = false;
++        writePending = false;
++        //initiate handshake
++        sslEngine.beginHandshake();
++        handshakeStatus = sslEngine.getHandshakeStatus();
++    }
++
++    @Override
++    public int getBufferSize() {
++        int size = super.getBufferSize();
++        size += netInBuffer!=null?netInBuffer.capacity():0;
++        size += netOutBuffer!=null?netOutBuffer.capacity():0;
++        return size;
++    }
++
++    private class FutureFlush implements Future<Boolean> {
++        private Future<Integer> integer;
++        protected FutureFlush(Future<Integer> integer) {
++            this.integer = integer;
++        }
++        @Override
++        public boolean cancel(boolean mayInterruptIfRunning) {
++            return integer.cancel(mayInterruptIfRunning);
++        }
++        @Override
++        public boolean isCancelled() {
++            return integer.isCancelled();
++        }
++        @Override
++        public boolean isDone() {
++            return integer.isDone();
++        }
++        @Override
++        public Boolean get() throws InterruptedException,
++                ExecutionException {
++            int result = integer.get();
++            return result >= 0;
++        }
++        @Override
++        public Boolean get(long timeout, TimeUnit unit)
++                throws InterruptedException, ExecutionException,
++                TimeoutException {
++            int result = integer.get(timeout, unit);
++            return result >= 0;
++        }
++    };
++
++    /**
++     * Flush the channel.
++     *
++     * @return <code>true</code> if the network buffer has been flushed out and
++     *         is empty else <code>false</code> (as a future)
++     * @throws IOException
++     */
++    @Override
++    public Future<Boolean> flush()
++            throws IOException {
++        return new FutureFlush(sc.write(netOutBuffer));
++    }
++
++    /**
++     * Performs SSL handshake, non blocking, but performs NEED_TASK on the same thread.<br>
++     * Hence, you should never call this method using your Acceptor thread, as you would slow down
++     * your system significantly.<br>
++     * The return for this operation is 0 if the handshake is complete and a positive value if it is not complete.
++     * In the event of a positive value coming back, reregister the selection key for the return values interestOps.
++     *
++     * @return int - 0 if hand shake is complete, otherwise it returns a SelectionKey interestOps value
++     * @throws IOException
++     */
++    @Override
++    public int handshake() throws IOException {
++        return handshakeInternal(true);
++    }
++
++    protected int handshakeInternal(boolean async) throws IOException {
++        if (handshakeComplete)
++            return 0; //we have done our initial handshake
++
++        SSLEngineResult handshake = null;
++
++        while (!handshakeComplete) {
++            switch (handshakeStatus) {
++                case NOT_HANDSHAKING: {
++                    //should never happen
++                    throw new IOException("NOT_HANDSHAKING during handshake");
++                }
++                case FINISHED: {
++                    //we are complete if we have delivered the last package
++                    handshakeComplete = !netOutBuffer.hasRemaining();
++                    //return 0 if we are complete, otherwise we still have data to write
++                    if (handshakeComplete) {
++                        return 0;
++                    } else {
++                        if (async) {
++                            sc.write(netOutBuffer, socket, handshakeWriteCompletionHandler);
++                        } else {
++                            try {
++                                sc.write(netOutBuffer).get(endpoint.getSoTimeout(), TimeUnit.MILLISECONDS);
++                            } catch (InterruptedException | ExecutionException | TimeoutException e) {
++                                throw new IOException("Handshake error");
++                            }
++                        }
++                        return Nio2Endpoint.OP_WRITE;
++                    }
++                }
++                case NEED_WRAP: {
++                    //perform the wrap function
++                    handshake = handshakeWrap();
++                    if (handshake.getStatus() == Status.OK){
++                        if (handshakeStatus == HandshakeStatus.NEED_TASK)
++                            handshakeStatus = tasks();
++                    } else {
++                        //wrap should always work with our buffers
++                        throw new IOException("Unexpected status:" + handshake.getStatus() + " during handshake WRAP.");
++                    }
++                    if (handshakeStatus != HandshakeStatus.NEED_UNWRAP || netOutBuffer.remaining() > 0) {
++                        //should actually return OP_READ if we have NEED_UNWRAP
++                        if (async) {
++                            sc.write(netOutBuffer, socket, handshakeWriteCompletionHandler);
++                        } else {
++                            try {
++                                sc.write(netOutBuffer).get(endpoint.getSoTimeout(), TimeUnit.MILLISECONDS);
++                            } catch (InterruptedException | ExecutionException | TimeoutException e) {
++                                throw new IOException("Handshake error");
++                            }
++                        }
++                        return Nio2Endpoint.OP_WRITE;
++                    }
++                    //fall down to NEED_UNWRAP on the same call, will result in a
++                    //BUFFER_UNDERFLOW if it needs data
++                }
++                //$FALL-THROUGH$
++                case NEED_UNWRAP: {
++                    //perform the unwrap function
++                    handshake = handshakeUnwrap();
++                    if (handshake.getStatus() == Status.OK) {
++                        if (handshakeStatus == HandshakeStatus.NEED_TASK)
++                            handshakeStatus = tasks();
++                    } else if (handshake.getStatus() == Status.BUFFER_UNDERFLOW) {
++                        //read more data, reregister for OP_READ
++                        if (async) {
++                            sc.read(netInBuffer, socket, handshakeReadCompletionHandler);
++                        } else {
++                            try {
++                                sc.read(netInBuffer).get(endpoint.getSoTimeout(), TimeUnit.MILLISECONDS);
++                            } catch (InterruptedException | ExecutionException | TimeoutException e) {
++                                throw new IOException("Handshake error");
++                            }
++                        }
++                        return Nio2Endpoint.OP_READ;
++                    } else {
++                        throw new IOException("Invalid handshake status:"+handshakeStatus+" during handshake UNWRAP.");
++                    }
++                    break;
++                }
++                case NEED_TASK: {
++                    handshakeStatus = tasks();
++                    break;
++                }
++                default: throw new IllegalStateException("Invalid handshake status:"+handshakeStatus);
++            }
++        }
++        //return 0 if we are complete, otherwise recurse to process the task
++        return handshakeComplete ? 0 : handshakeInternal(async);
++    }
++
++    /**
++     * Force a blocking handshake to take place for this key.
++     * This requires that both network and application buffers have been emptied out prior to this call taking place, or a
++     * IOException will be thrown.
++     * @throws IOException - if an IO exception occurs or if application or network buffers contain data
++     * @throws SocketTimeoutException - if a socket operation timed out
++     */
++    public void rehandshake() throws IOException {
++        //validate the network buffers are empty
++        if (netInBuffer.position() > 0 && netInBuffer.position()<netInBuffer.limit()) throw new IOException("Network input buffer still contains data. Handshake will fail.");
++        if (netOutBuffer.position() > 0 && netOutBuffer.position()<netOutBuffer.limit()) throw new IOException("Network output buffer still contains data. Handshake will fail.");
++        if (getBufHandler().getReadBuffer().position()>0 && getBufHandler().getReadBuffer().position()<getBufHandler().getReadBuffer().limit()) throw new IOException("Application input buffer still contains data. Data would have been lost.");
++        if (getBufHandler().getWriteBuffer().position()>0 && getBufHandler().getWriteBuffer().position()<getBufHandler().getWriteBuffer().limit()) throw new IOException("Application output buffer still contains data. Data would have been lost.");
++        reset();
++        boolean handshaking = true;
++        try {
++            while (handshaking) {
++                int hsStatus = handshakeInternal(false);
++                switch (hsStatus) {
++                    case -1 : throw new EOFException("EOF during handshake.");
++                    case  0 : handshaking = false; break;
++                    default : // Some blocking IO occurred, so iterate
++                }
++            }
++        } catch (IOException x) {
++            throw x;
++        } catch (Exception cx) {
++            IOException x = new IOException(cx);
++            throw x;
++        }
++    }
++
++
++
++    /**
++     * Executes all the tasks needed on the same thread.
++     * @return HandshakeStatus
++     */
++    protected SSLEngineResult.HandshakeStatus tasks() {
++        Runnable r = null;
++        while ( (r = sslEngine.getDelegatedTask()) != null) {
++            r.run();
++        }
++        return sslEngine.getHandshakeStatus();
++    }
++
++    /**
++     * Performs the WRAP function
++     * @param doWrite boolean
++     * @return SSLEngineResult
++     * @throws IOException
++     */
++    protected SSLEngineResult handshakeWrap() throws IOException {
++        //this should never be called with a network buffer that contains data
++        //so we can clear it here.
++        netOutBuffer.clear();
++        //perform the wrap
++        SSLEngineResult result = sslEngine.wrap(bufHandler.getWriteBuffer(), netOutBuffer);
++        //prepare the results to be written
++        netOutBuffer.flip();
++        //set the status
++        handshakeStatus = result.getHandshakeStatus();
++        return result;
++    }
++
++    /**
++     * Perform handshake unwrap
++     * @param doread boolean
++     * @return SSLEngineResult
++     * @throws IOException
++     */
++    protected SSLEngineResult handshakeUnwrap() throws IOException {
++
++        if (netInBuffer.position() == netInBuffer.limit()) {
++            //clear the buffer if we have emptied it out on data
++            netInBuffer.clear();
++        }
++        SSLEngineResult result;
++        boolean cont = false;
++        //loop while we can perform pure SSLEngine data
++        do {
++            //prepare the buffer with the incoming data
++            netInBuffer.flip();
++            //call unwrap
++            result = sslEngine.unwrap(netInBuffer, bufHandler.getReadBuffer());
++            //compact the buffer, this is an optional method, wonder what would happen if we didn't
++            netInBuffer.compact();
++            //read in the status
++            handshakeStatus = result.getHandshakeStatus();
++            if (result.getStatus() == SSLEngineResult.Status.OK &&
++                 result.getHandshakeStatus() == HandshakeStatus.NEED_TASK) {
++                //execute tasks if we need to
++                handshakeStatus = tasks();
++            }
++            //perform another unwrap?
++            cont = result.getStatus() == SSLEngineResult.Status.OK &&
++                   handshakeStatus == HandshakeStatus.NEED_UNWRAP;
++        } while (cont);
++        return result;
++    }
++
++    /**
++     * Sends a SSL close message, will not physically close the connection here.<br>
++     * To close the connection, you could do something like
++     * <pre><code>
++     *   close();
++     *   while (isOpen() && !myTimeoutFunction()) Thread.sleep(25);
++     *   if ( isOpen() ) close(true); //forces a close if you timed out
++     * </code></pre>
++     * @throws IOException if an I/O error occurs
++     * @throws IOException if there is data on the outgoing network buffer and we are unable to flush it
++     */
++    @Override
++    public void close() throws IOException {
++        if (closing) return;
++        closing = true;
++        sslEngine.closeOutbound();
++
++        try {
++            if (!flush().get(endpoint.getSoTimeout(), TimeUnit.MILLISECONDS)) {
++                throw new IOException("Remaining data in the network buffer, can't send SSL close message, force a close with close(true) instead");
++            }
++        } catch (InterruptedException | ExecutionException | TimeoutException e) {
++            throw new IOException("Remaining data in the network buffer, can't send SSL close message, force a close with close(true) instead", e);
++        }
++        //prep the buffer for the close message
++        netOutBuffer.clear();
++        //perform the close, since we called sslEngine.closeOutbound
++        SSLEngineResult handshake = sslEngine.wrap(getEmptyBuf(), netOutBuffer);
++        //we should be in a close state
++        if (handshake.getStatus() != SSLEngineResult.Status.CLOSED) {
++            throw new IOException("Invalid close state, will not send network data.");
++        }
++        //prepare the buffer for writing
++        netOutBuffer.flip();
++        //if there is data to be written
++        flush();
++
++        //is the channel closed?
++        closed = (!netOutBuffer.hasRemaining() && (handshake.getHandshakeStatus() != HandshakeStatus.NEED_WRAP));
++    }
++
++    /**
++     * Force a close, can throw an IOException
++     * @param force boolean
++     * @throws IOException
++     */
++    @Override
++    public void close(boolean force) throws IOException {
++        try {
++            close();
++        } finally {
++            if ( force || closed ) {
++                closed = true;
++                sc.close();
++            }
++        }
++    }
++
++    private class FutureRead implements Future<Integer> {
++        @Override
++        public boolean cancel(boolean mayInterruptIfRunning) {
++            return false;
++        }
++        @Override
++        public boolean isCancelled() {
++            return false;
++        }
++        @Override
++        public boolean isDone() {
++            return true;
++        }
++        @Override
++        public Integer get() throws InterruptedException, ExecutionException {
++            return unwrap(netInBuffer.position());
++        }
++        @Override
++        public Integer get(long timeout, TimeUnit unit)
++                throws InterruptedException, ExecutionException,
++                TimeoutException {
++            return unwrap(netInBuffer.position());
++        }
++        protected Integer unwrap(int netread) throws ExecutionException {
++            //are we in the middle of closing or closed?
++            if (closing || closed)
++                return -1;
++            //did we reach EOF? if so send EOF up one layer.
++            if (netread == -1)
++                return -1;
++            //the data read
++            int read = 0;
++            //the SSL engine result
++            SSLEngineResult unwrap;
++            do {
++                //prepare the buffer
++                netInBuffer.flip();
++                //unwrap the data
++                try {
++                    unwrap = sslEngine.unwrap(netInBuffer, bufHandler.getReadBuffer());
++                } catch (SSLException e) {
++                    throw new ExecutionException(e);
++                }
++                //compact the buffer
++                netInBuffer.compact();
++                if (unwrap.getStatus()==Status.OK || unwrap.getStatus()==Status.BUFFER_UNDERFLOW) {
++                    //we did receive some data, add it to our total
++                    read += unwrap.bytesProduced();
++                    //perform any tasks if needed
++                    if (unwrap.getHandshakeStatus() == HandshakeStatus.NEED_TASK)
++                        tasks();
++                    //if we need more network data, then bail out for now.
++                    if (unwrap.getStatus() == Status.BUFFER_UNDERFLOW)
++                        break;
++                } else if (unwrap.getStatus()==Status.BUFFER_OVERFLOW && read > 0) {
++                    //buffer overflow can happen, if we have read data, then
++                    //empty out the dst buffer before we do another read
++                    break;
++                } else {
++                    //here we should trap BUFFER_OVERFLOW and call expand on the buffer
++                    //for now, throw an exception, as we initialized the buffers
++                    //in the constructor
++                    throw new ExecutionException(new IOException("Unable to unwrap data, invalid status: " + unwrap.getStatus()));
++                }
++            } while ((netInBuffer.position() != 0)); //continue to unwrapping as long as the input buffer has stuff
++            return (read);
++        }
++    }
++
++    private class FutureNetRead extends FutureRead {
++        private Future<Integer> integer;
++        protected FutureNetRead() {
++            this.integer = sc.read(netInBuffer);
++        }
++        @Override
++        public boolean cancel(boolean mayInterruptIfRunning) {
++            return integer.cancel(mayInterruptIfRunning);
++        }
++        @Override
++        public boolean isCancelled() {
++            return integer.isCancelled();
++        }
++        @Override
++        public boolean isDone() {
++            return integer.isDone();
++        }
++        @Override
++        public Integer get() throws InterruptedException, ExecutionException {
++            int netread = integer.get();
++            return unwrap(netread);
++        }
++        @Override
++        public Integer get(long timeout, TimeUnit unit)
++                throws InterruptedException, ExecutionException,
++                TimeoutException {
++            int netread = integer.get(timeout, unit);
++            return unwrap(netread);
++        }
++    }
++
++    /**
++     * Reads a sequence of bytes from this channel into the given buffer.
++     *
++     * @param dst The buffer into which bytes are to be transferred
++     * @return The number of bytes read, possibly zero, or <tt>-1</tt> if the channel has reached end-of-stream
++     * @throws IOException If some other I/O error occurs
++     * @throws IllegalArgumentException if the destination buffer is different than bufHandler.getReadBuffer()
++     */
++    @Override
++    public Future<Integer> read(ByteBuffer dst) {
++        //did we finish our handshake?
++        if (!handshakeComplete)
++            throw new IllegalStateException("Handshake incomplete, you must complete handshake before reading data.");
++        if (netInBuffer.position() > 0) {
++            return new FutureRead();
++        } else {
++            return new FutureNetRead();
++        }
++    }
++
++    private class FutureWrite implements Future<Integer> {
++        private Future<Integer> integer = null;
++        private int written = 0;
++        private Throwable t = null;
++        protected FutureWrite() {
++            //are we closing or closed?
++            if (closing || closed) {
++                t = new IOException("Channel is in closing state.");
++                return;
++            }
++            //The data buffer should be empty, we can reuse the entire buffer.
++            netOutBuffer.clear();
++            try {
++                SSLEngineResult result = sslEngine.wrap(bufHandler.getWriteBuffer(), netOutBuffer);
++                written = result.bytesConsumed();
++                netOutBuffer.flip();
++                if (result.getStatus() == Status.OK) {
++                    if (result.getHandshakeStatus() == HandshakeStatus.NEED_TASK)
++                        tasks();
++                } else {
++                    t = new IOException("Unable to wrap data, invalid engine state: " +result.getStatus());
++                }
++                integer = sc.write(netOutBuffer);
++            } catch (SSLException e) {
++                t = e;
++            }
++        }
++        @Override
++        public boolean cancel(boolean mayInterruptIfRunning) {
++            return integer.cancel(mayInterruptIfRunning);
++        }
++        @Override
++        public boolean isCancelled() {
++            return integer.isCancelled();
++        }
++        @Override
++        public boolean isDone() {
++            return integer.isDone();
++        }
++        @Override
++        public Integer get() throws InterruptedException, ExecutionException {
++            if (t != null) {
++                throw new ExecutionException(t);
++            }
++            integer.get();
++            return written;
++        }
++        @Override
++        public Integer get(long timeout, TimeUnit unit)
++                throws InterruptedException, ExecutionException,
++                TimeoutException {
++            if (t != null) {
++                throw new ExecutionException(t);
++            }
++            integer.get(timeout, unit);
++            return written;
++        }
++    }
++
++    /**
++     * Writes a sequence of bytes to this channel from the given buffer.
++     *
++     * @param src The buffer from which bytes are to be retrieved
++     * @return The number of bytes written, possibly zero
++     * @throws IOException If some other I/O error occurs
++     */
++    @Override
++    public Future<Integer> write(ByteBuffer src) {
++        return new FutureWrite();
++    }
++
++    private class ReadCompletionHandler<A> implements CompletionHandler<Integer, A> {
++        protected ByteBuffer dst;
++        protected CompletionHandler<Integer, ? super A> handler;
++        protected ReadCompletionHandler(ByteBuffer dst, CompletionHandler<Integer, ? super A> handler) {
++            this.dst = dst;
++            this.handler = handler;
++        }
++
++        @Override
++        public void completed(Integer nBytes, A attach) {
++            if (nBytes < 0) {
++                handler.failed(new ClosedChannelException(), attach);
++                return;
++            }
++            try {
++                //the data read
++                int read = 0;
++                //the SSL engine result
++                SSLEngineResult unwrap;
++                do {
++                    //prepare the buffer
++                    netInBuffer.flip();
++                    //unwrap the data
++                    unwrap = sslEngine.unwrap(netInBuffer, dst);
++                    //compact the buffer
++                    netInBuffer.compact();
++                    if (unwrap.getStatus() == Status.OK || unwrap.getStatus() == Status.BUFFER_UNDERFLOW) {
++                        //we did receive some data, add it to our total
++                        read += unwrap.bytesProduced();
++                        //perform any tasks if needed
++                        if (unwrap.getHandshakeStatus() == HandshakeStatus.NEED_TASK)
++                            tasks();
++                        //if we need more network data, then bail out for now.
++                        if (unwrap.getStatus() == Status.BUFFER_UNDERFLOW)
++                            break;
++                    } else if (unwrap.getStatus() == Status.BUFFER_OVERFLOW && read > 0) {
++                        //buffer overflow can happen, if we have read data, then
++                        //empty out the dst buffer before we do another read
++                        break;
++                    } else {
++                        //here we should trap BUFFER_OVERFLOW and call expand on the buffer
++                        //for now, throw an exception, as we initialized the buffers
++                        //in the constructor
++                        throw new IOException("Unable to unwrap data, invalid status: " + unwrap.getStatus());
++                    }
++                } while ((netInBuffer.position() != 0)); //continue to unwrapping as long as the input buffer has stuff
++                // If everything is OK, so complete
++                handler.completed(read, attach);
++            } catch (Exception e) {
++                // The operation must fails
++                handler.failed(e, attach);
++            }
++        }
++        @Override
++        public void failed(Throwable exc, A attach) {
++            handler.failed(exc, attach);
++        }
++    }
++
++    @Override
++    public <A> void read(final ByteBuffer dst,
++            long timeout, TimeUnit unit, final A attachment,
++            final CompletionHandler<Integer, ? super A> handler) {
++        //are we in the middle of closing or closed?
++        if (closing || closed) {
++            handler.completed(-1, attachment);
++            return;
++        }
++        //did we finish our handshake?
++        if (!handshakeComplete)
++            throw new IllegalStateException("Handshake incomplete, you must complete handshake before reading data.");
++        ReadCompletionHandler<A> readCompletionHandler = new ReadCompletionHandler<A>(dst, handler);
++        if (netInBuffer.position() > 0 ) {
++            readCompletionHandler.completed(netInBuffer.position(), attachment);
++        } else {
++            sc.read(netInBuffer, timeout, unit, attachment, readCompletionHandler);
++        }
++    }
++
++    @Override
++    public <A> void write(final ByteBuffer src, long timeout, TimeUnit unit, final A attachment,
++            final CompletionHandler<Integer, ? super A> handler) {
++        //are we closing or closed?
++        if (closing || closed) {
++            handler.failed(new IOException("Channel is in closing state."), attachment);
++            return;
++        }
++
++        try {
++            // Prepare the output buffer
++            this.netOutBuffer.clear();
++            // Wrap the source data into the internal buffer
++            SSLEngineResult result = sslEngine.wrap(bufHandler.getWriteBuffer(), netOutBuffer);
++            final int written = result.bytesConsumed();
++            netOutBuffer.flip();
++            if (result.getStatus() == Status.OK) {
++                if (result.getHandshakeStatus() == HandshakeStatus.NEED_TASK)
++                    tasks();
++            } else {
++                handler.failed(new IOException("Unable to wrap data, invalid engine state: " +result.getStatus()), attachment);
++                return;
++            }
++            // Write data to the channel
++            sc.write(this.netOutBuffer, timeout, unit, attachment,
++                    new CompletionHandler<Integer, A>() {
++                @Override
++                public void completed(Integer nBytes, A attach) {
++                    if (nBytes < 0) {
++                        handler.failed(new ClosedChannelException(), attach);
++                    } else {
++                        // Call the handler completed method with the
++                        // consumed bytes number
++                        handler.completed(written, attach);
++                    }
++                }
++                @Override
++                public void failed(Throwable exc, A attach) {
++                    handler.failed(exc, attach);
++                }
++            });
++        } catch (Throwable exp) {
++            handler.failed(exp, attachment);
++        }
++    }
++
++    private class GatherState<A> {
++        public ByteBuffer[] srcs;
++        public int offset;
++        public int length;
++        public A attachment;
++        public long timeout;
++        public TimeUnit unit;
++        public CompletionHandler<Long, ? super A> handler;
++        protected GatherState(ByteBuffer[] srcs, int offset, int length,
++                long timeout, TimeUnit unit, A attachment,
++                CompletionHandler<Long, ? super A> handler) {
++            this.srcs = srcs;
++            this.offset = offset;
++            this.length = length;
++            this.timeout = timeout;
++            this.unit = unit;
++            this.attachment = attachment;
++            this.handler = handler;
++            this.pos = offset + 1;
++        }
++        public long writeCount = 0;
++        public int pos;
++    }
++
++    private class GatherCompletionHandler<A> implements CompletionHandler<Integer, GatherState<A>> {
++        protected GatherState<A> state;
++        protected GatherCompletionHandler(GatherState<A> state) {
++            this.state = state;
++        }
++        @Override
++        public void completed(Integer nBytes, GatherState<A> attachment) {
++            if (nBytes < 0) {
++                state.handler.failed(new ClosedChannelException(), state.attachment);
++            } else {
++                if (state.pos == state.offset + state.length) {
++                    state.handler.completed(state.writeCount, state.attachment);
++                    return;
++                }
++                try {
++                    // Prepare the output buffer
++                    netOutBuffer.clear();
++                    // Wrap the source data into the internal buffer
++                    SSLEngineResult result = sslEngine.wrap(state.srcs[state.offset], netOutBuffer);
++                    state.writeCount += result.bytesConsumed();
++                    netOutBuffer.flip();
++                    if (result.getStatus() == Status.OK) {
++                        if (result.getHandshakeStatus() == HandshakeStatus.NEED_TASK)
++                            tasks();
++                    } else {
++                        failed(new IOException("Unable to wrap data, invalid engine state: " +result.getStatus()), attachment);
++                        return;
++                    }
++                    state.offset++;
++                    // Write data to the channel
++                    sc.write(netOutBuffer, state.timeout, state.unit, state, this);
++                } catch (Throwable exp) {
++                    failed(exp, attachment);
++                }
++            }
++        }
++        @Override
++        public void failed(Throwable exc, GatherState<A> attachment) {
++            state.handler.failed(exc, state.attachment);
++        }
++    }
++
++    @Override
++    public <A> void write(ByteBuffer[] srcs, int offset, int length,
++            long timeout, TimeUnit unit, A attachment,
++            CompletionHandler<Long, ? super A> handler) {
++        if ((offset < 0) || (length < 0) || (offset > srcs.length - length)) {
++            throw new IndexOutOfBoundsException();
++        }
++        //are we closing or closed?
++        if (closing || closed) {
++            handler.failed(new IOException("Channel is in closing state."), attachment);
++            return;
++        }
++        try {
++            GatherState<A> state = new GatherState<>(srcs, offset, length,
++                    timeout, unit, attachment, handler);
++            // Prepare the output buffer
++            netOutBuffer.clear();
++            // Wrap the source data into the internal buffer
++            SSLEngineResult result = sslEngine.wrap(srcs[offset], netOutBuffer);
++            state.writeCount += result.bytesConsumed();
++            netOutBuffer.flip();
++            if (result.getStatus() == Status.OK) {
++                if (result.getHandshakeStatus() == HandshakeStatus.NEED_TASK)
++                    tasks();
++            } else {
++                handler.failed(new IOException("Unable to wrap data, invalid engine state: " +result.getStatus()), attachment);
++                return;
++            }
++            // Write data to the channel
++            sc.write(netOutBuffer, timeout, unit, state, new GatherCompletionHandler<A>(state));
++        } catch (Throwable exp) {
++            handler.failed(exp, attachment);
++        }
++   }
++
++    /**
++     * Callback interface to be able to expand buffers
++     * when buffer overflow exceptions happen
++     */
++    public static interface ApplicationBufferHandler {
++        public ByteBuffer expand(ByteBuffer buffer, int remaining);
++        public ByteBuffer getReadBuffer();
++        public ByteBuffer getWriteBuffer();
++    }
++
++    @Override
++    public ApplicationBufferHandler getBufHandler() {
++        return bufHandler;
++    }
++
++    @Override
++    public boolean isHandshakeComplete() {
++        return handshakeComplete;
++    }
++
++    @Override
++    public boolean isClosing() {
++        return closing;
++    }
++
++    public SSLEngine getSslEngine() {
++        return sslEngine;
++    }
++
++    public ByteBuffer getEmptyBuf() {
++        return emptyBuf;
++    }
++
++    public void setBufHandler(ApplicationBufferHandler bufHandler) {
++        this.bufHandler = bufHandler;
++    }
++
++    @Override
++    public AsynchronousSocketChannel getIOChannel() {
++        return sc;
++    }
++
++}
+\ No newline at end of file
+
+==================================================

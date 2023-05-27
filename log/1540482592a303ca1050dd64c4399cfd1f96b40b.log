@@ -1,0 +1,227 @@
+1540482592a303ca1050dd64c4399cfd1f96b40b
+==================================================
+Implement getOpenSessions
+==================================================
+Mark Emlyn
+==================================================
+Wed Feb 13 20:02:38 2013 +0000
+==================================================
+Session.java
+Implement getOpenSessions
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1445893 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+WsSession.java
+index 5d635f0d50..a991be9fcd 100644
+--- a/java/javax/websocket/Session.java
++++ b/java/javax/websocket/Session.java
+@@ -107,5 +107,9 @@ public interface Session extends Closeable {
+ 
+     Principal getUserPrincipal();
+ 
++    /**
++     * Obtain the set of currently open sessions for the local endpoint that
++     * this session is associated with.
++     */
+     Set<Session> getOpenSessions();
+ }
+
+==================================================
+WsWebSocketContainer.java
+index e86c24c96c..ef3736ecc2 100644
+--- a/java/org/apache/tomcat/websocket/WsSession.java
++++ b/java/org/apache/tomcat/websocket/WsSession.java
+@@ -51,7 +51,7 @@ public class WsSession implements Session {
+     private final Endpoint localEndpoint;
+     private final WsRemoteEndpointBase wsRemoteEndpoint;
+     private final ClassLoader applicationClassLoader;
+-    private final WebSocketContainer webSocketContainer;
++    private final WsWebSocketContainer webSocketContainer;
+ 
+     private MessageHandler textMessageHandler = null;
+     private MessageHandler binaryMessageHandler = null;
+@@ -76,13 +76,13 @@ public class WsSession implements Session {
+      */
+     public WsSession(Endpoint localEndpoint,
+             WsRemoteEndpointBase wsRemoteEndpoint,
+-            WebSocketContainer webSocketContainer) {
++            WsWebSocketContainer wsWebSocketContainer) {
+         this.localEndpoint = localEndpoint;
+         this.wsRemoteEndpoint = wsRemoteEndpoint;
+-        this.webSocketContainer = webSocketContainer;
++        this.webSocketContainer = wsWebSocketContainer;
+         applicationClassLoader = Thread.currentThread().getContextClassLoader();
+         wsRemoteEndpoint.setAsyncSendTimeout(
+-                webSocketContainer.getDefaultAsyncSendTimeout());
++                wsWebSocketContainer.getDefaultAsyncSendTimeout());
+         this.maxBinaryMessageBufferSize =
+                 webSocketContainer.getDefaultMaxBinaryMessageBufferSize();
+         this.maxTextMessageBufferSize =
+@@ -240,8 +240,7 @@ public class WsSession implements Session {
+ 
+     @Override
+     public Set<Session> getOpenSessions() {
+-        // TODO Auto-generated method stub
+-        return null;
++        return webSocketContainer.getOpenSession(localEndpoint.getClass());
+     }
+ 
+ 
+@@ -286,6 +285,9 @@ public class WsSession implements Session {
+                 // TODO - Ignore?
+             }
+ 
++            webSocketContainer.unregisterSession(
++                    localEndpoint.getClass(), this);
++
+             // Fire the onClose event
+             Thread t = Thread.currentThread();
+             ClassLoader cl = t.getContextClassLoader();
+
+==================================================
+ServerContainerImpl.java
+index a4a98e5860..a09419b23c 100644
+--- a/java/org/apache/tomcat/websocket/WsWebSocketContainer.java
++++ b/java/org/apache/tomcat/websocket/WsWebSocketContainer.java
+@@ -25,6 +25,7 @@ import java.nio.channels.AsynchronousSocketChannel;
+ import java.nio.charset.Charset;
+ import java.util.ArrayList;
+ import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
+@@ -53,6 +54,10 @@ public class WsWebSocketContainer implements WebSocketContainer {
+     private static final Charset iso88591 = Charset.forName("ISO-8859-1");
+     private static final byte[] crlf = new byte[] {13, 10};
+ 
++    private final Map<Class<?>, Set<WsSession>> endpointSessionMap =
++            new HashMap<>();
++    private final Object endPointSessionMapLock = new Object();
++
+     private long defaultAsyncTimeout = -1;
+     private int maxBinaryMessageBufferSize = Constants.DEFAULT_BUFFER_SIZE;
+     private int maxTextMessageBufferSize = Constants.DEFAULT_BUFFER_SIZE;
+@@ -147,8 +152,8 @@ public class WsWebSocketContainer implements WebSocketContainer {
+         }
+         WsSession wsSession =
+                 new WsSession(endpoint, wsRemoteEndpointClient, this);
+-
+         endpoint.onOpen(wsSession, clientEndpointConfiguration);
++        registerSession(clazz, wsSession);
+ 
+         // Object creation will trigger input processing
+         @SuppressWarnings("unused")
+@@ -159,6 +164,37 @@ public class WsWebSocketContainer implements WebSocketContainer {
+     }
+ 
+ 
++    protected void registerSession(Class<?> endpoint, WsSession wsSession) {
++        synchronized (endPointSessionMapLock) {
++            Set<WsSession> wsSessions = endpointSessionMap.get(endpoint);
++            if (wsSessions == null) {
++                wsSessions = new HashSet<>();
++                endpointSessionMap.put(endpoint, wsSessions);
++            }
++            wsSessions.add(wsSession);
++        }
++    }
++
++
++    protected void unregisterSession(Class<?> endpoint, WsSession wsSession) {
++        synchronized (endPointSessionMapLock) {
++            Set<WsSession> wsSessions = endpointSessionMap.get(endpoint);
++            if (wsSessions != null) {
++                wsSessions.remove(wsSession);
++                if (wsSessions.size() == 0) {
++                    endpointSessionMap.remove(endpoint);
++                }
++            }
++        }
++    }
++
++
++    Set<Session> getOpenSession(Class<?> endpoint) {
++        HashSet<Session> result = new HashSet<>();
++        result.addAll(endpointSessionMap.get(endpoint));
++        return result;
++    }
++
+     private Map<String,List<String>> createRequestHeaders(String host,
+             int port) {
+ 
+
+==================================================
+WsProtocolHandler.java
+index 10644038e4..723e7f0d41 100644
+--- a/java/org/apache/tomcat/websocket/server/ServerContainerImpl.java
++++ b/java/org/apache/tomcat/websocket/server/ServerContainerImpl.java
+@@ -31,6 +31,7 @@ import javax.websocket.server.ServerEndpointConfiguration;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.res.StringManager;
++import org.apache.tomcat.websocket.WsSession;
+ import org.apache.tomcat.websocket.WsWebSocketContainer;
+ import org.apache.tomcat.websocket.pojo.PojoEndpointConfiguration;
+ import org.apache.tomcat.websocket.pojo.PojoMethodMapping;
+@@ -244,6 +245,28 @@ public class ServerContainerImpl extends WsWebSocketContainer {
+     }
+ 
+ 
++    /**
++     * {@inheritDoc}
++     *
++     * Overridden to make them visible to other classes in this package.
++     */
++    @Override
++    protected void registerSession(Class<?> endpoint, WsSession wsSession) {
++        super.registerSession(endpoint, wsSession);
++    }
++
++
++    /**
++     * {@inheritDoc}
++     *
++     * Overridden to make them visible to other classes in this package.
++     */
++    @Override
++    protected void unregisterSession(Class<?> endpoint, WsSession wsSession) {
++        super.unregisterSession(endpoint, wsSession);
++    }
++
++
+     /**
+      * Converts a path defined for a WebSocket endpoint into a path that can be
+      * used as a servlet mapping.
+
+==================================================
+TestWsSession.java
+index 498b4b7c34..cd85fccbbc 100644
+--- a/java/org/apache/tomcat/websocket/server/WsProtocolHandler.java
++++ b/java/org/apache/tomcat/websocket/server/WsProtocolHandler.java
+@@ -93,6 +93,7 @@ public class WsProtocolHandler implements HttpUpgradeHandler {
+             sos.setWriteListener(
+                     new WsWriteListener(this, wsRemoteEndpointServer));
+             ep.onOpen(wsSession, endpointConfig);
++            webSocketContainer.registerSession(ep.getClass(), wsSession);
+         } finally {
+             t.setContextClassLoader(cl);
+         }
+
+==================================================
+TestWsWebSocketContainer.java
+index f306401b32..d7d237529b 100644
+--- a/test/org/apache/tomcat/websocket/TestWsSession.java
++++ b/test/org/apache/tomcat/websocket/TestWsSession.java
+@@ -132,4 +132,6 @@ public class TestWsSession {
+             // NO-OP
+         }
+     }
++
++
+ }
+
+==================================================

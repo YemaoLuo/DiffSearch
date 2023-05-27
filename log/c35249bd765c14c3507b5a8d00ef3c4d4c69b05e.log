@@ -1,0 +1,684 @@
+c35249bd765c14c3507b5a8d00ef3c4d4c69b05e
+==================================================
+Further fix for https://issues.apache.org/bugzilla/show_bug.cgi?id=56334
+==================================================
+Mark Emlyn
+==================================================
+Wed Apr 16 11:14:32 2014 +0000
+==================================================
+ELParser.java
+Further fix for https://issues.apache.org/bugzilla/show_bug.cgi?id=56334
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1587865 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Validator.java
+index e1fab19a18..91552dfb97 100644
+--- a/java/org/apache/jasper/compiler/ELParser.java
++++ b/java/org/apache/jasper/compiler/ELParser.java
+@@ -206,15 +206,22 @@ public class ELParser {
+         while (hasNextChar()) {
+             char ch = nextChar();
+             if (prev == '\\') {
+-                prev = 0;
+-                if (ch == '\\') {
++                if (ch == '$' || (!isDeferredSyntaxAllowedAsLiteral && ch == '#')) {
++                    prev = 0;
++                    buf.append(ch);
++                    continue;
++                } else if (ch == '\\') {
++                    // Not an escape (this time).
++                    // Optimisation - no need to set prev as it is unchanged
+                     buf.append('\\');
+                     continue;
+-                } else if (ch == '$'
+-                        || (!isDeferredSyntaxAllowedAsLiteral && ch == '#')) {
++                } else {
++                    // Not an escape
++                    prev = 0;
++                    buf.append('\\');
+                     buf.append(ch);
++                    continue;
+                 }
+-                // else error!
+             } else if (prev == '$'
+                     || (!isDeferredSyntaxAllowedAsLiteral && prev == '#')) {
+                 if (ch == '{') {
+@@ -238,6 +245,90 @@ public class ELParser {
+         return buf.toString();
+     }
+ 
++
++    /**
++     * Escape '\\', '$' and '#', inverting the unescaping performed in
++     * {@link #skipUntilEL()}.
++     *
++     * @param input Non-EL input to be escaped
++     * @param isDeferredSyntaxAllowedAsLiteral
++     *
++     * @return The escaped version of the input
++     */
++    private static String escapeLiteralExpression(String input,
++            boolean isDeferredSyntaxAllowedAsLiteral) {
++        int len = input.length();
++        int lastAppend = 0;
++        StringBuilder output = null;
++        for (int i = 0; i < len; i++) {
++            char ch = input.charAt(i);
++            if (ch =='$' || (!isDeferredSyntaxAllowedAsLiteral && ch == '#')) {
++                if (output == null) {
++                    output = new StringBuilder(len + 20);
++                }
++                output.append(input.subSequence(lastAppend, i));
++                lastAppend = i + 1;
++                output.append('\\');
++                output.append(ch);
++            }
++        }
++        if (output == null) {
++            return input;
++        } else {
++            output.append(input.substring(lastAppend, len));
++            return output.toString();
++        }
++    }
++
++
++    /**
++     * Escape '\\', '\'' and '\"', inverting the unescaping performed in
++     * {@link #skipUntilEL()}.
++     *
++     * @param input Non-EL input to be escaped
++     * @param isDeferredSyntaxAllowedAsLiteral
++     *
++     * @return The escaped version of the input
++     */
++    private static String escapeStringLiteral(String input) {
++        int len = input.length();
++        if (len < 2) {
++            // Can't possibly be quoted
++            return input;
++        }
++        char quote = input.charAt(0);
++        if (quote != '\'' && quote != '\"') {
++            throw new IllegalArgumentException();
++        }
++
++        int lastAppend = 1;
++        StringBuilder output = null;
++        if (input.charAt(len - 1) != quote) {
++            throw new IllegalArgumentException();
++        }
++        for (int i = 1; i < len - 1; i++) {
++            char ch = input.charAt(i);
++            if (ch == '\\' || ch == '\'' || ch == '\"') {
++                if (output == null) {
++                    output = new StringBuilder(len + 20);
++                    output.append(quote);
++                }
++                output.append(input.subSequence(lastAppend, i));
++                lastAppend = i + 1;
++                output.append('\\');
++                output.append(ch);
++            }
++        }
++        if (output == null) {
++            return input;
++        } else {
++            // 'len' rather than 'len - 1' to add final quote
++            output.append(input.substring(lastAppend, len));
++            return output.toString();
++        }
++    }
++
++
+     /*
+      * @return true if there is something left in EL expression buffer other
+      * than white spaces.
+@@ -285,7 +376,7 @@ public class ELParser {
+ 
+     /*
+      * Parse a string in single or double quotes, allowing for escape sequences
+-     * '\\', and ('\"', or "\'")
++     * '\\', '\"' and "\'"
+      */
+     private Token parseQuotedChars(char quote) {
+         StringBuilder buf = new StringBuilder();
+@@ -294,10 +385,11 @@ public class ELParser {
+             char ch = nextChar();
+             if (ch == '\\') {
+                 ch = nextChar();
+-                if (ch == '\\' || ch == quote) {
++                if (ch == '\\' || ch == '\'' || ch == '\"') {
+                     buf.append(ch);
++                } else {
++                    throw new IllegalArgumentException();
+                 }
+-                // else error!
+             } else if (ch == quote) {
+                 buf.append(ch);
+                 break;
+@@ -452,8 +544,13 @@ public class ELParser {
+ 
+     protected static class TextBuilder extends ELNode.Visitor {
+ 
++        private final boolean isDeferredSyntaxAllowedAsLiteral;
+         protected StringBuilder output = new StringBuilder();
+ 
++        protected TextBuilder(boolean isDeferredSyntaxAllowedAsLiteral) {
++            this.isDeferredSyntaxAllowedAsLiteral = isDeferredSyntaxAllowedAsLiteral;
++        }
++
+         public String getText() {
+             return output.toString();
+         }
+@@ -468,18 +565,18 @@ public class ELParser {
+ 
+         @Override
+         public void visit(Function n) throws JasperException {
+-            output.append(Generator.escape(n.getOriginalText()));
++            output.append(escapeLiteralExpression(n.getOriginalText(), isDeferredSyntaxAllowedAsLiteral));
+             output.append('(');
+         }
+ 
+         @Override
+         public void visit(Text n) throws JasperException {
+-            output.append(Generator.escape(n.getText()));
++            output.append(escapeLiteralExpression(n.getText(),isDeferredSyntaxAllowedAsLiteral));
+         }
+ 
+         @Override
+         public void visit(ELText n) throws JasperException {
+-            output.append(Generator.escape(n.getText()));
++            output.append(escapeStringLiteral(n.getText()));
+         }
+     }
+ }
+
+==================================================
+TestELProcessor.java
+index a599b622be..6a4ab65d12 100644
+--- a/java/org/apache/jasper/compiler/Validator.java
++++ b/java/org/apache/jasper/compiler/Validator.java
+@@ -1091,6 +1091,7 @@ class Validator {
+                     pageInfo.isDeferredSyntaxAllowedAsLiteral() ||
+                     libraryVersion < 2.1;
+ 
++                String attributeValue;
+                 ELNode.Nodes el = null;
+                 if (!runtimeExpression && !pageInfo.isELIgnored()) {
+                     el = ELParser.parse(attrs.getValue(i),
+@@ -1115,6 +1116,14 @@ class Validator {
+                             }
+                         }
+                     }
++                    if (elExpression) {
++                        attributeValue = attrs.getValue(i);
++                    } else {
++                        // Should be a single Text node
++                        attributeValue = ((ELNode.Text) el.iterator().next()).getText();
++                    }
++                } else {
++                    attributeValue = attrs.getValue(i);
+                 }
+ 
+                 boolean expression = runtimeExpression || elExpression;
+@@ -1183,7 +1192,7 @@ class Validator {
+                                             Boolean.TYPE == expectedClass ||
+                                             expectedClass.isEnum()) {
+                                         try {
+-                                            expressionFactory.coerceToType(attrs.getValue(i), expectedClass);
++                                            expressionFactory.coerceToType(attributeValue, expectedClass);
+                                         } catch (Exception e) {
+                                             err.jspError
+                                                 (n, "jsp.error.coerce_to_type",
+@@ -1193,9 +1202,9 @@ class Validator {
+                                 }
+ 
+                                 jspAttrs[i] = new Node.JspAttribute(tldAttr,
+-                                        attrs.getQName(i), attrs.getURI(i), attrs
+-                                                .getLocalName(i),
+-                                        attrs.getValue(i), false, null, false);
++                                        attrs.getQName(i), attrs.getURI(i),
++                                        attrs.getLocalName(i),
++                                        attributeValue, false, null, false);
+                             } else {
+ 
+                                 if (deferred && !tldAttr.isDeferredMethod() && !tldAttr.isDeferredValue()) {
+@@ -1215,7 +1224,7 @@ class Validator {
+                                     jspAttrs[i] = new Node.JspAttribute(tldAttr,
+                                             attrs.getQName(i), attrs.getURI(i),
+                                             attrs.getLocalName(i),
+-                                            attrs.getValue(i), false, el, false);
++                                            attributeValue, false, el, false);
+                                     ELContextImpl ctx = new ELContextImpl(
+                                             expressionFactory);
+                                     ctx.setFunctionMapper(getFunctionMapper(el));
+@@ -1230,8 +1239,8 @@ class Validator {
+                                     // Runtime expression
+                                     jspAttrs[i] = getJspAttribute(tldAttr,
+                                             attrs.getQName(i), attrs.getURI(i),
+-                                            attrs.getLocalName(i), attrs
+-                                            .getValue(i), n, false);
++                                            attrs.getLocalName(i),
++                                            attributeValue, n, false);
+                                 }
+                             }
+ 
+@@ -1243,16 +1252,15 @@ class Validator {
+                                                 tldAttr.getName());
+                             }
+                             jspAttrs[i] = new Node.JspAttribute(tldAttr,
+-                                    attrs.getQName(i), attrs.getURI(i), attrs
+-                                            .getLocalName(i),
+-                                    attrs.getValue(i), false, null, false);
++                                    attrs.getQName(i), attrs.getURI(i),
++                                    attrs.getLocalName(i),
++                                    attributeValue, false, null, false);
+                         }
+                         if (expression) {
+                             tagDataAttrs.put(attrs.getQName(i),
+                                     TagData.REQUEST_TIME_VALUE);
+                         } else {
+-                            tagDataAttrs.put(attrs.getQName(i), attrs
+-                                    .getValue(i));
++                            tagDataAttrs.put(attrs.getQName(i), attributeValue);
+                         }
+                         found = true;
+                         break;
+@@ -1261,8 +1269,8 @@ class Validator {
+                 if (!found) {
+                     if (tagInfo.hasDynamicAttributes()) {
+                         jspAttrs[i] = getJspAttribute(null, attrs.getQName(i),
+-                                attrs.getURI(i), attrs.getLocalName(i), attrs
+-                                        .getValue(i), n, true);
++                                attrs.getURI(i), attrs.getLocalName(i),
++                                attributeValue, n, true);
+                     } else {
+                         err.jspError(n, "jsp.error.bad_attribute", attrs
+                                 .getQName(i), n.getLocalName());
+@@ -1387,7 +1395,8 @@ class Validator {
+                         // The wrinkle is that the output of any EL must not be
+                         // re-escaped as that must be output as is.
+                         if (el != null) {
+-                            XmlEscapeNonELVisitor v = new XmlEscapeNonELVisitor();
++                            XmlEscapeNonELVisitor v = new XmlEscapeNonELVisitor(
++                                    pageInfo.isDeferredSyntaxAllowedAsLiteral());
+                             el.visit(v);
+                             value = v.getText();
+                         } else {
+@@ -1432,6 +1441,11 @@ class Validator {
+ 
+         private static class XmlEscapeNonELVisitor extends ELParser.TextBuilder {
+ 
++            protected XmlEscapeNonELVisitor(
++                    boolean isDeferredSyntaxAllowedAsLiteral) {
++                super(isDeferredSyntaxAllowedAsLiteral);
++            }
++
+             @Override
+             public void visit(Text n) throws JasperException {
+                 output.append(xmlEscape(n.getText()));
+
+==================================================
+TestELInJsp.java
+index aabaaa81e1..b51a41e37d 100644
+--- a/test/javax/el/TestELProcessor.java
++++ b/test/javax/el/TestELProcessor.java
+@@ -43,6 +43,15 @@ public class TestELProcessor {
+     }
+ 
+ 
++    @Test
++    public void testEval03() {
++        ELProcessor elp = new ELProcessor();
++        // Note \ is escaped as \\ in Java source code
++        String result = (String) elp.eval("'\\\\'");
++        Assert.assertEquals("\\", result);
++    }
++
++
+     @Test
+     public void testDefineFunctionMethod01() throws Exception {
+         ELProcessor elp = new ELProcessor();
+
+==================================================
+TestELParser.java
+index fd9fb65d1e..fe9a1a044d 100644
+--- a/test/org/apache/el/TestELInJsp.java
++++ b/test/org/apache/el/TestELInJsp.java
+@@ -504,6 +504,6 @@ public class TestELInJsp extends TomcatBaseTest {
+ 
+     // Assertion for text contained with <p></p>, e.g. printed by tags:echo
+     private static void assertEcho(String result, String expected) {
+-        assertTrue(result.indexOf("<p>" + expected + "</p>") > 0);
++        assertTrue(result, result.indexOf("<p>" + expected + "</p>") > 0);
+     }
+ }
+
+==================================================
+TestParser.java
+index 19dc89c372..4b9c88a9b3 100644
+--- a/test/org/apache/jasper/compiler/TestELParser.java
++++ b/test/org/apache/jasper/compiler/TestELParser.java
+@@ -16,6 +16,12 @@
+  */
+ package org.apache.jasper.compiler;
+ 
++import javax.el.ELContext;
++import javax.el.ELException;
++import javax.el.ELManager;
++import javax.el.ExpressionFactory;
++import javax.el.ValueExpression;
++
+ import org.junit.Assert;
+ import org.junit.Test;
+ 
+@@ -23,169 +29,274 @@ import org.apache.jasper.JasperException;
+ import org.apache.jasper.compiler.ELNode.Nodes;
+ import org.apache.jasper.compiler.ELParser.TextBuilder;
+ 
++/**
++ * You will need to keep your wits about you when working with this class. Keep
++ * in mind the following:
++ * <ul>
++ * <li>If in doubt, read the EL and JSP specifications. Twice.</li>
++ * <li>The escaping rules are complex and subtle. The explanation below (as well
++ *     as the tests and the implementation) may have missed an edge case despite
++ *     trying hard not to.
++ * <li>The strings passed to {@link #doTestParser(String,String)} are Java
++ *     escaped in the source code and will be unescaped before being used.</li>
++ * <li>LiteralExpressions always occur outside of "${...}" and "#{...}". Literal
++ *     expressions escape '$' and '#' with '\\' if '$' or '#' is followed by '{'
++ *     but neither '\\' nor '{' is escaped.</li>
++ * <li>LiteralStrings always occur inside "${...}" or "#{...}". Literal strings
++ *     escape '\'', '\"' and '\\' with '\\'. Escaping '\"' is optional if the
++ *     literal string is delimited by '\''. Escaping '\'' is optional if the
++ *     literal string is delimited by '\"'.</li>
++ * </ul>
++ */
+ public class TestELParser {
+ 
+     @Test
+     public void testText() throws JasperException {
+-        doTestParser("foo");
++        doTestParser("foo", "foo");
+     }
+ 
+ 
+     @Test
+     public void testLiteral() throws JasperException {
+-        doTestParser("${'foo'}");
++        doTestParser("${'foo'}", "foo");
+     }
+ 
+ 
+     @Test
+     public void testVariable() throws JasperException {
+-        doTestParser("${test}");
++        doTestParser("${test}", null);
+     }
+ 
+ 
+     @Test
+     public void testFunction01() throws JasperException {
+-        doTestParser("${do(x)}");
++        doTestParser("${do(x)}", null);
+     }
+ 
+ 
+     @Test
+     public void testFunction02() throws JasperException {
+-        doTestParser("${do:it(x)}");
++        doTestParser("${do:it(x)}", null);
+     }
+ 
+ 
+     @Test
+     public void testFunction03() throws JasperException {
+-        doTestParser("${do:it(x,y)}");
++        doTestParser("${do:it(x,y)}", null);
+     }
+ 
+ 
+     @Test
+     public void testFunction04() throws JasperException {
+-        doTestParser("${do:it(x,y,z)}");
++        doTestParser("${do:it(x,y,z)}", null);
+     }
+ 
+ 
+     @Test
+     public void testCompound01() throws JasperException {
+-        doTestParser("1${'foo'}1");
++        doTestParser("1${'foo'}1", "1foo1");
+     }
+ 
+ 
+     @Test
+     public void testCompound02() throws JasperException {
+-        doTestParser("1${test}1");
++        doTestParser("1${test}1", null);
+     }
+ 
+ 
+     @Test
+     public void testCompound03() throws JasperException {
+-        doTestParser("${foo}${bar}");
++        doTestParser("${foo}${bar}", null);
+     }
+ 
+ 
+     @Test
+     public void testTernary01() throws JasperException {
+-        doTestParser("${true?true:false}");
++        doTestParser("${true?true:false}", "true");
+     }
+ 
+ 
+     @Test
+     public void testTernary02() throws JasperException {
+-        doTestParser("${a==1?true:false}");
++        doTestParser("${a==1?true:false}", null);
+     }
+ 
+ 
+     @Test
+     public void testTernary03() throws JasperException {
+-        doTestParser("${a eq1?true:false}");
++        doTestParser("${a eq1?true:false}", null);
+     }
+ 
+ 
+     @Test
+     public void testTernary04() throws JasperException {
+-        doTestParser(" ${ a eq 1 ? true : false } ");
++        doTestParser(" ${ a eq 1 ? true : false } ", null);
+     }
+ 
+ 
+     @Test
+     public void testTernary05() throws JasperException {
+         // Note this is invalid EL
+-        doTestParser("${aeq1?true:false}");
++        doTestParser("${aeq1?true:false}", null);
+     }
+ 
+ 
+     @Test
+     public void testTernary06() throws JasperException {
+-        doTestParser("${do:it(a eq1?true:false,y)}");
++        doTestParser("${do:it(a eq1?true:false,y)}", null);
+     }
+ 
+ 
+     @Test
+     public void testTernary07() throws JasperException {
+-        doTestParser(" ${ do:it( a eq 1 ? true : false, y ) } ");
++        doTestParser(" ${ do:it( a eq 1 ? true : false, y ) } ", null);
+     }
+ 
+ 
+     @Test
+     public void testTernary08() throws JasperException {
+-        doTestParser(" ${ do:it ( a eq 1 ? true : false, y ) } ");
++        doTestParser(" ${ do:it ( a eq 1 ? true : false, y ) } ", null);
+     }
+ 
+ 
+     @Test
+     public void testTernary09() throws JasperException {
+-        doTestParser(" ${ do : it ( a eq 1 ? true : false, y ) } ");
++        doTestParser(" ${ do : it ( a eq 1 ? true : false, y ) } ", null);
+     }
+ 
+ 
+     @Test
+     public void testTernary10() throws JasperException {
+-        doTestParser(" ${!empty my:link(foo)} ");
++        doTestParser(" ${!empty my:link(foo)} ", null);
++    }
++
++
++    @Test
++    public void testTernary11() throws JasperException {
++        doTestParser("${true?'true':'false'}", "true");
++    }
++
++
++    @Test
++    public void testTernary12() throws JasperException {
++        doTestParser("${true?'tr\"ue':'false'}", "tr\"ue");
++    }
++
++
++    @Test
++    public void testTernary13() throws JasperException {
++        doTestParser("${true?'tr\\'ue':'false'}", "tr'ue");
+     }
+ 
+ 
+     @Test
+     public void testTernaryBug56031() throws JasperException {
+-        doTestParser("${my:link(!empty registration ? registration : '/test/registration')}");
++        doTestParser("${my:link(!empty registration ? registration : '/test/registration')}", null);
+     }
+ 
+ 
+     @Test
+     public void testQuotes01() throws JasperException {
+-        doTestParser("'");
++        doTestParser("'", "'");
+     }
+ 
+ 
+     @Test
+     public void testQuotes02() throws JasperException {
+-        doTestParser("'${foo}'");
++        doTestParser("'${foo}'", null);
+     }
+ 
+ 
+     @Test
+     public void testQuotes03() throws JasperException {
+-        doTestParser("'${'foo'}'");
++        doTestParser("'${'foo'}'", "'foo'");
+     }
+ 
+ 
+     @Test
+     public void testEscape01() throws JasperException {
+-        doTestParser("${'\\\\'}");
++        doTestParser("${'\\\\'}", "\\");
+     }
+ 
+ 
+     @Test
+     public void testEscape02() throws JasperException {
+-        doTestParser("\\\\x${'\\\\'}");
++        doTestParser("\\\\x${'\\\\'}", "\\\\x\\");
++    }
++
++
++    @Test
++    public void testEscape03() throws JasperException {
++        doTestParser("\\\\", "\\\\");
+     }
+ 
+ 
+-    private void doTestParser(String input) throws JasperException {
+-        Nodes nodes = ELParser.parse(input, false);
++    @Test
++    public void testEscape04() throws JasperException {
++        doTestParser("\\$", "\\$");
++    }
++
++
++    @Test
++    public void testEscape05() throws JasperException {
++        doTestParser("\\#", "\\#");
++    }
++
++
++    @Test
++    public void testEscape07() throws JasperException {
++        doTestParser("${'\\\\$'}", "\\$");
++    }
++
++
++    @Test
++    public void testEscape08() throws JasperException {
++        doTestParser("${'\\\\#'}", "\\#");
++    }
++
++
++    @Test
++    public void testEscape09() throws JasperException {
++        doTestParser("\\${", "${");
++    }
++
++
++    @Test
++    public void testEscape10() throws JasperException {
++        doTestParser("\\#{", "#{");
++    }
++
+ 
+-        TextBuilder textBuilder = new TextBuilder();
++    private void doTestParser(String input, String expected) throws JasperException {
++        ELException elException = null;
++        String elResult = null;
++
++        // Don't try and evaluate expressions that depend on variables or functions
++        if (expected != null) {
++            try {
++                ELManager manager = new ELManager();
++                ELContext context = manager.getELContext();
++                ExpressionFactory factory = ELManager.getExpressionFactory();
++                ValueExpression ve = factory.createValueExpression(context, input, String.class);
++                elResult = ve.getValue(context).toString();
++                Assert.assertEquals(expected, elResult);
++            } catch (ELException ele) {
++                elException = ele;
++            }
++        }
++
++        Nodes nodes = null;
++        try {
++            nodes = ELParser.parse(input, false);
++            Assert.assertNull(elException);
++        } catch (IllegalArgumentException iae) {
++            Assert.assertNotNull(elResult, elException);
++            // Not strictly true but enables us to report both
++            iae.initCause(elException);
++            throw iae;
++        }
++
++        TextBuilder textBuilder = new TextBuilder(false);
+ 
+         nodes.visit(textBuilder);
+ 
+
+==================================================

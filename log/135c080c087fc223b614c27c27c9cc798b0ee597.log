@@ -1,0 +1,1129 @@
+135c080c087fc223b614c27c27c9cc798b0ee597
+==================================================
+Remove NIO blocking selector
+==================================================
+remm remm@apache.org
+==================================================
+Tue Jan 14 15:34:36 2020 +0100
+==================================================
+SecurityClassLoad.java
+index ffee9663cd..98394981bf 100644
+--- a/TOMCAT-NEXT.txt
++++ b/TOMCAT-NEXT.txt
+@@ -63,6 +63,4 @@ New items for 10.0.x onwards:
+ 
+ 12. Consider disabling the AJP connector by default.
+ 
+-14. Remove unused NIO blocking code.
+-
+-16. Share configuration between HTTP/1.1 and nested HTTP/2 rather than duplicating.
++13. Share configuration between HTTP/1.1 and nested HTTP/2 rather than duplicating.
+
+==================================================
+NioBlockingSelector.java
+index 5db3f69c4e..6f11e172bd 100644
+--- a/java/org/apache/catalina/security/SecurityClassLoad.java
++++ b/java/org/apache/catalina/security/SecurityClassLoad.java
+@@ -186,9 +186,6 @@ public final class SecurityClassLoad {
+         // net
+         loader.loadClass(basePackage + "util.net.Constants");
+         loader.loadClass(basePackage + "util.net.DispatchType");
+-        loader.loadClass(basePackage + "util.net.NioBlockingSelector$BlockPoller$RunnableAdd");
+-        loader.loadClass(basePackage + "util.net.NioBlockingSelector$BlockPoller$RunnableCancel");
+-        loader.loadClass(basePackage + "util.net.NioBlockingSelector$BlockPoller$RunnableRemove");
+         loader.loadClass(basePackage + "util.net.AprEndpoint$AprSocketWrapper$AprOperationState");
+         loader.loadClass(basePackage + "util.net.NioEndpoint$NioSocketWrapper$NioOperationState");
+         loader.loadClass(basePackage + "util.net.Nio2Endpoint$Nio2SocketWrapper$Nio2OperationState");
+
+==================================================
+NioChannel.java
+deleted file mode 100644
+index eb8d511690..0000000000
+--- a/java/org/apache/tomcat/util/net/NioBlockingSelector.java
++++ /dev/null
+@@ -1,515 +0,0 @@
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package org.apache.tomcat.util.net;
+-
+-import java.io.EOFException;
+-import java.io.IOException;
+-import java.net.SocketTimeoutException;
+-import java.nio.ByteBuffer;
+-import java.nio.channels.CancelledKeyException;
+-import java.nio.channels.ClosedChannelException;
+-import java.nio.channels.SelectionKey;
+-import java.nio.channels.Selector;
+-import java.nio.channels.SocketChannel;
+-import java.util.Iterator;
+-import java.util.concurrent.CountDownLatch;
+-import java.util.concurrent.TimeUnit;
+-import java.util.concurrent.atomic.AtomicInteger;
+-
+-import org.apache.juli.logging.Log;
+-import org.apache.juli.logging.LogFactory;
+-import org.apache.tomcat.util.ExceptionUtils;
+-import org.apache.tomcat.util.collections.SynchronizedQueue;
+-import org.apache.tomcat.util.collections.SynchronizedStack;
+-import org.apache.tomcat.util.net.NioEndpoint.NioSocketWrapper;
+-import org.apache.tomcat.util.res.StringManager;
+-
+-public class NioBlockingSelector {
+-
+-    private static final Log log = LogFactory.getLog(NioBlockingSelector.class);
+-    protected static final StringManager sm = StringManager.getManager(NioBlockingSelector.class);
+-
+-    private final SynchronizedStack<KeyReference> keyReferenceStack =
+-            new SynchronizedStack<>();
+-
+-    protected Selector sharedSelector;
+-
+-    protected BlockPoller poller;
+-
+-    public void open(String name, Selector selector) {
+-        sharedSelector = selector;
+-        poller = new BlockPoller();
+-        poller.selector = sharedSelector;
+-        poller.setDaemon(true);
+-        poller.setName(name + "-BlockPoller");
+-        poller.start();
+-    }
+-
+-    public void close() {
+-        if (poller != null) {
+-            poller.disable();
+-            poller.interrupt();
+-            poller = null;
+-        }
+-    }
+-
+-    /**
+-     * Performs a blocking write using the byte buffer for data to be written
+-     * If the <code>selector</code> parameter is null, then it will perform a busy write that could
+-     * take up a lot of CPU cycles.
+-     *
+-     * @param buf ByteBuffer - the buffer containing the data, we will write as long as <code>(buf.hasRemaining()==true)</code>
+-     * @param socket SocketChannel - the socket to write data to
+-     * @param writeTimeout long - the timeout for this write operation in milliseconds, -1 means no timeout
+-     * @return the number of bytes written
+-     * @throws EOFException if write returns -1
+-     * @throws SocketTimeoutException if the write times out
+-     * @throws IOException if an IO Exception occurs in the underlying socket logic
+-     */
+-    public int write(ByteBuffer buf, NioChannel socket, long writeTimeout)
+-            throws IOException {
+-        SelectionKey key = socket.getIOChannel().keyFor(socket.getSocketWrapper().getPoller().getSelector());
+-        if (key == null) {
+-            throw new IOException(sm.getString("nioBlockingSelector.keyNotRegistered"));
+-        }
+-        KeyReference reference = keyReferenceStack.pop();
+-        if (reference == null) {
+-            reference = new KeyReference();
+-        }
+-        NioSocketWrapper att = (NioSocketWrapper) key.attachment();
+-        int written = 0;
+-        boolean timedout = false;
+-        int keycount = 1; //assume we can write
+-        long time = System.currentTimeMillis(); //start the timeout timer
+-        try {
+-            while (!timedout && buf.hasRemaining()) {
+-                if (keycount > 0) { //only write if we were registered for a write
+-                    int cnt = socket.write(buf); //write the data
+-                    if (cnt == -1) {
+-                        throw new EOFException();
+-                    }
+-                    written += cnt;
+-                    if (cnt > 0) {
+-                        time = System.currentTimeMillis(); //reset our timeout timer
+-                        continue; //we successfully wrote, try again without a selector
+-                    }
+-                }
+-                try {
+-                    if (att.getWriteLatch() == null || att.getWriteLatch().getCount() == 0) {
+-                        att.startWriteLatch(1);
+-                    }
+-                    poller.add(att, SelectionKey.OP_WRITE, reference);
+-                    att.awaitWriteLatch(AbstractEndpoint.toTimeout(writeTimeout), TimeUnit.MILLISECONDS);
+-                } catch (InterruptedException ignore) {
+-                    // Ignore
+-                }
+-                if (att.getWriteLatch() != null && att.getWriteLatch().getCount() > 0) {
+-                    //we got interrupted, but we haven't received notification from the poller.
+-                    keycount = 0;
+-                } else {
+-                    //latch countdown has happened
+-                    keycount = 1;
+-                    att.resetWriteLatch();
+-                }
+-
+-                if (writeTimeout > 0 && (keycount == 0)) {
+-                    timedout = (System.currentTimeMillis() - time) >= writeTimeout;
+-                }
+-            }
+-            if (timedout) {
+-                throw new SocketTimeoutException();
+-            }
+-        } finally {
+-            poller.remove(att, SelectionKey.OP_WRITE);
+-            if (timedout && reference.key != null) {
+-                poller.cancelKey(reference.key);
+-            }
+-            reference.key = null;
+-            keyReferenceStack.push(reference);
+-        }
+-        return written;
+-    }
+-
+-    /**
+-     * Performs a blocking read using the bytebuffer for data to be read
+-     * If the <code>selector</code> parameter is null, then it will perform a busy read that could
+-     * take up a lot of CPU cycles.
+-     *
+-     * @param buf ByteBuffer - the buffer containing the data, we will read as until we have read at least one byte or we timed out
+-     * @param socket SocketChannel - the socket to write data to
+-     * @param readTimeout long - the timeout for this read operation in milliseconds, -1 means no timeout
+-     * @return the number of bytes read
+-     * @throws EOFException if read returns -1
+-     * @throws SocketTimeoutException if the read times out
+-     * @throws IOException if an IO Exception occurs in the underlying socket logic
+-     */
+-    public int read(ByteBuffer buf, NioChannel socket, long readTimeout) throws IOException {
+-        SelectionKey key = socket.getIOChannel().keyFor(socket.getSocketWrapper().getPoller().getSelector());
+-        if (key == null) {
+-            throw new IOException(sm.getString("nioBlockingSelector.keyNotRegistered"));
+-        }
+-        KeyReference reference = keyReferenceStack.pop();
+-        if (reference == null) {
+-            reference = new KeyReference();
+-        }
+-        NioSocketWrapper att = (NioSocketWrapper) key.attachment();
+-        int read = 0;
+-        boolean timedout = false;
+-        int keycount = 1; //assume we can read
+-        long time = System.currentTimeMillis(); //start the timeout timer
+-        try {
+-            while (!timedout) {
+-                if (keycount > 0) { //only read if we were registered for a read
+-                    read = socket.read(buf);
+-                    if (read != 0) {
+-                        break;
+-                    }
+-                }
+-                try {
+-                    if (att.getReadLatch()==null || att.getReadLatch().getCount()==0) {
+-                        att.startReadLatch(1);
+-                    }
+-                    poller.add(att,SelectionKey.OP_READ, reference);
+-                    att.awaitReadLatch(AbstractEndpoint.toTimeout(readTimeout), TimeUnit.MILLISECONDS);
+-                } catch (InterruptedException ignore) {
+-                    // Ignore
+-                }
+-                if ( att.getReadLatch()!=null && att.getReadLatch().getCount()> 0) {
+-                    //we got interrupted, but we haven't received notification from the poller.
+-                    keycount = 0;
+-                }else {
+-                    //latch countdown has happened
+-                    keycount = 1;
+-                    att.resetReadLatch();
+-                }
+-                if (readTimeout >= 0 && (keycount == 0)) {
+-                    timedout = (System.currentTimeMillis() - time) >= readTimeout;
+-                }
+-            }
+-            if (timedout) {
+-                throw new SocketTimeoutException();
+-            }
+-        } finally {
+-            poller.remove(att,SelectionKey.OP_READ);
+-            if (timedout && reference.key != null) {
+-                poller.cancelKey(reference.key);
+-            }
+-            reference.key = null;
+-            keyReferenceStack.push(reference);
+-        }
+-        return read;
+-    }
+-
+-
+-    protected static class BlockPoller extends Thread {
+-        protected volatile boolean run = true;
+-        protected Selector selector = null;
+-        protected final SynchronizedQueue<Runnable> events = new SynchronizedQueue<>();
+-        public void disable() {
+-            run = false;
+-            selector.wakeup();
+-        }
+-        protected final AtomicInteger wakeupCounter = new AtomicInteger(0);
+-
+-        public void cancelKey(final SelectionKey key) {
+-            Runnable r = new RunnableCancel(key);
+-            events.offer(r);
+-            wakeup();
+-        }
+-
+-        public void wakeup() {
+-            if (wakeupCounter.addAndGet(1)==0) selector.wakeup();
+-        }
+-
+-        public void cancel(SelectionKey sk, NioSocketWrapper key, int ops){
+-            if (sk != null) {
+-                sk.cancel();
+-                sk.attach(null);
+-                if (SelectionKey.OP_WRITE == (ops & SelectionKey.OP_WRITE)) {
+-                    countDown(key.getWriteLatch());
+-                }
+-                if (SelectionKey.OP_READ == (ops & SelectionKey.OP_READ)) {
+-                    countDown(key.getReadLatch());
+-                }
+-            }
+-        }
+-
+-        public void add(final NioSocketWrapper key, final int ops, final KeyReference ref) {
+-            if (key == null) {
+-                return;
+-            }
+-            NioChannel nch = key.getSocket();
+-            final SocketChannel ch = nch.getIOChannel();
+-            if (ch == null) {
+-                return;
+-            }
+-            Runnable r = new RunnableAdd(ch, key, ops, ref);
+-            events.offer(r);
+-            wakeup();
+-        }
+-
+-        public void remove(final NioSocketWrapper key, final int ops) {
+-            if (key == null) {
+-                return;
+-            }
+-            NioChannel nch = key.getSocket();
+-            final SocketChannel ch = nch.getIOChannel();
+-            if (ch == null) {
+-                return;
+-            }
+-            Runnable r = new RunnableRemove(ch, key, ops);
+-            events.offer(r);
+-            wakeup();
+-        }
+-
+-        public boolean events() {
+-            Runnable r = null;
+-            /* We only poll and run the runnable events when we start this
+-             * method. Further events added to the queue later will be delayed
+-             * to the next execution of this method.
+-             *
+-             * We do in this way, because running event from the events queue
+-             * may lead the working thread to add more events to the queue (for
+-             * example, the worker thread may add another RunnableAdd event when
+-             * waken up by a previous RunnableAdd event who got an invalid
+-             * SelectionKey). Trying to consume all the events in an increasing
+-             * queue till it's empty, will make the loop hard to be terminated,
+-             * which will kill a lot of time, and greatly affect performance of
+-             * the poller loop.
+-             */
+-            int size = events.size();
+-            for (int i = 0; i < size && (r = events.poll()) != null; i++) {
+-                r.run();
+-            }
+-            return (size > 0);
+-        }
+-
+-        @Override
+-        public void run() {
+-            while (run) {
+-                try {
+-                    events();
+-                    int keyCount = 0;
+-                    try {
+-                        int i = wakeupCounter.get();
+-                        if (i > 0) {
+-                            keyCount = selector.selectNow();
+-                        } else {
+-                            wakeupCounter.set(-1);
+-                            keyCount = selector.select(1000);
+-                        }
+-                        wakeupCounter.set(0);
+-                        if (!run) {
+-                            break;
+-                        }
+-                    } catch (NullPointerException x) {
+-                        // sun bug 5076772 on windows JDK 1.5
+-                        if (selector == null) {
+-                            throw x;
+-                        }
+-                        if (log.isDebugEnabled()) {
+-                            log.debug("Possibly encountered sun bug 5076772 on windows JDK 1.5", x);
+-                        }
+-                        continue;
+-                    } catch (CancelledKeyException x) {
+-                        // sun bug 5076772 on windows JDK 1.5
+-                        if (log.isDebugEnabled()) {
+-                            log.debug("Possibly encountered sun bug 5076772 on windows JDK 1.5", x);
+-                        }
+-                        continue;
+-                    } catch (Throwable x) {
+-                        ExceptionUtils.handleThrowable(x);
+-                        log.error(sm.getString("nioBlockingSelector.selectError"), x);
+-                        continue;
+-                    }
+-
+-                    Iterator<SelectionKey> iterator = keyCount > 0
+-                            ? selector.selectedKeys().iterator()
+-                            : null;
+-
+-                    // Walk through the collection of ready keys and dispatch
+-                    // any active event.
+-                    while (run && iterator != null && iterator.hasNext()) {
+-                        SelectionKey sk = iterator.next();
+-                        NioSocketWrapper socketWrapper = (NioSocketWrapper) sk.attachment();
+-                        try {
+-                            iterator.remove();
+-                            sk.interestOps(sk.interestOps() & (~sk.readyOps()));
+-                            if (sk.isReadable()) {
+-                                countDown(socketWrapper.getReadLatch());
+-                            }
+-                            if (sk.isWritable()) {
+-                                countDown(socketWrapper.getWriteLatch());
+-                            }
+-                        } catch (CancelledKeyException ckx) {
+-                            sk.cancel();
+-                            countDown(socketWrapper.getReadLatch());
+-                            countDown(socketWrapper.getWriteLatch());
+-                        }
+-                    }
+-                } catch (Throwable t) {
+-                    log.error(sm.getString("nioBlockingSelector.processingError"), t);
+-                }
+-            }
+-            events.clear();
+-            // If using a shared selector, the NioSelectorPool will also try and
+-            // close the selector. Try and avoid the ClosedSelectorException
+-            // although because multiple threads are involved there is always
+-            // the possibility of an Exception here.
+-            if (selector.isOpen()) {
+-                try {
+-                    // Cancels all remaining keys
+-                    selector.selectNow();
+-                } catch (Exception ignore) {
+-                    if (log.isDebugEnabled())
+-                        log.debug("", ignore);
+-                }
+-            }
+-            try {
+-                selector.close();
+-            } catch (Exception ignore) {
+-                if (log.isDebugEnabled())
+-                    log.debug("", ignore);
+-            }
+-        }
+-
+-        public void countDown(CountDownLatch latch) {
+-            if (latch == null) {
+-                return;
+-            }
+-            latch.countDown();
+-        }
+-
+-
+-        private class RunnableAdd implements Runnable {
+-
+-            private final SocketChannel ch;
+-            private final NioSocketWrapper key;
+-            private final int ops;
+-            private final KeyReference ref;
+-
+-            public RunnableAdd(SocketChannel ch, NioSocketWrapper key, int ops, KeyReference ref) {
+-                this.ch = ch;
+-                this.key = key;
+-                this.ops = ops;
+-                this.ref = ref;
+-            }
+-
+-            @Override
+-            public void run() {
+-                SelectionKey sk = ch.keyFor(selector);
+-                try {
+-                    if (sk == null) {
+-                        sk = ch.register(selector, ops, key);
+-                        ref.key = sk;
+-                    } else if (!sk.isValid()) {
+-                        cancel(sk, key, ops);
+-                    } else {
+-                        sk.interestOps(sk.interestOps() | ops);
+-                    }
+-                } catch (CancelledKeyException cx) {
+-                    cancel(sk, key, ops);
+-                } catch (ClosedChannelException cx) {
+-                    cancel(null, key, ops);
+-                }
+-            }
+-        }
+-
+-
+-        private class RunnableRemove implements Runnable {
+-
+-            private final SocketChannel ch;
+-            private final NioSocketWrapper key;
+-            private final int ops;
+-
+-            public RunnableRemove(SocketChannel ch, NioSocketWrapper key, int ops) {
+-                this.ch = ch;
+-                this.key = key;
+-                this.ops = ops;
+-            }
+-
+-            @Override
+-            public void run() {
+-                SelectionKey sk = ch.keyFor(selector);
+-                try {
+-                    if (sk == null) {
+-                        if (SelectionKey.OP_WRITE == (ops & SelectionKey.OP_WRITE)) {
+-                            countDown(key.getWriteLatch());
+-                        }
+-                        if (SelectionKey.OP_READ == (ops & SelectionKey.OP_READ)) {
+-                            countDown(key.getReadLatch());
+-                        }
+-                    } else {
+-                        if (sk.isValid()) {
+-                            sk.interestOps(sk.interestOps() & (~ops));
+-                            if (SelectionKey.OP_WRITE == (ops & SelectionKey.OP_WRITE)) {
+-                                countDown(key.getWriteLatch());
+-                            }
+-                            if (SelectionKey.OP_READ == (ops & SelectionKey.OP_READ)) {
+-                                countDown(key.getReadLatch());
+-                            }
+-                            if (sk.interestOps() == 0) {
+-                                sk.cancel();
+-                                sk.attach(null);
+-                            }
+-                        } else {
+-                            sk.cancel();
+-                            sk.attach(null);
+-                        }
+-                    }
+-                } catch (CancelledKeyException cx) {
+-                    if (sk != null) {
+-                        sk.cancel();
+-                        sk.attach(null);
+-                    }
+-                }
+-            }
+-
+-        }
+-
+-
+-        public static class RunnableCancel implements Runnable {
+-
+-            private final SelectionKey key;
+-
+-            public RunnableCancel(SelectionKey key) {
+-                this.key = key;
+-            }
+-
+-            @Override
+-            public void run() {
+-                key.cancel();
+-            }
+-        }
+-    }
+-
+-
+-    public static class KeyReference {
+-        SelectionKey key = null;
+-
+-        @Override
+-        protected void finalize() {
+-            if (key != null && key.isValid()) {
+-                log.warn(sm.getString("nioBlockingSelector.possibleLeak"));
+-                try {
+-                    key.cancel();
+-                } catch (Exception ignore) {
+-                }
+-            }
+-        }
+-    }
+-}
+
+==================================================
+NioEndpoint.java
+index 75bc3f83ba..065d23ba4c 100644
+--- a/java/org/apache/tomcat/util/net/NioChannel.java
++++ b/java/org/apache/tomcat/util/net/NioChannel.java
+@@ -21,7 +21,6 @@ import java.nio.ByteBuffer;
+ import java.nio.channels.ByteChannel;
+ import java.nio.channels.GatheringByteChannel;
+ import java.nio.channels.ScatteringByteChannel;
+-import java.nio.channels.Selector;
+ import java.nio.channels.SocketChannel;
+ 
+ import org.apache.tomcat.util.net.NioEndpoint.NioSocketWrapper;
+@@ -75,23 +74,6 @@ public class NioChannel implements ByteChannel, ScatteringByteChannel, Gathering
+         bufHandler.free();
+     }
+ 
+-    /**
+-     * Returns true if the network buffer has been flushed out and is empty.
+-     *
+-     * @param block     Unused. May be used when overridden
+-     * @param s         Unused. May be used when overridden
+-     * @param timeout   Unused. May be used when overridden
+-     * @return Always returns <code>true</code> since there is no network buffer
+-     *         in the regular channel
+-     *
+-     * @throws IOException Never for non-secure channel
+-     */
+-    public boolean flush(boolean block, Selector s, long timeout)
+-            throws IOException {
+-        return true;
+-    }
+-
+-
+     /**
+      * Closes this channel.
+      *
+
+==================================================
+NioSelectorPool.java
+index c72a15c3c7..6a2a5db027 100644
+--- a/java/org/apache/tomcat/util/net/NioEndpoint.java
++++ b/java/org/apache/tomcat/util/net/NioEndpoint.java
+@@ -48,7 +48,6 @@ import javax.net.ssl.SSLSession;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.ExceptionUtils;
+-import org.apache.tomcat.util.IntrospectionUtils;
+ import org.apache.tomcat.util.collections.SynchronizedQueue;
+ import org.apache.tomcat.util.collections.SynchronizedStack;
+ import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
+@@ -82,8 +81,6 @@ public class NioEndpoint extends AbstractJsseEndpoint<NioChannel,SocketChannel>
+ 
+     // ----------------------------------------------------------------- Fields
+ 
+-    private NioSelectorPool selectorPool = new NioSelectorPool();
+-
+     /**
+      * Server socket "pointer".
+      */
+@@ -108,25 +105,6 @@ public class NioEndpoint extends AbstractJsseEndpoint<NioChannel,SocketChannel>
+     // ------------------------------------------------------------- Properties
+ 
+ 
+-    /**
+-     * Generic properties, introspected
+-     */
+-    @Override
+-    public boolean setProperty(String name, String value) {
+-        final String selectorPoolName = "selectorPool.";
+-        try {
+-            if (name.startsWith(selectorPoolName)) {
+-                return IntrospectionUtils.setProperty(selectorPool, name.substring(selectorPoolName.length()), value);
+-            } else {
+-                return super.setProperty(name, value);
+-            }
+-        } catch (Exception e) {
+-            log.error(sm.getString("endpoint.setAttributeError", name, value), e);
+-            return false;
+-        }
+-    }
+-
+-
+     /**
+      * Use System.inheritableChannel to obtain channel from stdin/stdout.
+      */
+@@ -171,10 +149,6 @@ public class NioEndpoint extends AbstractJsseEndpoint<NioChannel,SocketChannel>
+     private Poller poller = null;
+ 
+ 
+-    public void setSelectorPool(NioSelectorPool selectorPool) {
+-        this.selectorPool = selectorPool;
+-    }
+-
+     /**
+      * Is deferAccept supported?
+      */
+@@ -215,8 +189,6 @@ public class NioEndpoint extends AbstractJsseEndpoint<NioChannel,SocketChannel>
+ 
+         // Initialize SSL if needed
+         initialiseSsl();
+-
+-        selectorPool.open(getName());
+     }
+ 
+     // Separated out to make it easier for folks that extend NioEndpoint to
+@@ -341,7 +313,6 @@ public class NioEndpoint extends AbstractJsseEndpoint<NioChannel,SocketChannel>
+         if (getHandler() != null ) {
+             getHandler().recycle();
+         }
+-        selectorPool.close();
+         if (log.isDebugEnabled()) {
+             log.debug("Destroy completed for " +
+                     new InetSocketAddress(getAddress(), getPortWithOffset()));
+@@ -360,11 +331,6 @@ public class NioEndpoint extends AbstractJsseEndpoint<NioChannel,SocketChannel>
+ 
+     // ------------------------------------------------------ Protected Methods
+ 
+-    protected NioSelectorPool getSelectorPool() {
+-        return selectorPool;
+-    }
+-
+-
+     protected SynchronizedStack<NioChannel> getNioChannels() {
+         return nioChannels;
+     }
+@@ -407,7 +373,7 @@ public class NioEndpoint extends AbstractJsseEndpoint<NioChannel,SocketChannel>
+                         socketProperties.getAppWriteBufSize(),
+                         socketProperties.getDirectBuffer());
+                 if (isSSLEnabled()) {
+-                    channel = new SecureNioChannel(bufhandler, selectorPool, this);
++                    channel = new SecureNioChannel(bufhandler, this);
+                 } else {
+                     channel = new NioChannel(bufhandler);
+                 }
+@@ -670,6 +636,8 @@ public class NioEndpoint extends AbstractJsseEndpoint<NioChannel,SocketChannel>
+             try {
+                 // If is important to cancel the key first, otherwise a deadlock may occur between the
+                 // poller select and the socket channel close which would cancel the key
++                // TODO: This workaround will likely be useless on Java 14+ (maybe even 11+)
++                //   and the cancelledKey method can be removed in favor of socketWrapper.close(), see BZ 64007
+                 if (sk != null) {
+                     sk.attach(null);
+                     if (sk.isValid()) {
+@@ -760,7 +728,7 @@ public class NioEndpoint extends AbstractJsseEndpoint<NioChannel,SocketChannel>
+             try {
+                 if (close) {
+                     cancelledKey(sk, socketWrapper);
+-                } else if (sk.isValid() && socketWrapper != null) {
++                } else if (sk.isValid()) {
+                     if (sk.isReadable() || sk.isWritable()) {
+                         if (socketWrapper.getSendfileData() != null) {
+                             processSendfile(sk, socketWrapper, false);
+@@ -950,8 +918,8 @@ public class NioEndpoint extends AbstractJsseEndpoint<NioChannel,SocketChannel>
+             try {
+                 for (SelectionKey key : selector.keys()) {
+                     keycount++;
++                    NioSocketWrapper socketWrapper = (NioSocketWrapper) key.attachment();
+                     try {
+-                        NioSocketWrapper socketWrapper = (NioSocketWrapper) key.attachment();
+                         if (socketWrapper == null) {
+                             // We don't support any keys without attachments
+                             cancelledKey(key, null);
+@@ -999,7 +967,7 @@ public class NioEndpoint extends AbstractJsseEndpoint<NioChannel,SocketChannel>
+                             }
+                         }
+                     } catch (CancelledKeyException ckx) {
+-                        cancelledKey(key, (NioSocketWrapper) key.attachment());
++                        cancelledKey(key, socketWrapper);
+                     }
+                 }
+             } catch (ConcurrentModificationException cme) {
+@@ -1024,13 +992,10 @@ public class NioEndpoint extends AbstractJsseEndpoint<NioChannel,SocketChannel>
+ 
+     public static class NioSocketWrapper extends SocketWrapperBase<NioChannel> {
+ 
+-        private final NioSelectorPool pool;
+         private final SynchronizedStack<NioChannel> nioChannels;
+         private final Poller poller;
+ 
+         private int interestOps = 0;
+-        private CountDownLatch readLatch = null;
+-        private CountDownLatch writeLatch = null;
+         private volatile SendfileData sendfileData = null;
+         private volatile long lastRead = System.currentTimeMillis();
+         private volatile long lastWrite = lastRead;
+@@ -1042,7 +1007,6 @@ public class NioEndpoint extends AbstractJsseEndpoint<NioChannel,SocketChannel>
+ 
+         public NioSocketWrapper(NioChannel channel, NioEndpoint endpoint) {
+             super(channel, endpoint);
+-            pool = endpoint.getSelectorPool();
+             nioChannels = endpoint.getNioChannels();
+             poller = endpoint.getPoller();
+             socketBufferHandler = channel.getBufHandler();
+@@ -1053,39 +1017,6 @@ public class NioEndpoint extends AbstractJsseEndpoint<NioChannel,SocketChannel>
+         public Poller getPoller() { return poller; }
+         public int interestOps() { return interestOps; }
+         public int interestOps(int ops) { this.interestOps  = ops; return ops; }
+-        public CountDownLatch getReadLatch() { return readLatch; }
+-        public CountDownLatch getWriteLatch() { return writeLatch; }
+-        protected CountDownLatch resetLatch(CountDownLatch latch) {
+-            if (latch == null || latch.getCount() == 0) {
+-                return null;
+-            } else {
+-                throw new IllegalStateException(sm.getString("endpoint.nio.latchMustBeZero"));
+-            }
+-        }
+-        public void resetReadLatch() { readLatch = resetLatch(readLatch); }
+-        public void resetWriteLatch() { writeLatch = resetLatch(writeLatch); }
+-
+-        protected CountDownLatch startLatch(CountDownLatch latch, int cnt) {
+-            if (latch == null || latch.getCount() == 0) {
+-                return new CountDownLatch(cnt);
+-            } else {
+-                throw new IllegalStateException(sm.getString("endpoint.nio.latchMustBeZero"));
+-            }
+-        }
+-        public void startReadLatch(int cnt) { readLatch = startLatch(readLatch, cnt); }
+-        public void startWriteLatch(int cnt) { writeLatch = startLatch(writeLatch, cnt); }
+-
+-        protected void awaitLatch(CountDownLatch latch, long timeout, TimeUnit unit) throws InterruptedException {
+-            if (latch == null) {
+-                throw new IllegalStateException(sm.getString("endpoint.nio.nullLatch"));
+-            }
+-            // Note: While the return value is ignored if the latch does time
+-            //       out, logic further up the call stack will trigger a
+-            //       SocketTimeoutException
+-            latch.await(timeout, unit);
+-        }
+-        public void awaitReadLatch(long timeout, TimeUnit unit) throws InterruptedException { awaitLatch(readLatch, timeout, unit); }
+-        public void awaitWriteLatch(long timeout, TimeUnit unit) throws InterruptedException { awaitLatch(writeLatch, timeout, unit); }
+ 
+         public void setSendfileData(SendfileData sf) { this.sendfileData = sf;}
+         public SendfileData getSendfileData() { return this.sendfileData; }
+
+==================================================
+SecureNioChannel.java
+deleted file mode 100644
+index ea365d9adf..0000000000
+--- a/java/org/apache/tomcat/util/net/NioSelectorPool.java
++++ /dev/null
+@@ -1,324 +0,0 @@
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements.  See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License.  You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package org.apache.tomcat.util.net;
+-
+-import java.io.EOFException;
+-import java.io.IOException;
+-import java.net.SocketTimeoutException;
+-import java.nio.ByteBuffer;
+-import java.nio.channels.SelectionKey;
+-import java.nio.channels.Selector;
+-import java.util.NoSuchElementException;
+-import java.util.concurrent.ConcurrentLinkedQueue;
+-import java.util.concurrent.atomic.AtomicInteger;
+-
+-/**
+- * Thread safe non blocking selector pool
+- */
+-public class NioSelectorPool {
+-
+-    protected NioBlockingSelector blockingSelector;
+-
+-    protected volatile Selector sharedSelector;
+-
+-    protected boolean shared = Boolean.parseBoolean(System.getProperty("org.apache.tomcat.util.net.NioSelectorShared", "true"));
+-    protected int maxSelectors = 200;
+-    protected long sharedSelectorTimeout = 30000;
+-    protected int maxSpareSelectors = -1;
+-    protected boolean enabled = true;
+-
+-    protected AtomicInteger active = new AtomicInteger(0);
+-    protected AtomicInteger spare = new AtomicInteger(0);
+-    protected ConcurrentLinkedQueue<Selector> selectors = new ConcurrentLinkedQueue<>();
+-
+-    protected Selector getSharedSelector() throws IOException {
+-        if (shared && sharedSelector == null) {
+-            synchronized (NioSelectorPool.class) {
+-                if (sharedSelector == null) {
+-                    sharedSelector = Selector.open();
+-                }
+-            }
+-        }
+-        return  sharedSelector;
+-    }
+-
+-    public Selector get() throws IOException{
+-        if (shared) {
+-            return getSharedSelector();
+-        }
+-        if ((!enabled) || active.incrementAndGet() >= maxSelectors) {
+-            if (enabled) {
+-                active.decrementAndGet();
+-            }
+-            return null;
+-        }
+-        Selector s = null;
+-        try {
+-            s = selectors.size() > 0 ? selectors.poll() : null;
+-            if (s == null) {
+-                s = Selector.open();
+-            } else {
+-                spare.decrementAndGet();
+-            }
+-        } catch (NoSuchElementException x) {
+-            try {
+-                s = Selector.open();
+-            } catch (IOException iox) {
+-            }
+-        } finally {
+-            if (s == null) {
+-                active.decrementAndGet();// we were unable to find a selector
+-            }
+-        }
+-        return s;
+-    }
+-
+-
+-
+-    public void put(Selector s) throws IOException {
+-        if (shared) {
+-            return;
+-        }
+-        if (enabled) {
+-            active.decrementAndGet();
+-        }
+-        if (enabled && (maxSpareSelectors == -1
+-                || spare.get() < Math.min(maxSpareSelectors, maxSelectors))) {
+-            spare.incrementAndGet();
+-            selectors.offer(s);
+-        } else {
+-            s.close();
+-        }
+-    }
+-
+-    public void close() throws IOException {
+-        enabled = false;
+-        Selector s;
+-        while ((s = selectors.poll()) != null) {
+-            s.close();
+-        }
+-        spare.set(0);
+-        active.set(0);
+-        if (blockingSelector != null) {
+-            blockingSelector.close();
+-        }
+-        if (shared && getSharedSelector() != null) {
+-            getSharedSelector().close();
+-            sharedSelector = null;
+-        }
+-    }
+-
+-    public void open(String name) throws IOException {
+-        enabled = true;
+-        getSharedSelector();
+-        if (shared) {
+-            blockingSelector = new NioBlockingSelector();
+-            blockingSelector.open(name, getSharedSelector());
+-        }
+-
+-    }
+-
+-    /**
+-     * Performs a write using the bytebuffer for data to be written and a
+-     * selector to block (if blocking is requested). If the
+-     * <code>selector</code> parameter is null, and blocking is requested then
+-     * it will perform a busy write that could take up a lot of CPU cycles.
+-     * @param buf           The buffer containing the data, we will write as long as <code>(buf.hasRemaining()==true)</code>
+-     * @param socket        The socket to write data to
+-     * @param selector      The selector to use for blocking, if null then a busy write will be initiated
+-     * @param writeTimeout  The timeout for this write operation in milliseconds, -1 means no timeout
+-     * @return the number of bytes written
+-     * @throws EOFException if write returns -1
+-     * @throws SocketTimeoutException if the write times out
+-     * @throws IOException if an IO Exception occurs in the underlying socket logic
+-     */
+-    public int write(ByteBuffer buf, NioChannel socket, Selector selector, long writeTimeout)
+-            throws IOException {
+-        if (shared) {
+-            return blockingSelector.write(buf, socket, writeTimeout);
+-        }
+-        SelectionKey key = null;
+-        int written = 0;
+-        boolean timedout = false;
+-        int keycount = 1; //assume we can write
+-        long time = System.currentTimeMillis(); //start the timeout timer
+-        try {
+-            while ((!timedout) && buf.hasRemaining()) {
+-                int cnt = 0;
+-                if ( keycount > 0 ) { //only write if we were registered for a write
+-                    cnt = socket.write(buf); //write the data
+-                    if (cnt == -1) {
+-                        throw new EOFException();
+-                    }
+-
+-                    written += cnt;
+-                    if (cnt > 0) {
+-                        time = System.currentTimeMillis(); //reset our timeout timer
+-                        continue; //we successfully wrote, try again without a selector
+-                    }
+-                }
+-                if (selector != null) {
+-                    //register OP_WRITE to the selector
+-                    if (key == null) {
+-                        key = socket.getIOChannel().register(selector, SelectionKey.OP_WRITE);
+-                    } else {
+-                        key.interestOps(SelectionKey.OP_WRITE);
+-                    }
+-                    if (writeTimeout == 0) {
+-                        timedout = buf.hasRemaining();
+-                    } else if (writeTimeout < 0) {
+-                        keycount = selector.select();
+-                    } else {
+-                        keycount = selector.select(writeTimeout);
+-                    }
+-                }
+-                if (writeTimeout > 0 && (selector == null || keycount == 0)) {
+-                    timedout = (System.currentTimeMillis() - time) >= writeTimeout;
+-                }
+-            }
+-            if (timedout) {
+-                throw new SocketTimeoutException();
+-            }
+-        } finally {
+-            if (key != null) {
+-                key.cancel();
+-                if (selector != null) selector.selectNow();//removes the key from this selector
+-            }
+-        }
+-        return written;
+-    }
+-
+-    /**
+-     * Performs a blocking read using the bytebuffer for data to be read and a selector to block.
+-     * If the <code>selector</code> parameter is null, then it will perform a busy read that could
+-     * take up a lot of CPU cycles.
+-     * @param buf ByteBuffer - the buffer containing the data, we will read as until we have read at least one byte or we timed out
+-     * @param socket SocketChannel - the socket to write data to
+-     * @param selector Selector - the selector to use for blocking, if null then a busy read will be initiated
+-     * @param readTimeout long - the timeout for this read operation in milliseconds, -1 means no timeout
+-     * @return the number of bytes read
+-     * @throws EOFException if read returns -1
+-     * @throws SocketTimeoutException if the read times out
+-     * @throws IOException if an IO Exception occurs in the underlying socket logic
+-     */
+-    public int read(ByteBuffer buf, NioChannel socket, Selector selector, long readTimeout)
+-            throws IOException {
+-        if (shared) {
+-            return blockingSelector.read(buf, socket, readTimeout);
+-        }
+-        SelectionKey key = null;
+-        int read = 0;
+-        boolean timedout = false;
+-        int keycount = 1; //assume we can write
+-        long time = System.currentTimeMillis(); //start the timeout timer
+-        try {
+-            while (!timedout) {
+-                int cnt = 0;
+-                if (keycount > 0) { //only read if we were registered for a read
+-                    cnt = socket.read(buf);
+-                    if (cnt == -1) {
+-                        if (read == 0) {
+-                            read = -1;
+-                        }
+-                        break;
+-                    }
+-                    read += cnt;
+-                    if (cnt > 0) continue; //read some more
+-                    if (cnt == 0 && read > 0) {
+-                        break; //we are done reading
+-                    }
+-                }
+-                if (selector != null) {//perform a blocking read
+-                    //register OP_WRITE to the selector
+-                    if (key == null) {
+-                        key = socket.getIOChannel().register(selector, SelectionKey.OP_READ);
+-                    }
+-                    else key.interestOps(SelectionKey.OP_READ);
+-                    if (readTimeout == 0) {
+-                        timedout = (read == 0);
+-                    } else if (readTimeout < 0) {
+-                        keycount = selector.select();
+-                    } else {
+-                        keycount = selector.select(readTimeout);
+-                    }
+-                }
+-                if (readTimeout > 0 && (selector == null || keycount == 0) ) {
+-                    timedout = (System.currentTimeMillis() - time) >= readTimeout;
+-                }
+-            }
+-            if (timedout) {
+-                throw new SocketTimeoutException();
+-            }
+-        } finally {
+-            if (key != null) {
+-                key.cancel();
+-                if (selector != null) {
+-                    selector.selectNow();//removes the key from this selector
+-                }
+-            }
+-        }
+-        return read;
+-    }
+-
+-    public void setMaxSelectors(int maxSelectors) {
+-        this.maxSelectors = maxSelectors;
+-    }
+-
+-    public void setMaxSpareSelectors(int maxSpareSelectors) {
+-        this.maxSpareSelectors = maxSpareSelectors;
+-    }
+-
+-    public void setEnabled(boolean enabled) {
+-        this.enabled = enabled;
+-    }
+-
+-    public void setSharedSelectorTimeout(long sharedSelectorTimeout) {
+-        this.sharedSelectorTimeout = sharedSelectorTimeout;
+-    }
+-
+-    public int getMaxSelectors() {
+-        return maxSelectors;
+-    }
+-
+-    public int getMaxSpareSelectors() {
+-        return maxSpareSelectors;
+-    }
+-
+-    public boolean isEnabled() {
+-        return enabled;
+-    }
+-
+-    public long getSharedSelectorTimeout() {
+-        return sharedSelectorTimeout;
+-    }
+-
+-    public ConcurrentLinkedQueue<Selector> getSelectors() {
+-        return selectors;
+-    }
+-
+-    public AtomicInteger getSpare() {
+-        return spare;
+-    }
+-
+-    public boolean isShared() {
+-        return shared;
+-    }
+-
+-    public void setShared(boolean shared) {
+-        this.shared = shared;
+-    }
+-}
+\ No newline at end of file
+
+==================================================

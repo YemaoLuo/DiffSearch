@@ -1,0 +1,200 @@
+16f4669ae109dc244b4b24e5da34d43604c37066
+==================================================
+Fix https://bz.apache.org/bugzilla/show_bug.cgi?id=58590
+==================================================
+Mark Thomas
+==================================================
+Fri Sep 14 12:36:58 2018 +0000
+==================================================
+MemoryUserDatabase.java
+index 10b2894180..dcdd05baee 100644
+--- a/java/org/apache/catalina/users/LocalStrings.properties
++++ b/java/org/apache/catalina/users/LocalStrings.properties
+@@ -20,6 +20,8 @@ memoryUserDatabase.nullGroup=Null or zero length group name specified. The group
+ memoryUserDatabase.nullRole=Null or zero length role name specified. The role will be ignored.
+ memoryUserDatabase.nullUser=Null or zero length user name specified. The user will be ignored.
+ memoryUserDatabase.readOnly=User database has been configured to be read only. Changes cannot be saved
++memoryUserDatabase.reload=Reloading memory user database [{0}] from updated source [{1}]
++memoryUserDatabase.reloadError=Error reloading memory user database [{0}] from updated source [{1}]
+ memoryUserDatabase.renameOld=Cannot rename original file to [{0}]
+ memoryUserDatabase.renameNew=Cannot rename new file to [{0}]
+ memoryUserDatabase.restoreOrig=Cannot restore [{0} to original file
+
+==================================================
+MemoryUserDatabaseFactory.java
+index 0d8556fda8..2dffba2fd8 100644
+--- a/java/org/apache/catalina/users/MemoryUserDatabase.java
++++ b/java/org/apache/catalina/users/MemoryUserDatabase.java
+@@ -22,6 +22,9 @@ import java.io.IOException;
+ import java.io.InputStream;
+ import java.io.OutputStreamWriter;
+ import java.io.PrintWriter;
++import java.net.URI;
++import java.net.URL;
++import java.net.URLConnection;
+ import java.util.ArrayList;
+ import java.util.Iterator;
+ import java.util.Map;
+@@ -148,6 +151,9 @@ public class MemoryUserDatabase implements UserDatabase {
+     private final Lock readLock = dbLock.readLock();
+     private final Lock writeLock = dbLock.writeLock();
+ 
++    private volatile long lastModified = 0;
++    private boolean watchSource = true;
++
+ 
+     // ------------------------------------------------------------- Properties
+ 
+@@ -165,6 +171,7 @@ public class MemoryUserDatabase implements UserDatabase {
+     }
+ 
+ 
++
+     /**
+      * @return the unique global identifier of this user database.
+      */
+@@ -212,6 +219,17 @@ public class MemoryUserDatabase implements UserDatabase {
+     }
+ 
+ 
++    public boolean getWatchSource() {
++        return watchSource;
++    }
++
++
++
++    public void setWatchSource(boolean watchSource) {
++        this.watchSource = watchSource;
++    }
++
++
+     /**
+      * @return the set of {@link Role}s defined in this user database.
+      */
+@@ -406,7 +424,13 @@ public class MemoryUserDatabase implements UserDatabase {
+             roles.clear();
+ 
+             String pathName = getPathname();
+-            try (InputStream is = ConfigFileLoader.getInputStream(getPathname())) {
++            URI uri = ConfigFileLoader.getURI(pathName);
++            URL url = uri.toURL();
++            URLConnection uConn = url.openConnection();
++
++            try (InputStream is = uConn.getInputStream()) {
++                this.lastModified = uConn.getLastModified();
++
+                 // Construct a digester to read the XML input file
+                 Digester digester = new Digester();
+                 try {
+@@ -538,21 +562,21 @@ public class MemoryUserDatabase implements UserDatabase {
+             fileNew = new File(System.getProperty(Globals.CATALINA_BASE_PROP), pathnameNew);
+         }
+ 
+-        try (FileOutputStream fos = new FileOutputStream(fileNew);
+-                OutputStreamWriter osw = new OutputStreamWriter(fos, "UTF8");
+-                PrintWriter writer = new PrintWriter(osw)) {
+-
+-            // Print the file prolog
+-            writer.println("<?xml version='1.0' encoding='utf-8'?>");
+-            writer.println("<tomcat-users xmlns=\"http://tomcat.apache.org/xml\"");
+-            writer.print("              ");
+-            writer.println("xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"");
+-            writer.print("              ");
+-            writer.println("xsi:schemaLocation=\"http://tomcat.apache.org/xml tomcat-users.xsd\"");
+-            writer.println("              version=\"1.0\">");
++        writeLock.lock();
++        try {
++            try (FileOutputStream fos = new FileOutputStream(fileNew);
++                    OutputStreamWriter osw = new OutputStreamWriter(fos, "UTF8");
++                    PrintWriter writer = new PrintWriter(osw)) {
++
++                // Print the file prolog
++                writer.println("<?xml version='1.0' encoding='utf-8'?>");
++                writer.println("<tomcat-users xmlns=\"http://tomcat.apache.org/xml\"");
++                writer.print("              ");
++                writer.println("xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"");
++                writer.print("              ");
++                writer.println("xsi:schemaLocation=\"http://tomcat.apache.org/xml tomcat-users.xsd\"");
++                writer.println("              version=\"1.0\">");
+ 
+-            writeLock.lock();
+-            try {
+                 // Print entries for each defined role, group, and user
+                 Iterator<?> values = null;
+                 values = getRoles();
+@@ -570,23 +594,24 @@ public class MemoryUserDatabase implements UserDatabase {
+                     writer.print("  ");
+                     writer.println(((MemoryUser) values.next()).toXml());
+                 }
+-            } finally {
+-                writeLock.unlock();
+-            }
+ 
+-            // Print the file epilog
+-            writer.println("</tomcat-users>");
++                // Print the file epilog
++                writer.println("</tomcat-users>");
+ 
+-            // Check for errors that occurred while printing
+-            if (writer.checkError()) {
+-                throw new IOException(sm.getString("memoryUserDatabase.writeException",
+-                        fileNew.getAbsolutePath()));
+-            }
+-        } catch (IOException e) {
+-            if (fileNew.exists() && !fileNew.delete()) {
+-                log.warn(sm.getString("memoryUserDatabase.fileDelete", fileNew));
++                // Check for errors that occurred while printing
++                if (writer.checkError()) {
++                    throw new IOException(sm.getString("memoryUserDatabase.writeException",
++                            fileNew.getAbsolutePath()));
++                }
++            } catch (IOException e) {
++                if (fileNew.exists() && !fileNew.delete()) {
++                    log.warn(sm.getString("memoryUserDatabase.fileDelete", fileNew));
++                }
++                throw e;
+             }
+-            throw e;
++            this.lastModified = fileNew.lastModified();
++        } finally {
++            writeLock.unlock();
+         }
+ 
+         // Perform the required renames to permanently save this file
+@@ -622,6 +647,34 @@ public class MemoryUserDatabase implements UserDatabase {
+     }
+ 
+ 
++    @Override
++    public void backgroundProcess() {
++        if (!watchSource) {
++            return;
++        }
++
++        URI uri = ConfigFileLoader.getURI(getPathname());
++        try {
++            URL url = uri.toURL();
++            URLConnection uConn = url.openConnection();
++
++            if (this.lastModified != uConn.getLastModified()) {
++                writeLock.lock();
++                try {
++                    if (this.lastModified != uConn.getLastModified()) {
++                        log.info(sm.getString("memoryUserDatabase.reload", id, uri));
++                        open();
++                    }
++                } finally {
++                    writeLock.unlock();
++                }
++            }
++        } catch (Exception ioe) {
++            log.error(sm.getString("memoryUserDatabase.reloadError", id, uri), ioe);
++        }
++    }
++
++
+     /**
+      * Return a String representation of this UserDatabase.
+      */
+
+==================================================

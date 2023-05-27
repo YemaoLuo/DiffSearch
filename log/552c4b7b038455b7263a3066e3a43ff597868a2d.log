@@ -1,0 +1,239 @@
+552c4b7b038455b7263a3066e3a43ff597868a2d
+==================================================
+Fix https://issues.apache.org/bugzilla/show_bug.cgi?id=50887
+==================================================
+Mark Emlyn
+==================================================
+Sun Mar 13 14:01:34 2011 +0000
+==================================================
+SSLValve.java
+index dbb51865fa..7317e632e4 100644
+--- a/java/org/apache/catalina/valves/LocalStrings.properties
++++ b/java/org/apache/catalina/valves/LocalStrings.properties
+@@ -41,6 +41,8 @@ errorReportValve.rootCauseInLogs=The full stack trace of the root cause is avail
+ # Remote IP valve
+ remoteIpValve.syntax=Invalid regular expressions [{0}] provided.
+ 
++sslValve.invalidProvider=The SSL provider specified on the connector associated with this request of [{0}] is invalid. The certificate data could not be processed.
++
+ # HTTP status reports
+ http.100=The client may continue ({0}).
+ http.101=The server is switching protocols according to the "Upgrade" header ({0}).
+
+==================================================
+AbstractProtocolHandler.java
+index e8d145345b..c023220991 100644
+--- a/java/org/apache/catalina/valves/SSLValve.java
++++ b/java/org/apache/catalina/valves/SSLValve.java
+@@ -19,6 +19,7 @@ package org.apache.catalina.valves;
+ 
+ import java.io.ByteArrayInputStream;
+ import java.io.IOException;
++import java.security.NoSuchProviderException;
+ import java.security.cert.CertificateFactory;
+ import java.security.cert.X509Certificate;
+ 
+@@ -27,6 +28,8 @@ import javax.servlet.ServletException;
+ import org.apache.catalina.Globals;
+ import org.apache.catalina.connector.Request;
+ import org.apache.catalina.connector.Response;
++import org.apache.juli.logging.Log;
++import org.apache.juli.logging.LogFactory;
+ 
+ /**
+  * When using mod_proxy_http, the client SSL information is not included in the
+@@ -59,6 +62,8 @@ import org.apache.catalina.connector.Response;
+  */
+ public class SSLValve extends ValveBase {
+     
++    private static final Log log = LogFactory.getLog(SSLValve.class);
++
+     
+     //------------------------------------------------------ Constructor
+     public SSLValve() {
+@@ -91,14 +96,24 @@ public class SSLValve extends ValveBase {
+             // ByteArrayInputStream bais = new ByteArrayInputStream(strcerts.getBytes("UTF-8"));
+             ByteArrayInputStream bais = new ByteArrayInputStream(strcerts.getBytes());
+             X509Certificate jsseCerts[] = null;
++            String providerName = (String) request.getConnector().getProperty(
++                    "clientCertProvider");
+             try {
+-                CertificateFactory cf = CertificateFactory.getInstance("X.509");
++                CertificateFactory cf;
++                if (providerName == null) {
++                    cf = CertificateFactory.getInstance("X.509");    
++                } else {
++                    cf = CertificateFactory.getInstance("X.509", providerName);
++                }
+                 X509Certificate cert = (X509Certificate) cf.generateCertificate(bais);
+                 jsseCerts = new X509Certificate[1];
+                 jsseCerts[0] = cert;
+             } catch (java.security.cert.CertificateException e) {
+                 System.out.println("SSLValve failed " + strcerts);
+                 System.out.println("SSLValve failed " + e);
++            } catch (NoSuchProviderException e) {
++                log.error(sm.getString(
++                        "sslValve.invalidProvider", providerName), e);
+             }
+             request.setAttribute(Globals.CERTIFICATES_ATTR, jsseCerts);
+         }
+
+==================================================
+AbstractAjpProcessor.java
+index 5d0fa561b3..c5284908ea 100644
+--- a/java/org/apache/coyote/AbstractProtocolHandler.java
++++ b/java/org/apache/coyote/AbstractProtocolHandler.java
+@@ -109,6 +109,20 @@ public abstract class AbstractProtocolHandler implements ProtocolHandler,
+     }
+ 
+ 
++    /**
++     * When client certificate information is presented in a form other than
++     * instances of {@link java.security.cert.X509Certificate} it needs to be
++     * converted before it can be used and this property controls which JSSE
++     * provider is used to perform the conversion. For example it is used with
++     * the AJP connectors, the HTTP APR connector and with the
++     * {@link org.apache.catalina.valves.SSLValve}. If not specified, the
++     * default provider will be used. 
++     */
++    protected String clientCertProvider = null;
++    public String getClientCertProvider() { return clientCertProvider; }
++    public void setClientCertProvider(String s) { this.clientCertProvider = s; }
++
++
+     // ---------------------- Properties that are passed through to the EndPoint
+ 
+     @Override
+
+==================================================
+AjpAprProtocol.java
+index 7c3fdc9f73..7e5b86e4d5 100644
+--- a/java/org/apache/coyote/ajp/AbstractAjpProcessor.java
++++ b/java/org/apache/coyote/ajp/AbstractAjpProcessor.java
+@@ -20,6 +20,7 @@ package org.apache.coyote.ajp;
+ import java.io.ByteArrayInputStream;
+ import java.io.IOException;
+ import java.net.InetAddress;
++import java.security.NoSuchProviderException;
+ import java.security.cert.CertificateFactory;
+ import java.security.cert.X509Certificate;
+ import java.util.concurrent.Executor;
+@@ -205,6 +206,19 @@ public abstract class AbstractAjpProcessor implements ActionHook, Processor {
+     }
+ 
+ 
++    /**
++     * When client certificate information is presented in a form other than
++     * instances of {@link java.security.cert.X509Certificate} it needs to be
++     * converted before it can be used and this property controls which JSSE
++     * provider is used to perform the conversion. For example it is used with
++     * the AJP connectors, the HTTP APR connector and with the
++     * {@link org.apache.catalina.valves.SSLValve}. If not specified, the
++     * default provider will be used. 
++     */
++    protected String clientCertProvider = null;
++    public String getClientCertProvider() { return clientCertProvider; }
++    public void setClientCertProvider(String s) { this.clientCertProvider = s; }
++
+     // --------------------------------------------------------- Public Methods
+ 
+ 
+@@ -294,8 +308,13 @@ public abstract class AbstractAjpProcessor implements ActionHook, Processor {
+                            certData.getLength());
+                // Fill the  elements.
+                try {
+-                   CertificateFactory cf =
+-                       CertificateFactory.getInstance("X.509");
++                   CertificateFactory cf;
++                   if (clientCertProvider == null) {
++                       cf = CertificateFactory.getInstance("X.509");
++                   } else {
++                       cf = CertificateFactory.getInstance("X.509",
++                               clientCertProvider);
++                   }
+                    while(bais.available() > 0) {
+                        X509Certificate cert = (X509Certificate)
+                            cf.generateCertificate(bais);
+@@ -312,6 +331,9 @@ public abstract class AbstractAjpProcessor implements ActionHook, Processor {
+                } catch (java.security.cert.CertificateException e) {
+                    getLog().error(sm.getString("ajpprocessor.certs.fail"), e);
+                    return;
++               } catch (NoSuchProviderException e) {
++                   getLog().error(sm.getString("ajpprocessor.certs.fail"), e);
++                   return;
+                }
+                request.setAttribute(SSLSupport.CERTIFICATE_KEY, jsseCerts);
+            }
+
+==================================================
+AjpProtocol.java
+index 30a5269944..2d862d9a46 100644
+--- a/java/org/apache/coyote/ajp/AjpAprProtocol.java
++++ b/java/org/apache/coyote/ajp/AjpAprProtocol.java
+@@ -266,6 +266,7 @@ public class AjpAprProtocol extends AbstractAjpProtocol {
+             processor.setAdapter(proto.adapter);
+             processor.setTomcatAuthentication(proto.tomcatAuthentication);
+             processor.setRequiredSecret(proto.requiredSecret);
++            processor.setClientCertProvider(proto.getClientCertProvider());
+             register(processor);
+             return processor;
+         }
+
+==================================================
+Http11AprProcessor.java
+index d5fd00efb5..95dcafd035 100644
+--- a/java/org/apache/coyote/ajp/AjpProtocol.java
++++ b/java/org/apache/coyote/ajp/AjpProtocol.java
+@@ -221,6 +221,7 @@ public class AjpProtocol extends AbstractAjpProtocol {
+             processor.setTomcatAuthentication(proto.tomcatAuthentication);
+             processor.setRequiredSecret(proto.requiredSecret);
+             processor.setKeepAliveTimeout(proto.getKeepAliveTimeout());
++            processor.setClientCertProvider(proto.getClientCertProvider());
+             register(processor);
+             return processor;
+         }
+
+==================================================
+Http11AprProtocol.java
+index 3eca711bdd..0471e97aae 100644
+--- a/java/org/apache/coyote/http11/Http11AprProcessor.java
++++ b/java/org/apache/coyote/http11/Http11AprProcessor.java
+@@ -139,6 +139,21 @@ public class Http11AprProcessor extends AbstractHttp11Processor {
+         return endpoint;
+     }
+ 
++
++    /**
++     * When client certificate information is presented in a form other than
++     * instances of {@link java.security.cert.X509Certificate} it needs to be
++     * converted before it can be used and this property controls which JSSE
++     * provider is used to perform the conversion. For example it is used with
++     * the AJP connectors, the HTTP APR connector and with the
++     * {@link org.apache.catalina.valves.SSLValve}. If not specified, the
++     * default provider will be used. 
++     */
++    protected String clientCertProvider = null;
++    public String getClientCertProvider() { return clientCertProvider; }
++    public void setClientCertProvider(String s) { this.clientCertProvider = s; }
++
++
+     // --------------------------------------------------------- Public Methods
+ 
+ 
+@@ -531,7 +546,13 @@ public class Http11AprProcessor extends AbstractHttp11Processor {
+                     X509Certificate[] certs = null;
+                     if (clientCert != null  && certLength > -1) {
+                         certs = new X509Certificate[certLength + 1];
+-                        CertificateFactory cf = CertificateFactory.getInstance("X.509");
++                        CertificateFactory cf;
++                        if (clientCertProvider == null) {
++                            cf = CertificateFactory.getInstance("X.509"); 
++                        } else {
++                            cf = CertificateFactory.getInstance("X.509",
++                                    clientCertProvider); 
++                        }
+                         certs[0] = (X509Certificate) cf.generateCertificate(new ByteArrayInputStream(clientCert));
+                         for (int i = 0; i < certLength; i++) {
+                             byte[] data = SSLSocket.getInfoB(socketRef, SSL.SSL_INFO_CLIENT_CERT_CHAIN + i);
+
+==================================================

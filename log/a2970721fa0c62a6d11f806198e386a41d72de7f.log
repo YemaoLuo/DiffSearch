@@ -1,0 +1,315 @@
+a2970721fa0c62a6d11f806198e386a41d72de7f
+==================================================
+Port fix from TC5 to display the JSP source when a compilation error occurs
+==================================================
+Mark Emlyn
+==================================================
+Mon Jan 1 18:55:08 2007 +0000
+==================================================
+DefaultErrorHandler.java
+Port fix from TC5 to display the JSP source when a compilation error occurs
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/tc6.0.x/trunk@491614 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+ErrorDispatcher.java
+index 761b6b6f34..cb2bb15fb1 100644
+--- a/java/org/apache/jasper/compiler/DefaultErrorHandler.java
++++ b/java/org/apache/jasper/compiler/DefaultErrorHandler.java
+@@ -67,22 +67,23 @@ class DefaultErrorHandler implements ErrorHandler {
+         StringBuffer buf = new StringBuffer();
+         
+         for (int i=0; i < details.length; i++) {
++            buf.append("\n");
+             if (details[i].getJspBeginLineNumber() >= 0) {
+                 args = new Object[] {
+                         new Integer(details[i].getJspBeginLineNumber()), 
+                         details[i].getJspFileName() };
++                buf.append("\n");
+                 buf.append(Localizer.getMessage("jsp.error.single.line.number",
+                         args));
+-                buf.append("\n"); 
++                buf.append("\n");
++                buf.append(details[i].getErrorMessage());
++                buf.append("\n");
++                buf.append(details[i].getJspExtract());
+             }
+-            
+-            buf.append(
+-                    Localizer.getMessage("jsp.error.corresponding.servlet"));
+-            buf.append(details[i].getErrorMessage());
+-            buf.append("\n\n");
+         }
+-        
+-        throw new JasperException(Localizer.getMessage("jsp.error.unable.compile") + "\n\n" + buf);
++        buf.append("\n\nStacktrace:");
++        throw new JasperException(
++                Localizer.getMessage("jsp.error.unable.compile") + ": " + buf);
+     }
+     
+     /**
+
+==================================================
+JDTCompiler.java
+index b484ccb397..970b13cc9c 100644
+--- a/java/org/apache/jasper/compiler/ErrorDispatcher.java
++++ b/java/org/apache/jasper/compiler/ErrorDispatcher.java
+@@ -23,6 +23,7 @@ import java.net.MalformedURLException;
+ import java.util.ArrayList;
+ 
+ import org.apache.jasper.JasperException;
++import org.apache.jasper.JspCompilationContext;
+ import org.xml.sax.SAXException;
+ 
+ /**
+@@ -501,8 +502,25 @@ public class ErrorDispatcher {
+      * @return JavacErrorDetail The error details
+      * @throws JasperException
+      */
+-    public static JavacErrorDetail createJavacError(String fname, Node.Nodes page, 
+-            StringBuffer errMsgBuf, int lineNum) throws JasperException {
++    public static JavacErrorDetail createJavacError(String fname,
++            Node.Nodes page, StringBuffer errMsgBuf, int lineNum)
++    throws JasperException {
++        return createJavacError(fname, page, errMsgBuf, lineNum, null);
++    }
++    
++    
++    /**
++     * @param fname
++     * @param page
++     * @param errMsgBuf
++     * @param lineNum
++     * @param ctxt
++     * @return JavacErrorDetail The error details
++     * @throws JasperException
++     */
++    public static JavacErrorDetail createJavacError(String fname,
++            Node.Nodes page, StringBuffer errMsgBuf, int lineNum,
++            JspCompilationContext ctxt) throws JasperException {
+         JavacErrorDetail javacError;
+         // Attempt to map javac error line number to line in JSP page
+         ErrorVisitor errVisitor = new ErrorVisitor(lineNum);
+@@ -514,7 +532,8 @@ public class ErrorDispatcher {
+                     lineNum,
+                     errNode.getStart().getFile(),
+                     errNode.getStart().getLineNumber(),
+-                    errMsgBuf);
++                    errMsgBuf,
++                    ctxt);
+         } else {
+             /*
+              * javac error line number cannot be mapped to JSP page
+
+==================================================
+JavacErrorDetail.java
+index 4e43207482..6aa13e27d1 100644
+--- a/java/org/apache/jasper/compiler/JDTCompiler.java
++++ b/java/org/apache/jasper/compiler/JDTCompiler.java
+@@ -352,7 +352,7 @@ public class JDTCompiler extends org.apache.jasper.compiler.Compiler {
+                                     try {
+                                         problemList.add(ErrorDispatcher.createJavacError
+                                                 (name, pageNodes, new StringBuffer(problem.getMessage()), 
+-                                                        problem.getSourceLineNumber()));
++                                                        problem.getSourceLineNumber(), ctxt));
+                                     } catch (JasperException e) {
+                                         log.error("Error visiting node", e);
+                                     }
+
+==================================================
+JspServletWrapper.java
+index 26e5427014..0750c59879 100644
+--- a/java/org/apache/jasper/compiler/JavacErrorDetail.java
++++ b/java/org/apache/jasper/compiler/JavacErrorDetail.java
+@@ -17,6 +17,16 @@
+ 
+ package org.apache.jasper.compiler;
+ 
++import java.io.BufferedReader;
++import java.io.FileInputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.InputStreamReader;
++import java.util.ArrayList;
++import java.util.List;
++
++import org.apache.jasper.JspCompilationContext;
++
+ /**
+  * Class providing details about a javac compilation error.
+  *
+@@ -30,6 +40,7 @@ public class JavacErrorDetail {
+     private String jspFileName;
+     private int jspBeginLineNum;
+     private StringBuffer errMsg;
++    private String jspExtract = null;
+ 
+     /**
+      * Constructor.
+@@ -40,12 +51,12 @@ public class JavacErrorDetail {
+      * @param errMsg The compilation error message
+      */
+     public JavacErrorDetail(String javaFileName,
+-			    int javaLineNum,
+-			    StringBuffer errMsg) {
++                            int javaLineNum,
++                            StringBuffer errMsg) {
+ 
+-	this.javaFileName = javaFileName;
+-	this.javaLineNum = javaLineNum;
+-	this.errMsg = errMsg;
++        this.javaFileName = javaFileName;
++        this.javaLineNum = javaLineNum;
++        this.errMsg = errMsg;
+         this.jspBeginLineNum = -1;
+     }
+ 
+@@ -62,14 +73,69 @@ public class JavacErrorDetail {
+      * @param errMsg The compilation error message
+      */
+     public JavacErrorDetail(String javaFileName,
+-			    int javaLineNum,
+-			    String jspFileName,
+-			    int jspBeginLineNum,
+-			    StringBuffer errMsg) {
++                            int javaLineNum,
++                            String jspFileName,
++                            int jspBeginLineNum,
++                            StringBuffer errMsg) {
++
++        this(javaFileName, javaLineNum, jspFileName, jspBeginLineNum, errMsg,
++                null);
++    }
+ 
++    public JavacErrorDetail(String javaFileName,
++            int javaLineNum,
++            String jspFileName,
++            int jspBeginLineNum,
++            StringBuffer errMsg,
++            JspCompilationContext ctxt) {
++        
+         this(javaFileName, javaLineNum, errMsg);
+-	this.jspFileName = jspFileName;
+-	this.jspBeginLineNum = jspBeginLineNum;
++        this.jspFileName = jspFileName;
++        this.jspBeginLineNum = jspBeginLineNum;
++        
++        if (jspBeginLineNum > 0 && ctxt != null) {
++            try {
++                // Read both files in, so we can inspect them
++                String[] jspLines = readFile
++                    (ctxt.getResourceAsStream(jspFileName));
++    
++                String[] javaLines = readFile
++                    (new FileInputStream(ctxt.getServletJavaFileName()));
++    
++                // If the line contains the opening of a multi-line scriptlet
++                // block, then the JSP line number we got back is probably
++                // faulty.  Scan forward to match the java line...
++                if (jspLines[jspBeginLineNum-1].lastIndexOf("<%") >
++                    jspLines[jspBeginLineNum-1].lastIndexOf("%>")) {
++                    String javaLine = javaLines[javaLineNum-1].trim();
++    
++                    for (int i=jspBeginLineNum-1; i<jspLines.length; i++) {
++                        if (jspLines[i].indexOf(javaLine) != -1) {
++                            // Update jsp line number
++                            this.jspBeginLineNum = i+1;
++                            break;
++                        }
++                    }
++                }
++    
++                // copy out a fragment of JSP to display to the user
++                StringBuffer fragment = new StringBuffer(1024);
++                int startIndex = Math.max(0, this.jspBeginLineNum-1-3);
++                int endIndex = Math.min(
++                        jspLines.length-1, this.jspBeginLineNum-1+3);
++    
++                for (int i=startIndex;i<=endIndex; ++i) {
++                    fragment.append(i+1);
++                    fragment.append(": ");
++                    fragment.append(jspLines[i]);
++                    fragment.append("\n");
++                }
++                jspExtract = fragment.toString();
++    
++            } catch (IOException ioe) {
++                // Can't read files - ignore
++            }
++        }
+     }
+ 
+     /**
+@@ -79,7 +145,7 @@ public class JavacErrorDetail {
+      * @return Java source file name
+      */
+     public String getJavaFileName() {
+-	return this.javaFileName;
++        return this.javaFileName;
+     }
+ 
+     /**
+@@ -88,7 +154,7 @@ public class JavacErrorDetail {
+      * @return Compilation error line number
+      */
+     public int getJavaLineNumber() {
+-	return this.javaLineNum;
++        return this.javaLineNum;
+     }
+ 
+     /**
+@@ -98,7 +164,7 @@ public class JavacErrorDetail {
+      * @return JSP file from which the Java source file was generated.
+      */
+     public String getJspFileName() {
+-	return this.jspFileName;
++        return this.jspFileName;
+     }
+ 
+     /**
+@@ -109,7 +175,7 @@ public class JavacErrorDetail {
+      * compilation error
+      */
+     public int getJspBeginLineNumber() {
+-	return this.jspBeginLineNum;
++        return this.jspBeginLineNum;
+     }
+ 
+     /**
+@@ -118,6 +184,31 @@ public class JavacErrorDetail {
+      * @return Compilation error message
+      */
+     public String getErrorMessage() {
+-	return this.errMsg.toString();
++        return this.errMsg.toString();
++    }
++    
++    /**
++     * Gets the extract of the JSP that corresponds to this message.
++     *
++     * @return Extract of JSP where error occurred
++     */
++    public String getJspExtract() {
++        return this.jspExtract;
++    }
++    
++    /**
++     * Reads a text file from an input stream into a String[]. Used to read in
++     * the JSP and generated Java file when generating error messages.
++     */
++    private String[] readFile(InputStream s) throws IOException {
++        BufferedReader reader = new BufferedReader(new InputStreamReader(s));
++        List lines = new ArrayList();
++        String line;
++
++        while ( (line = reader.readLine()) != null ) {
++            lines.add(line);
++        }
++
++        return (String[]) lines.toArray( new String[lines.size()] );
+     }
+ }
+
+==================================================

@@ -1,0 +1,413 @@
+e302964be625f05d3536da01299c7f66b436beb9
+==================================================
+Add a simple asynchronous stock ticker.
+==================================================
+Filip Hanik
+==================================================
+Thu Oct 15 01:10:34 2009 +0000
+==================================================
+AsyncListener.java
+Add a simple asynchronous stock ticker.
+Some more refactoring around common code
+
+
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@825366 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+CoyoteAdapter.java
+index c83b225a35..01dd54b8a5 100644
+--- a/java/javax/servlet/AsyncListener.java
++++ b/java/javax/servlet/AsyncListener.java
+@@ -27,4 +27,5 @@ import java.util.EventListener;
+ public interface AsyncListener extends EventListener {
+     void onComplete(AsyncEvent event) throws IOException;
+     void onTimeout(AsyncEvent event) throws IOException;
++    void onError(AsyncEvent event) throws IOException;
+ }
+
+==================================================
+RequestFacade.java
+index 07139f9df7..7ac3b21d3c 100644
+--- a/java/org/apache/catalina/connector/CoyoteAdapter.java
++++ b/java/org/apache/catalina/connector/CoyoteAdapter.java
+@@ -272,6 +272,12 @@ public class CoyoteAdapter
+                    //configure settings for timed out
+                    asyncConImpl.setTimeoutState();
+                 }
++                if (status==SocketStatus.ERROR) {
++                    AsyncContextImpl asyncConImpl = (AsyncContextImpl)request.getAsyncContext();
++                    //TODO SERVLET3 - async
++                    //configure settings for timed out
++                    asyncConImpl.setErrorState();
++                }
+                 connector.getContainer().getPipeline().getFirst().invoke(request, response);
+             }catch (RuntimeException x) {
+                 success = false;
+
+==================================================
+AsyncContextImpl.java
+index 56053f49d0..c82f371279 100644
+--- a/java/org/apache/catalina/connector/RequestFacade.java
++++ b/java/org/apache/catalina/connector/RequestFacade.java
+@@ -969,7 +969,7 @@ public class RequestFacade implements HttpServletRequest {
+ 
+ 
+     public boolean isAsyncSupported() {
+-        return request.isAsyncStarted();
++        return request.isAsyncSupported();
+     }
+ 
+     
+
+==================================================
+AsyncListenerWrapper.java
+index 29b754abd8..fa985ac8bf 100644
+--- a/java/org/apache/catalina/core/AsyncContextImpl.java
++++ b/java/org/apache/catalina/core/AsyncContextImpl.java
+@@ -48,7 +48,7 @@ import org.apache.juli.logging.LogFactory;
+ public class AsyncContextImpl implements AsyncContext {
+     
+     public static enum AsyncState {
+-        NOT_STARTED, STARTED, DISPATCHING, DISPATCHED, COMPLETING, TIMING_OUT
++        NOT_STARTED, STARTED, DISPATCHING, DISPATCHED, COMPLETING, TIMING_OUT, ERROR_DISPATCHING
+     }
+     
+     protected static Log log = LogFactory.getLog(AsyncContextImpl.class);
+@@ -265,6 +265,18 @@ public class AsyncContextImpl implements AsyncContext {
+                 ((HttpServletResponse)servletResponse).setStatus(500);
+             }
+             doInternalComplete(true);
++        } else if (this.state.compareAndSet(AsyncState.ERROR_DISPATCHING, AsyncState.DISPATCHED)) {
++            log.debug("ON ERROR!");
++            boolean listenerInvoked = false;
++            for (AsyncListenerWrapper listener : listeners) {
++                listener.fireOnError(event);
++                listenerInvoked = true;
++            }
++            if (!listenerInvoked) {
++                ((HttpServletResponse)servletResponse).setStatus(500);
++            }
++            doInternalComplete(true);
++        
+         } else if (this.state.compareAndSet(AsyncState.DISPATCHING, AsyncState.DISPATCHED)) {
+             if (this.dispatch!=null) {
+                 try {
+@@ -303,7 +315,6 @@ public class AsyncContextImpl implements AsyncContext {
+             }
+             try {
+                 if (!error) getResponse().flushBuffer();
+-
+             }catch (Exception x) {
+                 log.error("",x);
+             }
+@@ -335,6 +346,10 @@ public class AsyncContextImpl implements AsyncContext {
+         state.set(AsyncState.TIMING_OUT);
+     }
+     
++    public void setErrorState() {
++        state.set(AsyncState.ERROR_DISPATCHING);
++    }
++    
+     public void init(ServletRequest request, ServletResponse response) {
+         this.servletRequest = request;
+         this.servletResponse = response;
+
+==================================================
+ErrorReportValve.java
+index 0ac12cdbad..ae8626df8c 100644
+--- a/java/org/apache/catalina/core/AsyncListenerWrapper.java
++++ b/java/org/apache/catalina/core/AsyncListenerWrapper.java
+@@ -40,6 +40,12 @@ public class AsyncListenerWrapper {
+         // TODO SERVLET 3 - async 
+         listener.onTimeout(event);
+     }
++    
++    public void fireOnError(AsyncEvent event) throws IOException {
++        // TODO SERVLET 3 - async 
++        listener.onError(event);
++    }
++
+ 
+     public AsyncListener getListener() {
+         return listener;
+
+==================================================
+Http11AprProcessor.java
+index c80d3fa978..2f1d39fb28 100644
+--- a/java/org/apache/catalina/valves/ErrorReportValve.java
++++ b/java/org/apache/catalina/valves/ErrorReportValve.java
+@@ -53,7 +53,7 @@ public class ErrorReportValve
+ 
+     //------------------------------------------------------ Constructor
+     public ErrorReportValve() {
+-        super(false);
++        super(true);
+     }
+ 
+     // ----------------------------------------------------- Instance Variables
+@@ -104,14 +104,18 @@ public class ErrorReportValve
+ 
+         // Perform the request
+         getNext().invoke(request, response);
+-
+-        Throwable throwable =
+-            (Throwable) request.getAttribute(Globals.EXCEPTION_ATTR);
+-
++        
+         if (response.isCommitted()) {
+             return;
+         }
+ 
++        if (request.isAsyncStarted()) {
++            return;
++        }
++        
++        Throwable throwable =
++            (Throwable) request.getAttribute(Globals.EXCEPTION_ATTR);
++
+         if (throwable != null) {
+ 
+             // The response is an error
+
+==================================================
+Http11NioProcessor.java
+index 8a1ac9380d..30a24be1b1 100644
+--- a/java/org/apache/coyote/http11/Http11AprProcessor.java
++++ b/java/org/apache/coyote/http11/Http11AprProcessor.java
+@@ -54,7 +54,7 @@ import org.apache.tomcat.util.http.FastHttpDateFormat;
+ import org.apache.tomcat.util.http.MimeHeaders;
+ import org.apache.tomcat.util.net.AprEndpoint;
+ import org.apache.tomcat.util.net.SocketStatus;
+-import org.apache.tomcat.util.net.AprEndpoint.Handler.SocketState;
++import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+ 
+
+==================================================
+AbstractEndpoint.java
+index a480edfe56..8ee167d389 100644
+--- a/java/org/apache/coyote/http11/Http11NioProcessor.java
++++ b/java/org/apache/coyote/http11/Http11NioProcessor.java
+@@ -51,7 +51,7 @@ import org.apache.tomcat.util.net.NioChannel;
+ import org.apache.tomcat.util.net.NioEndpoint;
+ import org.apache.tomcat.util.net.SSLSupport;
+ import org.apache.tomcat.util.net.SocketStatus;
+-import org.apache.tomcat.util.net.NioEndpoint.Handler.SocketState;
++import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
+ import org.apache.tomcat.util.res.StringManager;
+ import org.apache.tomcat.util.net.NioEndpoint.KeyAttachment;
+ 
+
+==================================================
+AprEndpoint.java
+index 13f4f81d7f..fb79504f78 100644
+--- a/java/org/apache/tomcat/util/net/AbstractEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AbstractEndpoint.java
+@@ -67,7 +67,15 @@ public abstract class AbstractEndpoint {
+      * This one is a Tomcat extension to the Servlet spec.
+      */
+     public static final String SESSION_MGR = "javax.servlet.request.ssl_session_mgr";
+-    
++   
++    /**
++     * Different types of socket states to react upon
++     */
++    public static interface Handler {
++        public enum SocketState {
++            OPEN, CLOSED, LONG
++        }
++    }    
+     // ----------------------------------------------------------------- Fields
+ 
+ 
+
+==================================================
+NioEndpoint.java
+index 8a4ef2a62a..065a4c29e1 100644
+--- a/java/org/apache/tomcat/util/net/AprEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AprEndpoint.java
+@@ -1344,10 +1344,7 @@ public class AprEndpoint extends AbstractEndpoint {
+      * stored in the ThreadWithAttributes extra folders, or alternately in
+      * thread local fields.
+      */
+-    public interface Handler {
+-        public enum SocketState {
+-            OPEN, CLOSED, LONG
+-        }
++    public interface Handler extends AbstractEndpoint.Handler {
+         public SocketState process(long socket);
+         public SocketState event(long socket, SocketStatus status);
+     }
+
+==================================================
+AsyncStockServlet.java
+index 09f9dbda61..356100f122 100644
+--- a/java/org/apache/tomcat/util/net/NioEndpoint.java
++++ b/java/org/apache/tomcat/util/net/NioEndpoint.java
+@@ -1568,10 +1568,7 @@ public class NioEndpoint extends AbstractEndpoint {
+      * stored in the ThreadWithAttributes extra folders, or alternately in
+      * thread local fields.
+      */
+-    public interface Handler {
+-        public enum SocketState {
+-            OPEN, CLOSED, LONG
+-        }
++    public interface Handler extends AbstractEndpoint.Handler {
+         public SocketState process(NioChannel socket);
+         public SocketState event(NioChannel socket, SocketStatus status);
+         public void releaseCaches();
+
+==================================================
+Stockticker.java
+new file mode 100644
+index 0000000000..535d606ed2
+--- /dev/null
++++ b/webapps/examples/WEB-INF/classes/async/AsyncStockServlet.java
+@@ -0,0 +1,141 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package async;
++
++import java.io.IOException;
++import java.io.PrintWriter;
++import java.util.ArrayList;
++import java.util.Iterator;
++import java.util.concurrent.ConcurrentLinkedQueue;
++import java.util.concurrent.atomic.AtomicInteger;
++
++import javax.servlet.AsyncContext;
++import javax.servlet.AsyncEvent;
++import javax.servlet.AsyncListener;
++import javax.servlet.ServletException;
++import javax.servlet.http.HttpServlet;
++import javax.servlet.http.HttpServletRequest;
++import javax.servlet.http.HttpServletResponse;
++
++import async.Stockticker.Stock;
++import async.Stockticker.TickListener;
++
++public class AsyncStockServlet extends HttpServlet implements TickListener, AsyncListener{
++
++    public static final String POLL = "POLL";
++    public static final String LONG_POLL = "LONG-POLL";
++    public static final String STREAM = "STREAM";
++    
++    static ArrayList<Stock> ticks = new ArrayList<Stock>();
++    static ConcurrentLinkedQueue<AsyncContext> clients = new ConcurrentLinkedQueue<AsyncContext>();
++    static AtomicInteger clientcount = new AtomicInteger(0);
++    static Stockticker ticker = new Stockticker();
++    
++    public AsyncStockServlet() {
++        System.out.println("AsyncStockServlet created");
++    }
++    
++    
++
++    @Override
++    protected void service(HttpServletRequest req, HttpServletResponse resp)
++            throws ServletException, IOException {
++        //get the client Id, it should be in the URL
++        String clientId = req.getParameter("clientId");
++        //get the method this client prefers
++        String method = req.getParameter("method");
++
++        //if the client doesn't have a method defined, then we will assume it is POLLING
++        if (method==null) method = POLL;
++        //if the client hasn't specified its own clientId, abort
++//        if (clientId==null) {
++//            resp.sendError(404,"Client not found.");
++//            return;
++//        }
++        
++        if (req.isAsyncStarted()) {
++            req.getAsyncContext().complete();
++        } else if (req.isAsyncSupported()) {
++            AsyncContext actx = req.startAsync();
++            req.addAsyncListener(this);
++            resp.setContentType("text/plain");
++            clients.add(actx);
++            if (this.clientcount.incrementAndGet()==1) {
++                ticker.addTickListener(this);
++            }
++        } else {
++            new Exception("Async Not Supported").printStackTrace();
++            resp.sendError(400,"Async is not supported.");
++        }
++    }
++
++
++
++    @Override
++    public void tick(Stock stock) {
++        ticks.add((Stock)stock.clone());
++        Iterator<AsyncContext> it = clients.iterator();
++        while (it.hasNext()) {
++            AsyncContext actx = it.next();
++            writeStock(actx, stock);
++        }
++    }
++    
++    public void writeStock(AsyncContext actx, Stock stock) {
++        HttpServletResponse response = (HttpServletResponse)actx.getResponse();
++        try {
++            PrintWriter writer = response.getWriter();
++            writer.write("STOCK#");//make client parsing easier
++            writer.write(stock.getSymbol());
++            writer.write("#");
++            writer.write(stock.getValueAsString());
++            writer.write("#");
++            writer.write(stock.getLastChangeAsString());
++            writer.write("#");
++            writer.write(String.valueOf(stock.getCnt()));
++            writer.write("\n");
++            writer.flush();
++            response.flushBuffer();
++        }catch (IOException x) {
++            try {actx.complete();}catch (Exception ignore){}
++        }
++    }
++
++    @Override
++    public void onComplete(AsyncEvent event) throws IOException {
++        clients.remove(event.getRequest().getAsyncContext());
++        if (clientcount.decrementAndGet()==0) {
++            ticker.removeTickListener(this);
++        }
++    }
++
++    @Override
++    public void onError(AsyncEvent event) throws IOException {
++        event.getRequest().getAsyncContext().complete();
++    }
++
++    @Override
++    public void onTimeout(AsyncEvent event) throws IOException {
++        event.getRequest().getAsyncContext().complete();
++    }
++    
++    
++    
++    
++    
++
++}
+
+==================================================

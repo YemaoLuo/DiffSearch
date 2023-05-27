@@ -1,0 +1,284 @@
+e17e63dac8ede09d863db8029b1c98954219c6e7
+==================================================
+Add a test when sending a DATA frame on a stream that is already closed
+==================================================
+Mark Thomas
+==================================================
+Fri Jun 5 10:05:35 2015 +0000
+==================================================
+AbstractStream.java
+Add a test when sending a DATA frame on a stream that is already closed
+Refactor the StreamStateMachine to track which frames are permitted in which states
+Update the parser to check the frame type for non-zero streams
+Separate incrementWindowSize (triggered by incoming frame) and decrementWindowSize(triggered by write)
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1683698 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Http2Parser.java
+index c18c7e6246..505f9a0357 100644
+--- a/java/org/apache/coyote/http2/AbstractStream.java
++++ b/java/org/apache/coyote/http2/AbstractStream.java
+@@ -99,7 +99,7 @@ abstract class AbstractStream {
+ 
+ 
+     /**
+-s     * @param increment
++     * @param increment
+      * @throws Http2Exception
+      */
+     protected void incrementWindowSize(int increment) throws Http2Exception {
+@@ -107,6 +107,11 @@ s     * @param increment
+     }
+ 
+ 
++    protected void decrementWindowSize(int decrement) {
++        windowSize.addAndGet(-decrement);
++    }
++
++
+     protected abstract String getConnectionId();
+ 
+     protected abstract int getWeight();
+
+==================================================
+Http2UpgradeHandler.java
+index 1a822648f8..6e3acd97c8 100644
+--- a/java/org/apache/coyote/http2/Http2Parser.java
++++ b/java/org/apache/coyote/http2/Http2Parser.java
+@@ -386,7 +386,7 @@ class Http2Parser {
+ 
+         if (log.isDebugEnabled()) {
+             log.debug(sm.getString("http2Parser.processFrame", connectionId,
+-                    Integer.toString(streamId), Integer.toString(flags),
++                    Integer.toString(streamId), frameType, Integer.toString(flags),
+                     Integer.toString(payloadSize)));
+         }
+ 
+@@ -497,12 +497,15 @@ class Http2Parser {
+         void endOfStream(int streamId);
+ 
+         // Header frames
+-        HeaderEmitter headersStart(int streamId);
+-        void reprioritise(int streamId, int parentStreamId, boolean exclusive, int weight);
++        HeaderEmitter headersStart(int streamId) throws Http2Exception;
+         void headersEnd(int streamId);
+ 
++        // Priority frames (also headers)
++        void reprioritise(int streamId, int parentStreamId, boolean exclusive, int weight)
++                throws Http2Exception;
++
+         // Reset frames
+-        void reset(int streamId, long errorCode);
++        void reset(int streamId, long errorCode) throws Http2Exception;
+ 
+         // Settings frames
+         void setting(int identifier, long value) throws IOException;
+
+==================================================
+Stream.java
+index 1e0b68c92f..97adf780ad 100644
+--- a/java/org/apache/coyote/http2/LocalStrings.properties
++++ b/java/org/apache/coyote/http2/LocalStrings.properties
+@@ -39,7 +39,7 @@ http2Parser.headers.wrongStream=Connection [{0}], headers in progress for stream
+ http2Parser.payloadTooBig=The payload is [{0}] bytes long but the maximum frame size is [{1}]
+ http2Parser.preface.invalid=Invalid connection preface [{0}] presented
+ http2Parser.preface.io=Unable to read connection preface
+-http2Parser.processFrame=Connection [{0}], Stream [{1}], Flags [{2}], Payload size [{3}]
++http2Parser.processFrame=Connection [{0}], Stream [{1}], Frame type [{2}], Flags [{3}], Payload size [{4}]
+ http2Parser.processFrame.unexpectedType=Expected frame type [{0}] but received frame type [{1}]
+ http2Parser.processFrameContinuation.notExpected=Connection [{0}], Continuation frame received for stream [{1}] when no headers were in progress
+ http2Parser.processFrameGoaway.payloadTooSmall=Connection [{0}]: Goaway payload size was [{1}] which is less than the minimum 8
+
+==================================================
+StreamStateMachine.java
+index f033550aef..5ff5898051 100644
+--- a/java/org/apache/coyote/http2/Stream.java
++++ b/java/org/apache/coyote/http2/Stream.java
+@@ -105,15 +105,17 @@ public class Stream extends AbstractStream implements HeaderEmitter {
+     }
+ 
+ 
++    void checkState(FrameType frameType) throws Http2Exception {
++        state.checkFrameType(frameType);
++    }
++
++
+     @Override
+     public void incrementWindowSize(int windowSizeIncrement) throws Http2Exception {
+         // If this is zero then any thread that has been trying to write for
+         // this stream will be waiting. Notify that thread it can continue. Use
+         // notify all even though only one thread is waiting to be on the safe
+         // side.
+-        if (windowSizeIncrement > 0) {
+-            state.receivedWindowUpdate();
+-        }
+         boolean notify = getWindowSize() == 0;
+         super.incrementWindowSize(windowSizeIncrement);
+         if (notify) {
+@@ -221,8 +223,7 @@ public class Stream extends AbstractStream implements HeaderEmitter {
+     }
+ 
+ 
+-    ByteBuffer getInputByteBuffer() throws Http2Exception {
+-        state.receivedData();
++    ByteBuffer getInputByteBuffer() {
+         return inputBuffer.getInBuffer();
+     }
+ 
+@@ -233,9 +234,7 @@ public class Stream extends AbstractStream implements HeaderEmitter {
+ 
+ 
+     void setEndOfStream() {
+-        // TODO This is temporary until the state machine for a stream is
+-        // implemented
+-        inputBuffer.endOfStream = true;
++        state.recieveEndOfStream();
+     }
+ 
+     StreamOutputBuffer getOutputBuffer() {
+@@ -317,7 +316,7 @@ public class Stream extends AbstractStream implements HeaderEmitter {
+                     }
+                 } while (thisWrite < 1);
+ 
+-                incrementWindowSize(-thisWrite);
++                decrementWindowSize(thisWrite);
+ 
+                 // Do the write
+                 handler.writeBody(Stream.this, buffer, thisWrite);
+@@ -377,8 +376,6 @@ public class Stream extends AbstractStream implements HeaderEmitter {
+         // 'write mode'.
+         private volatile ByteBuffer inBuffer;
+ 
+-        private boolean endOfStream = false;
+-
+         @Override
+         public int doRead(ByteChunk chunk) throws IOException {
+ 
+@@ -388,7 +385,7 @@ public class Stream extends AbstractStream implements HeaderEmitter {
+ 
+             // Ensure that only one thread accesses inBuffer at a time
+             synchronized (inBuffer) {
+-                while (inBuffer.position() == 0 && !endOfStream) {
++                while (inBuffer.position() == 0 && !state.isFrameTypePermitted(FrameType.DATA)) {
+                     // Need to block until some data is written
+                     try {
+                         inBuffer.wait();
+@@ -403,7 +400,7 @@ public class Stream extends AbstractStream implements HeaderEmitter {
+                     written = inBuffer.remaining();
+                     inBuffer.get(outBuffer, 0, written);
+                     inBuffer.clear();
+-                } else if (endOfStream) {
++                } else if (state.isFrameTypePermitted(FrameType.DATA)) {
+                     return -1;
+                 } else {
+                     // TODO Should never happen
+
+==================================================
+TestHttp2Section_5_1.java
+index c57d38011c..491ed7807e 100644
+--- a/java/org/apache/coyote/http2/StreamStateMachine.java
++++ b/java/org/apache/coyote/http2/StreamStateMachine.java
+@@ -16,6 +16,9 @@
+  */
+ package org.apache.coyote.http2;
+ 
++import java.util.HashSet;
++import java.util.Set;
++
+ import org.apache.tomcat.util.res.StringManager;
+ 
+ /**
+@@ -144,52 +147,52 @@ public class StreamStateMachine {
+     }
+ 
+ 
+-    public synchronized void receivedWindowUpdate() throws Http2Exception {
+-        // No state change. Just checks state is valid for receiving window
+-        // update.
+-        if (!state.isWindowUpdatePermitted()) {
+-            throw new Http2Exception(sm.getString("streamStateMachine.invalidFrame.windowUpdate",
+-                    stream.getConnectionId(), stream.getIdentifier(), state),
+-                    0, ErrorCode.PROTOCOL_ERROR);
++    public synchronized void checkFrameType(FrameType frameType) throws Http2Exception {
++        // No state change. Checks that the frame type is valid for the current
++        // state of this stream.
++        if (!isFrameTypePermitted(frameType)) {
++            throw new Http2Exception(sm.getString("streamStateMachine.invalidFrame",
++                    stream.getConnectionId(), stream.getIdentifier(), state, frameType),
++                    0, state.errorCodeForInvalidFrame);
+         }
+     }
+ 
+ 
+-    public synchronized void receivedData() throws Http2Exception {
+-        // No state change. Just checks state is valid for receiving window
+-        // update.
+-        if (!state.isDataPermitted()) {
+-            throw new Http2Exception(sm.getString("streamStateMachine.invalidFrame.data",
+-                    stream.getConnectionId(), stream.getIdentifier(), state),
+-                    0, ErrorCode.PROTOCOL_ERROR);
+-        }
++    public synchronized boolean isFrameTypePermitted(FrameType frameType) {
++        return state.isFrameTypePermitted(frameType);
+     }
+ 
+ 
+     private enum State {
+-        IDLE               (false, false),
+-        OPEN               ( true,  true),
+-        RESERVED_LOCAL     ( true, false),
+-        RESERVED_REMOTE    (false, false),
+-        HALF_CLOSED_LOCAL  ( true,  true),
+-        HALF_CLOSED_REMOTE ( true, false),
+-        CLOSED             (false, false),
+-        CLOSED_RESET       ( true,  true);
+-
+-        private final boolean windowUpdatePermitted;
+-        private final boolean dataPermitted;
+-
+-        private State(boolean windowUpdatePermitted, boolean dataPermitted) {
+-            this.windowUpdatePermitted = windowUpdatePermitted;
+-            this.dataPermitted = dataPermitted;
+-        }
+-
+-        public boolean isWindowUpdatePermitted() {
+-            return windowUpdatePermitted;
++        IDLE               (ErrorCode.PROTOCOL_ERROR, FrameType.HEADERS, FrameType.PRIORITY),
++        OPEN               (ErrorCode.PROTOCOL_ERROR, FrameType.DATA, FrameType.HEADERS,
++                                    FrameType.PRIORITY, FrameType.RST, FrameType.PUSH_PROMISE,
++                                    FrameType.WINDOW_UPDATE),
++        RESERVED_LOCAL     (ErrorCode.PROTOCOL_ERROR, FrameType.PRIORITY, FrameType.RST,
++                                    FrameType.WINDOW_UPDATE),
++        RESERVED_REMOTE    (ErrorCode.PROTOCOL_ERROR, FrameType.HEADERS, FrameType.PRIORITY,
++                                    FrameType.RST),
++        HALF_CLOSED_LOCAL  (ErrorCode.PROTOCOL_ERROR, FrameType.DATA, FrameType.HEADERS,
++                                    FrameType.PRIORITY, FrameType.RST, FrameType.PUSH_PROMISE,
++                                    FrameType.WINDOW_UPDATE),
++        HALF_CLOSED_REMOTE (ErrorCode.STREAM_CLOSED, FrameType.PRIORITY, FrameType.RST,
++                                    FrameType.WINDOW_UPDATE),
++        CLOSED             (ErrorCode.PROTOCOL_ERROR, FrameType.PRIORITY, FrameType.RST,
++                                    FrameType.WINDOW_UPDATE),
++        CLOSED_RESET       (ErrorCode.PROTOCOL_ERROR, FrameType.PRIORITY);
++
++        private final ErrorCode errorCodeForInvalidFrame;
++        private final Set<FrameType> frameTypesPermitted = new HashSet<>();
++
++        private State(ErrorCode errorCode, FrameType... frameTypes) {
++            this.errorCodeForInvalidFrame = errorCode;
++            for (FrameType frameType : frameTypes) {
++                frameTypesPermitted.add(frameType);
++            }
+         }
+ 
+-        public boolean isDataPermitted() {
+-            return dataPermitted;
++        public boolean isFrameTypePermitted(FrameType frameType) {
++            return frameTypesPermitted.contains(frameType);
+         }
+     }
+ }
+
+==================================================

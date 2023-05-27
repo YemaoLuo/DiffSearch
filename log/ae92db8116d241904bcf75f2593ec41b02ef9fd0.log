@@ -1,0 +1,142 @@
+ae92db8116d241904bcf75f2593ec41b02ef9fd0
+==================================================
+Make sure thread starvation doesn't exist during reclamation of connections
+==================================================
+Filip Hanik
+==================================================
+Fri Feb 6 21:49:36 2009 +0000
+==================================================
+ConnectionPool.java
+Make sure thread starvation doesn't exist during reclamation of connections
+
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@741747 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+PooledConnection.java
+index 3009d52456..7efb077119 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/ConnectionPool.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/ConnectionPool.java
+@@ -98,7 +98,12 @@ public class ConnectionPool {
+      * reference to mbean
+      */
+     protected org.apache.tomcat.jdbc.pool.jmx.ConnectionPool jmxPool = null;
+-
++    
++    /**
++     * counter to track how many threads are waiting for a connection
++     */
++    protected AtomicInteger waitcount = new AtomicInteger(0);
++    
+     //===============================================================================
+     //         PUBLIC METHODS
+     //===============================================================================
+@@ -142,6 +147,14 @@ public class ConnectionPool {
+     public String getName() {
+         return getPoolProperties().getPoolName();
+     }
++    
++    /**
++     * Return the number of threads waiting for a connection
++     * @return number of threads waiting for a connection
++     */
++    public int getWaitCount() {
++        return waitcount.get();
++    }
+ 
+     /**
+      * Returns the pool properties associated with this connection pool
+@@ -397,6 +410,9 @@ public class ConnectionPool {
+                 jmxPool.notify(org.apache.tomcat.jdbc.pool.jmx.ConnectionPool.NOTIFY_ABANDON, trace);
+             }
+             con.abandon();
++            //we've asynchronously reduced the number of connections
++            //we could have threads stuck in idle.poll(timeout) that will never be notified
++            if (waitcount.get()>0) idle.offer(new PooledConnection(poolProperties,this));
+         } finally {
+             con.unlock();
+         }
+@@ -457,11 +473,17 @@ public class ConnectionPool {
+                 maxWait = (getPoolProperties().getMaxWait()<=0)?Long.MAX_VALUE:getPoolProperties().getMaxWait();
+             }
+             long timetowait = Math.max(0, maxWait - (System.currentTimeMillis() - now));
++            waitcount.incrementAndGet();
+             try {
+                 //retrieve an existing connection
+                 con = idle.poll(timetowait, TimeUnit.MILLISECONDS);
+             } catch (InterruptedException ex) {
+-                Thread.interrupted();
++                Thread.interrupted();//clear the flag, and bail out
++                SQLException sx = new SQLException("Pool wait interrupted.");
++                sx.initCause(ex);
++                throw sx;
++            } finally {
++                waitcount.decrementAndGet();
+             }
+             if (maxWait==0 && con == null) { //no wait, return one if we have one
+                 throw new SQLException("[" + Thread.currentThread().getName()+"] " +
+@@ -529,6 +551,9 @@ public class ConnectionPool {
+         boolean setToNull = false;
+         try {
+             con.lock();
++            if (!con.isDiscarded() && !con.isInitialized()) {
++                con.connect();
++            }
+             if ((!con.isDiscarded()) && con.validate(PooledConnection.VALIDATE_BORROW)) {
+                 //set the timestamp
+                 con.setTimestamp(now);
+@@ -647,7 +672,6 @@ public class ConnectionPool {
+                     if ((now - time) > con.getAbandonTimeout()) {
+                         busy.remove(con);
+                         abandon(con);
+-                        release(con);
+                         setToNull = true;
+                     } else {
+                         //do nothing
+
+==================================================
+ConnectionPool.java
+index 28326cd202..e73e8112f2 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/PooledConnection.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/PooledConnection.java
+@@ -53,8 +53,8 @@ public class PooledConnection {
+     protected ConnectionPool parent;
+ 
+     protected WeakReference<JdbcInterceptor> handler = null;
+-
+-    public PooledConnection(PoolProperties prop, ConnectionPool parent) throws SQLException {
++    
++    public PooledConnection(PoolProperties prop, ConnectionPool parent) {
+         instanceCount = counter.addAndGet(1);
+         poolProperties = prop;
+         this.parent = parent;
+@@ -112,6 +112,10 @@ public class PooledConnection {
+         }        
+         this.discarded = false;
+     }
++    
++    public boolean isInitialized() {
++        return connection!=null;
++    }
+ 
+     protected void reconnect() throws SQLException {
+         this.disconnect(false);
+
+==================================================
+StarvationTest.java
+index bcc547d30c..b10de81ce3 100644
+--- a/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/jmx/ConnectionPool.java
++++ b/modules/jdbc-pool/java/org/apache/tomcat/jdbc/pool/jmx/ConnectionPool.java
+@@ -233,5 +233,8 @@ public class ConnectionPool extends NotificationBroadcasterSupport implements Co
+     public String getJdbcInterceptors() {
+         return pool.getPoolProperties().getJdbcInterceptors();
+     }
++    public int getWaitCount() {
++        return pool.getWaitCount();
++    }
+ 
+ }
+
+==================================================

@@ -1,0 +1,278 @@
+7343eeddcc310af85a677613a4dd58a1e30984c6
+==================================================
+Refactor the stopping of the acceptor.
+==================================================
+Mark Thomas
+==================================================
+Thu Aug 13 17:10:48 2020 +0100
+==================================================
+Acceptor.java
+Refactor the stopping of the acceptor.
+
+Can't use !endpoint.isRunning() to trigger the stopping of the acceptor
+thread as endpoint.stop() followed immediately by endpoint.start() can
+result in the acceptor thread never seeing endpoint.isRunning()
+returning false.
+
+
+==================================================
+AprEndpoint.java
+index c09bf4b18f..9fa0818571 100644
+--- a/java/org/apache/tomcat/util/net/Acceptor.java
++++ b/java/org/apache/tomcat/util/net/Acceptor.java
+@@ -16,6 +16,9 @@
+  */
+ package org.apache.tomcat.util.net;
+ 
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.TimeUnit;
++
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.jni.Error;
+@@ -32,6 +35,13 @@ public class Acceptor<U> implements Runnable {
+ 
+     private final AbstractEndpoint<?,U> endpoint;
+     private String threadName;
++    /*
++     * Tracked separately rather than using endpoint.isRunning() as calls to
++     * endpoint.stop() and endpoint.start() in quick succession can cause the
++     * acceptor to continue running when it should terminate.
++     */
++    private volatile boolean stopCalled = false;
++    private final CountDownLatch stopLatch = new CountDownLatch(1);
+     protected volatile AcceptorState state = AcceptorState.NEW;
+ 
+ 
+@@ -60,88 +70,102 @@ public class Acceptor<U> implements Runnable {
+ 
+         int errorDelay = 0;
+ 
+-        // Loop until we receive a shutdown command
+-        while (endpoint.isRunning()) {
+-
+-            // Loop if endpoint is paused
+-            while (endpoint.isPaused() && endpoint.isRunning()) {
+-                state = AcceptorState.PAUSED;
+-                try {
+-                    Thread.sleep(50);
+-                } catch (InterruptedException e) {
+-                    // Ignore
++        try {
++            // Loop until we receive a shutdown command
++            while (!stopCalled) {
++
++                // Loop if endpoint is paused
++                while (endpoint.isPaused() && !stopCalled) {
++                    state = AcceptorState.PAUSED;
++                    try {
++                        Thread.sleep(50);
++                    } catch (InterruptedException e) {
++                        // Ignore
++                    }
+                 }
+-            }
+ 
+-            if (!endpoint.isRunning()) {
+-                break;
+-            }
+-            state = AcceptorState.RUNNING;
+-
+-            try {
+-                //if we have reached max connections, wait
+-                endpoint.countUpOrAwaitConnection();
+-
+-                // Endpoint might have been paused while waiting for latch
+-                // If that is the case, don't accept new connections
+-                if (endpoint.isPaused()) {
+-                    continue;
++                if (stopCalled) {
++                    break;
+                 }
++                state = AcceptorState.RUNNING;
+ 
+-                U socket = null;
+                 try {
+-                    // Accept the next incoming connection from the server
+-                    // socket
+-                    socket = endpoint.serverSocketAccept();
+-                } catch (Exception ioe) {
+-                    // We didn't get a socket
+-                    endpoint.countDownConnection();
+-                    if (endpoint.isRunning()) {
+-                        // Introduce delay if necessary
+-                        errorDelay = handleExceptionWithDelay(errorDelay);
+-                        // re-throw
+-                        throw ioe;
+-                    } else {
+-                        break;
++                    //if we have reached max connections, wait
++                    endpoint.countUpOrAwaitConnection();
++
++                    // Endpoint might have been paused while waiting for latch
++                    // If that is the case, don't accept new connections
++                    if (endpoint.isPaused()) {
++                        continue;
+                     }
+-                }
+-                // Successful accept, reset the error delay
+-                errorDelay = 0;
+-
+-                // Configure the socket
+-                if (endpoint.isRunning() && !endpoint.isPaused()) {
+-                    // setSocketOptions() will hand the socket off to
+-                    // an appropriate processor if successful
+-                    if (!endpoint.setSocketOptions(socket)) {
+-                        endpoint.closeSocket(socket);
++
++                    U socket = null;
++                    try {
++                        // Accept the next incoming connection from the server
++                        // socket
++                        socket = endpoint.serverSocketAccept();
++                    } catch (Exception ioe) {
++                        // We didn't get a socket
++                        endpoint.countDownConnection();
++                        if (endpoint.isRunning()) {
++                            // Introduce delay if necessary
++                            errorDelay = handleExceptionWithDelay(errorDelay);
++                            // re-throw
++                            throw ioe;
++                        } else {
++                            break;
++                        }
+                     }
+-                } else {
+-                    endpoint.destroySocket(socket);
+-                }
+-            } catch (Throwable t) {
+-                ExceptionUtils.handleThrowable(t);
+-                String msg = sm.getString("endpoint.accept.fail");
+-                // APR specific.
+-                // Could push this down but not sure it is worth the trouble.
+-                if (t instanceof Error) {
+-                    Error e = (Error) t;
+-                    if (e.getError() == 233) {
+-                        // Not an error on HP-UX so log as a warning
+-                        // so it can be filtered out on that platform
+-                        // See bug 50273
+-                        log.warn(msg, t);
++                    // Successful accept, reset the error delay
++                    errorDelay = 0;
++
++                    // Configure the socket
++                    if (!stopCalled && !endpoint.isPaused()) {
++                        // setSocketOptions() will hand the socket off to
++                        // an appropriate processor if successful
++                        if (!endpoint.setSocketOptions(socket)) {
++                            endpoint.closeSocket(socket);
++                        }
++                    } else {
++                        endpoint.destroySocket(socket);
++                    }
++                } catch (Throwable t) {
++                    ExceptionUtils.handleThrowable(t);
++                    String msg = sm.getString("endpoint.accept.fail");
++                    // APR specific.
++                    // Could push this down but not sure it is worth the trouble.
++                    if (t instanceof Error) {
++                        Error e = (Error) t;
++                        if (e.getError() == 233) {
++                            // Not an error on HP-UX so log as a warning
++                            // so it can be filtered out on that platform
++                            // See bug 50273
++                            log.warn(msg, t);
++                        } else {
++                            log.error(msg, t);
++                        }
+                     } else {
+-                        log.error(msg, t);
++                            log.error(msg, t);
+                     }
+-                } else {
+-                        log.error(msg, t);
+                 }
+             }
++        } finally {
++            stopLatch.countDown();
+         }
+         state = AcceptorState.ENDED;
+     }
+ 
+ 
++    public void stop() {
++        stopCalled = true;
++        try {
++            stopLatch.await(10, TimeUnit.SECONDS);
++        } catch (InterruptedException e) {
++            // Ignore
++        }
++    }
++
++
+     /**
+      * Handles exceptions where a delay is required to prevent a Thread from
+      * entering a tight loop which will consume CPU and may also trigger large
+
+==================================================
+Nio2Endpoint.java
+index 8f1a7eb587..57e6d5f4a8 100644
+--- a/java/org/apache/tomcat/util/net/AprEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AprEndpoint.java
+@@ -486,24 +486,13 @@ public class AprEndpoint extends AbstractEndpoint<Long,Long> implements SNICallB
+         }
+         if (running) {
+             running = false;
++            acceptor.stop();
+             poller.stop();
+             for (SocketWrapperBase<Long> socketWrapper : connections.values()) {
+                 socketWrapper.close();
+             }
+-            long waitLeft = 10000;
+-            while (waitLeft > 0 &&
+-                    acceptor.getState() != AcceptorState.ENDED &&
+-                    serverSock != 0) {
+-                try {
+-                    Thread.sleep(50);
+-                } catch (InterruptedException e) {
+-                    // Ignore
+-                }
+-                waitLeft -= 50;
+-            }
+-            if (waitLeft == 0) {
+-                log.warn(sm.getString("endpoint.warn.unlockAcceptorFailed",
+-                        acceptor.getThreadName()));
++            if (acceptor.getState() != AcceptorState.ENDED) {
++                log.warn(sm.getString("endpoint.warn.unlockAcceptorFailed", acceptor.getThreadName()));
+                 // If the Acceptor is still running force
+                 // the hard socket close.
+                 if (serverSock != 0) {
+
+==================================================
+NioEndpoint.java
+index 2e3a5af5b2..1d218a546c 100644
+--- a/java/org/apache/tomcat/util/net/Nio2Endpoint.java
++++ b/java/org/apache/tomcat/util/net/Nio2Endpoint.java
+@@ -192,7 +192,7 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel,AsynchronousS
+         }
+         if (running) {
+             running = false;
+-            acceptor.state = AcceptorState.ENDED;
++            acceptor.stop();
+             // Use the executor to avoid binding the main thread if something bad
+             // occurs and unbind will also wait for a bit for it to complete
+             getExecutor().execute(new Runnable() {
+@@ -407,6 +407,11 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel,AsynchronousS
+             }
+         }
+ 
++        @Override
++        public void stop() {
++            acceptor.state = AcceptorState.ENDED;
++        }
++
+         @Override
+         public void completed(AsynchronousSocketChannel socket,
+                 Void attachment) {
+
+==================================================

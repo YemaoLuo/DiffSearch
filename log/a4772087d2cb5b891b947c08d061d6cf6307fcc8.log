@@ -1,0 +1,326 @@
+a4772087d2cb5b891b947c08d061d6cf6307fcc8
+==================================================
+More Mapper clean-up.
+==================================================
+Mark Emlyn
+==================================================
+Tue Aug 7 20:01:34 2012 +0000
+==================================================
+Context.java
+More Mapper clean-up.
+Remove the per Context Mappers
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1370482 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+ApplicationContext.java
+index 2dfdfba84c..4522bf8fc2 100644
+--- a/java/org/apache/catalina/Context.java
++++ b/java/org/apache/catalina/Context.java
+@@ -35,7 +35,6 @@ import org.apache.catalina.deploy.FilterMap;
+ import org.apache.catalina.deploy.LoginConfig;
+ import org.apache.catalina.deploy.NamingResources;
+ import org.apache.catalina.deploy.SecurityConstraint;
+-import org.apache.catalina.mapper.Mapper;
+ import org.apache.tomcat.JarScanner;
+ 
+ /**
+@@ -412,12 +411,6 @@ public interface Context extends Container {
+     public void setLoginConfig(LoginConfig config);
+ 
+ 
+-    /**
+-     * Get the request dispatcher mapper.
+-     */
+-    public Mapper getMapper();
+-
+-
+     /**
+      * Return the naming resources associated with this web application.
+      */
+
+==================================================
+StandardContext.java
+index a113b41549..d6f53f5e93 100644
+--- a/java/org/apache/catalina/core/ApplicationContext.java
++++ b/java/org/apache/catalina/core/ApplicationContext.java
+@@ -120,6 +120,7 @@ public class ApplicationContext
+     public ApplicationContext(StandardContext context) {
+         super();
+         this.context = context;
++        this.service = ((Engine) context.getParent().getParent()).getService();
+ 
+         // Populate session tracking modes
+         populateSessionTrackingModes();
+@@ -148,11 +149,18 @@ public class ApplicationContext
+     private final StandardContext context;
+ 
+ 
++    /**
++     * The Service instance with which we are associated.
++     */
++    private final Service service;
++
++
+     /**
+      * Empty String collection to serve as the basis for empty enumerations.
+      */
+     private static final List<String> emptyString = Collections.emptyList();
+ 
++
+     /**
+      * Empty Servlet collection to serve as the basis for empty enumerations.
+      */
+@@ -454,7 +462,7 @@ public class ApplicationContext
+                 semicolon = -1;
+             }
+             uriCC.append(normalizedPath, 0, semicolon > 0 ? semicolon : pos);
+-            context.getMapper().map(uriMB, mappingData);
++            service.getMapper().map(context, uriMB, mappingData);
+             if (mappingData.wrapper == null) {
+                 return (null);
+             }
+
+==================================================
+Mapper.java
+index d44bfbd591..91016e0378 100644
+--- a/java/org/apache/catalina/core/StandardContext.java
++++ b/java/org/apache/catalina/core/StandardContext.java
+@@ -432,13 +432,6 @@ public class StandardContext extends ContainerBase
+     private LoginConfig loginConfig = null;
+ 
+ 
+-    /**
+-     * The mapper associated with this context.
+-     */
+-    private org.apache.catalina.mapper.Mapper mapper =
+-        new org.apache.catalina.mapper.Mapper();
+-
+-
+     /**
+      * The Manager implementation with which this Container is associated.
+      */
+@@ -2060,15 +2053,6 @@ public class StandardContext extends ContainerBase
+     }
+ 
+ 
+-    /**
+-     * Get the mapper associated with the context.
+-     */
+-    @Override
+-    public org.apache.catalina.mapper.Mapper getMapper() {
+-        return (mapper);
+-    }
+-
+-
+     /**
+      * Return the naming resources associated with this web application.
+      */
+@@ -3248,19 +3232,13 @@ public class StandardContext extends ContainerBase
+                 // Don't allow more than one servlet on the same pattern
+                 Wrapper wrapper = (Wrapper) findChild(name2);
+                 wrapper.removeMapping(decodedPattern);
+-                mapper.removeWrapper(decodedPattern);
+             }
+             servletMappings.put(decodedPattern, name);
+         }
+         Wrapper wrapper = (Wrapper) findChild(name);
+         wrapper.addMapping(decodedPattern);
+ 
+-        // Update context mapper
+-        mapper.addWrapper(decodedPattern, wrapper, jspWildCard,
+-                resourceOnlyServlets.contains(name));
+-
+         fireContainerEvent("addServletMapping", decodedPattern);
+-
+     }
+ 
+ 
+@@ -3280,7 +3258,6 @@ public class StandardContext extends ContainerBase
+             watchedResources = results;
+         }
+         fireContainerEvent("addWatchedResource", name);
+-
+     }
+ 
+ 
+@@ -4308,9 +4285,7 @@ public class StandardContext extends ContainerBase
+         if( wrapper != null ) {
+             wrapper.removeMapping(pattern);
+         }
+-        mapper.removeWrapper(pattern);
+         fireContainerEvent("removeServletMapping", pattern);
+-
+     }
+ 
+ 
+@@ -5260,9 +5235,6 @@ public class StandardContext extends ContainerBase
+             getServletContext().setAttribute
+                 (Globals.RESOURCES_ATTR, getResources());
+ 
+-        // Initialize associated mapper
+-        mapper.setContext(getPath(), welcomeFiles, getResources());
+-
+         // Binding thread
+         oldCCL = bindThread();
+ 
+
+==================================================
+MapperListener.java
+index 3dd168d522..94ca4a494a 100644
+--- a/java/org/apache/catalina/mapper/Mapper.java
++++ b/java/org/apache/catalina/mapper/Mapper.java
+@@ -14,9 +14,11 @@
+  *  See the License for the specific language governing permissions and
+  *  limitations under the License.
+  */
+-
+ package org.apache.catalina.mapper;
+ 
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
++
+ import javax.naming.NamingException;
+ import javax.naming.directory.DirContext;
+ 
+@@ -54,15 +56,17 @@ public final class Mapper {
+      */
+     protected String defaultHostName = null;
+ 
++
+     /**
+-     * Context associated with this wrapper, used for wrapper mapping.
++     * Mapping from Context object to Context version to support
++     * RequestDispatcher mappings.
+      */
+-    protected final ContextVersion context = new ContextVersion();
++    protected Map<Object, ContextVersion> contextObjectToContextVersionMap =
++            new ConcurrentHashMap<>();
+ 
+ 
+     // --------------------------------------------------------- Public Methods
+ 
+-
+     /**
+      * Set default host.
+      *
+@@ -171,20 +175,6 @@ public final class Mapper {
+     }
+ 
+ 
+-    /**
+-     * Set context, used for wrapper mapping (request dispatcher).
+-     *
+-     * @param welcomeResources Welcome files defined for this context
+-     * @param resources Static resources of the context
+-     */
+-    public void setContext(String path, String[] welcomeResources,
+-                           javax.naming.Context resources) {
+-        context.path = path;
+-        context.welcomeResources = welcomeResources;
+-        context.resources = resources;
+-    }
+-
+-
+     /**
+      * Add a new Context to an existing Host.
+      *
+@@ -243,6 +233,8 @@ public final class Mapper {
+                 newContextVersion.resources = resources;
+                 if (insertMap(contextVersions, newContextVersions, newContextVersion)) {
+                     mappedContext.versions = newContextVersions;
++                    contextObjectToContextVersionMap.put(
++                            context, newContextVersion);
+                 }
+             }
+         }
+@@ -253,12 +245,16 @@ public final class Mapper {
+     /**
+      * Remove a context from an existing host.
+      *
+-     * @param hostName Virtual host name this context belongs to
+-     * @param path Context path
+-     * @param version Context version
++     * @param object    The actual context
++     * @param hostName  Virtual host name this context belongs to
++     * @param path      Context path
++     * @param version   Context version
+      */
+-    public void removeContextVersion(String hostName, String path,
+-            String version) {
++    public void removeContextVersion(Object object, String hostName,
++            String path, String version) {
++
++        contextObjectToContextVersionMap.remove(object);
++
+         Host[] hosts = this.hosts;
+         int pos = find(hosts, hostName);
+         if (pos < 0) {
+@@ -340,12 +336,6 @@ public final class Mapper {
+     }
+ 
+ 
+-    public void addWrapper(String path, Object wrapper, boolean jspWildCard,
+-            boolean resourceOnly) {
+-        addWrapper(context, path, wrapper, jspWildCard, resourceOnly);
+-    }
+-
+-
+     /**
+      * Adds a wrapper to the given context.
+      *
+@@ -411,16 +401,6 @@ public final class Mapper {
+     }
+ 
+ 
+-    /**
+-     * Remove a wrapper from the context associated with this wrapper.
+-     *
+-     * @param path Wrapper mapping
+-     */
+-    public void removeWrapper(String path) {
+-        removeWrapper(context, path);
+-    }
+-
+-
+     /**
+      * Remove a wrapper from an existing context.
+      *
+@@ -688,13 +668,15 @@ public final class Mapper {
+      * @param mappingData This structure will contain the result of the mapping
+      *                    operation
+      */
+-    public void map(MessageBytes uri, MappingData mappingData)
+-        throws Exception {
++    public void map(Object context, MessageBytes uri,
++            MappingData mappingData) throws Exception {
+ 
++        ContextVersion contextVersion =
++                contextObjectToContextVersionMap.get(context);
+         uri.toChars();
+         CharChunk uricc = uri.getCharChunk();
+         uricc.setLimit(-1);
+-        internalMapWrapper(context, uricc, mappingData);
++        internalMapWrapper(contextVersion, uricc, mappingData);
+ 
+     }
+ 
+
+==================================================
+FailedContext.java
+index d1a9d7ca70..bc43a9276b 100644
+--- a/java/org/apache/catalina/mapper/MapperListener.java
++++ b/java/org/apache/catalina/mapper/MapperListener.java
+@@ -389,7 +389,7 @@ public class MapperListener extends LifecycleMBeanBase
+                     contextPath, service));
+         }
+ 
+-        mapper.removeContextVersion(hostName, contextPath,
++        mapper.removeContextVersion(context, hostName, contextPath,
+                 context.getWebappVersion());
+     }
+ 
+
+==================================================

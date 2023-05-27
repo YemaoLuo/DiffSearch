@@ -1,0 +1,505 @@
+459bf9cdb426034ef742f819b4bfb5f9c2bd6a5f
+==================================================
+Update package renamed Apache Commons FileUpload to r1569132 to pick up some small improvements (e.g. better <code>null</code> protection) and some code clean up.
+==================================================
+Mark Emlyn
+==================================================
+Fri May 9 12:26:40 2014 +0000
+==================================================
+FileUploadBase.java
+Update package renamed Apache Commons FileUpload to r1569132 to pick up some small improvements (e.g. better <code>null</code> protection) and some code clean up.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1593528 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+IOUtils.java
+index 1f331c298d..c84ddaa881 100644
+--- a/java/org/apache/tomcat/util/http/fileupload/FileUploadBase.java
++++ b/java/org/apache/tomcat/util/http/fileupload/FileUploadBase.java
+@@ -802,10 +802,10 @@ public abstract class FileUploadBase {
+                         MULTIPART_FORM_DATA, MULTIPART_MIXED, contentType));
+             }
+ 
+-            InputStream input = ctx.getInputStream();
+ 
+             final long requestSize = ((UploadContext) ctx).contentLength();
+ 
++            InputStream input; // N.B. this is eventually closed in MultipartStream processing
+             if (sizeMax >= 0) {
+                 if (requestSize != -1 && requestSize > sizeMax) {
+                     throw new SizeLimitExceededException(String.format(
+@@ -813,7 +813,8 @@ public abstract class FileUploadBase {
+                             Long.valueOf(requestSize), Long.valueOf(sizeMax)),
+                             requestSize, sizeMax);
+                 }
+-                input = new LimitedInputStream(input, sizeMax) {
++                // N.B. this is eventually closed in MultipartStream processing
++                input = new LimitedInputStream(ctx.getInputStream(), sizeMax) {
+                     @Override
+                     protected void raiseError(long pSizeMax, long pCount)
+                             throws IOException {
+@@ -824,6 +825,8 @@ public abstract class FileUploadBase {
+                         throw new FileUploadIOException(ex);
+                     }
+                 };
++            } else {
++                input = ctx.getInputStream();
+             }
+ 
+             String charEncoding = headerEncoding;
+@@ -833,6 +836,7 @@ public abstract class FileUploadBase {
+ 
+             boundary = getBoundary(contentType);
+             if (boundary == null) {
++                IOUtils.closeQuietly(input); // avoid possible resource leak
+                 throw new FileUploadException("the request was rejected because no multipart boundary was found");
+             }
+ 
+@@ -840,9 +844,9 @@ public abstract class FileUploadBase {
+             try {
+                 multi = new MultipartStream(input, boundary, notifier);
+             } catch (IllegalArgumentException iae) {
+-                throw new InvalidContentTypeException(String.format(
+-                        "The boundary specified in the %s header is too long",
+-                        CONTENT_TYPE), iae);
++                IOUtils.closeQuietly(input); // avoid possible resource leak
++                throw new InvalidContentTypeException(
++                        String.format("The boundary specified in the %s header is too long", CONTENT_TYPE), iae);
+             }
+             multi.setHeaderEncoding(charEncoding);
+ 
+@@ -1034,6 +1038,15 @@ public abstract class FileUploadBase {
+             super(message);
+         }
+ 
++        /**
++         * Constructs an <code>InvalidContentTypeException</code> with
++         * the specified detail message and cause.
++         *
++         * @param msg The detail message.
++         * @param cause the original cause
++         *
++         * @since 1.3.1
++         */
+         public InvalidContentTypeException(String msg, Throwable cause) {
+             super(msg, cause);
+         }
+
+==================================================
+MultipartStream.java
+index 382a34f1d7..b3943d698c 100644
+--- a/java/org/apache/tomcat/util/http/fileupload/IOUtils.java
++++ b/java/org/apache/tomcat/util/http/fileupload/IOUtils.java
+@@ -16,6 +16,8 @@
+  */
+ package org.apache.tomcat.util.http.fileupload;
+ 
++import java.io.Closeable;
++import java.io.EOFException;
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.io.OutputStream;
+@@ -73,6 +75,52 @@ public class IOUtils {
+         super();
+     }
+ 
++    /**
++     * Closes a <code>Closeable</code> unconditionally.
++     * <p>
++     * Equivalent to {@link Closeable#close()}, except any exceptions will be ignored. This is typically used in
++     * finally blocks.
++     * <p>
++     * Example code:
++     *
++     * <pre>
++     * Closeable closeable = null;
++     * try {
++     *     closeable = new FileReader(&quot;foo.txt&quot;);
++     *     // process closeable
++     *     closeable.close();
++     * } catch (Exception e) {
++     *     // error handling
++     * } finally {
++     *     IOUtils.closeQuietly(closeable);
++     * }
++     * </pre>
++     *
++     * Closing all streams:
++     *
++     * <pre>
++     * try {
++     *     return IOUtils.copy(inputStream, outputStream);
++     * } finally {
++     *     IOUtils.closeQuietly(inputStream);
++     *     IOUtils.closeQuietly(outputStream);
++     * }
++     * </pre>
++     *
++     * @param closeable
++     *            the objects to close, may be null or already closed
++     * @since 2.0
++     */
++    public static void closeQuietly(final Closeable closeable) {
++        try {
++            if (closeable != null) {
++                closeable.close();
++            }
++        } catch (final IOException ioe) {
++            // ignore
++        }
++    }
++
+     // copy from InputStream
+     //-----------------------------------------------------------------------
+     /**
+@@ -130,4 +178,75 @@ public class IOUtils {
+         }
+         return count;
+     }
++
++    /**
++     * Reads bytes from an input stream.
++     * This implementation guarantees that it will read as many bytes
++     * as possible before giving up; this may not always be the case for
++     * subclasses of {@link InputStream}.
++     *
++     * @param input where to read input from
++     * @param buffer destination
++     * @param offset initial offset into buffer
++     * @param length length to read, must be &gt;= 0
++     * @return actual length read; may be less than requested if EOF was reached
++     * @throws IOException if a read error occurs
++     * @since 2.2
++     */
++    public static int read(final InputStream input, final byte[] buffer, final int offset, final int length) throws IOException {
++        if (length < 0) {
++            throw new IllegalArgumentException("Length must not be negative: " + length);
++        }
++        int remaining = length;
++        while (remaining > 0) {
++            final int location = length - remaining;
++            final int count = input.read(buffer, offset + location, remaining);
++            if (EOF == count) { // EOF
++                break;
++            }
++            remaining -= count;
++        }
++        return length - remaining;
++    }
++
++    /**
++     * Reads the requested number of bytes or fail if there are not enough left.
++     * <p>
++     * This allows for the possibility that {@link InputStream#read(byte[], int, int)} may
++     * not read as many bytes as requested (most likely because of reaching EOF).
++     *
++     * @param input where to read input from
++     * @param buffer destination
++     * @param offset initial offset into buffer
++     * @param length length to read, must be &gt;= 0
++     *
++     * @throws IOException if there is a problem reading the file
++     * @throws IllegalArgumentException if length is negative
++     * @throws EOFException if the number of bytes read was incorrect
++     * @since 2.2
++     */
++    public static void readFully(final InputStream input, final byte[] buffer, final int offset, final int length) throws IOException {
++        final int actual = read(input, buffer, offset, length);
++        if (actual != length) {
++            throw new EOFException("Length to read: " + length + " actual: " + actual);
++        }
++    }
++
++    /**
++     * Reads the requested number of bytes or fail if there are not enough left.
++     * <p>
++     * This allows for the possibility that {@link InputStream#read(byte[], int, int)} may
++     * not read as many bytes as requested (most likely because of reaching EOF).
++     *
++     * @param input where to read input from
++     * @param buffer destination
++     *
++     * @throws IOException if there is a problem reading the file
++     * @throws IllegalArgumentException if length is negative
++     * @throws EOFException if the number of bytes read was incorrect
++     * @since 2.2
++     */
++    public static void readFully(final InputStream input, final byte[] buffer) throws IOException {
++        readFully(input, buffer, 0, buffer.length);
++    }
+ }
+
+==================================================
+ParameterParser.java
+index 80bb01a0c0..f192e84f58 100644
+--- a/java/org/apache/tomcat/util/http/fileupload/MultipartStream.java
++++ b/java/org/apache/tomcat/util/http/fileupload/MultipartStream.java
+@@ -218,12 +218,12 @@ public class MultipartStream {
+      * The amount of data, in bytes, that must be kept in the buffer in order
+      * to detect delimiters reliably.
+      */
+-    private int keepRegion;
++    private final int keepRegion;
+ 
+     /**
+      * The byte sequence that partitions the stream.
+      */
+-    private byte[] boundary;
++    private final byte[] boundary;
+ 
+     /**
+      * The length of the buffer used for processing the request.
+@@ -277,11 +277,18 @@ public class MultipartStream {
+      *                  progress listener, if any.
+      *
+      * @throws IllegalArgumentException If the buffer size is too small
++     *
++     * @since 1.3.1
+      */
+     public MultipartStream(InputStream input,
+             byte[] boundary,
+             int bufSize,
+             ProgressNotifier pNotifier) {
++
++        if (boundary == null) {
++            throw new IllegalArgumentException("boundary may not be null");
++        }
++
+         this.input = input;
+         this.bufSize = bufSize;
+         this.buffer = new byte[bufSize];
+@@ -529,8 +536,7 @@ public class MultipartStream {
+      */
+     public int readBodyData(OutputStream output)
+             throws MalformedStreamException, IOException {
+-        final InputStream istream = newInputStream();
+-        return (int) Streams.copy(istream, output, false);
++        return (int) Streams.copy(newInputStream(), output, false); // N.B. Streams.copy closes the input stream
+     }
+ 
+     /**
+@@ -642,11 +648,9 @@ public class MultipartStream {
+         int first;
+         int match = 0;
+         int maxpos = tail - boundaryLength;
+-        for (first = head;
+-        (first <= maxpos) && (match != boundaryLength);
+-        first++) {
++        for (first = head; first <= maxpos && match != boundaryLength; first++) {
+             first = findByte(boundary[0], first);
+-            if (first == -1 || (first > maxpos)) {
++            if (first == -1 || first > maxpos) {
+                 return -1;
+             }
+             for (match = 1; match < boundaryLength; match++) {
+
+==================================================
+DiskFileItem.java
+index d562abcb01..2cb93f857a 100644
+--- a/java/org/apache/tomcat/util/http/fileupload/ParameterParser.java
++++ b/java/org/apache/tomcat/util/http/fileupload/ParameterParser.java
+@@ -127,8 +127,8 @@ public class ParameterParser {
+      */
+     private boolean isOneOf(char ch, final char[] charray) {
+         boolean result = false;
+-        for (int i = 0; i < charray.length; i++) {
+-            if (ch == charray[i]) {
++        for (char element : charray) {
++            if (ch == element) {
+                 result = true;
+                 break;
+             }
+@@ -233,11 +233,11 @@ public class ParameterParser {
+         char separator = separators[0];
+         if (str != null) {
+             int idx = str.length();
+-            for (int i = 0;  i < separators.length;  i++) {
+-                int tmp = str.indexOf(separators[i]);
++            for (char separator2 : separators) {
++                int tmp = str.indexOf(separator2);
+                 if (tmp != -1 && tmp < idx) {
+                     idx = tmp;
+-                    separator = separators[i];
++                    separator = separator2;
+                 }
+             }
+         }
+@@ -264,24 +264,24 @@ public class ParameterParser {
+      * Extracts a map of name/value pairs from the given array of
+      * characters. Names are expected to be unique.
+      *
+-     * @param chars the array of characters that contains a sequence of
++     * @param charArray the array of characters that contains a sequence of
+      * name/value pairs
+      * @param separator the name/value pairs separator
+      *
+      * @return a map of name/value pairs
+      */
+-    public Map<String,String> parse(final char[] chars, char separator) {
+-        if (chars == null) {
++    public Map<String,String> parse(final char[] charArray, char separator) {
++        if (charArray == null) {
+             return new HashMap<>();
+         }
+-        return parse(chars, 0, chars.length, separator);
++        return parse(charArray, 0, charArray.length, separator);
+     }
+ 
+     /**
+      * Extracts a map of name/value pairs from the given array of
+      * characters. Names are expected to be unique.
+      *
+-     * @param chars the array of characters that contains a sequence of
++     * @param charArray the array of characters that contains a sequence of
+      * name/value pairs
+      * @param offset - the initial offset.
+      * @param length - the length.
+@@ -290,16 +290,16 @@ public class ParameterParser {
+      * @return a map of name/value pairs
+      */
+     public Map<String,String> parse(
+-        final char[] chars,
++        final char[] charArray,
+         int offset,
+         int length,
+         char separator) {
+ 
+-        if (chars == null) {
++        if (charArray == null) {
+             return new HashMap<>();
+         }
+         HashMap<String,String> params = new HashMap<>();
+-        this.chars = chars;
++        this.chars = charArray;
+         this.pos = offset;
+         this.len = length;
+ 
+@@ -309,7 +309,7 @@ public class ParameterParser {
+             paramName = parseToken(new char[] {
+                     '=', separator });
+             paramValue = null;
+-            if (hasChar() && (chars[pos] == '=')) {
++            if (hasChar() && (charArray[pos] == '=')) {
+                 pos++; // skip '='
+                 paramValue = parseQuotedToken(new char[] {
+                         separator });
+@@ -322,7 +322,7 @@ public class ParameterParser {
+                     }
+                 }
+             }
+-            if (hasChar() && (chars[pos] == separator)) {
++            if (hasChar() && (charArray[pos] == separator)) {
+                 pos++; // skip separator
+             }
+             if ((paramName != null) && (paramName.length() > 0)) {
+
+==================================================
+LimitedInputStream.java
+index ceb3ec7121..a1cb05dfa9 100644
+--- a/java/org/apache/tomcat/util/http/fileupload/disk/DiskFileItem.java
++++ b/java/org/apache/tomcat/util/http/fileupload/disk/DiskFileItem.java
+@@ -276,12 +276,13 @@ public class DiskFileItem
+      * contents of the file were not yet cached in memory, they will be
+      * loaded from the disk storage and cached.
+      *
+-     * @return The contents of the file as an array of bytes.
++     * @return The contents of the file as an array of bytes
++     * or {@code null} if the data cannot be read
+      */
+     @Override
+     public byte[] get() {
+         if (isInMemory()) {
+-            if (cachedContent == null) {
++            if (cachedContent == null && dfos != null) {
+                 cachedContent = dfos.getData();
+             }
+             return cachedContent;
+@@ -292,17 +293,11 @@ public class DiskFileItem
+ 
+         try {
+             fis = new BufferedInputStream(new FileInputStream(dfos.getFile()));
+-            fis.read(fileData);
++            IOUtils.readFully(fis, fileData);
+         } catch (IOException e) {
+             fileData = null;
+         } finally {
+-            if (fis != null) {
+-                try {
+-                    fis.close();
+-                } catch (IOException e) {
+-                    // ignore
+-                }
+-            }
++            IOUtils.closeQuietly(fis);
+         }
+ 
+         return fileData;
+@@ -401,20 +396,8 @@ public class DiskFileItem
+                                 new FileOutputStream(file));
+                         IOUtils.copy(in, out);
+                     } finally {
+-                        if (in != null) {
+-                            try {
+-                                in.close();
+-                            } catch (IOException e) {
+-                                // ignore
+-                            }
+-                        }
+-                        if (out != null) {
+-                            try {
+-                                out.close();
+-                            } catch (IOException e) {
+-                                // ignore
+-                            }
+-                        }
++                        IOUtils.closeQuietly(in);
++                        IOUtils.closeQuietly(out);
+                     }
+                 }
+             } else {
+@@ -549,6 +532,9 @@ public class DiskFileItem
+      */
+     @Override
+     protected void finalize() {
++        if (dfos == null) {
++            return;
++        }
+         File outputFile = dfos.getFile();
+ 
+         if (outputFile != null && outputFile.exists()) {
+@@ -561,6 +547,9 @@ public class DiskFileItem
+      * named temporary file in the configured repository path. The lifetime of
+      * the file is tied to the lifetime of the <code>FileItem</code> instance;
+      * the file will be deleted when the instance is garbage collected.
++     * <p>
++     * <b>Note: Subclasses that override this method must ensure that they return the
++     * same File each time.</b>
+      *
+      * @return The {@link java.io.File File} to be used for temporary storage.
+      */
+
+==================================================
+Streams.java
+index 9de3df4f9e..e10d1727b0 100644
+--- a/java/org/apache/tomcat/util/http/fileupload/util/LimitedInputStream.java
++++ b/java/org/apache/tomcat/util/http/fileupload/util/LimitedInputStream.java
+@@ -44,12 +44,12 @@ public abstract class LimitedInputStream extends FilterInputStream implements Cl
+     /**
+      * Creates a new instance.
+      *
+-     * @param pIn The input stream, which shall be limited.
++     * @param inputStream The input stream, which shall be limited.
+      * @param pSizeMax The limit; no more than this number of bytes
+      *   shall be returned by the source stream.
+      */
+-    public LimitedInputStream(InputStream pIn, long pSizeMax) {
+-        super(pIn);
++    public LimitedInputStream(InputStream inputStream, long pSizeMax) {
++        super(inputStream);
+         sizeMax = pSizeMax;
+     }
+ 
+
+==================================================

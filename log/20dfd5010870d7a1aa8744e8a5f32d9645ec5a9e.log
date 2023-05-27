@@ -1,0 +1,412 @@
+20dfd5010870d7a1aa8744e8a5f32d9645ec5a9e
+==================================================
+Fixes to the clustering code, some changes in StandardSession broke func, this has been fixed.
+==================================================
+Filip Hanik
+==================================================
+Fri Oct 6 21:17:50 2006 +0000
+==================================================
+Cluster.java
+index 50caa85c03..5c43599a5f 100644
+--- a/conf/server.xml
++++ b/conf/server.xml
+@@ -192,7 +192,8 @@
+         -->
+         
+         <!--
+-        <Cluster className="org.apache.catalina.ha.tcp.SimpleTcpCluster">
++        <Cluster className="org.apache.catalina.ha.tcp.SimpleTcpCluster"
++                 channelSendOptions="11">
+           <Manager className="org.apache.catalina.ha.session.DeltaManager"
+                    expireSessionsOnShutdown="false"
+                    notifyListenersOnReplication="true"/>
+
+==================================================
+CatalinaCluster.java
+index b860e01b48..ef93c24752 100644
+--- a/java/org/apache/catalina/Cluster.java
++++ b/java/org/apache/catalina/Cluster.java
+@@ -108,6 +108,12 @@ public interface Cluster {
+      * @param manager Manager
+      */
+     public void registerManager(Manager manager);
++    
++    /**
++     * Removes a manager from the cluster
++     * @param manager Manager
++     */
++    public void removeManager(Manager manager);
+ 
+     // --------------------------------------------------------- Cluster Wide Deployments
+     
+
+==================================================
+FarmWarDeployer.java
+index d4a9e6e36d..52bac116fd 100644
+--- a/java/org/apache/catalina/ha/CatalinaCluster.java
++++ b/java/org/apache/catalina/ha/CatalinaCluster.java
+@@ -119,12 +119,11 @@ public interface CatalinaCluster extends Cluster {
+     public Map getManagers();
+ 
+     public Manager getManager(String name);
+-    public void removeManager(String name,Manager manager);
+-    public void addManager(String name,Manager manager);
+     public String getManagerName(String name, Manager manager);
+     public Valve[] getValves();
+     
+     public void setChannel(Channel channel);
+     public Channel getChannel();
++    
+ 
+ }
+
+==================================================
+BackupManager.java
+index 98b6b4415b..11ec1f2827 100644
+--- a/java/org/apache/catalina/ha/deploy/FarmWarDeployer.java
++++ b/java/org/apache/catalina/ha/deploy/FarmWarDeployer.java
+@@ -174,7 +174,7 @@ public class FarmWarDeployer extends ClusterListener implements ClusterDeployer,
+     /*
+      * stop cluster wide deployments
+      * 
+-     * @see org.apache.catalina.cluster.ClusterDeployer#stop()
++     * @see org.apache.catalina.ha.ClusterDeployer#stop()
+      */
+     public void stop() throws LifecycleException {
+         started = false;
+@@ -426,7 +426,7 @@ public class FarmWarDeployer extends ClusterListener implements ClusterDeployer,
+     /*
+      * Modifcation from watchDir war detected!
+      * 
+-     * @see org.apache.catalina.cluster.deploy.FileChangeListener#fileModified(java.io.File)
++     * @see org.apache.catalina.ha.deploy.FileChangeListener#fileModified(java.io.File)
+      */
+     public void fileModified(File newWar) {
+         try {
+@@ -450,7 +450,7 @@ public class FarmWarDeployer extends ClusterListener implements ClusterDeployer,
+     /*
+      * War remvoe from watchDir
+      * 
+-     * @see org.apache.catalina.cluster.deploy.FileChangeListener#fileRemoved(java.io.File)
++     * @see org.apache.catalina.ha.deploy.FileChangeListener#fileRemoved(java.io.File)
+      */
+     public void fileRemoved(File removeWar) {
+         try {
+@@ -581,7 +581,7 @@ public class FarmWarDeployer extends ClusterListener implements ClusterDeployer,
+     /*
+      * Call watcher to check for deploy changes
+      * 
+-     * @see org.apache.catalina.cluster.ClusterDeployer#backgroundProcess()
++     * @see org.apache.catalina.ha.ClusterDeployer#backgroundProcess()
+      */
+     public void backgroundProcess() {
+         if (started) {
+
+==================================================
+DeltaManager.java
+index c360d74b20..879c1098b3 100644
+--- a/java/org/apache/catalina/ha/session/BackupManager.java
++++ b/java/org/apache/catalina/ha/session/BackupManager.java
+@@ -177,9 +177,10 @@ public class BackupManager extends StandardManager implements ClusterManager
+      */
+     public void start() throws LifecycleException {
+         if ( this.started ) return;
++        
+         try {
++            cluster.registerManager(this);
+             CatalinaCluster catclust = (CatalinaCluster)cluster;
+-            catclust.addManager(getName(), this);
+             LazyReplicatedMap map = new LazyReplicatedMap(this,
+                                                           catclust.getChannel(),
+                                                           DEFAULT_REPL_TIMEOUT,
+@@ -188,6 +189,7 @@ public class BackupManager extends StandardManager implements ClusterManager
+             map.setChannelSendOptions(mapSendOptions);
+             this.sessions = map;
+             super.start();
++            this.started = true;
+         }  catch ( Exception x ) {
+             log.error("Unable to start BackupManager",x);
+             throw new LifecycleException("Failed to start BackupManager",x);
+@@ -196,7 +198,7 @@ public class BackupManager extends StandardManager implements ClusterManager
+     
+     public String getMapName() {
+         CatalinaCluster catclust = (CatalinaCluster)cluster;
+-        String name = catclust.getManagerName(getName(),this)+"-"+"";
++        String name = catclust.getManagerName(getName(),this)+"-"+"map";
+         if ( log.isDebugEnabled() ) log.debug("Backup manager, Setting map name to:"+name);
+         return name;
+     }
+@@ -225,7 +227,7 @@ public class BackupManager extends StandardManager implements ClusterManager
+         } finally {
+             super.stop();
+         }
+-        cluster.removeManager(getName(),this);
++        cluster.removeManager(this);
+ 
+     }
+ 
+
+==================================================
+DeltaSession.java
+index d5a2bc8d0f..600e25a6bf 100644
+--- a/java/org/apache/catalina/ha/session/DeltaManager.java
++++ b/java/org/apache/catalina/ha/session/DeltaManager.java
+@@ -837,7 +837,7 @@ public class DeltaManager extends ClusterManagerBase{
+             if (log.isInfoEnabled()) log.info(sm.getString("deltaManager.startClustering", getName()));
+             //to survice context reloads, as only a stop/start is called, not
+             // createManager
+-            ((CatalinaCluster)cluster).addManager(getName(), this);
++            cluster.registerManager(this);
+ 
+             getAllClusterSessions();
+ 
+@@ -1015,7 +1015,7 @@ public class DeltaManager extends ClusterManagerBase{
+ 
+         // Require a new random number generator if we are restarted
+         this.random = null;
+-        getCluster().removeManager(getName(),this);
++        getCluster().removeManager(this);
+         replicationValve = null;
+         if (initialized) {
+             destroy();
+
+==================================================
+SimpleTcpReplicationManager.java
+index e55626e3c3..1f1b49417f 100644
+--- a/java/org/apache/catalina/ha/session/DeltaSession.java
++++ b/java/org/apache/catalina/ha/session/DeltaSession.java
+@@ -43,6 +43,7 @@ import org.apache.catalina.util.Enumerator;
+ import org.apache.catalina.util.StringManager;
+ import org.apache.catalina.session.StandardManager;
+ import org.apache.catalina.session.ManagerBase;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+ /**
+  *
+@@ -103,6 +104,7 @@ public class DeltaSession extends StandardSession implements Externalizable,Clus
+ 
+     public DeltaSession(Manager manager) {
+         super(manager);
++        accessCount = new AtomicInteger();
+         this.resetDeltaRequest();
+     }
+ 
+@@ -545,6 +547,7 @@ public class DeltaSession extends StandardSession implements Externalizable,Clus
+         isValid = ( (Boolean) stream.readObject()).booleanValue();
+         thisAccessedTime = ( (Long) stream.readObject()).longValue();
+         version = ( (Long) stream.readObject()).longValue();
++        this.accessCount = new AtomicInteger();
+         boolean hasPrincipal = stream.readBoolean();
+         principal = null;
+         if (hasPrincipal) {
+
+==================================================
+SimpleTcpCluster.java
+index d5f83c3332..9f3bb330e5 100644
+--- a/java/org/apache/catalina/ha/session/SimpleTcpReplicationManager.java
++++ b/java/org/apache/catalina/ha/session/SimpleTcpReplicationManager.java
+@@ -46,10 +46,7 @@ import org.apache.catalina.Loader;
+  * @author Bela Ban (modifications for synchronous replication)
+  * @version 1.0 for TC 4.0
+  * Description: The InMemoryReplicationManager is a session manager that replicated
+- * session information in memory. It uses <a href="www.javagroups.com">JavaGroups</a> as
+- * a communication protocol to ensure guaranteed and ordered message delivery.
+- * JavaGroups also provides a very flexible protocol stack to ensure that the replication
+- * can be used in any environment.
++ * session information in memory. 
+  * <BR><BR>
+  * The InMemoryReplicationManager extends the StandardManager hence it allows for us
+  * to inherit all the basic session management features like expiration, session listeners etc
+@@ -269,7 +266,6 @@ public class SimpleTcpReplicationManager extends StandardManager implements Clus
+                      getName()+"] is not distributable. Ignoring message");
+             return null;
+         }
+-        //notify javagroups
+         try
+         {
+             if ( invalidatedSessions.get(sessionId) != null ) {
+@@ -478,7 +474,6 @@ public class SimpleTcpReplicationManager extends StandardManager implements Clus
+     public void start() throws LifecycleException {
+         mManagerRunning = true;
+         super.start();
+-        //start the javagroups channel
+         try {
+             //the channel is already running
+             if ( mChannelStarted ) return;
+@@ -488,7 +483,7 @@ public class SimpleTcpReplicationManager extends StandardManager implements Clus
+                 log.error("Starting... no cluster associated with this context:"+getName());
+                 return;
+             }
+-            cluster.addManager(getName(),this);
++            cluster.registerManager(this);
+ 
+             if (cluster.getMembers().length > 0) {
+                 Member mbr = cluster.getMembers()[0];
+@@ -543,15 +538,10 @@ public class SimpleTcpReplicationManager extends StandardManager implements Clus
+         mManagerRunning = false;
+         mChannelStarted = false;
+         super.stop();
+-        //stop the javagroup channel
+         try
+         {
+             this.sessions.clear();
+-            cluster.removeManager(getName(),this);
+-//            mReplicationListener.stopListening();
+-//            mReplicationTransmitter.stop();
+-//            service.stop();
+-//            service = null;
++            cluster.removeManager(this);
+         }
+         catch ( Exception x )
+         {
+
+==================================================
+MBeanUtils.java
+index b32013c254..832e3eadb6 100644
+--- a/java/org/apache/catalina/ha/tcp/SimpleTcpCluster.java
++++ b/java/org/apache/catalina/ha/tcp/SimpleTcpCluster.java
+@@ -345,6 +345,10 @@ public class SimpleTcpCluster
+         this.managerTemplate = managerTemplate;
+     }
+ 
++    public void setChannelSendOptions(int channelSendOptions) {
++        this.channelSendOptions = channelSendOptions;
++    }
++
+     /**
+      * has members
+      */
+@@ -479,6 +483,10 @@ public class SimpleTcpCluster
+         return managerTemplate;
+     }
+ 
++    public int getChannelSendOptions() {
++        return channelSendOptions;
++    }
++
+     /**
+      * Create new Manager without add to cluster (comes with start the manager)
+      * 
+@@ -493,6 +501,7 @@ public class SimpleTcpCluster
+         Manager manager = null;
+         try {
+             manager = managerTemplate.cloneFromTemplate();
++            ((ClusterManager)manager).setName(name);
+         } catch (Exception x) {
+             log.error("Unable to clone cluster manager, defaulting to org.apache.catalina.ha.session.DeltaManager", x);
+             manager = new org.apache.catalina.ha.session.DeltaManager();
+@@ -503,13 +512,23 @@ public class SimpleTcpCluster
+     }
+     
+     public void registerManager(Manager manager) {
+-        manager.setDistributable(true);
+-        if (manager instanceof ClusterManager) {
+-            ClusterManager cmanager = (ClusterManager) manager ;
+-            cmanager.setDefaultMode(false);
+-            cmanager.setName(getManagerName(((ClusterManager)manager).getName(),manager));
+-            cmanager.setCluster(this);
++    
++        if (! (manager instanceof ClusterManager)) {
++            log.warn("Manager [ " + manager + "] does not implement ClusterManager, addition to cluster has been aborted.");
++            return;
+         }
++        ClusterManager cmanager = (ClusterManager) manager ;
++        cmanager.setDistributable(true);
++        // Notify our interested LifecycleListeners
++        lifecycle.fireLifecycleEvent(BEFORE_MANAGERREGISTER_EVENT, manager);
++        String clusterName = getManagerName(cmanager.getName(), manager);
++        cmanager.setName(clusterName);
++        cmanager.setCluster(this);
++        cmanager.setDefaultMode(false);
++    
++        managers.put(clusterName, manager);
++        // Notify our interested LifecycleListeners
++        lifecycle.fireLifecycleEvent(AFTER_MANAGERREGISTER_EVENT, manager);    
+     }
+ 
+     /**
+@@ -517,47 +536,18 @@ public class SimpleTcpCluster
+      * 
+      * @see org.apache.catalina.ha.CatalinaCluster#removeManager(java.lang.String,Manager)
+      */
+-    public void removeManager(String name,Manager manager) {
+-        if (manager != null) {
++    public void removeManager(Manager manager) {
++        if (manager != null && manager instanceof ClusterManager ) {
++            ClusterManager cmgr = (ClusterManager) manager;
+             // Notify our interested LifecycleListeners
+             lifecycle.fireLifecycleEvent(BEFORE_MANAGERUNREGISTER_EVENT,manager);
+-            managers.remove(getManagerName(name,manager));
+-            if (manager instanceof ClusterManager) ((ClusterManager) manager).setCluster(null);
++            managers.remove(getManagerName(cmgr.getName(),manager));
++            cmgr.setCluster(null);
+             // Notify our interested LifecycleListeners
+             lifecycle.fireLifecycleEvent(AFTER_MANAGERUNREGISTER_EVENT, manager);
+         }
+     }
+ 
+-    /**
+-     * add an application to cluster replication bus
+-     * 
+-     * @param name
+-     *            of the context
+-     * @param manager
+-     *            manager to register
+-     * @see org.apache.catalina.ha.CatalinaCluster#addManager(java.lang.String,
+-     *      org.apache.catalina.Manager)
+-     */
+-    public void addManager(String name, Manager manager) {
+-        if (!manager.getDistributable()) {
+-            log.warn("Manager with name " + name + " is not distributable, can't add as cluster manager");
+-            return;
+-        }
+-        // Notify our interested LifecycleListeners
+-        lifecycle.fireLifecycleEvent(BEFORE_MANAGERREGISTER_EVENT, manager);
+-        String clusterName = getManagerName(name, manager);
+-        if (manager instanceof ClusterManager) {
+-            ClusterManager cmanager = (ClusterManager) manager ;
+-            cmanager.setName(clusterName);
+-            cmanager.setCluster(this);
+-            //not needed anymore, we have an explicit Manager element
+-            //if(cmanager.isDefaultMode()) transferProperty("manager",cmanager);
+-        }
+-        managers.put(clusterName, manager);
+-        // Notify our interested LifecycleListeners
+-        lifecycle.fireLifecycleEvent(AFTER_MANAGERREGISTER_EVENT, manager);
+-    }
+-
+     /**
+      * @param name
+      * @param manager
+
+==================================================
+GroupChannel.java
+index 6acbe0b2d2..71ae2a8cfb 100644
+--- a/java/org/apache/catalina/mbeans/MBeanUtils.java
++++ b/java/org/apache/catalina/mbeans/MBeanUtils.java
+@@ -1366,7 +1366,7 @@ public class MBeanUtils {
+             registry.loadDescriptors("org.apache.catalina.session", cl);
+             registry.loadDescriptors("org.apache.catalina.startup", cl);
+             registry.loadDescriptors("org.apache.catalina.users", cl);
+-            registry.loadDescriptors("org.apache.catalina.cluster", cl);
++            registry.loadDescriptors("org.apache.catalina.ha", cl);
+             registry.loadDescriptors("org.apache.catalina.connector", cl);
+             registry.loadDescriptors("org.apache.catalina.valves",  cl);
+         }
+
+==================================================
+AbstractReplicatedMap.java
+index d6e3fc4fb0..41e3329229 100644
+--- a/java/org/apache/catalina/tribes/membership/mbeans-descriptors.xml
++++ b/java/org/apache/catalina/tribes/membership/mbeans-descriptors.xml
+@@ -8,7 +8,7 @@
+            description="Cluster Membership service implementation"
+                domain="Catalina"
+                 group="Cluster"
+-                 type="org.apache.catalina.cluster.mcast.McastService">
++                 type="org.apache.catalina.ha.mcast.McastService">
+     <attribute   name="info"
+           description="Class version info"
+                  type="java.lang.String"
+
+==================================================

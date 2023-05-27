@@ -1,0 +1,178 @@
+6ca79c8961b3dfa3f3a6f354c9972fef49a81830
+==================================================
+Refactor sendfile with compression support in mind. Use an approach similar to HTTP/1.1 so the StreamProcessor will have visibility of whether sendfile is in use when deciding whether or not to compress.
+==================================================
+Mark Thomas
+==================================================
+Tue Nov 28 20:49:45 2017 +0000
+==================================================
+Http2AsyncUpgradeHandler.java
+Refactor sendfile with compression support in mind. Use an approach similar to HTTP/1.1 so the StreamProcessor will have visibility of whether sendfile is in use when deciding whether or not to compress.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1816571 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Http2UpgradeHandler.java
+index c9e96f9009..cfcaf6c322 100644
+--- a/java/org/apache/coyote/http2/Http2AsyncUpgradeHandler.java
++++ b/java/org/apache/coyote/http2/Http2AsyncUpgradeHandler.java
+@@ -16,10 +16,8 @@
+  */
+ package org.apache.coyote.http2;
+ 
+-import java.io.File;
+ import java.io.IOException;
+ import java.nio.ByteBuffer;
+-import java.nio.MappedByteBuffer;
+ import java.nio.channels.CompletionHandler;
+ import java.nio.channels.FileChannel;
+ import java.nio.channels.FileChannel.MapMode;
+@@ -264,47 +262,37 @@ public class Http2AsyncUpgradeHandler extends Http2UpgradeHandler {
+     }
+ 
+     @Override
+-    protected SendfileState processSendfile(Stream stream) {
+-        String fileName = (String) stream.getCoyoteRequest().getAttribute(
+-                org.apache.coyote.Constants.SENDFILE_FILENAME_ATTR);
+-        if (fileName != null) {
+-            java.nio.file.Path path = new File(fileName).toPath();
+-            SendfileData sendfile = new SendfileData();
+-            sendfile.pos = ((Long) stream.getCoyoteRequest().getAttribute(
+-                    org.apache.coyote.Constants.SENDFILE_FILE_START_ATTR)).longValue();
+-            sendfile.end = ((Long) stream.getCoyoteRequest().getAttribute(
+-                    org.apache.coyote.Constants.SENDFILE_FILE_END_ATTR)).longValue();
+-            sendfile.left = sendfile.end - sendfile.pos;
++    protected SendfileState processSendfile(SendfileData sendfile) {
++        if (sendfile != null) {
+             try {
+-                try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
++                try (FileChannel channel = FileChannel.open(sendfile.path, StandardOpenOption.READ)) {
+                     sendfile.mappedBuffer = channel.map(MapMode.READ_ONLY, sendfile.pos, sendfile.end - sendfile.pos);
+-                    sendfile.stream = stream;
+                 }
+                 // Reserve as much as possible right away
+                 int reservation = (sendfile.end - sendfile.pos > Integer.MAX_VALUE) ? Integer.MAX_VALUE : (int) (sendfile.end - sendfile.pos);
+-                sendfile.streamReservation  = stream.reserveWindowSize(reservation, true);
+-                sendfile.connectionReservation = reserveWindowSize(stream, sendfile.streamReservation);
++                sendfile.streamReservation  = sendfile.stream.reserveWindowSize(reservation, true);
++                sendfile.connectionReservation = reserveWindowSize(sendfile.stream, sendfile.streamReservation);
+             } catch (IOException e) {
+                 return SendfileState.ERROR;
+             }
+             // Actually perform the write
+             int frameSize = Integer.min(getMaxFrameSize(), sendfile.connectionReservation);
+-            boolean finished = (frameSize == sendfile.left) && stream.getCoyoteResponse().getTrailerFields() == null;
++            boolean finished = (frameSize == sendfile.left) && sendfile.stream.getCoyoteResponse().getTrailerFields() == null;
+ 
+             // Need to check this now since sending end of stream will change this.
+-            boolean writeable = stream.canWrite();
++            boolean writeable = sendfile.stream.canWrite();
+             byte[] header = new byte[9];
+             ByteUtil.setThreeBytes(header, 0, frameSize);
+             header[3] = FrameType.DATA.getIdByte();
+             if (finished) {
+                 header[4] = FLAG_END_OF_STREAM;
+-                stream.sentEndOfStream();
+-                if (!stream.isActive()) {
++                sendfile.stream.sentEndOfStream();
++                if (!sendfile.stream.isActive()) {
+                     activeRemoteStreamCount.decrementAndGet();
+                 }
+             }
+             if (writeable) {
+-                ByteUtil.set31Bits(header, 5, stream.getIdentifier().intValue());
++                ByteUtil.set31Bits(header, 5, sendfile.stream.getIdentifier().intValue());
+                 sendfile.mappedBuffer.limit(sendfile.mappedBuffer.position() + frameSize);
+                 socketWrapper.write(BlockingMode.SEMI_BLOCK, protocol.getWriteTimeout(),
+                         TimeUnit.MILLISECONDS, sendfile, COMPLETE_WRITE_WITH_COMPLETION,
+@@ -397,19 +385,6 @@ public class Http2AsyncUpgradeHandler extends Http2UpgradeHandler {
+         }
+     }
+ 
+-    protected class SendfileData {
+-        protected Stream stream;
+-        // Note: a mapped buffer is a special construct with an underlying file
+-        // that doesn't need to be closed
+-        protected MappedByteBuffer mappedBuffer;
+-        protected int frameSize;
+-        protected long left;
+-        protected int streamReservation;
+-        protected int connectionReservation;
+-        protected long pos;
+-        protected long end;
+-    }
+-
+     protected class AsyncPingManager extends PingManager {
+         @Override
+         public void sendPing(boolean force) throws IOException {
+
+==================================================
+SendfileData.java
+index 96ff4836ec..db98da40f0 100644
+--- a/java/org/apache/coyote/http2/Http2UpgradeHandler.java
++++ b/java/org/apache/coyote/http2/Http2UpgradeHandler.java
+@@ -808,14 +808,15 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
+      * Process send file (if supported) for the given stream. The appropriate
+      * request attributes should be set before calling this method.
+      *
+-     * @param stream    The stream to process
++     * @param sendfileData  The stream and associated data to process
+      *
+      * @return  The result of the send file processing
+      */
+-    protected SendfileState processSendfile(Stream stream) {
++    protected SendfileState processSendfile(SendfileData sendfileData) {
+         return SendfileState.DONE;
+     }
+ 
++
+     private synchronized Set<AbstractStream> releaseBackLog(int increment) {
+         Set<AbstractStream> result = new HashSet<>();
+         if (backLogSize < increment) {
+
+==================================================
+StreamProcessor.java
+new file mode 100644
+index 0000000000..25a9f68de8
+--- /dev/null
++++ b/java/org/apache/coyote/http2/SendfileData.java
+@@ -0,0 +1,34 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.coyote.http2;
++
++import java.nio.MappedByteBuffer;
++import java.nio.file.Path;
++
++class SendfileData {
++    Path path;
++    Stream stream;
++    // Note: a mapped buffer is a special construct with an underlying file
++    // that doesn't need to be closed
++    MappedByteBuffer mappedBuffer;
++    int frameSize;
++    long left;
++    int streamReservation;
++    int connectionReservation;
++    long pos;
++    long end;
++}
+\ No newline at end of file
+
+==================================================

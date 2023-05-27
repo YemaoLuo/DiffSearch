@@ -1,0 +1,264 @@
+aba1417937a553f3ca12244af72b52f9f230efe8
+==================================================
+Improve the handling of client disconnections during the TLS renegotiation handshake.
+==================================================
+Mark Thomas
+==================================================
+Tue Aug 8 19:29:55 2017 +0000
+==================================================
+AbstractProcessor.java
+Improve the handling of client disconnections during the TLS renegotiation handshake.
+
+git-svn-id: https://svn.apache.org/repos/asf/tomcat/trunk@1804463 13f79535-47bb-0310-9956-ffa450edef68
+
+
+
+==================================================
+Http11Processor.java
+index 9dc2a5d68f..625bf9bfa4 100644
+--- a/java/org/apache/coyote/AbstractProcessor.java
++++ b/java/org/apache/coyote/AbstractProcessor.java
+@@ -371,7 +371,11 @@ public abstract class AbstractProcessor extends AbstractProcessorLight implement
+             break;
+         }
+         case REQ_SSL_CERTIFICATE: {
+-            sslReHandShake();
++            try {
++                sslReHandShake();
++            } catch (IOException ioe) {
++                setErrorState(ErrorState.CLOSE_CONNECTION_NOW, ioe);
++            }
+             break;
+         }
+ 
+@@ -645,8 +649,12 @@ public abstract class AbstractProcessor extends AbstractProcessorLight implement
+     /**
+      * Processors that can perform a TLS re-handshake (e.g. HTTP/1.1) should
+      * override this method and implement the re-handshake.
++     *
++     * @throws IOException If authentication is required then there will be I/O
++     *                     with the client and this exception will be thrown if
++     *                     that goes wrong
+      */
+-    protected void sslReHandShake() {
++    protected void sslReHandShake() throws IOException {
+         // NO-OP
+     }
+ 
+
+==================================================
+AprEndpoint.java
+index 4bc39fdc58..5c26f194e5 100644
+--- a/java/org/apache/coyote/http11/Http11Processor.java
++++ b/java/org/apache/coyote/http11/Http11Processor.java
+@@ -1242,7 +1242,7 @@ public class Http11Processor extends AbstractProcessor {
+ 
+ 
+     @Override
+-    protected final void sslReHandShake() {
++    protected final void sslReHandShake() throws IOException {
+         if (sslSupport != null) {
+             // Consume and buffer the request body, so that it does not
+             // interfere with the client's handshake messages
+@@ -1251,8 +1251,17 @@ public class Http11Processor extends AbstractProcessor {
+                     protocol.getMaxSavePostSize());
+             inputBuffer.addActiveFilter(inputFilters[Constants.BUFFERED_FILTER]);
+ 
++            /*
++             * Outside the try/catch because we want I/O errors during
++             * renegotiation to be thrown for the caller to handle since they
++             * will be fatal to the connection.
++             */
++            socketWrapper.doClientAuth(sslSupport);
+             try {
+-                socketWrapper.doClientAuth(sslSupport);
++                /*
++                 * Errors processing the cert chain do not affect the client
++                 * connection so they can be logged and swallowed here.
++                 */
+                 Object sslO = sslSupport.getPeerCertificateChain();
+                 if (sslO != null) {
+                     request.setAttribute(SSLSupport.CERTIFICATE_KEY, sslO);
+
+==================================================
+Nio2Endpoint.java
+index 7dfc313086..961157325c 100644
+--- a/java/org/apache/tomcat/util/net/LocalStrings.properties
++++ b/java/org/apache/tomcat/util/net/LocalStrings.properties
+@@ -83,6 +83,7 @@ endpoint.nio.timeoutCme=Exception during processing of timeouts. The code has be
+ endpoint.nio2.exclusiveExecutor=The NIO2 connector requires an exclusive executor to operate properly on shutdown
+ 
+ channel.nio.interrupted=The current thread was interrupted
++channel.nio.ssl.closeSilentError=As expected, there was an exception trying to close the connection cleanly.
+ channel.nio.ssl.notHandshaking=NOT_HANDSHAKING during handshake
+ channel.nio.ssl.handshakeError=Handshake error
+ channel.nio.ssl.unexpectedStatusDuringWrap=Unexpected status [{0}] during handshake WRAP.
+
+==================================================
+NioEndpoint.java
+index 4ad90d4dd4..204b93ec01 100644
+--- a/java/org/apache/tomcat/util/net/Nio2Endpoint.java
++++ b/java/org/apache/tomcat/util/net/Nio2Endpoint.java
+@@ -1589,18 +1589,14 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel,AsynchronousS
+ 
+ 
+         @Override
+-        public void doClientAuth(SSLSupport sslSupport) {
++        public void doClientAuth(SSLSupport sslSupport) throws IOException {
+             SecureNio2Channel sslChannel = (SecureNio2Channel) getSocket();
+             SSLEngine engine = sslChannel.getSslEngine();
+             if (!engine.getNeedClientAuth()) {
+                 // Need to re-negotiate SSL connection
+                 engine.setNeedClientAuth(true);
+-                try {
+-                    sslChannel.rehandshake();
+-                    ((JSSESupport) sslSupport).setSession(engine.getSession());
+-                } catch (IOException ioe) {
+-                    log.warn(sm.getString("socket.sslreneg"), ioe);
+-                }
++                sslChannel.rehandshake();
++                ((JSSESupport) sslSupport).setSession(engine.getSession());
+             }
+         }
+ 
+
+==================================================
+SecureNio2Channel.java
+index 6e71c36502..0de624136b 100644
+--- a/java/org/apache/tomcat/util/net/NioEndpoint.java
++++ b/java/org/apache/tomcat/util/net/NioEndpoint.java
+@@ -1293,18 +1293,14 @@ public class NioEndpoint extends AbstractJsseEndpoint<NioChannel,SocketChannel>
+ 
+ 
+         @Override
+-        public void doClientAuth(SSLSupport sslSupport) {
++        public void doClientAuth(SSLSupport sslSupport) throws IOException {
+             SecureNioChannel sslChannel = (SecureNioChannel) getSocket();
+             SSLEngine engine = sslChannel.getSslEngine();
+             if (!engine.getNeedClientAuth()) {
+                 // Need to re-negotiate SSL connection
+                 engine.setNeedClientAuth(true);
+-                try {
+-                    sslChannel.rehandshake(getEndpoint().getConnectionTimeout());
+-                    ((JSSESupport) sslSupport).setSession(engine.getSession());
+-                } catch (IOException ioe) {
+-                    log.warn(sm.getString("socket.sslreneg",ioe));
+-                }
++                sslChannel.rehandshake(getEndpoint().getConnectionTimeout());
++                ((JSSESupport) sslSupport).setSession(engine.getSession());
+             }
+         }
+ 
+
+==================================================
+SecureNioChannel.java
+index 3b42bd6693..edc9d5d9cb 100644
+--- a/java/org/apache/tomcat/util/net/SecureNio2Channel.java
++++ b/java/org/apache/tomcat/util/net/SecureNio2Channel.java
+@@ -305,8 +305,11 @@ public class SecureNio2Channel extends Nio2Channel  {
+                             sc.read(netInBuffer, socket, handshakeReadCompletionHandler);
+                         } else {
+                             try {
+-                                sc.read(netInBuffer).get(endpoint.getConnectionTimeout(),
+-                                        TimeUnit.MILLISECONDS);
++                                int read = sc.read(netInBuffer).get(endpoint.getConnectionTimeout(),
++                                        TimeUnit.MILLISECONDS).intValue();
++                                if (read == -1) {
++                                    throw new EOFException();
++                                }
+                             } catch (InterruptedException | ExecutionException | TimeoutException e) {
+                                 throw new IOException(sm.getString("channel.nio.ssl.handshakeError"));
+                             }
+@@ -449,8 +452,10 @@ public class SecureNio2Channel extends Nio2Channel  {
+                 }
+             }
+         } catch (IOException x) {
++            closeSilently();
+             throw x;
+         } catch (Exception cx) {
++            closeSilently();
+             IOException x = new IOException(cx);
+             throw x;
+         }
+@@ -576,18 +581,31 @@ public class SecureNio2Channel extends Nio2Channel  {
+         closed = (!netOutBuffer.hasRemaining() && (handshake.getHandshakeStatus() != HandshakeStatus.NEED_WRAP));
+     }
+ 
++
+     @Override
+     public void close(boolean force) throws IOException {
+         try {
+             close();
+         } finally {
+-            if ( force || closed ) {
++            if (force || closed) {
+                 closed = true;
+                 sc.close();
+             }
+         }
+     }
+ 
++
++    private void closeSilently() {
++        try {
++            close(true);
++        } catch (IOException ioe) {
++            // This is expected - swallowing the exception is the reason this
++            // method exists. Log at debug in case someone is interested.
++            log.debug(sm.getString("channel.nio.ssl.closeSilentError"), ioe);
++        }
++    }
++
++
+     private class FutureRead implements Future<Integer> {
+         private ByteBuffer dst;
+         private Future<Integer> integer;
+
+==================================================
+SocketWrapperBase.java
+index a522e7b923..42866d0621 100644
+--- a/java/org/apache/tomcat/util/net/SecureNioChannel.java
++++ b/java/org/apache/tomcat/util/net/SecureNioChannel.java
+@@ -395,8 +395,10 @@ public class SecureNioChannel extends NioChannel  {
+                 }
+             }
+         } catch (IOException x) {
++            closeSilently();
+             throw x;
+         } catch (Exception cx) {
++            closeSilently();
+             IOException x = new IOException(cx);
+             throw x;
+         } finally {
+@@ -526,8 +528,8 @@ public class SecureNioChannel extends NioChannel  {
+     public void close(boolean force) throws IOException {
+         try {
+             close();
+-        }finally {
+-            if ( force || closed ) {
++        } finally {
++            if (force || closed) {
+                 closed = true;
+                 sc.socket().close();
+                 sc.close();
+@@ -535,6 +537,18 @@ public class SecureNioChannel extends NioChannel  {
+         }
+     }
+ 
++
++    private void closeSilently() {
++        try {
++            close(true);
++        } catch (IOException ioe) {
++            // This is expected - swallowing the exception is the reason this
++            // method exists. Log at debug in case someone is interested.
++            log.debug(sm.getString("channel.nio.ssl.closeSilentError"), ioe);
++        }
++    }
++
++
+     /**
+      * Reads a sequence of bytes from this channel into the given buffer.
+      *
+
+==================================================
